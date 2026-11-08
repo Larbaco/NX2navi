@@ -41,7 +41,7 @@ namespace Ryujinx.Common
             "01007ef00011e000", // The Legend of Zelda: Breath of the Wild
             "01006bb00c6f0000", // The Legend of Zelda: Link's Awakening
             "01002da013484000", // The Legend of Zelda: Skyward Sword HD
-            "0100f2c0115b6000",
+            "0100f2c0115b6000", // The Legend of Zelda: Tears of the Kingdom
             "01008cf01baac000", // The Legend of Zelda: Echoes of Wisdom
                 
                           //Luigi Franchise
