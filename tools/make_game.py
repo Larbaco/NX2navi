@@ -370,6 +370,10 @@ def step_romfs(src, out, jobs):
 # ---------------------------------------------------------------- lift
 
 EMITTED = re.compile(r'emitted (\d+)/(\d+) chunks')
+# step_shaders: the game's --prepare-shaders log lines (runtime/gfx_shader.c, runtime/vk_pipeline.c lb_report)
+SHADER_PROGRESS = ((re.compile(r'gfx_shader: prepare: (\d+) of (\d+) pairs'), 'shaders translated'),
+                   (re.compile(r'stage library prebuild preparation (?:progress|done): (\d+) of (\d+) variants'),
+                    'shaders built by the graphics driver'))
 
 
 def lift_digest():
@@ -980,7 +984,18 @@ def step_shaders(out):
     """Every shader of the game files into the game's shader cache and the driver's own cache, before the first start."""
     cmd = [sys.executable, str(KIT / 'tools' / 'prepare_shaders.py'), str(out), '--romfs', str(out / 'romfs'),
            '--exefs', str(out / 'exefs'), '--no-list', '--exe', 'ocarina.exe']
-    if subprocess.run(cmd).returncode:
+    # The game's log lines say how far each half of the step is (translation, then the driver's builds): passed on as
+    # progress, so the launcher's row moves with the work instead of reading 0% until the step ends.
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8',
+                         errors='replace', bufsize=1)
+    for line in p.stdout:
+        line = line.rstrip('\n')
+        say(line)
+        for pattern, unit in SHADER_PROGRESS:
+            m = pattern.search(line)
+            if m:
+                emit('progress', step='shaders', done=int(m.group(1)), total=int(m.group(2)), unit=unit)
+    if p.wait():
         fail('preparing the shaders failed (the lines above say why); the game still runs, compiling shaders as it '
              'meets them. Run the build again to retry this step')
     for seed in ('seed-programs.bin', 'seed-answers.bin'):   # translated now: the shader cache holds them
