@@ -265,6 +265,9 @@ static void open_window(void *arg) {
     note_applied();
     refresh_rate_update();
     if (cfg_get("NX2NAVI_BACKGROUND_WINDOW")) rt_log("gfx: NX2NAVI_BACKGROUND_WINDOW has no effect with SDL windows");
+    const char *monitor = cfg_get("NX2NAVI_MONITOR");   // open_window runs once, so this is logged once
+    if (monitor && *monitor && strcasecmp(monitor, "auto"))
+        rt_log("gfx: NX2NAVI_MONITOR=%s has no effect with SDL windows: monitor selection is Win32-only (gfx_window_win.c)", monitor);
     if (gfx_cfg_fullscreen()) SDL_SetWindowFullscreen(g_win, true);
     SDL_SyncWindow(g_win);
     input_sdl_window(g_win);
@@ -275,6 +278,12 @@ int wsys_open(void) {
     if (!video_up()) return 0;
     if (!g_win) run_on_window(open_window, NULL);
     return open_ok;
+}
+
+// --list-monitors (main.c) lists Win32 monitors only; see open_window for the setting.
+int list_monitors(void) {
+    fprintf(stderr, "list-monitors: monitor selection is Win32-only; this build uses SDL windows\n");
+    return 1;
 }
 
 typedef struct { VkInstance inst; VkSurfaceKHR surface; } SurfaceReq;

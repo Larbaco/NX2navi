@@ -137,6 +137,12 @@
 # here. Changes while the game runs take effect at once.
 # window_size = 1920x1080
 # fullscreen = 0
+# Which monitor the game window opens on, centred in its work area; fullscreen covers that monitor. auto (default): the
+# system places the window. primary; a number, counting from 1 in the order `nx2navi.exe --list-monitors` prints; or part
+# of a GDI device name (display3) or of the monitor's name, ignoring case. For a virtual display that may not exist yet,
+# use its name: when nothing matches, the log lists the monitors and the window is placed as with auto. The command line
+# `--monitor <value>` overrides this for one run. Read at start; Windows only.
+# monitor = auto
 # 1, the default: the game keeps running while you are in another window; the keyboard stays quiet until the window is
 # in front again. 0: it pauses when its window loses focus, as it does on the Switch when Home is pressed; a load
 # interrupted that way can stop for good. Read at each focus change.

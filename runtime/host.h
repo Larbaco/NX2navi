@@ -332,6 +332,7 @@ void rt_boot(void);                                        // boot.c
 // process exit code.
 int probe_cfg(void);                                       // cfg_probe.c
 int probe_dpi(void);                                       // dpi_probe_win.c (Windows only)
+int list_monitors(void);                                   // --list-monitors: gfx_window_win.c, gfx_window_sdl.c
 int probe_mods(void);                                      // mods_probe.c
 void discord_init(void);                                   // discord_rpc.c: the Rich Presence thread, game runs only
 int probe_discord(void);                                   // discord_rpc.c
