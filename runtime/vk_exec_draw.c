@@ -4097,11 +4097,67 @@ static int native_tensor(const VkExec *ex) {
     return on || !uses_tensor_ops(ex);
 }
 
+// Everything an untranslated program binds (NX2NAVI_LOG_CS_BINDS): what a stand-in could use instead. Texture lock held.
+static void log_cs_bindings_locked(const VkExec *ex) {
+    char line[1600];
+    int o = 0;
+    line[0] = 0;
+    for (int i = 0; i < 160 && o < (int)sizeof line - 80; i++) {
+        int im = i >= 128;
+        uint64_t h = im ? ex->img[NVN_STAGE_CS][i - 128 < 32 ? i - 128 : 0] : ex->tex[NVN_STAGE_CS][i];
+        if (im && i - 128 >= 32) break;
+        view_t v; int hv = 0;
+        const VkTexImage *t = h ? vk_texture_by_id_locked(NVN_HANDLE_TEX(h), &v, &hv) : NULL;
+        if (t && (i == 0 || h != ex->tex[NVN_STAGE_CS][0] || im))
+            o += snprintf(line + o, sizeof line - o, " %s%d=%ux%u/f%d@%#llx", im ? "img" : "tex", im ? i - 128 : i,
+                          t->width, t->height, t->format, (unsigned long long)t->addr);
+    }
+    for (int i = 0; i < 18 && o < (int)sizeof line - 60; i++)
+        if (ex->ubo[NVN_STAGE_CS][i].size)
+            o += snprintf(line + o, sizeof line - o, " ubo%d=%#llx+%#x", i + 3,
+                          (unsigned long long)ex->ubo[NVN_STAGE_CS][i].addr, (unsigned)ex->ubo[NVN_STAGE_CS][i].size);
+    rt_log("vk_exec:   its bindings:%s", line);
+}
+
+// NX2NAVI_LOG_CS_BINDS: an untranslated program the fallback leaves alone, so its output keeps what it held (black when
+// nothing else wrote it): why, and what it binds. in_place -1: not a tensor program (its translation failed). Each
+// (program, output) once, 256 at most. Texture lock held.
+static void log_fallback_skip_locked(const VkExec *ex, const VkTexImage *out, int in_place) {
+    static struct { uint64_t prog, d; } seen[256];
+    static int n;
+    uint64_t pr = ex->prog ? ex->prog->serial : 0, d = out ? out->addr : 0;
+    for (int k = 0; k < n; k++)
+        if (seen[k].prog == pr && seen[k].d == d) return;
+    if (n == 256) return;
+    seen[n].prog = pr, seen[n].d = d, n++;
+    if (in_place < 0)
+        rt_log("vk_exec: fallback leaves prog %llu alone: not translated and no tensor-core ops, so nothing stands in",
+               (unsigned long long)pr);
+    else if (!out)
+        rt_log("vk_exec: fallback leaves prog %llu alone: it binds no single-sample 2D colour image to write",
+               (unsigned long long)pr);
+    else
+        rt_log("vk_exec: fallback leaves prog %llu alone: %s; its output %ux%u fmt %d at %#llx", (unsigned long long)pr,
+               in_place ? "it also samples its output (in place)"
+                        : "no RGBA8 input and no input in the output's format, no larger than the output",
+               out->width, out->height, out->format, (unsigned long long)out->addr);
+    log_cs_bindings_locked(ex);
+}
+
 static void untranslated_dispatch_fallback(VkExec *ex) {
     static int on = -1;
     if (on < 0) on = rt_knob("CS_FALLBACK", "1");
-    if (!on || !uses_tensor_ops(ex)) return;
-    const VkTexImage *dst = NULL, *src = NULL;
+    if (!on) return;
+    if (!uses_tensor_ops(ex)) {   // its translation failed, and no stand-in exists for programs without tensor ops
+        if (knob_log_cs_binds()) {
+            vk_texture_lock();
+            log_fallback_skip_locked(ex, NULL, -1);
+            vk_texture_unlock();
+        }
+        return;
+    }
+    const VkTexImage *dst = NULL, *src = NULL, *out;
+    int in_place = 0;
     vk_texture_lock();
     for (int i = 0; i < 32; i++) {
         uint64_t h = ex->img[NVN_STAGE_CS][i];
@@ -4111,11 +4167,12 @@ static void untranslated_dispatch_fallback(VkExec *ex) {
             (!dst || (uint64_t)t->width * t->height > (uint64_t)dst->width * dst->height))
             dst = t;
     }
+    out = dst;
     for (int i = 0; dst && i < 128; i++) {   // an in-place pass (its output also sampled) is left alone
         uint64_t h = ex->tex[NVN_STAGE_CS][i];
         view_t v; int hv = 0;
         const VkTexImage *t = h ? vk_texture_by_id_locked(NVN_HANDLE_TEX(h), &v, &hv) : NULL;
-        if (t && t->image == dst->image) { dst = NULL; break; }
+        if (t && t->image == dst->image) { dst = NULL; in_place = 1; break; }
     }
     for (int i = 0; dst && i < 128; i++) {
         uint64_t h = ex->tex[NVN_STAGE_CS][i];
@@ -4131,6 +4188,7 @@ static void untranslated_dispatch_fallback(VkExec *ex) {
             src = t;
     }
     if (dst && src) vk_texture_storage_bound_locked(dst);
+    else if (knob_log_cs_binds()) log_fallback_skip_locked(ex, out, in_place);
     if (dst && src && knob_log_cs_binds()) {   // each distinct (program, source, target) once, 256 at most
         static struct { uint64_t prog, s, d; } seen[256];
         static int n;
@@ -4142,23 +4200,7 @@ static void untranslated_dispatch_fallback(VkExec *ex) {
             rt_log("vk_exec: fallback blit prog %llu: %ux%u fmt %d at %#llx -> %ux%u fmt %d at %#llx",
                    (unsigned long long)(ex->prog ? ex->prog->serial : 0), src->width, src->height, src->format,
                    (unsigned long long)src->addr, dst->width, dst->height, dst->format, (unsigned long long)dst->addr);
-            char line[1600];   // everything the untranslated program binds: what a stand-in could use instead
-            int o = 0;
-            for (int i = 0; i < 160 && o < (int)sizeof line - 80; i++) {
-                int im = i >= 128;
-                uint64_t h = im ? ex->img[NVN_STAGE_CS][i - 128 < 32 ? i - 128 : 0] : ex->tex[NVN_STAGE_CS][i];
-                if (im && i - 128 >= 32) break;
-                view_t v; int hv = 0;
-                const VkTexImage *t = h ? vk_texture_by_id_locked(NVN_HANDLE_TEX(h), &v, &hv) : NULL;
-                if (t && (i == 0 || h != ex->tex[NVN_STAGE_CS][0] || im))
-                    o += snprintf(line + o, sizeof line - o, " %s%d=%ux%u/f%d@%#llx", im ? "img" : "tex", im ? i - 128 : i,
-                                  t->width, t->height, t->format, (unsigned long long)t->addr);
-            }
-            for (int i = 0; i < 18 && o < (int)sizeof line - 60; i++)
-                if (ex->ubo[NVN_STAGE_CS][i].size)
-                    o += snprintf(line + o, sizeof line - o, " ubo%d=%#llx+%#x", i + 3,
-                                  (unsigned long long)ex->ubo[NVN_STAGE_CS][i].addr, (unsigned)ex->ubo[NVN_STAGE_CS][i].size);
-            rt_log("vk_exec:   its bindings:%s", line);
+            log_cs_bindings_locked(ex);
         }
     }
     VkImage si = src ? src->image : VK_NULL_HANDLE, di = dst ? dst->image : VK_NULL_HANDLE;

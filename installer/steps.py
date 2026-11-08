@@ -815,8 +815,10 @@ EMITTED = re.compile(r'^emitted (\d+)/(\d+) chunks')
 DISCOVERED = re.compile(r'^(\w+): \d+ functions \(.*discovery')
 
 
-CHEAT_PLACES = ('cheats', 'atmosphere/contents/0100F2C0115B6000/cheats', 'contents/0100F2C0115B6000/cheats',
-                '0100F2C0115B6000/cheats')
+MOD_TITLE = '0400486024DEC000'   # the game's title id, which names a mod's Atmosphere folders (tools/cheats.py TITLE)
+
+CHEAT_PLACES = ('cheats', f'atmosphere/contents/{MOD_TITLE}/cheats', f'contents/{MOD_TITLE}/cheats',
+                f'{MOD_TITLE}/cheats')
 
 
 def cheat_files(ctx):
@@ -831,8 +833,8 @@ def cheat_files(ctx):
                   for f in ((mod / where).glob('*.txt') if (mod / where).is_dir() else ()))
 
 
-EXEFS_PLACES = ('exefs', 'atmosphere/contents/0100F2C0115B6000/exefs', 'contents/0100F2C0115B6000/exefs',
-                '0100F2C0115B6000/exefs')
+EXEFS_PLACES = ('exefs', f'atmosphere/contents/{MOD_TITLE}/exefs', f'contents/{MOD_TITLE}/exefs',
+                f'{MOD_TITLE}/exefs')
 
 
 def exefs_files(ctx):

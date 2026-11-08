@@ -626,6 +626,12 @@ static int pad_physical(uint8_t pd[PAD_COUNT]) {
     // every RESCAN_MS, not only without a gamepad: a second controller, or one that wakes up after the start, is found
     if (plat_now_ns() / 1000000u >= next_scan) { next_scan = plat_now_ns() / 1000000u + RESCAN_MS; scan_pads(); }
     SDL_UpdateGamepads();
+#ifdef _WIN32
+    // The Windows window is our own (gfx_window_win.c), so nothing reads SDL's event queue, yet every axis and button
+    // change of a gamepad is queued there: at SDL's cap (about 65,000 events, several MB) each further one fails and
+    // sets SDL's error text. The state the calls below read does not come from the queue.
+    SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST);
+#endif
     pad_follow();
     if (!pad || !SDL_GamepadConnected(pad)) return 0;
     for (int p = PAD_SOUTH; p < PAD_ZL; p++) pd[p] = SDL_GetGamepadButton(pad, pad_sdl[p]);

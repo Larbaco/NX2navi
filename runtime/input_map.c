@@ -2,6 +2,7 @@
 // tab's edits (input_map.h). No Win32 or SDL here.
 #include <ctype.h>
 #include <math.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -368,8 +369,12 @@ void input_pad_stick(int32_t x, int32_t y, float dead, int32_t out[2]) {
 }
 
 float input_pad_deadzone(int stick) {
+    // the stick's own dead zone when it reads as a number; else (unset, or "8%" and other typos, whose row has no
+    // default of its own and would read as 0, no dead zone at all) the shared stick_deadzone
     const char *own = stick ? "NX2NAVI_RSTICK_DEADZONE" : "NX2NAVI_LSTICK_DEADZONE", *set = cfg_get(own);
-    double v = cfg_double(set && *set ? own : "NX2NAVI_STICK_DEADZONE");
+    char *end = NULL;
+    double v = set && *set ? strtod(set, &end) : 0;
+    if (!set || !*set || end == set || *end || v != v) v = cfg_double("NX2NAVI_STICK_DEADZONE");
     return (float)(v < 0 ? 0 : v > 50 ? 50 : v) / 100.f;
 }
 

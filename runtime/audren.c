@@ -322,6 +322,8 @@ static void advance_voice(AudioRenderer *r, ServerVoice *v) {
     uint64_t samples = audio_voice_consumed(r, v, (int)r->param.sample_count);
     while (samples && v->valid[v->index]) {
         AudrenWaveBuffer *b = &v->buffers[v->index];
+        if (audio_buffer_empty(b)) break;   // an endless empty loop skip_empty kept: it starves the voice, and its
+                                            // zero length would make the loop below go round for good
         uint64_t length = (uint64_t)(b->end - b->start), left = length - v->offset;
         uint64_t step = samples < left ? samples : left;
         v->offset += step;

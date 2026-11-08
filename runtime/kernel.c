@@ -1098,7 +1098,9 @@ void rt_spin_gate(Cpu *c, uint64_t head) {
     if (g_spin_on < 0) {
         const char *e = cfg_get("NX2NAVI_SPIN_HANDOFF_US");
         g_spin_handoff_ns = (uint64_t)(e && *e ? atoll(e) : 50) * 1000;
-        g_spin_on = !(cfg_get("NX2NAVI_SPIN") && !cfg_bool("NX2NAVI_SPIN"));
+        // an empty value is unset: cfg_bool of a key without a settings row would stop the game on it
+        const char *spin = cfg_get("NX2NAVI_SPIN");
+        g_spin_on = !(spin && *spin && !cfg_bool("NX2NAVI_SPIN"));
     }
     t->sp_n++;
     t->sp_site = head;

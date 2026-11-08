@@ -1,8 +1,8 @@
-// Player mods (mods.c): one folder per mod under mods/ next to nx2navi.exe (NX2NAVI_MODS_DIR), unpacked as emulators take
-// them: <mod>/romfs, <mod>/exefs and <mod>/cheats, the Atmosphere layout (atmosphere/contents/<title id>/romfs,
-// atmosphere/exefs_patches/<name>/*.ips) or a mod manager's merged output (romfs or romfslite, exefs, cheats). ExeFS patch
-// files (.ips, .pchtxt) for the game's main are patch sets the setup builds into the game (tools/exefs_patches.py),
-// switched with their mod (mods_exefs_switch). The list is scanned once at start (romfs.c overlay_init);
+// Player mods (mods.c): one folder per mod under mods/ next to nx2navi.exe (NX2NAVI_MODS_DIR; a relative one is under
+// that folder too), unpacked as emulators take them: <mod>/romfs, <mod>/exefs and <mod>/cheats, the Atmosphere layout
+// (atmosphere/contents/<title id>/romfs, atmosphere/exefs_patches/<name>/*.ips) or a mod manager's merged output
+// (romfs or romfslite, exefs, cheats). ExeFS patch files (.ips, .pchtxt) for the game's main are patch sets the setup
+// builds into the game (tools/exefs_patches.py), switched with their mod (mods_exefs_switch). The list is scanned once at start (romfs.c overlay_init);
 // its order and switches live in nx2navi.ini [mods] (NX2NAVI_MODS_ORDER: names top first, separated by '|';
 // NX2NAVI_MODS_DISABLED: names switched off). The top mod wins a file two mods replace.
 #pragma once
@@ -27,6 +27,7 @@ typedef struct {
     char exefs[2048];      // UTF-8 path of its ExeFS folder; "" none
     char cheats[2048];     // UTF-8 path of its cheats folder; "" none
     int kind, enabled;
+    int start_enabled;     // enabled at the scan: what romfs.c, cheats.c and the ExeFS patch sets go by this run
     ModProblem problem;
     uint32_t replaced, added, overridden;   // romfs.c: files served (replacing / added), files a higher mod serves
     uint32_t other_version;                 // files for another game version (RomFS *.Product.<n>.*, ExeFS patches

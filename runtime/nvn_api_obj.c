@@ -221,6 +221,12 @@ NVN_API(nvnTextureInitialize) {
     if (s->pkg_data) {
         if (!o->mem || nvn_gpu_only((uintptr_t)o->mem))
             rt_fatal("nvn: packaged texture data without CPU-visible storage");
+        // the layout's size from the game's descriptor, against the pool it is copied into (its host storage may span
+        // more than its size): a heap overrun otherwise
+        uint64_t room = s->pool->span > s->pool->size ? s->pool->span : s->pool->size;
+        if (s->off < 0 || (uint64_t)s->off > room || o->L.size > room - (uint64_t)s->off)
+            rt_fatal("nvn: packaged texture data of %#llx bytes at %#llx does not fit its pool (%#llx bytes)",
+                     (unsigned long long)o->L.size, (unsigned long long)s->off, (unsigned long long)room);
         memcpy(o->mem, s->pkg_data, (size_t)o->L.size);
         nvn_guest_written((uintptr_t)o->mem, o->L.size);
     }
@@ -816,6 +822,7 @@ NVN_API(nvnWindowAcquireTexture) {
             perf_end(PERF_PACE, p0);
         }
     }
+    if (gfx_backend()->frame_start) gfx_backend()->frame_start();   // the frame's work starts here
     // The sync means "the display no longer reads this image". Presents are copies queued in submit order, so it is
     // already satisfied: fenced = 3 with fence 0.
     if (s) {

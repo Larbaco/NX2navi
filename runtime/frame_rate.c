@@ -124,6 +124,10 @@ int frame_step_realtime(void) { return step_word != NULL; }
 static int fps60_set = -2;
 static int game_interval = 1;   // the present interval of the newest frame (frame_step_present)
 
+// The rate "display" paces at: 0 is a monitor rate not known yet (no window), taken as 60; a real one below the
+// lowest limit (a 24 or 25 Hz TV) is held at that limit rather than read as unknown and doubled to 60.
+static double shown_hz(double hz) { return hz <= 0 ? 60 : hz < LIMIT_MIN_HZ ? LIMIT_MIN_HZ : hz; }
+
 // A build without the fps60 and realtime patch sets (Ocarina) steps its game by the clock itself: walked by the same
 // frame-numbered input script, Link covered half the distance at 120 fps that he covers at 60. There the pacer holds
 // frames to the limit alone (nvn_api_obj.c present_period), the game's own 60 Hz interval aside, and the limit may be
@@ -181,6 +185,20 @@ static void frame_limit_live(void) {
     else rt_log("frame rate: limit at the monitor's refresh rate (60 until the window measures it)");
 }
 
+// NX2NAVI_MOVIE_FPS (default 60; 0 = off): the game's frame rate while a movie plays (ov_movie2.c ov_movie_live). A
+// movie's event counts the game's updates as 60 Hz frames whatever the step: at 144 fps the intro's narration lines
+// started 2.4 times too early, each over the one before, and its closing fade to black came at 65 s of the movie's
+// 154, hiding the whole dream. The movies are 60 fps, so the cap shows the same pictures.
+static int movie_cap_hz(void) {
+    static int hz = -1;
+    if (hz < 0) {
+        const char *e = cfg_get("NX2NAVI_MOVIE_FPS");
+        hz = e && *e ? atoi(e) : 60;
+        if (hz && hz < LIMIT_MIN_HZ) hz = 60;
+    }
+    return hz && ov_movie_live() ? hz : 0;
+}
+
 // RivaTuner Statistics Server (rtss_limit.c) gets the same limit; while it limits this process the pacer holds no
 // frames, so the two never stack. NX2NAVI_RTSS=0 and frame generation (RTSS would count the generated frames) keep it out.
 uint64_t frame_step_cap_ns(void) {
@@ -190,17 +208,28 @@ uint64_t frame_step_cap_ns(void) {
         const char *e = cfg_get("NX2NAVI_RTSS");
         rtss = !(e && !strcmp(e, "0")) && !vk_fg_wanted();
     }
-    if (limit_hz == -2) {   // unlimited: the pacer does not hold frames, and RTSS's limit is cleared
+    int movie_hz = movie_cap_hz();
+    static int movie_was, movie_logs;
+    if (!!movie_hz != movie_was) {
+        movie_was = !!movie_hz;
+        if (movie_logs++ < 40) {   // the first 20 movies
+            if (movie_hz) rt_log("frame rate: a movie plays: at most %d fps until it ends (NX2NAVI_MOVIE_FPS)", movie_hz);
+            else rt_log("frame rate: the movie ended: the frame limit again");
+        }
+    }
+    if (limit_hz == -2 && !movie_hz) {   // unlimited: the pacer does not hold frames, and RTSS's limit is cleared
         rtss_limit_want(rtss ? 0 : -1);
         return 0;
     }
-    double hz = limit_hz ? limit_hz : gfx_window_refresh_hz();
-    if (hz < LIMIT_MIN_HZ) hz = 60;   // display rate unknown (no window yet)
+    // unlimited during a movie: the movie's rate, doubled for frame generation's halving below
+    double hz = limit_hz == -2 ? movie_hz * (vk_fg_generating() ? 2 : 1)
+                               : shown_hz(limit_hz ? limit_hz : gfx_window_refresh_hz());
     double max = frame_free_running() ? LIMIT_FREE_MAX_HZ : LIMIT_MAX_HZ;
     if (hz > max) hz = max;
     // Frame generation presents a generated frame between each two of the game's (vk_fg.cpp): the game is paced at
     // half the limit then, so the screen shows the limit
     if (vk_fg_generating()) hz /= 2;
+    if (movie_hz && hz > movie_hz) hz = movie_hz;
     rtss_limit_want(rtss ? (int64_t)(hz * 1000 + 0.5) : -1);
     if (rtss_limit_active()) return 0;
     return (uint64_t)(1e9 / hz + 0.5);
@@ -213,13 +242,11 @@ double frame_step_limit_hz(void) {
     if (frame_free_running()) {   // 0 for unlimited, as before the first read
         frame_limit_live();
         if (limit_hz == -2 || limit_hz == -1) return 0;
-        double r = limit_hz ? limit_hz : gfx_window_refresh_hz();
-        return r < LIMIT_MIN_HZ ? 60 : r;
+        return shown_hz(limit_hz ? limit_hz : gfx_window_refresh_hz());
     }
     int hz = limit_hz;
     if (hz < 0) return 0;
-    double r = hz ? hz : gfx_window_refresh_hz();
-    if (r < LIMIT_MIN_HZ) r = 60;
+    double r = shown_hz(hz ? hz : gfx_window_refresh_hz());
     return !step_word && r > 60 ? 60 : r > LIMIT_MAX_HZ ? LIMIT_MAX_HZ : r;
 }
 

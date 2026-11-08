@@ -27,14 +27,13 @@
 #include "mods.h"
 #include "platform/platform.h"
 
-#define TITLE "0100F2C0115B6000"
+#define TITLE "0400486024DEC000"   // the game's title id, which names a mod's Atmosphere folders
 #define MAX_MODS 512
 
 static ModInfo *mods;
 static int nmods;
 static char dir[2048];
-static char start_order[MAX_MODS][256];   // names in the scan's order and their switches, for mods_changed
-static int start_enabled[MAX_MODS];
+static char start_order[MAX_MODS][256];   // names in the scan's order, for mods_changed
 
 // 1 when a file lies anywhere under path.
 static int has_file_cb(const char *name, int kind, uint64_t size, void *ctx);
@@ -170,6 +169,33 @@ static int same_build(const char *hex, size_t n) {
     return 1;
 }
 
+// The build id of a pchtxt file as tools/exefs_patches.py parse_pchtxt reads it: the last "@nsobid-<hex>" line before
+// an "@stop" line, a UTF-8 BOM, blanks around it and a "//" comment after it left out. 1 when the file names one; *len
+// is 0 when that line holds anything but hex digits (no build id, so for no main).
+static int pchtxt_build(const char *data, size_t n, const char **id, size_t *len) {
+    int found = 0;
+    const char *p = data, *end = data + n;
+    if (n >= 3 && !memcmp(p, "\xEF\xBB\xBF", 3)) p += 3;
+    while (p < end) {
+        const char *eol = memchr(p, '\n', (size_t)(end - p));
+        if (!eol) eol = end;
+        while (p < eol && isspace((unsigned char)*p)) p++;
+        if (eol - p >= 5 && !memcmp(p, "@stop", 5)) break;
+        if (eol - p >= 8 && !memcmp(p, "@nsobid-", 8)) {
+            const char *h = p + 8, *t = h;
+            while (t < eol && isxdigit((unsigned char)*t)) t++;
+            const char *rest = t;
+            while (rest < eol && isspace((unsigned char)*rest)) rest++;
+            int clean = rest == eol || (eol - rest >= 2 && rest[0] == '/' && rest[1] == '/');
+            found = 1;
+            *id = h;
+            *len = clean ? (size_t)(t - h) : 0;
+        }
+        p = eol + 1;
+    }
+    return found;
+}
+
 // build-cache/exefs.status next to nx2navi.exe, read once; "" when there is none.
 static const char *exefs_status(void) {
     static char *text;
@@ -238,15 +264,9 @@ static int exefs_file_cb(const char *leaf, int kind, uint64_t size, void *ctx) {
     if (ips) {
         for_main = same_build(leaf, strlen(leaf) - 4);
     } else {
-        char *id = NULL;   // after "@nsobid-" at the start of a line
-        for (char *p = data; !id && p && data + n - p > 8;) {
-            if (!memcmp(p, "@nsobid-", 8)) id = p + 8;
-            p = memchr(p, '\n', (size_t)(data + n - p));
-            if (p) p++;
-        }
+        const char *id = NULL;
         size_t len = 0;
-        while (id && id + len < data + n && isxdigit((unsigned char)id[len])) len++;
-        for_main = id && same_build(id, len);
+        for_main = pchtxt_build(data, (size_t)n, &id, &len) && len && same_build(id, len);
     }
     char key[9], content[9], kind_s[16], over[256], note[256];
     snprintf(key, sizeof key, "%08X", fnv(rel, strlen(rel)));
@@ -304,7 +324,7 @@ static int exefs_check(ModInfo *m, const char *path) {
 static int scan_cb(const char *name, int kind, uint64_t size, void *ctx) {
     (void)size;
     const char *disabled = ctx;
-    if (kind != PLAT_FS_DIR) return 1;
+    if (kind != PLAT_FS_DIR && kind != PLAT_FS_LINK) return 1;
     if (nmods == MAX_MODS) {
         rt_log("mods: more than %d folders in %s; the rest are left out", MAX_MODS, dir);
         return 0;
@@ -317,6 +337,8 @@ static int scan_cb(const char *name, int kind, uint64_t size, void *ctx) {
         rt_log("mods: %s: name too long, left out", name);
         return 1;
     }
+    // a symbolic link or junction to a folder is a mod, as the setup's tools see it (tools/cheats.py cheat_files)
+    if (kind == PLAT_FS_LINK && !plat_dir_exists(path)) return 1;
     find_root(path, "romfs", m->romfs, sizeof m->romfs);
     if (!m->romfs[0]) find_root(path, "romfslite", m->romfs, sizeof m->romfs);
     find_root(path, "exefs", m->exefs, sizeof m->exefs);
@@ -333,7 +355,7 @@ static int scan_cb(const char *name, int kind, uint64_t size, void *ctx) {
                : m->nsets || m->kind & (MOD_ROMFS | MOD_CHEATS)     ? MOD_OK
                : m->kind & MOD_EXEFS                                 ? MOD_EXEFS_OTHER
                                                                      : MOD_EMPTY;
-    m->enabled = !listed(disabled, m->name);
+    m->enabled = m->start_enabled = !listed(disabled, m->name);
     nmods++;
     return 1;
 }
@@ -342,17 +364,24 @@ void mods_scan(void) {
     static int done;
     if (done) return;
     done = 1;
+    // a relative mods_dir is under the folder of nx2navi.exe, as the default is, whatever folder the game started in
     const char *d = cfg_get("NX2NAVI_MODS_DIR");
-    if (d && *d) {
-        snprintf(dir, sizeof dir, "%s", d);
-    } else {
-        char exe[2048];
-        if (!plat_exe_path(exe, sizeof exe)) return;
-        char *cut = strrchr(exe, '/'), *back = strrchr(exe, '\\');
+    if (!d || !*d) d = "mods";
+    int absolute = d[0] == '/' || d[0] == '\\' || (d[0] && d[1] == ':');
+    char exe[2048];
+    char *cut = NULL;
+    if (!absolute && plat_exe_path(exe, sizeof exe)) {
+        cut = strrchr(exe, '/');
+        char *back = strrchr(exe, '\\');
         if (back > cut) cut = back;
-        if (!cut) return;
+    }
+    if (absolute) {
+        snprintf(dir, sizeof dir, "%s", d);
+    } else if (cut) {
         *cut = 0;
-        snprintf(dir, sizeof dir, "%s/mods", exe);
+        snprintf(dir, sizeof dir, "%s/%s", exe, d);
+    } else {
+        return;
     }
     if (!plat_dir_exists(dir)) {
         rt_log("mods: no folder %s", dir);
@@ -360,13 +389,13 @@ void mods_scan(void) {
     }
     mods = calloc(MAX_MODS, sizeof *mods);
     if (!mods) return;
-    plat_fs_list(dir, scan_cb, (void *)cfg_get("NX2NAVI_MODS_DISABLED"));
+    if (plat_fs_list(dir, scan_cb, (void *)cfg_get("NX2NAVI_MODS_DISABLED")) != PLAT_FS_OK)
+        rt_log("mods: cannot list %s (error %d); no mods", dir, plat_fs_os_error());
     order_list = cfg_get("NX2NAVI_MODS_ORDER");
     qsort(mods, nmods, sizeof *mods, by_order);
     order_list = NULL;
     for (int i = 0; i < nmods; i++) {
         snprintf(start_order[i], sizeof start_order[i], "%s", mods[i].name);
-        start_enabled[i] = mods[i].enabled;
         const ModInfo *m = &mods[i];
         rt_log("mods: %s: %s,%s%s%s%s%s, %s%s%s", m->name, m->enabled ? "on" : "off", m->kind & MOD_ROMFS ? " romfs" : "",
                m->kind & MOD_EXEFS ? " exefs" : "", m->kind & MOD_SUBSDK ? " subsdk" : "",
@@ -380,7 +409,7 @@ void mods_exefs_switch(void) {
     mods_scan();
     for (int i = 0; i < nmods; i++) {
         const ModInfo *m = &mods[i];
-        if (!start_enabled[i] || m->problem != MOD_OK || !m->nsets) continue;
+        if (!m->start_enabled || m->problem != MOD_OK || !m->nsets) continue;
         for (int k = 0; k < m->nsets; k++) {
             char name[32];
             snprintf(name, sizeof name, "mod_%08x", m->sets[k]);
@@ -402,7 +431,7 @@ void mods_exefs_switch(void) {
 int mods_exefs_pending(uint32_t *key) {
     int n = 0;
     for (int i = 0; i < nmods; i++) {
-        if (!start_enabled[i] || mods[i].problem != MOD_EXEFS_LATER) continue;
+        if (!mods[i].start_enabled || mods[i].problem != MOD_EXEFS_LATER) continue;
         n += (int)mods[i].pending;
         *key = (*key ^ mods[i].pending_key) * 0x01000193u;
     }
@@ -452,6 +481,6 @@ void mods_move(int i, int delta) {
 
 int mods_changed(void) {
     for (int i = 0; i < nmods; i++)
-        if (strcmp(mods[i].name, start_order[i]) || mods[i].enabled != start_enabled[i]) return 1;
+        if (strcmp(mods[i].name, start_order[i]) || mods[i].enabled != mods[i].start_enabled) return 1;
     return 0;
 }

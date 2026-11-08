@@ -47,25 +47,35 @@ def list_files(staged: bool) -> list[Path]:
     return [Path(p) for p in out.decode("utf-8").split("\0") if p]
 
 
-def problems_for(path: Path, allow_large: bool = False) -> list[str]:
+def staged_bytes(path: Path) -> bytes | None:
+    """The content of path as staged for the next commit (the index), not the working copy, which may differ."""
+    r = subprocess.run(["git", "cat-file", "blob", f":{path.as_posix()}"], capture_output=True)
+    return r.stdout if r.returncode == 0 else None
+
+
+def problems_for(path: Path, allow_large: bool = False, data: bytes | None = None) -> list[str]:
     """allow_large: files over MAX_BYTES (toolchain binaries in a release folder) are checked for the generated marker
-    only, not refused."""
+    only, not refused. data: the content to check in place of the file on disk (the staged one, for --staged)."""
     found = []
     if path.suffix.lower() in BLOCKED_SUFFIXES:
         found.append(f"blocked file type {path.suffix}")
     if path.name.lower() in BLOCKED_NAMES:
         found.append("name of a Switch executable module")
-    if not path.is_file():
-        return found
-    size = path.stat().st_size
+    if data is None:
+        if not path.is_file():
+            return found
+        size = path.stat().st_size
+    else:
+        size = len(data)
     if size > MAX_BYTES and allow_large:
-        if GENERATED_MARKER.encode() in path.read_bytes():
+        if GENERATED_MARKER.encode() in (path.read_bytes() if data is None else data):
             found.append("generated from game code")
         return found
     if size > MAX_BYTES:
         found.append(f"{size // 1024} KiB, over the {MAX_BYTES // 1024} KiB limit")
         return found
-    data = path.read_bytes()
+    if data is None:
+        data = path.read_bytes()
     if GENERATED_MARKER.encode() in data:
         found.append("generated from game code")
     if KEY_LINE.search(data.decode("utf-8", errors="ignore")):
@@ -80,7 +90,9 @@ def main() -> int:
 
     failed = False
     for path in list_files(args.staged):
-        for problem in problems_for(path):
+        # --staged checks what the commit takes: a marker staged and then removed from the working copy alone
+        # passed when the file on disk was read
+        for problem in problems_for(path, data=staged_bytes(path) if args.staged else None):
             print(f"{path}: {problem}")
             failed = True
     if failed:

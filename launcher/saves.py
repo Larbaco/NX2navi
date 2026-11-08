@@ -18,8 +18,21 @@ account folder inside).
 import os
 import re
 import shutil
+import stat
 import time
 from pathlib import Path
+
+
+def _rmtree(path):
+    """Delete a folder, read-only files in it too (shutil.rmtree stops at them on Windows); what still fails stays."""
+    def writable(func, p, _exc):
+        try:
+            os.chmod(p, stat.S_IREAD | stat.S_IWRITE)
+            func(p)
+        except OSError:
+            pass
+    if Path(path).exists():
+        shutil.rmtree(path, onexc=writable)
 
 README = '''NX2navi saves folder
 
@@ -168,17 +181,9 @@ def _newest(game, account):
 
 
 def game_running(game):
-    """Windows: ocarina.exe cannot be opened for writing while it runs."""
-    exe = Path(game) / 'ocarina.exe'
-    if os.name != 'nt' or not exe.is_file():
-        return False
-    try:
-        with open(exe, 'r+b'):
-            return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
+    """Windows: ocarina.exe cannot be opened for writing while it runs (launcher/build.py game_running)."""
+    from .build import game_running as running
+    return running(game)
 
 
 def import_save(game, folder=None, log=print):
@@ -210,9 +215,12 @@ def import_save(game, folder=None, log=print):
     for rel in files:
         (stage / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(Path(src) / rel, stage / rel)
+        # a save copied from read-only media keeps the attribute through copy2; the game rewrites its files
+        os.chmod(stage / rel, stat.S_IREAD | stat.S_IWRITE)
     # The journal of the replaced save goes out of save-tx (the game would load a finished commit first, or complete an
     # interrupted one): what holds files moves into the backup, beside the save it was copied from, so a copy the
     # backup's own choice missed (an interrupted commit's other half) is kept too.
+    moved = []
     for d in list(tx.iterdir()):
         if d == stage:
             continue
@@ -222,22 +230,34 @@ def import_save(game, folder=None, log=print):
                 backup.mkdir()
             (backup / 'save-tx').mkdir(exist_ok=True)
             shutil.move(str(d), str(backup / 'save-tx' / d.name))
+            moved.append(d)
         else:
-            shutil.rmtree(d, ignore_errors=True) if d.is_dir() else d.unlink(missing_ok=True)
+            _rmtree(d) if d.is_dir() else d.unlink(missing_ok=True)
     account.parent.mkdir(parents=True, exist_ok=True)
-    # The imported save goes into place before the old one is deleted; a failed rename puts the old one back.
+    # The imported save goes into place before the old one is deleted; a failed rename puts the old one back, and the
+    # journal too: a finished commit waiting in save-tx is newer than the account folder, and without it the game
+    # would load the older save although nothing was imported.
     gone = None
-    if account.exists():
-        gone = _fresh(tx, 'replaced')
-        os.replace(account, gone)
     try:
-        os.replace(stage, account)
+        if account.exists():
+            gone = _fresh(tx, 'replaced')
+            os.replace(account, gone)
+        try:
+            os.replace(stage, account)
+        except OSError:
+            if gone is not None:
+                os.replace(gone, account)
+            raise
     except OSError:
-        if gone is not None:
-            os.replace(gone, account)
+        for d in moved:
+            try:
+                shutil.move(str(backup / 'save-tx' / d.name), str(d))
+            except OSError as e:
+                log(f'saves: could not put {d.name} back into {tx}: {e}; it is in {backup / "save-tx"}')
+        _rmtree(stage)
         raise
     if gone is not None:
-        shutil.rmtree(gone, ignore_errors=True)
+        _rmtree(gone)
     if from_saves:   # what was put into saves/ moves out whole, so the next import does not take any of it again
         done = _fresh(saves, f'imported {stamp}')
         done.mkdir()

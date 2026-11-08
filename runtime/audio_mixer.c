@@ -71,6 +71,10 @@ typedef struct Mixer {
     float voice_scratch[6][MAX_FRAME], filter_scratch[MAX_FRAME], output_scratch[MAX_FRAME * OUT_MAX];
     double level_sum, level_peak; uint64_t level_count, level_frames; int first_sound_logged;
     int prefill;                                   // render blocks
+    uint64_t trace_pass, trace_seen[1024];         // NX2NAVI_TRACE=audio: render passes; the pass each voice was last mixed in
+    uint64_t trace_buf[1024];                      // and the wave buffer address it read in that pass
+    uint64_t trace_pair[1024];                     // the last shared-buffer pair logged for each voice (other voice, address)
+    unsigned trace_shared;                         // "voices share a buffer" lines written (capped)
 } Mixer;
 
 static _Atomic float device_volume = 1.0f;
@@ -272,7 +276,9 @@ static void ring_pull(Mixer *m, float *out, uint32_t frames) {
     }
     uint64_t prefill = (uint64_t)m->frame * (uint64_t)m->prefill;
     if (prefill < frames) prefill = frames;
-    if (prefill > RING_FRAMES) prefill = RING_FRAMES;
+    // no more than the target the renderer fills the ring to (output_open caps it at half the ring): a longer
+    // prefill (audio_prefill_ms of 180 and up) was never reached, and the output stayed silent for good
+    if (prefill > RING_FRAMES / 2) prefill = RING_FRAMES / 2;
     if (!m->ready) {
         if (have < prefill) {
             memset(out, 0, (size_t)frames * oc * sizeof(float));
@@ -751,8 +757,12 @@ static void walk_step(Walk *w) {   /* the same transitions as advance_voice in a
     walk_skip_empty(w);
 }
 /* Decodes `frames` output samples per channel into out[c][k]; the renderer advances the voice afterwards by the same amount. */
+// Source samples per output sample. The guest's sample rate and pitch are not checked: an infinite or huge step
+// would keep the per-sample loops below (audio_voice_consumed, voice_render) running for good under the renderer's
+// lock, so it is held to 64 source samples per output sample, far above any pitch the game asks for.
 static double voice_step(const AudioRenderer *r, const ServerVoice *v) {
-    return v->in.sample_rate * (v->in.pitch > 0 ? v->in.pitch : 1.0) / r->param.sample_rate;
+    double step = v->in.sample_rate * (v->in.pitch > 0 ? v->in.pitch : 1.0) / r->param.sample_rate;
+    return step >= 0 && step <= 64 ? step : step > 64 ? 64 : 0;   // NaN: no progress
 }
 /* Source samples the voice consumes over `frames` output samples, counted with the exact accumulation voice_render steps by
    (float rounding makes `fraction + seconds * rate * pitch` differ from it by one sample on some frames, a seam click);
@@ -990,6 +1000,7 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
     if (at > m->nbuf) { rt_log("audio: mixes use %d buffers, renderer has %d", at, m->nbuf); rt_fatal("audio mix buffer layout"); }
 
     float (*vs)[MAX_FRAME]=m->voice_scratch,*filtered=m->filter_scratch;
+    m->trace_pass++;
     for (int i = 0; i < r->param.voice_count; i++) {
         ServerVoice *v = &r->voices[i];
         if (!v->in.in_use || v->state != SV_STARTED || !v->in.sample_rate || !v->valid[v->index]) continue;
@@ -1001,6 +1012,18 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
                 rt_log("audio: voice %d uses sample format %u (%s), %d channel(s) at %u Hz", i, v->in.sample_format,
                        v->in.sample_format == FMT_ADPCM || fmt_bytes(v->in.sample_format) ? "decoded" : "NOT decoded: silent",
                        cc, (unsigned)v->in.sample_rate);
+        }
+        if ((rt_trace & RT_TRACE_AUDIO) && i < 1024) {   // mixed now and not in the last pass: what it plays and where to
+            const AudrenWaveBuffer *wb = &v->buffers[v->index & 3];
+            if (m->trace_seen[i] + 1 != m->trace_pass)   // pass: 5 ms each at 48 kHz (frame samples per pass)
+                rt_log("audio: voice %d plays at pass %llu: format %u, %d channel(s) at %u Hz, buffer %u at %#llx+%#llx "
+                       "(%s%s), volume %.3f, pitch %.3f, mix %d, splitter %u, priority %d", i,
+                       (unsigned long long)m->trace_pass, (unsigned)v->in.sample_format, cc, (unsigned)v->in.sample_rate,
+                       v->index, (unsigned long long)wb->address, (unsigned long long)wb->size,
+                       wb->loop ? "loop" : "once", wb->end_of_stream ? ", end of stream" : "", v->in.volume, v->in.pitch,
+                       (int)v->in.mix_id, (unsigned)v->in.splitter_id, (int)v->in.priority);
+            m->trace_seen[i] = m->trace_pass;
+            m->trace_buf[i] = wb->address;
         }
         voice_render(r, v, vs, frames);
         for (int f = 0; f < 2; f++) if (v->in.biquads[f].enable) {
@@ -1035,6 +1058,31 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
                 const AudrenChannelIn *ch = &r->channels[id];
                 for (int b = 0; b < r->mixes[v->in.mix_id].buffer_count && b < 24; b++) accumulate(m, m->offset[v->in.mix_id] + b, vs[c], ch->mix[b] * v->in.volume, frames);
             }
+        }
+    }
+    if (rt_trace & RT_TRACE_AUDIO) {
+        // Voices mixed in the last pass and not in this one, and why; then voices that read the same wave buffer memory
+        // in this pass (one stream heard twice, offset by how far apart the two read).
+        for (int i = 0; i < r->param.voice_count && i < 1024; i++) {
+            if (!m->trace_seen[i] || m->trace_seen[i] + 1 != m->trace_pass) continue;   // 0: never mixed
+            const ServerVoice *v = &r->voices[i];
+            rt_log("audio: voice %d stops at pass %llu: %s; %llu samples played, %u buffers consumed", i,
+                   (unsigned long long)m->trace_pass,
+                   !v->in.in_use ? "released by the game" : v->state == SV_PAUSED ? "paused"
+                   : v->state != SV_STARTED ? "stopped by the game" : "out of wave buffers",
+                   (unsigned long long)v->played, (unsigned)v->consumed);
+        }
+        for (int i = 0; i < r->param.voice_count && i < 1024; i++) {
+            if (m->trace_seen[i] != m->trace_pass || !m->trace_buf[i]) continue;
+            for (int j = i + 1; j < r->param.voice_count && j < 1024 && m->trace_shared < 400; j++)
+                if (m->trace_seen[j] == m->trace_pass && m->trace_buf[j] == m->trace_buf[i] &&
+                    m->trace_pair[i] != ((uint64_t)j << 48 ^ m->trace_buf[i])) {   // once per pair and buffer
+                    m->trace_pair[i] = (uint64_t)j << 48 ^ m->trace_buf[i];
+                    m->trace_shared++;
+                    rt_log("audio: voices %d and %d both play the wave buffer at %#llx in pass %llu (offsets %llu and %llu)",
+                           i, j, (unsigned long long)m->trace_buf[i], (unsigned long long)m->trace_pass,
+                           (unsigned long long)r->voices[i].offset, (unsigned long long)r->voices[j].offset);
+                }
         }
     }
     /* submixes: deepest first, so every mix is complete before it is folded into its destination */
@@ -1094,7 +1142,8 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
             raw[2 * k] = s[0] * gain; raw[2 * k + 1] = s[1] * gain;   /* NX2NAVI_AUDIO_DUMP: the front pair before clipping */
             for (int c = 0; c < oc; c++) {
                 float x = s[c] * gain;
-                out[oc * k + c] = x > 1 ? 1 : x < -1 ? -1 : x;
+                // NaN (a NaN sample, an effect's state gone NaN) reaches the device as silence, not full scale
+                out[oc * k + c] = x > 1 ? 1 : x < -1 ? -1 : x == x ? x : 0;
             }
         }
         sink_dump(raw, frames);

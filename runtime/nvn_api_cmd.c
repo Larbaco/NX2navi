@@ -1160,8 +1160,18 @@ NVN_API(nvnCommandBufferSetBlendColor) { memcpy(REC(cmd_of(c), OP_BLEND_COLOR, p
 // void nvnCommandBufferWaitSync(NVNcommandBuffer *cmd, const NVNsync *sync), WaitEvent(cmd, const NVNevent *event,
 // NVNeventWaitMode mode, uint32_t value), SetShaderScratchMemory(cmd, const NVNmemoryPool *pool, ptrdiff_t offset,
 // size_t size), SetPatchSize(cmd, int size)
-NVN_API(nvnCommandBufferWaitSync) { (void)c; }
-NVN_API(nvnCommandBufferWaitEvent) { (void)c; }
+// WaitSync logs its first call: a game that orders two queues with it replays here in submission order only.
+NVN_API(nvnCommandBufferWaitSync) {
+    static volatile int32_t logged;
+    if (!plat_xchg32(&logged, 1)) rt_log("nvn: first CommandBufferWaitSync: recorded as nothing (one replay queue)");
+    (void)c;
+}
+// WaitEvent is recorded (OP_WAIT_EVENT) so that the replay can count the waits its submission order would have
+// passed before the signal they wait for (vk_exec_xfer.c wait_event); it waits for nothing.
+NVN_API(nvnCommandBufferWaitEvent) {
+    const ev_t *e = arg_p(c, 1);
+    *REC(cmd_of(c), OP_WAIT_EVENT, p_wait_event) = (p_wait_event){e->val, (uint32_t)arg_x(c, 2), (uint32_t)arg_x(c, 3)};
+}
 NVN_API(nvnCommandBufferSetShaderScratchMemory) { (void)c; }
 NVN_API(nvnCommandBufferSetPatchSize) { (void)c; }
 
@@ -1264,6 +1274,7 @@ const char *nvn_op_name(uint32_t op) {
         "DRAW_IDX", "DISPATCH", "BARRIER", "SET_TEX_POOL", "SET_SAMP_POOL", "COPY_B2T", "COPY_STRIDE", "BLEND_COLOR",
         "COPY_T2B", "BIND_IMG", "COPY_T2T", "RESET_COUNTER", "CLEAR_TEX", "DEPTH_CLAMP", "RENDER_ENABLE",
         "RASTER_DISCARD", "RENDER_COND", "PRIM_RESTART", "DRAW_IDX_IND", "DISPATCH_IND", "CLEAR_BUF", "PUSH_CC", "DRAW_MESH", "DRAW_MESH_IND",
+        "WAIT_EVENT",
     };
     _Static_assert(sizeof names / sizeof *names == OP_COUNT_, "one name per op");
     return op < OP_COUNT_ ? names[op] : "?";

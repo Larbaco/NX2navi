@@ -277,7 +277,7 @@ class LiftKeyTest(unittest.TestCase):
         self.add_cheats('277178B7DBA1B6D4.txt', '[b]')
         edited = self.key()
         self.assertNotEqual(edited, added)
-        self.add_cheats('277178B7DBA1B6D4.txt', '[c]', mod='Other', where='atmosphere/contents/0100F2C0115B6000/cheats')
+        self.add_cheats('277178B7DBA1B6D4.txt', '[c]', mod='Other', where='atmosphere/contents/0400486024DEC000/cheats')
         self.assertNotEqual(self.key(), edited)
 
     def test_exefs_patch_files_change_the_key(self):

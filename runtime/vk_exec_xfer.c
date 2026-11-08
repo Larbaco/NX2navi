@@ -333,7 +333,76 @@ static void oq_report(VkExec *ex, uint64_t addr) {
     if (!oq_keep) oq_counting = 0;
 }
 
+// ---- event order check
+// The game orders work between its queues with events: a command buffer waits (WaitEvent) until another's SignalEvent
+// has set the value. Every submission replays here on one queue in the order it came, and a wait records nothing, so a
+// wait whose signal comes in a later submission does not hold its work back: that work runs before what it waits for.
+// The replay keeps the value each event reaches in replay order (ev_seen, the signals recorded so far, on top of the
+// value in memory) and counts the waits it reaches unmet; NX2NAVI_TRACE=perf logs the count, and the first few are
+// logged as they happen. Replay thread only.
+#define EV_SEEN 64
+static struct { volatile uint32_t *val; uint32_t v; } ev_seen[EV_SEEN];
+static int ev_n, ev_next;
+static uint64_t ev_waits, ev_unmet, ev_late, ev_late_subs;
+// Waits reached unmet, until a replayed signal meets them (ev_late: the signal came that many submissions later, so
+// the work after the wait ran before the work it waited for) or they are pushed out by newer ones.
+#define EV_OPEN 64
+static struct { volatile uint32_t *val; uint32_t mode, value; uint64_t sub; } ev_open[EV_OPEN];
+static int ev_open_n;
+
+static uint32_t *ev_slot(volatile uint32_t *val, int create) {
+    for (int i = 0; i < ev_n; i++)
+        if (ev_seen[i].val == val) return &ev_seen[i].v;
+    if (!create) return NULL;
+    int i = ev_n < EV_SEEN ? ev_n++ : ev_next++ % EV_SEEN;
+    ev_seen[i].val = val, ev_seen[i].v = __atomic_load_n(val, __ATOMIC_ACQUIRE);
+    return &ev_seen[i].v;
+}
+
+static int ev_holds(uint32_t have, uint32_t mode, uint32_t want) {
+    return mode == NVN_EVENT_WAIT_MODE_GEQUAL_WRAP ? (int32_t)(have - want) >= 0 : have == want;
+}
+
+int vk_exec_event_met(const void *payload) {
+    const p_wait_event *p = payload;
+    const uint32_t *seen = ev_slot(p->val, 0);
+    return ev_holds(__atomic_load_n(p->val, __ATOMIC_ACQUIRE), p->mode, p->value) ||
+           (seen && ev_holds(*seen, p->mode, p->value));
+}
+
+int vk_exec_signalled;
+
+int vk_exec_wait_event(const void *payload) {
+    const p_wait_event *p = payload;
+    ev_waits++;
+    uint32_t mem = __atomic_load_n(p->val, __ATOMIC_ACQUIRE);
+    const uint32_t *seen = ev_slot(p->val, 0);
+    if (ev_holds(mem, p->mode, p->value) || (seen && ev_holds(*seen, p->mode, p->value))) return 1;
+    ev_unmet++;
+    if (ev_open_n == EV_OPEN) memmove(ev_open, ev_open + 1, sizeof ev_open - sizeof *ev_open), ev_open_n--;
+    ev_open[ev_open_n].val = p->val, ev_open[ev_open_n].mode = p->mode, ev_open[ev_open_n].value = p->value;
+    ev_open[ev_open_n++].sub = vk_exec_submit_seq;
+    static int logged;
+    if (logged++ < 8)
+        rt_log("vk: event wait reached before its signal: event %p, mode %u, wants %#x, memory %#x, replayed signals %s%#x",
+               (void *)p->val, p->mode, p->value, mem, seen ? "" : "none ", seen ? *seen : 0);
+    return 0;
+}
+
+void vk_exec_event_stats(uint64_t *waits, uint64_t *unmet, uint64_t *late, uint64_t *late_subs) {
+    *waits = ev_waits, *unmet = ev_unmet, *late = ev_late, *late_subs = ev_late_subs;
+    ev_waits = ev_unmet = ev_late = ev_late_subs = 0;
+}
+
 static void signal_event(VkExec *ex, const p_signal_event *p) {
+    uint32_t *seen = ev_slot(p->val, 1);
+    *seen = p->mode == NVN_EVENT_SIGNAL_MODE_ADD ? *seen + p->value : p->value;
+    vk_exec_signalled = 1;
+    for (int i = 0; i < ev_open_n;)
+        if (ev_open[i].val == p->val && ev_holds(*seen, ev_open[i].mode, ev_open[i].value)) {
+            ev_late++, ev_late_subs += vk_exec_submit_seq - ev_open[i].sub;
+            ev_open[i] = ev_open[--ev_open_n];
+        } else i++;
     EventWrite *e = malloc(sizeof *e);
     if (!e) rt_fatal("vk: out of memory");
     *e = (EventWrite){p->val, p->mode, p->value};
@@ -642,6 +711,10 @@ static void clear_buf(VkExec *ex, const p_clear_buf *p) {
         if (!started) vk_exec_pass_end(ex), vk_exec_barrier(ex), started = 1;
         VK_MEM_PICK(d);
         vkCmdFillBuffer(ex->cb, d.buffer, d.offset, n, p->value);
+        // A VRAM mirror's guest copy is filled too, at once: atomics through the device address table count in both
+        // copies (translator patch 0036), and a counter reset here must start from the same value in both.
+        VkBuffer twin = vk_mem_guest_twin(&d);
+        if (twin) vkCmdFillBuffer(ex->cb, twin, d.offset, n, p->value), ex->recorded++;
         vk_mem_gpu_wrote(&d, n);
         ex->recorded++;
         vk_mem_count(d.cls, VK_MUSE_GPU_WRITE, n);

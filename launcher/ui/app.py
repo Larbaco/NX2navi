@@ -473,7 +473,9 @@ class App:
             self.fonts_from_game(gd, self.settings.get('dump'))
         if a.uninstall:
             self.show('uninstall')
-        elif a.continue_update is not None:
+        elif a.continue_update is not None and not a.rolled_back:
+            # after a rollback the stub passes the failed version's --continue-update on to this one: the game was
+            # never rebuilt for the new version, so there is nothing to finish, and home tells why the version is back
             self.run_job(jobs.ContinueUpdateJob(self.ctx, gd if gd and build.built_version(gd) else '',
                                                 a.continue_update, self.settings.get('dump')), 'home')
         elif gd and build.built_version(gd):

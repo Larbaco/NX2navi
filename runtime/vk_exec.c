@@ -11,6 +11,7 @@
 // Contains code Copyright (c) 2026 jhaizhou, Copyright (c) 2026 Peiikai (MIT; see THIRD_PARTY_NOTICES.md).
 #include <math.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -58,10 +59,14 @@ void vk_exec_frame_written(const tex_t *t) {
     fw[nfw++].n = 1;
 }
 
+uint64_t vk_exec_submit_seq;
+
 void vk_exec_frame_log(const tex_t *p, uint64_t frame) {
     vk_exec_cond_frame_end(frame);   // a frame boundary in replay order (present_image runs on the replay thread)
     if (!(rt_trace & RT_TRACE_GFX)) return;
     VkExecFrame *f = &vk_exec_frame;
+    uint64_t ew, eu, el, ed;
+    vk_exec_event_stats(&ew, &eu, &el, &ed);
     int hit = 0;
     char list[512] = "";
     size_t o = 0;
@@ -73,14 +78,16 @@ void vk_exec_frame_log(const tex_t *p, uint64_t frame) {
     }
     rt_log("frame %llu: submits %llu passes %llu draws %llu/%llu clears %llu copies %llu dispatches %llu; present %p "
            "%ux%u/%#x written %d; feedback draws %llu barriers %llu restarts %llu layouts %llu read-before-write %llu; "
-           "uniform updates %llu (%llu ended a pass); targets%s",
+           "uniform updates %llu (%llu ended a pass); event waits %llu (%llu before their signal: %llu "
+           "signalled later, %.1f submits later on average); targets%s",
            (unsigned long long)frame, (unsigned long long)f->submits,
            (unsigned long long)f->passes, (unsigned long long)f->draws, (unsigned long long)f->draws_seen,
            (unsigned long long)f->clears, (unsigned long long)f->copies, (unsigned long long)f->dispatches,
            p ? (const void *)p->mem : NULL, p ? p->d.width : 0, p ? p->d.height : 0, p ? (uint32_t)p->d.format : 0,
            hit, (unsigned long long)f->fb_draws, (unsigned long long)f->fb_barriers, (unsigned long long)f->fb_restarts,
            (unsigned long long)f->fb_layouts, (unsigned long long)f->fb_war_barriers, (unsigned long long)f->ub_updates,
-           (unsigned long long)f->ub_pass_breaks, list);
+           (unsigned long long)f->ub_pass_breaks, (unsigned long long)ew, (unsigned long long)eu, (unsigned long long)el,
+           el ? (double)ed / (double)el : 0.0, list);
     memset(f, 0, sizeof *f);
     nfw = 0;
 }
@@ -868,13 +875,194 @@ static void maybe_split(VkExec *ex) {
     n_parts++;
 }
 
-static void walk(VkExec *ex, const op_hdr *h, int depth) {
+// ---- event order across the game's queues
+// Ocarina runs work on a second queue that hands results back and forth with the main one by events: each frame the
+// worker submits first, its command buffer waits (WaitEvent) for a signal the main queue gives in its submission a few
+// submits later, does a step, signals, waits for the next point of the main queue's frame, and so on, while the main
+// queue waits for the worker's signals before it uses the results (Kokiri Forest: about 13 waits a frame, 7 of them
+// reached before their signal in submission order). On one Vulkan queue in submission order the worker's steps would
+// run before the work they wait for and read the previous frame's results: Link and the other characters were
+// drawn much too dark, at any time of day.
+// So a top-level wait whose condition does not hold in replay order (vk_exec_wait_event: memory, or the signals
+// replayed so far) stops its submission there: the rest becomes a continuation of that queue (Cont), and later
+// submissions of the queue line up behind it. After every replayed signal the continuations whose wait now holds go
+// on, inside the command buffer being recorded: the open pass ends, a full barrier orders them after what came before
+// (the event's memory dependency), the queue's own state replaces the running one while they run, and another barrier
+// and the running state come back after. One that would still wait after CONT_MAX submissions goes on regardless, as
+// it did before (counted, logged). Only with the replay on the submitting thread: the recording copies a continuation
+// reads stay alive there until the game recycles them, which it does only after the work ran on the console.
+// NX2NAVI_EVENT_ORDER=0: every submission in the order it came.
+#define CONT_MAX 36
+#define EVO_QUEUES 16
+typedef struct Cont {
+    struct Cont *next;      // the next submission of the same queue
+    uint64_t *h;            // private copies of the recordings it has still to walk (cont_new), the one being walked
+    int n, i;
+    const op_hdr *at;       // the wait it stopped at in h[i] (NULL: not started)
+    uint64_t since;         // vk_exec_submit_seq when it stopped
+    int has_st;             // st holds the queue's state (else the running state carries over, as for any submission)
+    uint8_t *st;
+} Cont;
+static struct { uintptr_t q; Cont *head, *tail; } evq[EVO_QUEUES];
+static int evo_on = -1, evo_in;     // knob; inside a continuation
+static uintptr_t evo_queue;         // queue of the stream being walked (0: it cannot stop at a wait)
+static int evo_pending;             // continuations held
+static uint64_t evo_held, evo_resumed, evo_forced, evo_switches;   // since the last perf line
+#define ST_LO offsetof(VkExec, rt)
+#define ST_HI offsetof(VkExec, views)
+
+static const op_hdr *walk(VkExec *ex, const op_hdr *h, int depth);
+
+static int evo_enabled(void) {
+    if (evo_on < 0) {
+        const char *e = cfg_get("NX2NAVI_EVENT_ORDER");
+        evo_on = !(e && !strcmp(e, "0"));
+        if (evo_on && gfx_replay_async()) {
+            evo_on = 0;
+            rt_log("vk: event order across queues off: the replay runs on its own thread (NX2NAVI_REPLAY_ASYNC)");
+        } else rt_log("vk: event order across queues %s (NX2NAVI_EVENT_ORDER)", evo_on ? "on" : "off");
+    }
+    return evo_on;
+}
+
+static int evq_slot(uintptr_t q) {
+    int free_i = -1;
+    for (int i = 0; i < EVO_QUEUES; i++) {
+        if (evq[i].q == q) return i;
+        if (free_i < 0 && !evq[i].head) free_i = i;
+    }
+    if (free_i >= 0) evq[free_i].q = q;
+    return free_i;
+}
+
+// Holds h[from..n), stopped at `at` in h[from] (NULL: from its start). The recordings are copied: the game records a
+// command buffer again once the fence it took after the submission is done, and that fence does not wait for a held
+// part (it signals with the submission that held it).
+static Cont *cont_new(const uint64_t *h, int n, int from, const op_hdr *at) {
+    Cont *c = calloc(1, sizeof *c);
+    if (!c || !(c->h = calloc((size_t)(n - from) + 1, sizeof *c->h))) rt_fatal("vk: out of memory (held submission)");
+    for (int k = from; k < n; k++) {
+        const op_hdr *x = nvn_op_first(h[k]);
+        uint64_t bytes = 0;
+        for (; x->op != OP_END; x = nvn_op_next(x)) bytes += x->size;
+        bytes += x->size;
+        uint8_t *copy = malloc(bytes);
+        if (!copy) rt_fatal("vk: out of memory (held submission, %llu bytes)", (unsigned long long)bytes);
+        memcpy(copy, (const void *)(uintptr_t)h[k], bytes);
+        c->h[k - from] = (uintptr_t)copy;
+        if (k == from && at) c->at = (const op_hdr *)(const void *)(copy + ((const uint8_t *)at - (const uint8_t *)(uintptr_t)h[k]));
+    }
+    c->n = n - from;
+    c->since = vk_exec_submit_seq;
+    return c;
+}
+
+static void cont_free(Cont *c) {
+    for (int k = 0; k < c->n; k++) free((void *)(uintptr_t)c->h[k]);
+    free(c->h), free(c->st), free(c);
+}
+
+static void cont_push(int slot, Cont *c) {
+    if (evq[slot].tail) evq[slot].tail->next = c;
+    else evq[slot].head = c;
+    evq[slot].tail = c;
+    evo_pending++;
+}
+
+// Swaps the queue state in ex with buf (ST_HI - ST_LO bytes); what the swapped-in state names is bound again.
+static void st_swap(VkExec *ex, uint8_t *buf) {
+    static uint8_t tmp[ST_HI - ST_LO];
+    memcpy(tmp, (uint8_t *)ex + ST_LO, sizeof tmp);
+    memcpy((uint8_t *)ex + ST_LO, buf, sizeof tmp);
+    memcpy(buf, tmp, sizeof tmp);
+    ex->rt_resolved = 0;
+    ex->dirty = VK_EXEC_DIRTY_ALL;
+    ex->tex_serial++;
+    vk_exec_draw_new_cb();
+}
+
+static int cont_ready(const Cont *c) {
+    return !c->at || vk_exec_event_met(nvn_op_payload(c->at)) || vk_exec_submit_seq - c->since > CONT_MAX;
+}
+
+// Walks the continuation from where it stopped; 1 when it stopped at another wait (c->i, c->at updated), 0 when done.
+static int cont_walk(VkExec *ex, Cont *c) {
+    if (c->at && !vk_exec_event_met(nvn_op_payload(c->at))) {
+        evo_forced++;
+        static int logged;
+        if (logged++ < 8)
+            rt_log("vk: event order: a held submission goes on after %llu submissions without its signal",
+                   (unsigned long long)(vk_exec_submit_seq - c->since));
+    }
+    for (; c->i < c->n; c->i++) {
+        const op_hdr *from = c->at ? nvn_op_next(c->at) : nvn_op_first(c->h[c->i]);
+        c->at = NULL;
+        const op_hdr *stop = walk(ex, from, 0);
+        if (stop) {
+            c->at = stop;
+            c->since = vk_exec_submit_seq;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Runs the held continuations whose wait holds now, in the command buffer being recorded, until none can go on.
+static void evo_resume(VkExec *ex) {
+    if (evo_in || !evo_pending) return;
+    vk_exec_signalled = 0;
+    uintptr_t run_q = evo_queue;
+    for (int progress = 1; progress;) {
+        progress = 0;
+        for (int s = 0; s < EVO_QUEUES; s++) {
+            Cont *c = evq[s].head;
+            if (!c || !cont_ready(c)) continue;
+            progress = 1;
+            evo_switches++;
+            vk_exec_pass_end(ex);
+            vk_exec_barrier(ex);
+            uint8_t *mine = malloc(ST_HI - ST_LO);
+            if (!mine) rt_fatal("vk: out of memory (queue state)");
+            memcpy(mine, (uint8_t *)ex + ST_LO, ST_HI - ST_LO);
+            if (c->has_st) st_swap(ex, c->st);
+            evo_in = 1, evo_queue = evq[s].q;
+            for (;;) {
+                evo_resumed++;
+                if (cont_walk(ex, c)) {   // waits again: the queue's state stays with it
+                    vk_exec_pass_end(ex);
+                    if (!c->st && !(c->st = malloc(ST_HI - ST_LO))) rt_fatal("vk: out of memory (queue state)");
+                    memcpy(c->st, (uint8_t *)ex + ST_LO, ST_HI - ST_LO);
+                    c->has_st = 1;
+                    break;
+                }
+                evq[s].head = c->next;   // done: the queue's next submission starts with the state this one left
+                if (!evq[s].head) evq[s].tail = NULL;
+                evo_pending--;
+                cont_free(c);
+                c = evq[s].head;
+                if (!c) break;
+                c->has_st = 0;
+            }
+            evo_in = 0, evo_queue = run_q;
+            vk_exec_pass_end(ex);
+            vk_exec_barrier(ex);
+            memcpy((uint8_t *)ex + ST_LO, mine, ST_HI - ST_LO);   // the running stream's state back
+            ex->rt_resolved = 0;
+            ex->dirty = VK_EXEC_DIRTY_ALL;
+            ex->tex_serial++;
+            vk_exec_draw_new_cb();
+            free(mine);
+        }
+    }
+}
+
+static const op_hdr *walk(VkExec *ex, const op_hdr *h, int depth) {
     for (;;) {
         if (h->size < sizeof *h || (h->size & 7) || h->op >= OP_COUNT_)
             rt_fatal("vk: corrupt command record at %p: op %u size %u", (const void *)h, h->op, h->size);
         const void *a = nvn_op_payload(h);
         switch (h->op) {
-        case OP_END: return;
+        case OP_END: return NULL;
         case OP_BEGIN: break;
         case OP_JUMP: h = (const op_hdr *)(uintptr_t)((const p_jump *)a)->target; continue;
         case OP_CALL:
@@ -945,8 +1133,15 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
         case OP_CLEAR_BUF:
             vk_exec_op_xfer(ex, h->op, a);
             break;
+        case OP_WAIT_EVENT:
+            if (!vk_exec_wait_event(a) && depth == 0 && evo_queue) {
+                vk_exec_pass_end(ex);
+                return h;
+            }
+            break;
         default: rt_fatal("vk: op %s has no replay handler", nvn_op_name(h->op));
         }
+        if (vk_exec_signalled && depth == 0 && !evo_in) evo_resume(ex);
         if (split_draws >= split_n) maybe_split(ex);
         h = nvn_op_next(h);
     }
@@ -971,13 +1166,44 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     ex->barrier_at = -1;
     ex->nfbl = 0;   // the previous command buffer ended with a full barrier: every image is in GENERAL
     vk_exec_frame.submits++;
+    vk_exec_submit_seq++;
     split_draws = part_start = 0;
     part_t0 = kern_now_ns();
     x_here = 1;
-    if (n) vk_mem_mirror_begin(), vk_usnap_begin(handles, n, fence);
-    for (int i = 0; i < n; i++) {
+    int evo = evo_enabled() && gfx_submit_queue;
+    int slot = evo ? evq_slot(gfx_submit_queue) : -1;
+    if (evo && slot < 0) evo = 0;
+    if (n) {
+        vk_mem_mirror_begin();
+        if (evo_pending) {   // the uniform snapshot covers what held submissions bind too: they may go on here
+            int tot = n;
+            for (int s = 0; s < EVO_QUEUES; s++)
+                for (Cont *c = evq[s].head; c; c = c->next) tot += c->n;
+            uint64_t *all = malloc(sizeof *all * (size_t)tot);
+            if (!all) rt_fatal("vk: out of memory (snapshot handles)");
+            memcpy(all, handles, sizeof *all * (size_t)n);
+            int k = n;
+            for (int s = 0; s < EVO_QUEUES; s++)
+                for (Cont *c = evq[s].head; c; c = c->next) memcpy(all + k, c->h, sizeof *all * (size_t)c->n), k += c->n;
+            vk_usnap_begin(all, tot, fence);
+            free(all);
+        } else vk_usnap_begin(handles, n, fence);
+    }
+    for (int i = 0; i < n; i++)
         if (!handles[i]) rt_fatal("vk: command handle %d of a submission is null", i);
-        walk(ex, nvn_op_first(handles[i]), 0);
+    if (evo_pending) evo_resume(ex);   // signals the CPU gave since, and holds past CONT_MAX
+    if (evo && evq[slot].head) {   // the queue waits: this submission lines up behind it
+        if (n) cont_push(slot, cont_new(handles, n, 0, NULL)), evo_held++;
+    } else {
+        evo_queue = evo ? gfx_submit_queue : 0;
+        for (int i = 0; i < n; i++) {
+            const op_hdr *stop = walk(ex, nvn_op_first(handles[i]), 0);
+            if (!stop) continue;
+            cont_push(slot, cont_new(handles, n, i, stop));   // the rest of this submission waits for its signal
+            evo_held++;
+            break;
+        }
+        evo_queue = 0;
     }
     vk_exec_pass_end(ex);
     x_here = 0;
@@ -994,7 +1220,11 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     ex->cb = VK_NULL_HANDLE;
     if (n) n_subs++;
     if ((rt_trace & RT_TRACE_PERF) && n_subs >= 240) {
-        rt_log("perf: replay command buffer parts per submission %.2f", (double)(n_subs + n_parts) / (double)n_subs);
+        rt_log("perf: replay command buffer parts per submission %.2f; event order: held %llu, resumed %llu (%llu "
+               "without their signal), switches %llu, held now %d", (double)(n_subs + n_parts) / (double)n_subs,
+               (unsigned long long)evo_held, (unsigned long long)evo_resumed, (unsigned long long)evo_forced,
+               (unsigned long long)evo_switches, evo_pending);
+        evo_held = evo_resumed = evo_forced = evo_switches = 0;
         n_subs = n_parts = 0;
     }
     return ex->recorded - part_start;   // what the last part holds

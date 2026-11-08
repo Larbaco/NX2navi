@@ -367,6 +367,7 @@ static void boot_wait(PlatThread *warm, uint64_t cap_ms) {
         if (p.phase != last.phase || p.sh_done != last.sh_done || p.pipe_done != last.pipe_done) last = p, moved = now;
         if ((cap_ms && now - t0 >= cap_ms) || now - moved >= BOOT_STALL_MS) {
             plat_thread_detach(warm);
+            vk_pipeline_prewarm_marker_clear();
             rt_log("boot: the prewarm goes on in the background after %llu ms (%s)", (unsigned long long)(now - t0),
                    cap_ms && now - t0 >= cap_ms ? "NX2NAVI_PREWARM_WAIT_MS" : "no progress for 60 s");
             break;

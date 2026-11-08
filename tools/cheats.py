@@ -39,7 +39,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'recomp'))
 import flags  # noqa: E402
-from lifter import Lifter  # noqa: E402
+from lifter import Lifter, Unsupported  # noqa: E402
 from nso import Nso  # noqa: E402
 
 BASE = 0x7000000000   # main's base in the layout (recomp/layout.py); only pc-relative decoding sees it
@@ -90,7 +90,7 @@ def parse(text, mod):
     return out
 
 
-TITLE = '0100F2C0115B6000'
+TITLE = '0400486024DEC000'   # the game's title id: a mod's Atmosphere folders are named after it
 
 
 def cheat_files(mods, bid):
@@ -249,7 +249,16 @@ def cave_body(writes, caves, start, back, call):
 
 
 def convert(main, writes):
-    """{offset: [replacement words]} of a set of instruction writes; ValueError when it cannot."""
+    """{offset: [replacement words]} of a set of instruction writes; ValueError when it cannot. An instruction the
+    lifter cannot take (an FP16 operation in a code cave) is a ValueError too: it makes this cheat or patch file
+    unsupported, where the lifter's own exception stopped the tool, and every cheat and patch of the build with it."""
+    try:
+        return _convert(main, writes)
+    except Unsupported as e:
+        raise ValueError(f'an instruction the lifter cannot take: {e}') from None
+
+
+def _convert(main, writes):
     caves = {a for a in writes if main.word(a) == 0}
     sites = {}
     for a, w in sorted(writes.items()):
@@ -277,6 +286,11 @@ def convert(main, writes):
         last = main.lift(repl[-1], a).kind
         if last not in ('op', 'bl', 'b', 'bcond', 'ret'):
             raise ValueError(f'main+{a:X} gets a {last}')
+        # the generator takes only plain instructions before the last one (recomp/gen.py replacements): a trap or a
+        # system instruction in the middle of a code cave failed the whole lift there
+        mid = next((k for k in (main.lift(x, a).kind for x in repl[:-1]) if k != 'op'), None)
+        if mid:
+            raise ValueError(f'main+{a:X}: its code cave holds a {mid} before its last instruction')
         want = main.effect(orig, a)[1]
         got = [e[1] for e in (main.effect(x, a) for x in repl) if e[1]]
         if (got[0] if got else None) != want or len(got) > 1:

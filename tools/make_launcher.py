@@ -113,10 +113,13 @@ def version():
 # ---------------------------------------------------------------- python/
 
 def tcltk_files():
+    """The Tcl/Tk files of the pinned msi, unpacked into WORK/tcltk once. The stamp names the msi they came from and
+    is written last: an unpack from an older pin, or one stopped after _tkinter.pyd was written, is done again."""
     dest = WORK / 'tcltk'
-    if (dest / 'DLLs' / '_tkinter.pyd').is_file():
-        return dest
     msi = fetch('tcltk')
+    stamp, want = dest / '.unpacked-from', f'{msi.name} {msi.stat().st_size}'
+    if (dest / 'DLLs' / '_tkinter.pyd').is_file() and stamp.is_file() and stamp.read_text() == want:
+        return dest
     shutil.rmtree(dest, ignore_errors=True)
     dest.mkdir(parents=True)
     if os.name == 'nt':   # an administrative image: copies the files, installs nothing
@@ -125,6 +128,7 @@ def tcltk_files():
         run(['msiextract', '-C', dest, msi], stdout=subprocess.DEVNULL)
     if not (dest / 'DLLs' / '_tkinter.pyd').is_file():
         sys.exit(f'{dest}: no _tkinter.pyd in {msi.name}')
+    stamp.write_text(want)
     return dest
 
 

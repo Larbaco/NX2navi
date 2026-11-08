@@ -794,12 +794,13 @@ static int put_picture(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat 
     return fsr;
 }
 
-// The display's frame rate with frame generation: the swapchain's present count (generated frames included, vk_fg.cpp)
-// over half a second, sampled at each of the game's presents (gfx_output_fps).
+// The display's frame rate with frame generation: the frames the display got (generated ones included: vk_fg.cpp
+// vk_fg_presents, vk_dlssg.c vk_dlssg_shown) over half a second, sampled at each of the game's presents
+// (gfx_output_fps).
 static volatile double g_out_fps;
 static void output_rate(void) {
     static uint64_t t0, n0;
-    uint64_t n = vk_fg_presents(g_sc), t = plat_now_ns();
+    uint64_t n = vk_dlssg_active() ? vk_dlssg_shown() : vk_fg_presents(g_sc), t = plat_now_ns();
     if (!n) { g_out_fps = 0, t0 = 0; return; }
     if (!t0 || n < n0) { t0 = t, n0 = n; return; }
     if (t - t0 >= 500000000ull) g_out_fps = (double)(n - n0) * 1e9 / (double)(t - t0), t0 = t, n0 = n;
@@ -921,6 +922,8 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     if (cy < 0) cy = 0;
     if (cx + cw > w) cw = w - cx;
     if (cy + ch > h) ch = h - cy;
+    if (cw <= 0 || ch <= 0) cx = cy = 0, cw = w, ch = h;   // a crop outside the image (the game's nvnWindowSetCrop):
+                                                             // the whole image, not an inverted blit rectangle
     window_settings_live();
     // The menu overlay: laid out before recording (its first frame starts the ImGui back end and uploads the font)
     const char *menu_shot = NULL;
@@ -1066,6 +1069,16 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     } else {
         vk_device_fault_report(r);
         rt_log("gfx: present submit failed (%d)", (int)r);
+        // The fence was reset after the acquire and the acquire's semaphore is signalled: left so, this slot's fence
+        // wait would time out (5 s) at every later present and the picture stop for good. An empty batch takes the
+        // semaphore and signals the fence; the acquired image goes back with the swapchain, made again next frame.
+        VkSubmitInfo2 settle = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .waitSemaphoreInfoCount = 1,
+                                .pWaitSemaphoreInfos = &wait};
+        vk_queue_lock();
+        VkResult r2 = vkQueueSubmit2(c->gfx_queue, 1, &settle, g_fence[slot]);
+        vk_queue_unlock();
+        if (r2 != VK_SUCCESS) rt_log("gfx: the present slot could not be settled either (%d)", (int)r2);
+        plat_xchg32(&g_dirty, 1);
     }
     g_frame++;
     if (cap) {

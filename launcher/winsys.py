@@ -199,27 +199,55 @@ def keep_awake(on):
         pass
 
 
+# What the launcher puts in its folder (launcher/paths.py, the stub's python.next and python.old-<n>). Uninstall deletes
+# only these: the default game folder is <root>\game, and a folder given to the setup with --dest may hold other things.
+OWNED = ('NX2navi.exe', 'app', 'python', 'python.next', 'pydeps', 'data', 'toolchain')
+
+
+def uninstall_plan(layout, remove_game=''):
+    """(paths to delete with all they hold, folders to delete only when that left them empty), in order. A kept game
+    folder stays whether or not it lies inside the launcher's folder."""
+    root = Path(layout.root)
+    gone = [Path(remove_game)] if remove_game else []
+    gone += [root / n for n in OWNED]
+    try:
+        gone += sorted(p for p in root.glob('python.old-*'))
+    except OSError:
+        pass
+    empty = [root]
+    if Path(layout.toolchain).parent != root:   # the toolchain went to C:\NX2navi (launcher/paths.py ansi_safe)
+        gone.append(Path(layout.toolchain))
+        empty.append(Path(layout.toolchain).parent)
+    return gone, empty
+
+
+def uninstall_script(gone, empty):
+    """The cmd.exe line that deletes them once the launcher has exited: a file with del, a folder with rmdir /s, the
+    folders that must be empty with a plain rmdir (which leaves a folder that still holds something)."""
+    steps = ['ping -n 3 127.0.0.1 >nul']
+    for p in gone:
+        steps.append(f'(if exist "{p}\\*" (rmdir /s /q "{p}") else if exist "{p}" (del /f /q "{p}"))')
+    steps += [f'rmdir "{p}" 2>nul' for p in empty]
+    return ' & '.join(steps)
+
+
 def uninstall(layout, remove_game='', log=print):
-    """Remove the shortcuts, the uninstall entry and, once this process has exited, the launcher's folder (and the
-    game folder when remove_game names it). Saves inside a kept game folder stay."""
+    """Remove the shortcuts, the uninstall entry and, once this process has exited, what the launcher put in its folder
+    (and the game folder when remove_game names it). A kept game folder and its saves stay, also when it lies inside
+    the launcher's folder."""
     stub_run(layout, ['--shortcuts', 'off'])
+    gone, empty = uninstall_plan(layout, remove_game)
     if os.name == 'nt':
         try:
             import winreg
             winreg.DeleteKey(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY)
         except OSError:
             pass
-        targets = [str(layout.root)] + ([str(remove_game)] if remove_game else [])
-        if layout.toolchain.parent != layout.root:
-            targets.append(str(layout.toolchain.parent))
-        script = 'ping -n 3 127.0.0.1 >nul & ' + ' & '.join(f'rmdir /s /q "{t}"' for t in targets)
-        # One command line written here, not an argument list: subprocess would pass the script as one quoted
-        # argument with its inner quotes escaped as \", which cmd.exe does not read, so every rmdir got a broken path
-        # and nothing was removed. /s makes cmd.exe drop only the outer pair of quotes and run the rest as written;
-        # /d skips the AutoRun commands of the registry.
-        start_detached(f'cmd.exe /d /s /c "{script}"', cwd=os.environ.get('TEMP', 'C:\\'))
+        # one command line as cmd.exe reads it: a list would have its quotes escaped as \", which cmd.exe does not
+        # understand, and no rmdir would find its folder
+        start_detached(f'cmd.exe /d /s /c "{uninstall_script(gone, empty)}"', cwd=os.environ.get('TEMP', 'C:\\'))
     else:
-        log('uninstall: remove these folders yourself: ' + ', '.join([str(layout.root), str(remove_game)]))
+        log('uninstall: remove these yourself: ' + ', '.join(str(p) for p in gone if p.exists()))
 
 
 # ---------------------------------------------------------------- gamepad (XInput)

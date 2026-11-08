@@ -177,8 +177,11 @@ void menu_sound_mix(float *out, uint32_t frames, int channels, int rate) {
     for (int v = 0; v < VOICES; v++) {
         int pos = atomic_load_explicit(&voices[v].pos, memory_order_acquire);
         if (pos < 0) continue;
-        int which = atomic_load_explicit(&voices[v].sound, memory_order_relaxed);
+        int which = atomic_load_explicit(&voices[v].sound, memory_order_acquire);
         const Sound *s = &sounds[which];
+        // menu_sound_play may restart the voice between the two loads: pos would then belong to the old sound, past
+        // the end of a shorter new one; such a voice is mixed from the next call on
+        if (atomic_load_explicit(&voices[v].pos, memory_order_acquire) != pos || (uint32_t)pos >= s->frames) continue;
         if (g < 0) g = volume();
         float vg = which == MENU_SOUND_CURSOR ? g * CURSOR_GAIN : g;
         uint32_t n = s->frames - (uint32_t)pos < frames ? s->frames - (uint32_t)pos : frames;

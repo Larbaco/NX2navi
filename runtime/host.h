@@ -60,6 +60,7 @@ typedef struct {
     int have_idle;                              // calibrated timestamps: the idle split below is filled
     uint64_t idle_ns, starved_ns, queued_ns;    // GPU idle between timed parts; of it, before the part was submitted; submit to start
     uint64_t idle_gaps, max_gap_ns;             // gaps over 0.5 ms; the longest
+    uint64_t mirror_ns;                         // of gpu_ns, the copies into VRAM mirrors (vk_sync.c ts_submitted)
 } PerfGpu;
 extern void (*perf_gpu_stats)(PerfGpu *out);
 // The performance overlay (perfmon.c): mode 0 off, 1 fps, 2 full. While it is on, perf_present hands every frame to
@@ -296,12 +297,13 @@ void *rt_patch_page(void);                                 // the page the patch
 void frame_step_init(void);                                // after rt_patches_init: the real-time step's first value
 int frame_step_realtime(void);                             // the real-time step is on: presents ignore the interval
 uint64_t frame_step_cap_ns(void);                          // with the real-time step: the shortest frame in ns
+int ov_movie_live(void);                                   // ov_movie2.c: a movie plays (frame_rate.c movie_cap_hz)
 int frame_limit_adjustable(void);                         // the frame limit setting changes the rate (always)
 int frame_free_running(void);                             // no fps60/realtime patch set: the game steps by the clock
 double frame_step_limit_hz(void);                         // the frame rate the limit gives (overlay); 0 unknown
 // rtss_limit.c: RivaTuner Statistics Server takes the frame limit where it runs
 void rtss_limit_want(int64_t mhz);                        // the pacer's limit in millihertz: >0, 0 none, -1 keep RTSS out
-int rtss_limit_active(void);                              // RTSS limits this process: the pacer holds no frames
+int rtss_limit_active(void);                              // RTSS limits to the wanted rate: the pacer holds no frames
 int rtss_limit_state(void);                               // menu: 1 RTSS limits, 2 its profile is read-only, 3 it let the
                                                            // game run past its limit
 void rtss_limit_restore(void);                            // before the process ends: the profile's old limit back

@@ -462,9 +462,9 @@ static void buf_snap(VkExec *ex, int pass) {
     vk_completion_add(ex->fence, buf_done, j);
 }
 
-static int active(void) {
+static int active(void) {   // passes_f is NULL before a dump that opens its files when it starts (open_files)
     uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
-    return !finished && (f == dump_frame || (log_from && f >= log_from && f < dump_frame));
+    return !finished && passes_f && (f == dump_frame || (log_from && f >= log_from && f < dump_frame));
 }
 static uint64_t frame_now(void) { return __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1; }
 
@@ -744,6 +744,11 @@ void vk_dump_draw(VkExec *ex, const VkPipeState *s, VkPipeline p, const VkPipeIn
     Str b = {0};
     sp(&b, "vs %016llx fs %016llx prog %llu prim %d\n", (unsigned long long)shader_hash(s->vs),
        (unsigned long long)shader_hash(s->fs), (unsigned long long)(ex->prog ? ex->prog->serial : 0), s->prim);
+    // target 0's blending as NVN numbers (NVNblendFunc, NVNblendEquation), which decides whether a quad covers or mixes
+    const blend_st *bl = &s->blend[0];
+    sp(&b, "    blend: enabled targets %#x; target 0 rgb %u*src %u*dst eq %u, alpha %u*src %u*dst eq %u; channel mask %#x\n",
+       (unsigned)s->color.blend_en, (unsigned)bl->src_rgb, (unsigned)bl->dst_rgb, (unsigned)bl->eq_rgb,
+       (unsigned)bl->src_a, (unsigned)bl->dst_a, (unsigned)bl->eq_a, (unsigned)s->chmask.mask);
     describe_bindings(&b, ex, info);
     ents[nents++] = (Ent){p, th, 1, b.s};
 out:
@@ -792,9 +797,12 @@ static void pass_decide(int same_targets) {
     if (!pass_skip) copied++;
 }
 
+static void open_files(void);
+
 void vk_dump_pass_end(VkExec *ex) {
     plat_mutex_lock(&rec_lock);
     if (dump_after && dump_frame == UINT64_MAX && ex->depth.tex && (uint64_t)(uintptr_t)ex->depth.tex->mem == dump_after) {
+        if (!passes_f) open_files();   // NX2NAVI_DUMP_WHITE and NX2NAVI_DUMP_MOVIE open them for each of their dumps
         dump_frame = frame_now();   // this pass and the rest of its frame
         rt_log("vk_dump: a pass drew into %#llx in frame %llu: it and the rest of the frame go to %s",
                (unsigned long long)dump_after, (unsigned long long)dump_frame, dir);
@@ -943,6 +951,21 @@ static void make_dirs(char *path) { plat_file_mkdir_p(path); }
 int vk_dump_white;   // vk_backend.c asks for a thumbnail of every present while it is set
 #define dump_white vk_dump_white
 
+// NX2NAVI_DUMP_MOVIE=<k>:<frame>[,<frame>...] (diagnosis): the k-th movie of the run (counted from 1 as each video
+// decoder comes up, ov_movie2.c ov_initialize) asks for a dump of the next present once it has shown each listed
+// frame, so a movie's picture can be followed through the game's passes at chosen moments. Each dump has its own
+// folder, base_dir/f<present>.
+static int movie_k, movie_n, movie_done;
+static uint64_t movie_at[8];
+static int movie_req;   // set by the movie's thread, taken by vk_dump_present
+
+void vk_dump_movie_frame(int k, uint64_t shown) {
+    if (!movie_k || k != movie_k || movie_done >= movie_n || shown != movie_at[movie_done]) return;
+    movie_done++;
+    __atomic_store_n(&movie_req, 1, __ATOMIC_RELEASE);
+    rt_log("vk_dump: movie %d shows frame %llu: dumping the next present", k, (unsigned long long)shown);
+}
+
 // passes.txt and images.txt in dir (a new folder per NX2NAVI_DUMP_WHITE attempt)
 static void open_files(void) {
     make_dirs(dir);
@@ -961,9 +984,18 @@ void vk_dump_init(void) {
     // (a target drawn once, at an area load)
     const char *da = cfg_get("NX2NAVI_DUMP_AFTER");
     dump_after = da && *da ? strtoull(da, NULL, 0) : 0;
+    const char *dm = cfg_get("NX2NAVI_DUMP_MOVIE");
+    if (dm && *dm) {
+        char *q;
+        movie_k = (int)strtol(dm, &q, 10);
+        while ((*q == ':' || *q == ',') && movie_n < 8) movie_at[movie_n++] = strtoull(q + 1, &q, 10);
+        if (movie_k < 1 || !movie_n) movie_k = 0;
+    }
     if (dump_white || dump_after) {
         dump_frame = UINT64_MAX;
         vk_thumbs_enable(16);
+    } else if (movie_k) {
+        dump_frame = UINT64_MAX;
     } else if (!e || !*e || !(dump_frame = strtoull(e, NULL, 10))) return;
     const char *lf = cfg_get("NX2NAVI_DUMP_LOG");
     if (lf && *lf) log_from = strtoull(lf, NULL, 10);
@@ -984,7 +1016,7 @@ void vk_dump_init(void) {
     snprintf(base_dir, sizeof base_dir, "%s", d && *d ? d : "dump");
     snprintf(dir, sizeof dir, "%s", base_dir);
     char path[600];
-    if (!dump_white) open_files();
+    if (!dump_white && !movie_k) open_files();
     const char *bf = cfg_get("NX2NAVI_DUMP_BUF");
     if (bf && *bf) {
         char *q;
@@ -1039,6 +1071,12 @@ void vk_dump_present(uint64_t frame) {
         white_last = 0;
     }
     if (dump_white && !white_caught && !white_last && dump_frame == UINT64_MAX) white_check(frame);
+    if (movie_k && dump_frame == UINT64_MAX && __atomic_exchange_n(&movie_req, 0, __ATOMIC_ACQ_REL)) {
+        snprintf(dir, sizeof dir, "%s/f%llu", base_dir, (unsigned long long)(frame + 1));
+        open_files();   // before the frame is named: its passes write to them
+        dump_frame = frame + 1;
+        rt_log("vk_dump: frame %llu goes to %s", (unsigned long long)dump_frame, dir);
+    }
     if (frame != dump_frame) return;
     plat_mutex_lock(&rec_lock);
     finished = 1;
@@ -1053,8 +1091,8 @@ void vk_dump_present(uint64_t frame) {
     passes_f = NULL;
     rt_log("vk_dump: frame %llu: %d passes and dispatches, about %llu MB of PNGs in %s", (unsigned long long)frame, seq,
            (unsigned long long)(png_bytes >> 20), dir);
-    if (dump_white) {   // ready for another attempt (vk_dump_present checks this one's thumbnail 3 presents on)
-        white_last = frame;
+    if (dump_white || movie_k) {   // ready for another dump (vk_dump_present checks a white one's thumbnail 3 presents on)
+        if (dump_white) white_last = frame;
         plat_mutex_lock(&rec_lock);
         seq = copied = 0, last_targets = 0, pass_skip = NULL, png_bytes = 0;
         nluts = nluts_done = nents = ents_over = pass_draws = 0;

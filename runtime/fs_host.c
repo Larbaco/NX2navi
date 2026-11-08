@@ -24,7 +24,7 @@
 #include "platform/platform.h"
 #include "romfs_path.h"
 
-#define NX2NAVI_APPLICATION_ID 0x0100f2c0115b6000ull
+#define NX2NAVI_APPLICATION_ID 0x0400486024dec000ull   // the game's title id, as svc.c PROGRAM_ID tells it
 #define FILE_BASE 0x200000000ull
 #define DIR_BASE 0x300000000ull
 #define NFILES 1024
@@ -105,9 +105,14 @@ int fs_save_busy(void) {
 }
 
 // ---- host directories
+// A junction or symbolic link to a folder counts as the folder: a player who moved the profile to another drive links
+// it back, and the start stopped at "cannot create directory" for it.
 static int make_dir(const char *p) {
     int e = plat_fs_mkdir(p);
-    return !e || (e == PLAT_FS_EXISTS && plat_fs_kind(p) == PLAT_FS_DIR);
+    if (!e) return 1;
+    if (e != PLAT_FS_EXISTS) return 0;
+    int k = plat_fs_kind(p);
+    return k == PLAT_FS_DIR || (k == PLAT_FS_LINK && plat_dir_exists(p));
 }
 
 // p and every missing parent.
@@ -227,7 +232,13 @@ static int move_dir(const char *from, const char *to, int tries) {
     for (int i = 0; i < tries; i++) {
         int e = plat_fs_rename(from, to, 1);
         if (!e) return 0;
-        if (e != PLAT_FS_BUSY) return -1;
+        if (e != PLAT_FS_BUSY) {
+            // a folder rename cannot cross drives: save/ linked to another drive than save-tx/ (link the whole
+            // profile folder instead) fails every commit here
+            rt_log("fs: cannot move %s to %s (error %d)%s", from, to, plat_fs_os_error(),
+                   plat_fs_os_error() == 17 ? ": they are on different drives; keep save and save-tx on one drive" : "");
+            return -1;
+        }
         plat_sleep_ms(50);
     }
     return -1;
@@ -490,7 +501,8 @@ static void save_recover(void) {
 static void work_create(void) {
     int n = 0, linked = 0;
     uint64_t bytes = 0;
-    if (remove_tree(work_root) || copy_tree(newest_save(), work_root, NULL, 0, &n, &linked, &bytes))
+    // remove_tree_retry: the last unmount's delete may have been held up by a scanner, as at the start
+    if (remove_tree_retry(work_root) || copy_tree(newest_save(), work_root, NULL, 0, &n, &linked, &bytes))
         rt_fatal("fs: cannot make the save working copy");
     rt_log("host save working copy: %d files, %.1f MiB", n, bytes / 1048576.0);
 }
@@ -614,6 +626,12 @@ static void storage_init(void *param) {
     uint64_t uid[2];
     char p[PATH_CAP];
     make_dirs(profile);
+    // One game per profile: a second one's start would take the first one's commit in progress for an interrupted
+    // one and delete it, and both would write into one working copy (save-tx/work), losing or mixing their saves.
+    snprintf(p, sizeof p, "%s/instance.lock", profile);
+    int held = plat_lock_file(p);
+    if (!held) rt_fatal("fs: another copy of the game is running with the profile %s; close it first", profile);
+    if (held < 0) rt_log("fs: cannot make %s; a second copy of the game would not be stopped", p);
     account_uid(uid);
     snprintf(p, sizeof p, "%s/save", profile);
     make_dirs(p);
@@ -953,7 +971,8 @@ static uint32_t write_file(uint64_t h, int64_t offset, const void *buffer, uint6
     if (!(mode & FS_OPEN_WRITE)) return FS_R_OPEN_MODE;
     PlatFileId id;
     if (!plat_file_id(f, &id)) rt_fatal("fs: host save size");
-    if ((uint64_t)offset + size > id.size && !(mode & FS_OPEN_APPEND)) return FS_R_APPEND_REQUIRED;
+    // offset + size without the sum: a size near 2^64 would wrap it below the file's size
+    if ((size > id.size || (uint64_t)offset > id.size - size) && !(mode & FS_OPEN_APPEND)) return FS_R_APPEND_REQUIRED;
     if (file->save) save_touched();
     for (uint64_t done = 0; done < size;) {
         uint32_t chunk = size - done > 0x40000000 ? 0x40000000 : (uint32_t)(size - done);
@@ -1480,10 +1499,11 @@ static void probe_restart(const uint64_t *uid) {
     CHECK(RES(S_MOUNT_SAVE, U("save"), U(uid)) == 0, "MountSaveData after a restart");
 }
 
-// Commit through the override, then wait for its background thread, as the checks read the disk next.
+// Commit through the override, then wait for its background thread, as the checks read the disk next. Not with
+// fs_save_flush: that also marks the process as exiting, and every later Commit of the probe would be refused.
 static uint32_t tx_commit(void) {
     uint32_t r = RES(S_COMMIT, U("save"));
-    fs_save_flush();
+    save_wait_commit();
     return r;
 }
 
@@ -1796,6 +1816,9 @@ static void probe_storage(void) {
     CHECK(RES(S_DELETE_CACHE, 3) == 0, "DeleteCacheStorage");
     CALL(S_UNMOUNT, U("save"));
 
+    char lock[PLAT_PATH_MAX * 3 + 96];
+    snprintf(lock, sizeof lock, "%s/instance.lock", dir);
+    plat_unlock_file(lock);   // storage_init's one-game-per-profile lock, held open until given back
     int removed = !remove_tree(dir) && !exists(dir);
     CHECK(removed, "the temporary profile was not deleted");
     printf("storage: save create/write/commit/reopen, directories, rename/delete, temporary and cache storage in a "

@@ -500,6 +500,34 @@ static void make_dirs(const char *dir) {
     if (!plat_dir_exists(dir)) rt_fatal("account: cannot create %s", dir);
 }
 
+// Holding account_lock. 1 when <profile>/save holds exactly one folder named as fs_host.c names an account's
+// (<uid hi><uid lo>, 32 hex digits); local is then that account.
+static int local_adopted;
+typedef struct { int n; uint64_t hi, lo; } AdoptScan;
+static int adopt_cb(const char *name, int kind, uint64_t size, void *ctx) {
+    (void)size;
+    AdoptScan *a = ctx;
+    if (kind != PLAT_FS_DIR && kind != PLAT_FS_LINK) return 1;
+    if (strlen(name) != 32 || strspn(name, "0123456789abcdefABCDEF") != 32) return 1;
+    char half[17];
+    memcpy(half, name, 16), half[16] = 0;
+    a->hi = strtoull(half, NULL, 16);
+    a->lo = strtoull(name + 16, NULL, 16);
+    a->n++;
+    return 1;
+}
+static int adopt_save_uid(const char *profile) {
+    char save[1100];
+    AdoptScan a = {0};
+    if (snprintf(save, sizeof save, "%s/save", profile) >= (int)sizeof save || !plat_dir_exists(save)) return 0;
+    plat_fs_list(save, adopt_cb, &a);
+    if (a.n != 1 || (!a.hi && !a.lo)) return 0;
+    local.lo = a.lo;
+    local.hi = a.hi;
+    local_adopted = 1;
+    return 1;
+}
+
 // Holding account_lock.
 static void load_uid(void) {
     if (local.lo || local.hi) return;
@@ -508,11 +536,17 @@ static void load_uid(void) {
     make_dirs(dir);
     need(snprintf(path, sizeof path, "%s/account.uid", dir) < (int)sizeof path, "account: path too long");
     int64_t size = plat_file_size(path);
+    // a file that is there but cannot be asked for its size is no reason for a new account: its saves would vanish
+    if (size < 0 && plat_fs_kind(path) != PLAT_FS_MISSING) rt_fatal("account: cannot read %s", path);
     if (size <= 0) {
-        do need(plat_random(&local, sizeof local), "account: random uid");
-        while (!local.lo && !local.hi);
+        // account.uid lost (a profile copied without it, or the save folder alone put in place): the one account
+        // folder in save/ is the player's, and taking its name keeps that save; otherwise a new account
+        if (!adopt_save_uid(dir)) {
+            do need(plat_random(&local, sizeof local), "account: random uid");
+            while (!local.lo && !local.hi);
+        }
         need(plat_file_write_atomic(path, &local, sizeof local), "account: persist the local account identity");
-        rt_log("account: new local account in %s", path);
+        rt_log("account: %s local account in %s", local_adopted ? "the save folder's" : "new", path);
     } else {
         uint64_t got = 0;
         uint8_t *b = plat_file_read(path, &got);

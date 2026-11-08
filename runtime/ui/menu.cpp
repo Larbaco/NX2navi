@@ -868,20 +868,20 @@ static void row_framegen(void) {
     const char *names[] = {menu_text(UI_MENU_FRAMEGEN_OFF), "AMD FSR 3.1", "NVIDIA DLSS"};
     const char *v = cfg_value("NX2NAVI_FRAMEGEN");
     int cur = !strcmp(v, "fsr3") ? 1 : !strcmp(v, "dlss") ? 2 : 0;
-    // NVIDIA DLSS (vk_dlssg.c) is listed only while it is set: Streamline now starts and takes the swapchain, but presents
-    // no generated frames yet (one presented per frame, status OK)
-    int n = cur == 2 ? 3 : 2;
+    // NVIDIA DLSS (vk_dlssg.c, through Streamline and nx2navi_dlssg.dll) is listed on NVIDIA GPUs now that Reflex paces it
+    // from the frame's start and generated frames are presented; elsewhere only while it is set
+    int n = dlss || cur == 2 ? 3 : 2;
     int nv = opt_choice_index("NX2NAVI_FRAMEGEN", UI_MENU_FRAMEGEN, names, n, cur, 0,
                               dlss ? UI_MENU_FRAMEGEN_DESC : UI_MENU_FRAMEGEN_DESC_FSR,
                               menu_text(dlss ? UI_MENU_FRAMEGEN_NOTE : UI_MENU_FRAMEGEN_NOTE_FSR));
     if (nv >= 0 && nv < n) opt_apply("NX2NAVI_FRAMEGEN", values[nv]);
 }
 
-// The picture's height (widescreen.c picture_height): the game's 1440 or more.
+// The picture's height (widescreen.c picture_height): 1080, the game's 1440 or more.
 static void row_game_res(void) {
-    static const char *const values[] = {"1440", "1800", "2160", "2880", "window"};
-    const char *names[] = {"1440p", "1800p", "2160p (4K)", "2880p (5K)", menu_text(UI_MENU_GAME_RES_NATIVE)};
-    opt_choice_list("NX2NAVI_GAME_RES", UI_MENU_GAME_RES, values, names, 5, UI_MENU_GAME_RES_DESC);
+    static const char *const values[] = {"1080", "1440", "1800", "2160", "2880", "window"};
+    const char *names[] = {"1080p", "1440p", "1800p", "2160p (4K)", "2880p (5K)", menu_text(UI_MENU_GAME_RES_NATIVE)};
+    opt_choice_list("NX2NAVI_GAME_RES", UI_MENU_GAME_RES, values, names, 6, UI_MENU_GAME_RES_DESC);
 }
 
 static void tab_screen(float scale) {

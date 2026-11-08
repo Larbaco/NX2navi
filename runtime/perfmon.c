@@ -380,8 +380,10 @@ void perfmon_mode(int mode) {
 }
 
 void perfmon_snapshot(PerfStats *out) {
-    uint64_t now = plat_now_ns();
+    // the time under the lock: a frame pushed between the two would be newer than now, and now - at wrapping would
+    // end the frame window at once (0 fps on the overlay)
     plat_mutex_lock(&g_lock);
+    uint64_t now = plat_now_ns();
     frames_summary(&g_stats, now);
     counters_summary(now);
     *out = g_stats;

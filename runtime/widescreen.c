@@ -55,17 +55,20 @@ static double wanted_ratio(void) {
     return (double)w / h;
 }
 
-// NX2NAVI_GAME_RES: the picture's height, from the game's 1440 up to 4320 ("window": the window's height, or the
-// monitor's in fullscreen).
+// NX2NAVI_GAME_RES: the picture's height, 1080 up to 4320 ("window": the window's height, or the monitor's in
+// fullscreen, never below the game's 1440). 1080 is the one height below the game's own: a lighter picture for slower
+// GPUs, its scene and the DLSS modes scaled down with it (wide_present, scale_k).
+#define PICTURE_MIN_H 1080
 static unsigned picture_height(void) {
     const char *s = cfg_value("NX2NAVI_GAME_RES");
-    int w = 0, h = GAME_H;
+    int w = 0, h = GAME_H, min = PICTURE_MIN_H;
     if (!strcmp(s, "window")) {
         if (!screen_size(&w, &h)) h = GAME_H;
+        min = GAME_H;
     } else {
         h = atoi(s);
     }
-    return h < GAME_H ? GAME_H : h > 4320 ? 4320 : (unsigned)h;
+    return h < min ? (unsigned)min : h > 4320 ? 4320 : (unsigned)h;
 }
 
 

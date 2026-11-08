@@ -76,6 +76,7 @@ static struct {
     int vs_outs_all;                   // NX2NAVI_VS_OUTS: 0 union of paired fragment inputs, 1 (all) all 32 output locations
     int dyn_vi, dyn_clamp, dyn_poly, dyn_blend_en, dyn_blend_eq, dyn_wmask, dyn_a2c;
     int f_logic_op, f_depth_clamp, f_fill_non_solid, f_dual_src, f_full_subgroups;
+    int cache_control;                 // pipelineCreationCacheControl: a create can ask for the pipeline caches only
     int pv_last;                       // provokingVertexLast enabled: NVN's default is the last vertex
     VkShaderStageFlags sg32_stages;    // stages that accept requiredSubgroupSize = 32 (0: not available)
     VkDynamicState dyn[32];
@@ -237,6 +238,7 @@ static int ensure_init(void) {
                p13.maxSubgroupSize, (unsigned)p13.requiredSubgroupSizeStages, vk_caps.sg_size, (unsigned)P.sg32_stages);
     }
     P.f_full_subgroups = v13.computeFullSubgroups;
+    P.cache_control = v13.pipelineCreationCacheControl;
     P.f_logic_op = f2.features.logicOp;
     P.f_depth_clamp = f2.features.depthClamp;
     P.f_fill_non_solid = f2.features.fillModeNonSolid;
@@ -2673,6 +2675,8 @@ static void warm_builder(void *arg) {
 }
 
 static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]);
+static int pm_skipped(void);
+static void pm_set(void);
 
 // vk_pipeline_prewarm_progress's numbers: the phase, and the pipelines finished (built or failed) of those queued, copied
 // while prewarm_run waits for its builders.
@@ -2756,6 +2760,16 @@ static void prewarm_run(void) {
         rt_log("vk_pipeline: vertex output unions: %u vertex shaders, %.2f locations each; %llu pairs read %.2f each",
                VO.n, VO.n ? (double)uni / VO.n : 0.0, (unsigned long long)pairs, pairs ? (double)pair / pairs : 0.0);
     }
+    if (pm_skipped()) {   // the boot's pipeline builds killed an earlier start on this GPU and driver
+        plat_mutex_lock(&P.lock);
+        free(K.file);
+        K.file = NULL;
+        plat_mutex_unlock(&P.lock);
+        free(ids), free(sh);
+        lb_start(pr_hist, fs_hist);
+        return;
+    }
+    pm_set();
     uint32_t queued = 0, dropped = 0, known = 0;
     plat_mutex_lock(&P.lock);
     K.t0 = t1;
@@ -2820,7 +2834,69 @@ static void prewarm_run(void) {
     free(K.file);
     K.file = NULL;
     plat_mutex_unlock(&P.lock);
+    vk_pipeline_prewarm_marker_clear();   // the boot's share is done; what the pool builds later runs during play
     lb_start(pr_hist, fs_hist);
+}
+
+// ---- boot prebuild crash marker
+// The boot builds the recorded pipelines (warm_builder) before the game starts. A driver whose compiler crashes on one
+// of them would kill every start at the same point, and the preparation journal above does not cover these builds.
+// So <dir>/pipeline-prewarm-running.txt exists while they run: written before the first one, deleted when the boot's
+// share ends (or when the boot stops waiting and lets the game start). A start that finds it left over records this
+// GPU and driver in <dir>/pipeline-prewarm-skip.txt, and starts on them build no recorded pipelines ahead of play:
+// each one is built at its first draw instead, as with NX2NAVI_PIPE_PREBUILD=0. Another driver version, or deleting
+// the file, brings the prebuild back. Only the boot's own share is covered: a crash during play, where the pool also
+// builds what the boot left, says nothing about these builds.
+static int cache_dir(char *dir, size_t n);
+static void gpu_key(char *out, size_t n);
+static char PM_run[PLAT_PATH_MAX * 2 + 48];
+static volatile int32_t pm_on;
+
+static int pm_skipped(void) {
+    char dir[PLAT_PATH_MAX * 2], sp[sizeof PM_run], key[32];
+    if (!cache_dir(dir, sizeof dir)) return 0;
+    snprintf(PM_run, sizeof PM_run, "%s/pipeline-prewarm-running.txt", dir);
+    snprintf(sp, sizeof sp, "%s/pipeline-prewarm-skip.txt", dir);
+    gpu_key(key, sizeof key);
+    uint64_t n = 0;
+    uint8_t *left = plat_file_read(PM_run, &n);
+    if (left) {
+        char text[256];
+        int len = snprintf(text, sizeof text,
+                           "# The boot's pipeline prebuild did not finish on this GPU and driver (runtime/vk_pipeline.c "
+                           "pm_skipped): starts skip it\n# while this line matches. Delete this file to build ahead of play "
+                           "again.\n%s\n", key);
+        if (plat_file_write_atomic(sp, text, (size_t)len)) plat_file_delete(PM_run);
+        rt_log("vk_pipeline: the last start died while the boot built pipelines (%s was left); %s now skips that "
+               "prebuild on this GPU and driver (%s)", PM_run, sp, key);
+        free(left);
+    }
+    uint8_t *skip = plat_file_read(sp, &n);
+    int on = 0;
+    for (char *line = (char *)skip, *next; line && *line && !on; line = next) {
+        next = strchr(line, '\n');
+        if (next) *next++ = 0;
+        size_t l = strlen(line);
+        while (l && (line[l - 1] == '\r' || line[l - 1] == ' ')) line[--l] = 0;
+        on = line[0] != '#' && !strcmp(line, key);
+    }
+    free(skip);
+    if (on)
+        rt_log("vk_pipeline: prewarm: %zu recorded pipelines not built ahead of play: an earlier start died while building "
+               "them on this GPU and driver (%s lists %s); each builds at its first draw", K.file_n, sp, key);
+    return on;
+}
+
+static void pm_set(void) {
+    if (!PM_run[0]) return;
+    char key[32];
+    gpu_key(key, sizeof key);
+    // straight to the disk: the file has to be there if the driver takes the process down a moment later
+    if (plat_file_write_atomic(PM_run, key, strlen(key))) plat_xchg32(&pm_on, 1);
+}
+
+void vk_pipeline_prewarm_marker_clear(void) {
+    if (plat_xchg32(&pm_on, 0)) plat_file_delete(PM_run);
 }
 
 // ensure_init's hook: without a prewarm (NX2NAVI_PIPE_PREBUILD=0, or the device came up first elsewhere) the records
@@ -2859,7 +2935,9 @@ static uint32_t *spv_override(const uint32_t *code, uint64_t words, uint64_t *ou
 }
 
 // A compute pipeline for cs in layout l; VK_NULL_HANDLE on failure. No lock needed (P.cache is driver-synchronised).
-static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
+// cached_only (needs P.cache_control): from P.cache or the driver's own disk cache, never compiled; VK_NULL_HANDLE when
+// neither holds it (the driver returns VK_PIPELINE_COMPILE_REQUIRED, a success code, with no pipeline).
+static VkPipeline compute_create(const GfxShader *cs, const Layout *l, int cached_only) {
     uint64_t words;
     const uint32_t *code = gfx_shader_spirv(cs, &words);
     uint64_t ow = 0;
@@ -2872,6 +2950,7 @@ static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
                                       .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                                                 .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main"},
                                       .layout = l->layout, .flags = noopt_flag()};
+    if (cached_only) ci.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
     pin_subgroup32(&ci.stage, &rqc, code, words);
     // Subgroup operations in a workgroup whose width is a whole number of subgroups need every subgroup full: the
     // driver may otherwise run partial ones, and a ballot over the culling's candidates then counted differently from
@@ -2916,8 +2995,16 @@ static Layout *compute_layout(const GfxShader *cs, Bindings *B, const char **why
 // file: clamp 0, fill, -w..w), single-sampled, no dual source; the state dynamic on this GPU is 0 in every key.
 // A draw that meets such a variant in a new pipeline then gets its libraries from libs[] or the driver cache and
 // fast-links (gpl_link). NX2NAVI_LIB_PREBUILD=0 turns the boot part off, =N stops it after N variants;
-// NX2NAVI_LIB_PREBUILD_THREADS sets its thread count.
+// NX2NAVI_LIB_PREBUILD_THREADS sets its thread count, NX2NAVI_LIB_PREBUILD_BIG its compute size limit (LB_BIG_WORDS).
 #define LB_MAX_THREADS 16
+// The boot part builds a compute shader over LB_BIG_WORDS SPIR-V words only from the pipeline caches (compute_create
+// cached_only); one that no cache holds is left to its first dispatch, like any shader outside the warm list. Play
+// recorded four straight-line compute shaders of 0.87-4.4 million words (one function of up to 888K instructions; the
+// median of 3,648 compute shaders is 7,351 words, p99 64,844). NVIDIA 621.01 on an RTX 4090 compiled them on four
+// prebuild threads for minutes at 100% CPU each while the process grew from 12 GB to 28-31 GB, until RAM ran out and the
+// game stuttered and went black a few minutes after boot. None finished, so no cache held one and every boot did it
+// again. NX2NAVI_LIB_PREBUILD_BIG sets the limit in words; 0 builds every size.
+#define LB_BIG_WORDS (512u * 1024)
 
 static struct {
     GfxWarmEnt *e;
@@ -2931,6 +3018,7 @@ static struct {
     // warmed: driver cache only; nolib: vertex and fragment variants skipped with the graphics pipeline library off
     // skipped: variants of the skip list (SK below)
     uint64_t built[3], have[3], fail[3], warmed[3], noshader, nolib, skipped, done, cs_draw;
+    uint64_t big_words, deferred;                      // LB_BIG_WORDS; compute shaders over it left to their dispatch
     double warm_ms[3];
     volatile int32_t kept;                                // libraries entered in libs[] so far
     int32_t keep_n;
@@ -3113,7 +3201,7 @@ VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info) {
             int flight = cs_flight_add(cs);
             plat_mutex_unlock(&P.lock);   // the compile runs without the lock
             uint64_t p0 = perf_begin();
-            pipe = compute_create(cs, l);
+            pipe = compute_create(cs, l, 0);
             perf_end(PERF_PIPE, p0);
             plat_mutex_lock(&P.lock);
             if (flight) cs_flight_remove(cs);
@@ -3173,11 +3261,30 @@ static uint32_t vs_union_peek(const GfxShader *vs, GfxShaderIo fin[32]) {
     return missing;
 }
 
-static void lb_compute(const GfxShader *cs) {
+// A compute shader over LB.big_words that no pipeline cache holds: its first dispatch builds it (vk_pipeline_compute).
+static void lb_defer(const uint8_t iid[32], uint64_t words) {
+    plat_mutex_lock(&LB.stat);
+    LB.deferred++;
+    plat_mutex_unlock(&LB.stat);
+    rt_log("vk_pipeline: stage library prebuild: compute shader %02x%02x%02x%02x%02x%02x%02x%02x (%llu SPIR-V words) %s: "
+           "left to its first dispatch (NX2NAVI_LIB_PREBUILD_BIG %llu)", iid[0], iid[1], iid[2], iid[3], iid[4], iid[5],
+           iid[6], iid[7], (unsigned long long)words,
+           P.cache_control ? "not in the pipeline caches" : "too large to build without a cache probe (no pipelineCreationCacheControl)",
+           (unsigned long long)LB.big_words);
+}
+
+static void lb_compute(const GfxShader *cs, const uint8_t iid[32]) {
     struct { const GfxShader *cs; uint32_t compute; } k = {cs, 1};
     uint64_t h = key_hash(&k, sizeof k);
     Bindings B = {0};
     const char *why = NULL;
+    uint64_t words = 0;
+    gfx_shader_spirv(cs, &words);
+    int big = LB.big_words && words > LB.big_words;   // only from the caches (LB_BIG_WORDS)
+    if (big && !P.cache_control) {
+        lb_defer(iid, words);
+        return;
+    }
     lb_lock();
     int busy = cs_flight_has(cs);   // the replay compiles it now (vk_pipeline_compute)
     Layout *l = busy || pipe_find(&k, sizeof k, h) ? NULL : compute_layout(cs, &B, &why);
@@ -3191,7 +3298,7 @@ static void lb_compute(const GfxShader *cs) {
     // at normal priority: while it is in flight a dispatch of the same shader waits for it (vk_pipeline_compute), and an
     // idle-priority compile under load held that frame for seconds
     if (LB.idle) plat_thread_priority(PLAT_PRIO_NORMAL);
-    VkPipeline pipe = compute_create(cs, l);
+    VkPipeline pipe = compute_create(cs, l, big);
     double ms = now_ms() - t0;
     lb_lock();
     if (flight) cs_flight_remove(cs);
@@ -3203,7 +3310,8 @@ static void lb_compute(const GfxShader *cs) {
         have = 1;
     }
     lb_unlock();
-    lb_count(2, pipe ? have : 2, ms);
+    if (!pipe && big) lb_defer(iid, words);
+    else lb_count(2, pipe ? have : 2, ms);
 }
 
 // The pre-rasterization (vertex) or fragment-shader library of one shader with the LB state.
@@ -3281,7 +3389,8 @@ static void lb_report(const char *how) {
            "%llu there; fragment %llu built (avg %.1f ms), %llu there; compute %llu built (avg %.1f ms), %llu there; driver "
            "cache only: vertex %llu (avg %.1f ms), fragment %llu (avg %.1f ms), compute %llu (avg %.1f ms); %llu failed, %llu not in the shader cache, "
            "%llu vertex/fragment skipped (graphics pipeline library off), %llu skipped (the driver crashed on them before, "
-           "shader-prepare-skip.txt); process working set %.0f MB", how, (unsigned long long)LB.done, LB.n,
+           "shader-prepare-skip.txt), %llu large compute shaders left to their first dispatch (NX2NAVI_LIB_PREBUILD_BIG); "
+           "process working set %.0f MB", how, (unsigned long long)LB.done, LB.n,
            now_ms() - LB.t0, (unsigned long long)LB.built[0], LB.built[0] ? LB.ms[0] / LB.built[0] : 0.0,
            (unsigned long long)LB.have[0], (unsigned long long)LB.built[1], LB.built[1] ? LB.ms[1] / LB.built[1] : 0.0,
            (unsigned long long)LB.have[1], (unsigned long long)LB.built[2], LB.built[2] ? LB.ms[2] / LB.built[2] : 0.0,
@@ -3289,7 +3398,8 @@ static void lb_report(const char *how) {
            (unsigned long long)LB.warmed[1], LB.warmed[1] ? LB.warm_ms[1] / LB.warmed[1] : 0.0,
            (unsigned long long)LB.warmed[2], LB.warmed[2] ? LB.warm_ms[2] / LB.warmed[2] : 0.0,
            (unsigned long long)(LB.fail[0] + LB.fail[1] + LB.fail[2]),
-           (unsigned long long)LB.noshader, (unsigned long long)LB.nolib, (unsigned long long)LB.skipped, (double)mem_proc);
+           (unsigned long long)LB.noshader, (unsigned long long)LB.nolib, (unsigned long long)LB.skipped,
+           (unsigned long long)LB.deferred, (double)mem_proc);
     plat_mutex_unlock_shared(&LB.stat);
 }
 
@@ -3315,7 +3425,7 @@ static void lb_worker(void *arg) {
             LB.noshader++;
             plat_mutex_unlock(&LB.stat);
         } else if (gfx_shader_stage(sh) == GFX_STAGE_CS) {
-            lb_compute(sh);
+            lb_compute(sh, LB.e[i].iid);
         } else if (gfx_shader_stage(sh) == GFX_STAGE_VS || gfx_shader_stage(sh) == GFX_STAGE_FS) {
             if (P.gpl) lb_library(sh, gfx_shader_stage(sh) == GFX_STAGE_VS, 1);
             else lb_skip_lib();
@@ -3343,7 +3453,9 @@ static void lb_state(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
 static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
     const char *e = cfg_value("NX2NAVI_LIB_PREBUILD"), *ke = cfg_get("NX2NAVI_LIB_PREBUILD_KEEP");
     const char *te = cfg_get("NX2NAVI_LIB_PREBUILD_THREADS");   // no fixed default: half the CPUs when unset
+    const char *be = cfg_get("NX2NAVI_LIB_PREBUILD_BIG");       // SPIR-V words; LB_BIG_WORDS when unset, 0 no limit
     if (!A.on || !cfg_bool("NX2NAVI_LIB_PREBUILD")) return;
+    LB.big_words = be && *be ? strtoull(be, NULL, 10) : LB_BIG_WORDS;
     char dir[PLAT_PATH_MAX * 2];
     if (cache_dir(dir, sizeof dir)) skip_init(dir);
     GfxWarmEnt *all = NULL;
@@ -3375,10 +3487,14 @@ static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
         if ((LB.th[started] = plat_thread_new(lb_worker, NULL, "lib prebuild"))) started++;
     plat_add32(&LB.running, started - t);
     LB.threads = started;
+    char big[128];
+    if (!LB.big_words) snprintf(big, sizeof big, "compute shaders of every size");
+    else snprintf(big, sizeof big, "compute shaders over %llu SPIR-V words %s", (unsigned long long)LB.big_words,
+                  P.cache_control ? "only from the pipeline caches" : "left to their first dispatch");
     rt_log("vk_pipeline: stage library prebuild: %zu compute pipelines and %zu recorded variants' libraries "
            "(NX2NAVI_LIB_PREBUILD_KEEP %d) on %d idle-priority threads; library state clamp %u, polygon mode %u, depth "
-           "-w..w %u, samples %u", n_cs < n ? n_cs : n, n > n_cs ? n - n_cs : 0, LB.keep_n, started, LB.clamp, LB.poly,
-           LB.minus_w, LB.samples);
+           "-w..w %u, samples %u; %s (NX2NAVI_LIB_PREBUILD_BIG)", n_cs < n ? n_cs : n, n > n_cs ? n - n_cs : 0, LB.keep_n,
+           started, LB.clamp, LB.poly, LB.minus_w, LB.samples, big);
 }
 
 static void lb_stop(void) {
@@ -3412,7 +3528,7 @@ static void lb_warm_worker(void *arg) {
             Layout *l = compute_layout(sh, &B, &why);
             lb_unlock();
             double t0 = now_ms();
-            VkPipeline pipe = l ? compute_create(sh, l) : VK_NULL_HANDLE;
+            VkPipeline pipe = l ? compute_create(sh, l, 0) : VK_NULL_HANDLE;
             if (pipe) vkDestroyPipeline(P.device, pipe, NULL);
             lb_count(2, pipe ? 3 : 2, now_ms() - t0);
         } else if (st == GFX_STAGE_VS || st == GFX_STAGE_FS) {

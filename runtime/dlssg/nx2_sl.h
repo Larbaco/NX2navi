@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <vulkan/vulkan.h>
 
-#define NX2SL_VERSION 1
+#define NX2SL_VERSION 3
 
 typedef struct {
     VkImage image;
@@ -44,12 +44,23 @@ typedef PFN_vkGetInstanceProcAddr (*PFN_nx2sl_instance_proc)(void);
 typedef PFN_vkGetDeviceProcAddr (*PFN_nx2sl_device_proc)(void);
 // 1 when DLSS-G loaded and supports this GPU (after the device exists)
 typedef int (*PFN_nx2sl_available)(void);
-// Each present, before the present call: a new frame, its latency markers up to the render's end, its constants and
-// tags, and frame generation on or off. Then nx2sl_present_marker(0) before and (1) after the present.
+// Reflex's low-latency mode, 0 off, 1 on, 2 on with boost: after the device, and after each swapchain the game creates
+// through the interposer (the mode is the swapchain's)
+typedef void (*PFN_nx2sl_reflex)(int mode);
+// Frames are numbered by the game's presents: frame n ends with its n-th present (vk_dlssg.c vk_dlssg_game_present).
+// Where the game starts a frame: with hold, Reflex's sleep, which holds the start until the time the driver computes
+// from the measured render and queue times; then the frame's simulation and render-submit-start markers.
+typedef void (*PFN_nx2sl_sleep)(uint32_t frame, int hold);
+// The frame's submissions went out (at the game's present; with asynchronous replay, when the replay reaches it): its
+// render-submit-end marker.
+typedef void (*PFN_nx2sl_submit_end)(uint32_t frame);
+// Each host present, before the present call: the frame's constants and tags, and frame generation on or off. Then
+// nx2sl_present_marker(0) before and (1) after the present.
 typedef int (*PFN_nx2sl_frame)(VkCommandBuffer cb, const Nx2SlImage *depth, const Nx2SlImage *mv, const Nx2SlImage *hudless,
-                               const Nx2SlCamera *cam, uint32_t out_w, uint32_t out_h, int enable);
-typedef void (*PFN_nx2sl_present_marker)(int after);
-typedef void (*PFN_nx2sl_stats)(uint64_t *presented, uint32_t *generated_per_frame);
+                               const Nx2SlCamera *cam, uint32_t out_w, uint32_t out_h, int enable, uint32_t frame);
+typedef void (*PFN_nx2sl_present_marker)(int after, uint32_t frame);
+// The frames the display got, generated ones included, counted after each present (on the present thread)
+typedef uint64_t (*PFN_nx2sl_shown)(void);
 typedef void (*PFN_nx2sl_shutdown)(void);
 #ifdef __cplusplus
 }

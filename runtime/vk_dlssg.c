@@ -6,10 +6,16 @@
 // device are created through Streamline's proxies (vk_device.c), so it can add the extensions, features and queues
 // DLSS-G needs; the present path calls Streamline's swapchain functions (gfx_present.c), and every present records the
 // frame's constants and tags first (vk_dlssg_frame). Generation pauses while the menu is open.
+//
+// DLSS-G needs Reflex, whose low-latency mode paces the game (NX2NAVI_REFLEX, default 1; 0 off, 2 on with boost): the
+// game's frame sleeps in Reflex where it starts (its acquire of a window image), and each frame carries the latency
+// markers from that start to the host present, all with the frame's number, the count of the game's presents up to it.
+// The mode is the swapchain's, so it is set again after each one (vk_dlssg_create_swapchain).
 #ifdef _WIN32
 #include <windows.h>
 #endif
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "cfg.h"
@@ -28,6 +34,14 @@ static struct {
     PFN_nx2sl_available available;
     PFN_nx2sl_frame frame;
     PFN_nx2sl_present_marker marker;
+    PFN_nx2sl_sleep sleep;
+    PFN_nx2sl_submit_end submit_end;
+    PFN_nx2sl_shown shown;
+    PFN_nx2sl_reflex reflex;
+    uint32_t game;   // the game's presents (vk_dlssg_game_present)
+    uint32_t cur;    // the frame the present thread blits and presents next (vk_dlssg_present_frame)
+    uint32_t started;      // the last frame vk_dlssg_frame_start started
+    uint64_t hosted_ns;    // kern_now_ns after the last host present
     PFN_nx2sl_shutdown shutdown;
     PFN_vkCreateSwapchainKHR create_sc;
     PFN_vkDestroySwapchainKHR destroy_sc;
@@ -37,6 +51,16 @@ static struct {
 } S = {.wanted = -1};
 
 static void sl_line(const char *line) { rt_log("%s", line); }
+
+static int reflex_mode(void) {
+    static int m = -1;
+    if (m < 0) {
+        const char *s = cfg_get("NX2NAVI_REFLEX");
+        m = s && *s ? atoi(s) : 1;
+        if (m < 0 || m > 2) m = 1;
+    }
+    return m;
+}
 
 int vk_dlssg_wanted(void) {
     if (S.wanted < 0) {
@@ -71,8 +95,13 @@ int vk_dlssg_early(void) {
     S.available = (PFN_nx2sl_available)(void *)GetProcAddress(m, "nx2sl_available");
     S.frame = (PFN_nx2sl_frame)(void *)GetProcAddress(m, "nx2sl_frame");
     S.marker = (PFN_nx2sl_present_marker)(void *)GetProcAddress(m, "nx2sl_present_marker");
+    S.sleep = (PFN_nx2sl_sleep)(void *)GetProcAddress(m, "nx2sl_sleep");
+    S.submit_end = (PFN_nx2sl_submit_end)(void *)GetProcAddress(m, "nx2sl_submit_end");
+    S.shown = (PFN_nx2sl_shown)(void *)GetProcAddress(m, "nx2sl_shown");
     S.shutdown = (PFN_nx2sl_shutdown)(void *)GetProcAddress(m, "nx2sl_shutdown");
-    if (!ver || ver() != NX2SL_VERSION || !S.init || !S.gipa || !S.gdpa || !S.available || !S.frame || !S.marker) {
+    S.reflex = (PFN_nx2sl_reflex)(void *)GetProcAddress(m, "nx2sl_reflex");
+    if (!ver || ver() != NX2SL_VERSION || !S.init || !S.gipa || !S.gdpa || !S.available || !S.frame || !S.marker ||
+        !S.sleep || !S.submit_end || !S.shown || !S.reflex) {
         rt_log("dlssg: nx2navi_dlssg.dll is from another build: DLSS Frame Generation off");
         return 0;
     }
@@ -120,12 +149,15 @@ void vk_dlssg_device_ready(VkDevice dev) {
     S.present = (PFN_vkQueuePresentKHR)g(dev, "vkQueuePresentKHR");
     S.active = S.create_sc && S.destroy_sc && S.images && S.acquire && S.present;
     rt_log("dlssg: %s", S.active ? "DLSS Frame Generation on the swapchain" : "the swapchain hooks are missing: off");
+    if (S.active) S.reflex(reflex_mode());
 }
 
 int vk_dlssg_active(void) { return S.active; }
 
 VkResult vk_dlssg_create_swapchain(VkDevice d, const VkSwapchainCreateInfoKHR *ci, VkSwapchainKHR *sc) {
-    return S.create_sc(d, ci, NULL, sc);
+    VkResult r = S.create_sc(d, ci, NULL, sc);
+    if (r == VK_SUCCESS) S.reflex(reflex_mode());
+    return r;
 }
 void vk_dlssg_destroy_swapchain(VkDevice d, VkSwapchainKHR sc) { S.destroy_sc(d, sc, NULL); }
 VkResult vk_dlssg_get_images(VkDevice d, VkSwapchainKHR sc, uint32_t *n, VkImage *img) { return S.images(d, sc, n, img); }
@@ -134,11 +166,37 @@ VkResult vk_dlssg_acquire(VkDevice d, VkSwapchainKHR sc, uint64_t t, VkSemaphore
 }
 
 VkResult vk_dlssg_present(VkQueue q, const VkPresentInfoKHR *pi) {
-    S.marker(0);
+    S.marker(0, S.cur);
     VkResult r = S.present(q, pi);
-    S.marker(1);
+    S.marker(1, S.cur);
+    __atomic_store_n(&S.hosted_ns, kern_now_ns(), __ATOMIC_RELAXED);
     return r;
 }
+
+// Reflex holds the frame's start until the time the driver computes from the measured render and queue times, so the
+// game's CPU work ends about when the GPU is free for it; then the frame's first markers. Once a frame: the game may
+// acquire again before it presents. No hold while no host present went out for HOLD_IDLE_NS (the window minimized:
+// gfx_present.c skips the host presents while the game runs on): the driver then has no present to time the frame by,
+// and the sleep would wait out Streamline's half-second timeout each frame.
+#define HOLD_IDLE_NS 200000000ull
+void vk_dlssg_frame_start(void) {
+    if (!S.active) return;
+    uint32_t f = __atomic_load_n(&S.game, __ATOMIC_RELAXED) + 1;
+    if (f == S.started) return;
+    S.started = f;
+    uint64_t hosted = __atomic_load_n(&S.hosted_ns, __ATOMIC_RELAXED);
+    S.sleep(f, hosted && kern_now_ns() - hosted < HOLD_IDLE_NS);
+}
+
+void vk_dlssg_game_present(void) { __atomic_add_fetch(&S.game, 1, __ATOMIC_RELAXED); }
+
+void vk_dlssg_submitted(uint64_t frame) {
+    if (S.active) S.submit_end((uint32_t)frame);
+}
+
+void vk_dlssg_present_frame(uint64_t frame) { S.cur = (uint32_t)frame; }
+
+uint64_t vk_dlssg_shown(void) { return S.active ? S.shown() : 0; }
 
 void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext) {
     if (!S.active) return;
@@ -164,7 +222,7 @@ void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext) {
         k.mv_scale[0] = 1.0f / (float)d.width, k.mv_scale[1] = 1.0f / (float)d.height;   // render pixels
         k.reset = reset;
     }
-    S.frame(cb, have ? &zd : NULL, have ? &zm : NULL, NULL, have ? &k : NULL, ext.width, ext.height, on);
+    S.frame(cb, have ? &zd : NULL, have ? &zm : NULL, NULL, have ? &k : NULL, ext.width, ext.height, on, S.cur);
 }
 
 void vk_dlssg_release(void) {

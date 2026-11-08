@@ -202,10 +202,21 @@ static void discord_main(void *arg) {
         unsigned v = cfg_version();
         if (v != seen) {   // the settings changed (the menu writes them): pick the new ones up at once
             seen = v;
+            // any setting bumps the version (a slider step, a cheat): only a new app id needs a new handshake, and
+            // a new image only a resend; reconnecting on every change made the status blink and could hit Discord's
+            // rate limit while a slider was held
+            char was_id[APP_ID_CAP], was_image[IMAGE_KEY_CAP];
+            memcpy(was_id, app_id, sizeof was_id);
+            memcpy(was_image, image, sizeof was_image);
             read_setting("NX2NAVI_DISCORD_APP_ID", app_id, sizeof app_id, valid_app_id);
             read_setting("NX2NAVI_DISCORD_IMAGE", image, sizeof image, valid_image_key);
-            if (ipc) plat_ipc_close(ipc), ipc = NULL;   // the new app id needs a new handshake; the image is resent
-            said_no_client = said_no_app = 0;
+            if (strcmp(was_id, app_id)) {
+                if (ipc) plat_ipc_close(ipc), ipc = NULL;
+                retry_at = 0;
+                said_no_client = said_no_app = 0;
+            } else if (strcmp(was_image, image)) {
+                send_at = 0;
+            }
         }
         if (!cfg_bool("NX2NAVI_DISCORD_RPC")) {
             if (ipc) plat_ipc_close(ipc), ipc = NULL;

@@ -129,6 +129,19 @@ int probe_cfg(void) {
     got = plat_file_read(path, &got_n);
     CHECK(got && !strcmp((const char *)got, "[audio]\nvolume = 90\n"), "new file: the section and the key");
     free(got);
+    // values cfg_load would trim or unquote: mod folder names in the order list start with a space or are quoted
+    cfg_set("NX2NAVI_MODS_ORDER", " Lead|Tail ");
+    cfg_set("NX2NAVI_MODS_DISABLED", "\"Q\"");
+    CHECK(cfg_save_to(path) == 1 && cfg_load(path) == 1 && EQ(cfg_get("NX2NAVI_MODS_ORDER"), " Lead|Tail ") &&
+          EQ(cfg_get("NX2NAVI_MODS_DISABLED"), "\"Q\""), "blanks at the ends and quotes survive a save");
+    cfg_set("NX2NAVI_MODS_ORDER", "A|B");
+    CHECK(cfg_save_to(path) == 1 && cfg_load(path) == 1 && EQ(cfg_get("NX2NAVI_MODS_ORDER"), "A|B"),
+          "a plain value replacing a quoted one");
+    got = plat_file_read(path, &got_n);
+    CHECK(got && strstr((const char *)got, "mods_order = A|B\n") &&
+              strstr((const char *)got, "mods_disabled = \"\"Q\"\"\n"),
+          "only the values that need it are quoted");
+    free(got);
 
     // Defaults table: the menu's "default" marks and Reset
     const CfgMeta *m = cfg_meta("FPS60");

@@ -230,12 +230,24 @@ static int unzip(void)
 
 /* ---------------------------------------------------------------- the work */
 
+/* The installed release ver can start: its launcher (launcher/native/nx2navi.c release_ok) and the Python it runs on. */
+static int installed_ok(const wchar_t *dest, const wchar_t *ver)
+{
+    wchar_t p[PATHN];
+    swprintf(p, PATHN, L"%ls\\app\\%ls\\launcher\\start.pyw", dest, ver);
+    if (!ver[0] || !path_exists(p)) return 0;
+    swprintf(p, PATHN, L"%ls\\python\\pythonw.exe", dest);
+    return path_exists(p);
+}
+
 static DWORD WINAPI work(void *arg)
 {
     wchar_t cur[PATHN], have[64];
     (void)arg;
     swprintf(cur, PATHN, L"%ls\\app\\current.txt", S.dest);
-    int newer_installed = read_line(cur, have, 64) && version_cmp(have, S.version) > 0;
+    /* A newer launcher (one that updated itself) stays, unless it cannot start: the stub sends the player to this
+       setup to repair just that, and the setup's own release then replaces it. */
+    int newer_installed = read_line(cur, have, 64) && version_cmp(have, S.version) > 0 && installed_ok(S.dest, have);
     wchar_t probe[PATHN];
     swprintf(probe, PATHN, L"%ls\\x", S.dest);
     if (!make_dirs(probe)) {

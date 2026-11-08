@@ -39,11 +39,13 @@ typedef struct Tex {
     tex_t t;                      // the newest texture object seen with this key
     TexVkFormat f;
     VmaAllocation alloc;          // own memory; NULL when bound into pool memory
+    uint64_t bytes;               // the size of alloc (0 without own memory), for the released entries' total
     VmaAllocation bound_to;       // the pool memory it is bound into
     uint32_t wgen;                // page generation of the last upload check
     uint32_t checked;             // submit_epoch of the last check from a draw binding
     int uploaded, released;
     uint32_t rel_serial;          // reg_serial when it was released: slots registered before then are stale (slot_resolve)
+    uint64_t rel_frame;           // gfx_counters.frames when it was released (drop_stale)
     uint32_t n_up;                // uploads of this entry (vk_texture_debug)
     int last_ch;                  // last vk_mem_changed result of make_fresh: 1 written, 0 clean, -1 not tracked
     struct Tex *next_at;          // other entries at the same storage address
@@ -535,6 +537,11 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
             return NULL;
         }
     }
+    if (e->alloc) {
+        VmaAllocationInfo own;
+        vmaGetAllocationInfo(c->vma, e->alloc, &own);
+        e->bytes = own.size;
+    }
     VkTexImage *p = &e->pub;
     p->image = img;
     p->format = f.vk;
@@ -607,15 +614,19 @@ static void own_remove(Tex *e) {
     plat_mutex_unlock(&owned_lock);
 }
 
+static uint64_t rel_bytes;   // own memory of the released entries (Tex.bytes)
+
 static void rel_append(Tex *e) {
     e->rel_next = NULL;
     e->rel_prev = rel_tail;
     if (rel_tail) rel_tail->rel_next = e;
     else rel_head = e;
     rel_tail = e;
+    rel_bytes += e->bytes;
 }
 
 static void rel_unlink(Tex *e) {
+    rel_bytes -= e->bytes;
     if (e->rel_prev) e->rel_prev->rel_next = e->rel_next;
     else rel_head = e->rel_next;
     if (e->rel_next) e->rel_next->rel_prev = e->rel_prev;
@@ -663,6 +674,80 @@ static void sweep_released(void) {
 static int vram_pressure = -1;
 static uint64_t n_pressure_drops;
 
+static int comes_back_intact(const Tex *e) { return e->pub.mirrored && !e->pub.gpu_owned && !e->gpu_dirty; }
+
+// NX2NAVI_TEX_RELEASED_MB (default a sixteenth of the installed memory, 1 to 4 GiB; 0 = no limit) bounds the own memory
+// of the released entries: RELEASED_MAX alone kept 5-7 GiB of released render targets and decoded textures after an
+// hour of play at a 2160p game resolution, device memory the driver also charges to the system's commit (the process's
+// private bytes reached 31 GiB). NX2NAVI_TEX_COMMIT_FREE_MB (default the larger of 4 GiB and a tenth of the commit
+// limit; 0 = off) lowers that bound to COMMIT_LOW_KEEP while less of the system's commit is free: an allocation that
+// fails there ends the game. Both drop only stale entries (drop_stale), a few per check like the VRAM pressure.
+#define COMMIT_LOW_KEEP ((uint64_t)256 << 20)
+static uint64_t released_cap;   // bytes; 0 = not read yet, UINT64_MAX = no limit
+static long long commit_free_mb = -2;   // -2: not read yet, -1: the default
+static int commit_low, commit_logs;
+static uint64_t n_cap_drops, n_commit_drops;
+
+static uint64_t released_cap_bytes(void) {
+    if (!released_cap) {
+        const char *s = cfg_get("NX2NAVI_TEX_RELEASED_MB");
+        long long mb;
+        if (s && *s) mb = atoll(s);
+        else {
+            float used, total, proc;
+            plat_mem_info(&used, &total, &proc);
+            mb = total > 0 ? (long long)(total / 16) : 2048;
+            mb = mb < 1024 ? 1024 : mb > 4096 ? 4096 : mb;
+        }
+        released_cap = mb > 0 ? (uint64_t)mb << 20 : UINT64_MAX;
+        if (mb > 0) rt_log("vk: released textures keep at most %lld MiB of their own memory", mb);
+        else rt_log("vk: released textures: no size limit");
+    }
+    return released_cap;
+}
+
+static int commit_is_low(void) {
+    if (commit_free_mb == -2) {
+        const char *s = cfg_get("NX2NAVI_TEX_COMMIT_FREE_MB");
+        commit_free_mb = s && *s ? atoll(s) : -1;
+        if (commit_free_mb < -1) commit_free_mb = -1;
+        if (!plat_commit_enforced()) commit_free_mb = 0;   // a limit no allocation fails at
+    }
+    if (!commit_free_mb) return 0;
+    double proc, used, limit;
+    plat_commit_info(&proc, &used, &limit);
+    if (used < 0 || limit <= 0) return 0;
+    double want = commit_free_mb > 0 ? (double)commit_free_mb : limit / 10 > 4096 ? limit / 10 : 4096;
+    int low = limit - used < want;
+    if (low != commit_low && commit_logs < 40) {   // a few lines, however often it flips
+        commit_logs++;
+        rt_log("vk: system commit %s: %.0f of %.0f MB in use (this process %.0f MB); released textures kept %d, %.0f MiB "
+               "of own memory%s", low ? "low" : "no longer low", used, limit, proc, nreleased, rel_bytes / 1048576.0,
+               low ? ": dropping the stale ones" : "");
+    }
+    return commit_low = low;
+}
+
+// Drops up to PRESSURE_STEP released entries that own memory and were released STALE_FRAMES presents ago or earlier,
+// oldest first and the intact ones before the others, while the released entries own more than keep. A transient
+// texture is taken back within frames, so dropping it frees nothing: the game initializes it again and it is created
+// again, empty if it is a render target. Under commit pressure that a system-managed page file never relieves, dropping
+// young ones destroyed 2160p render targets about every frame for whole sessions. Frame generation also reads a frame's
+// depth target at the host present (vk_dlssg.c vk_dlssg_frame tags it), after the blit deferred destruction waits for.
+#define STALE_FRAMES 120
+static void drop_stale(uint64_t keep, uint64_t *count) {
+    uint64_t now = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    int dropped = 0;
+    for (int any = 0; any < 2; any++)
+        for (Tex *e = rel_head, *next; e && now - e->rel_frame >= STALE_FRAMES; e = next) {   // in release order
+            if (dropped == PRESSURE_STEP || rel_bytes <= keep) return;
+            next = e->rel_next;
+            if (!e->bytes || (!any && !comes_back_intact(e))) continue;
+            destroy_tex(e);
+            dropped++, (*count)++;
+        }
+}
+
 static void sweep_pressure(void) {   // tex_lock held
     if (vram_pressure < 0) {
         const char *s = cfg_get("NX2NAVI_TEX_VRAM_PRESSURE");
@@ -670,17 +755,19 @@ static void sweep_pressure(void) {   // tex_lock held
         if (vram_pressure < 0 || vram_pressure > 100) vram_pressure = 90;
         rt_log("vk: released textures under VRAM pressure: %s%d%%", vram_pressure ? "dropped above " : "off", vram_pressure);
     }
-    if (!vram_pressure || !rel_head || submit_epoch & 7) return;   // the budget query every 8 submits
+    if (!rel_head || submit_epoch & 7) return;   // the budget and commit queries every 8 submits
     uint64_t used, budget;
-    int exact;
-    if (!vk_mem_vram(&used, &budget, &exact) || used <= budget / 100 * (uint64_t)vram_pressure) return;
-    int dropped = 0;
-    for (Tex *e = rel_head, *next; e && dropped < PRESSURE_STEP; e = next) {
-        next = e->rel_next;
-        if (!e->pub.mirrored || e->pub.gpu_owned || e->gpu_dirty) continue;
-        destroy_tex(e);
-        dropped++, n_pressure_drops++;
-    }
+    int exact, dropped = 0;
+    if (vram_pressure && vk_mem_vram(&used, &budget, &exact) && used > budget / 100 * (uint64_t)vram_pressure)
+        for (Tex *e = rel_head, *next; e && dropped < PRESSURE_STEP; e = next) {
+            next = e->rel_next;
+            if (!comes_back_intact(e)) continue;
+            destroy_tex(e);
+            dropped++, n_pressure_drops++;
+        }
+    uint64_t cap = released_cap_bytes();
+    if (rel_bytes > cap) drop_stale(cap, &n_cap_drops);
+    if (rel_bytes > COMMIT_LOW_KEEP && commit_is_low()) drop_stale(COMMIT_LOW_KEEP, &n_commit_drops);
 }
 
 // ---------------------------------------------------------------- uploads
@@ -1253,6 +1340,7 @@ void vk_texture_release(const tex_t *t) {
     if (e && !e->released) {
         e->released = 1;
         e->rel_serial = reg_serial;
+        e->rel_frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
         nreleased++;
         rel_append(e);
         n_site[3]++;
@@ -1528,9 +1616,11 @@ void vk_texture_new_submit(void) {
                (unsigned long long)f * 60, (unsigned long long)ck, (unsigned long long)n_checks, (unsigned long long)calls,
                (unsigned long long)untr);
         n_checks = 0;
-        rt_log("perf: frame %llu: released textures kept %d, dropped under VRAM pressure %llu", (unsigned long long)f * 60,
-               nreleased, (unsigned long long)n_pressure_drops);
-        n_pressure_drops = 0;
+        rt_log("perf: frame %llu: released textures kept %d (%.0f MiB of own memory), dropped past the size limit %llu, "
+               "under VRAM pressure %llu, under commit pressure %llu", (unsigned long long)f * 60, nreleased,
+               rel_bytes / 1048576.0, (unsigned long long)n_cap_drops, (unsigned long long)n_pressure_drops,
+               (unsigned long long)n_commit_drops);
+        n_cap_drops = n_pressure_drops = n_commit_drops = 0;
     }
     unlock();
 }
@@ -2277,7 +2367,7 @@ void vk_texture_shutdown(void) {
     samplers = (nvn_hmap){.klen = sizeof(samp_par)};
     free(tslots), free(sslots);
     tslots = NULL, sslots = NULL, ntslots = nsslots = 0, nreleased = 0;
-    rel_head = rel_tail = NULL;
+    rel_head = rel_tail = NULL, rel_bytes = 0;
     if (sinfo) memset(sinfo, 0, sizeof *sinfo << 20);   // no slot is registered: tokens 0
     unlock();
 }

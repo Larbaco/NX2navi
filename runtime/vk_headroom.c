@@ -49,7 +49,8 @@ static void VKAPI_PTR on_allocate(VmaAllocator a, uint32_t type, VkDeviceMemory 
 
 const VmaDeviceMemoryCallbacks *vk_headroom_callbacks(void) {
     static const VmaDeviceMemoryCallbacks cb = {.pfnAllocate = on_allocate};
-    H.on = !cfg_get("NX2NAVI_VRAM_HEADROOM") || cfg_bool("NX2NAVI_VRAM_HEADROOM");
+    const char *v = cfg_get("NX2NAVI_VRAM_HEADROOM");   // empty is unset: the key has no settings row for cfg_bool
+    H.on = !v || !*v || cfg_bool("NX2NAVI_VRAM_HEADROOM");
     return H.on ? &cb : NULL;
 }
 

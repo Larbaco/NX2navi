@@ -403,6 +403,7 @@ static uint64_t record_all(void) {
     CALL(nvnTextureViewSetLevels, U(&view), 1, 3);
 
     REC(OP_SIGNAL_EVENT, CALL(nvnCommandBufferSignalEvent, U(c), U(&ev), NVN_EVENT_SIGNAL_MODE_ADD, NVN_EVENT_SIGNAL_LOCATION_BOTTOM, 0, 0x55));
+    REC(OP_WAIT_EVENT, CALL(nvnCommandBufferWaitEvent, U(c), U(&ev), NVN_EVENT_WAIT_MODE_EQUAL, 0x55));
     REC(OP_REPORT_COUNTER, CALL(nvnCommandBufferReportCounter, U(c), NVN_COUNTER_TYPE_SAMPLES_PASSED, 0xaabb00));
     REC(OP_RESET_COUNTER, CALL(nvnCommandBufferResetCounter, U(c), NVN_COUNTER_TYPE_SAMPLES_PASSED));
     REC(OP_COPY_B2B, CALL(nvnCommandBufferCopyBufferToBuffer, U(c), 0x1000, 0x2000, 0x40, 0));
@@ -492,6 +493,11 @@ static void parse_all(uint64_t h) {
         case OP_SIGNAL_EVENT: {
             const p_signal_event *p = a;
             CHECK(p->val == (volatile uint32_t *)pmem && p->mode == NVN_EVENT_SIGNAL_MODE_ADD && p->value == 0x55, "SIGNAL_EVENT payload");
+            break;
+        }
+        case OP_WAIT_EVENT: {
+            const p_wait_event *p = a;
+            CHECK(p->val == (volatile uint32_t *)pmem && p->mode == NVN_EVENT_WAIT_MODE_EQUAL && p->value == 0x55, "WAIT_EVENT payload");
             break;
         }
         case OP_REPORT_COUNTER: {

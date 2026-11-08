@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
@@ -734,6 +735,49 @@ int plat_file_replace(const char *from, const char *to) {
     return 1;
 }
 
+static char lock_held[4][1100];
+static int lock_fd[4];
+static int lock_n;
+static PlatMutex lock_lock = PLAT_MUTEX_INIT;
+
+int plat_lock_file(const char *path) {
+    plat_mutex_lock(&lock_lock);
+    int r = 1, nheld = lock_n;
+    for (int i = 0; i < nheld; i++)
+        if (!strcmp(lock_held[i], path)) goto done;
+    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);   // open until plat_unlock_file or the process ends
+    if (fd < 0) {
+        r = -1;
+        goto done;
+    }
+    if (flock(fd, LOCK_EX | LOCK_NB)) {
+        r = errno == EWOULDBLOCK ? 0 : -1;
+        close(fd);
+        goto done;
+    }
+    if (nheld < 4) {
+        snprintf(lock_held[nheld], sizeof lock_held[0], "%s", path);
+        lock_fd[nheld] = fd;
+        lock_n = nheld + 1;
+    }
+done:
+    plat_mutex_unlock(&lock_lock);
+    return r;
+}
+
+void plat_unlock_file(const char *path) {
+    plat_mutex_lock(&lock_lock);
+    for (int i = 0; i < lock_n; i++)
+        if (!strcmp(lock_held[i], path)) {
+            close(lock_fd[i]);
+            lock_n--;
+            memmove(&lock_held[i], &lock_held[i + 1], sizeof lock_held[0] * (size_t)(lock_n - i));
+            memmove(&lock_fd[i], &lock_fd[i + 1], sizeof lock_fd[0] * (size_t)(lock_n - i));
+            break;
+        }
+    plat_mutex_unlock(&lock_lock);
+}
+
 int plat_file_write_atomic(const char *path, const void *data, size_t n) {
     // A rename replaces a read-only file here (only the folder's permission counts) but not on Windows: a file the
     // player made read-only stays as it is on both.
@@ -892,6 +936,11 @@ int plat_mem_state(uint64_t addr, uint64_t limit, uint64_t *end) {
     while ((i + 1) * PG < lim && pstate[i + 1] == v) i++;
     *end = (i + 1) * PG < lim ? (i + 1) * PG : lim;
     return v == PS_FREE ? PLAT_MEM_FREE : v == PS_RESERVED ? PLAT_MEM_RESERVED : v - PS_NONE;
+}
+
+int plat_mem_census(uint64_t *priv, uint64_t *wc, uint64_t *wc_allocs) {
+    *priv = *wc = *wc_allocs = 0;
+    return 0;
 }
 
 uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t max, int reset) {
@@ -1664,6 +1713,20 @@ void plat_commit_info(double *proc_mb, double *used_mb, double *limit_mb) {
     uint64_t resident, private_bytes;
     plat_process_memory(&resident, &private_bytes);
     if (private_bytes) *proc_mb = (double)(private_bytes >> 20);
+}
+
+int plat_commit_enforced(void) {
+    static int v = -1;   // read once
+    if (v < 0) {
+        int mode = 0;
+        FILE *f = fopen("/proc/sys/vm/overcommit_memory", "r");
+        if (f) {
+            if (fscanf(f, "%d", &mode) != 1) mode = 0;
+            fclose(f);
+        }
+        v = mode == 2;
+    }
+    return v;
 }
 
 // ---- child processes

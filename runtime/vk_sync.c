@@ -61,7 +61,11 @@ static volatile int64_t ts_busy_ns, ts_parts, ts_missed;
 // GPU idle (with calibrated timestamps): the gap before each timed part, split by whether the part was submitted after
 // the previous one had ended (the GPU waited for the CPU: starved) or before (it waited for untimed work or a wait).
 static uint64_t ts_sub_ns[TS_PAIRS];       // CPU time the part was handed to vkQueueSubmit2
-static int ts_unsent[4], ts_n_unsent;      // pairs closed and not yet submitted (sub_lock)
+// A pair to read at its value. mirror: the copies of a mirror prologue (vk_sync.c prologue), counted apart as well.
+typedef struct { uint32_t pair; int mirror; uint64_t fence; } TsRead;
+static TsRead *ts_unsent[4];               // closed and not yet submitted (sub_lock)
+static int ts_n_unsent;
+static volatile int64_t ts_mirror_ns;     // of ts_busy_ns, the mirror prologues' copies
 static uint64_t ts_last_end_ns;            // completion thread: ts_last_end on the CPU clock
 static volatile int64_t ts_idle_ns, ts_starved_ns, ts_gaps, ts_max_gap_ns, ts_queued_ns;
 static int64_t cal_tick, cal_ns, cal_at;   // completion thread: a calibrated (GPU tick, CPU ns) pair and when it was taken
@@ -93,8 +97,6 @@ static void ts_setup(VkCtx *c) {
     ts_mask = bits >= 64 ? ~0ull : (1ull << bits) - 1;
     ts_state = 1;
 }
-
-typedef struct { uint32_t pair; } TsRead;
 
 // Completion thread: refresh the GPU tick / CPU clock pair every 250 ms; 0 when there is no calibration. The host
 // domain is the clock plat_now_ns reads (QPC on Windows, CLOCK_MONOTONIC elsewhere), plat_counter_hz ticks a second.
@@ -132,10 +134,21 @@ static void max64(volatile int64_t *m, int64_t v) {
     while (v > o && !__atomic_compare_exchange_n(m, &o, v, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
 }
 
-// Just before vkQueueSubmit2 (sub_lock held): the parts closed since the last submit leave the CPU now.
+static void ts_read_cb(void *arg);
+
+// Just before vkQueueSubmit2 (sub_lock held): the parts closed since the last submit leave the CPU now. Their reads
+// are queued in the order the GPU runs them: a mirror prologue is closed after the part it was made for but runs
+// first. Read after its part, its copies counted neither as busy time nor as a gap of their own: they showed up as
+// idle time with work queued, 7-8 ms a frame over PCIe 3.0 in Kokiri Forest, and the frame as CPU-bound.
 static void ts_submitted(void) {
     uint64_t now = plat_now_ns();
-    for (int i = 0; i < ts_n_unsent; i++) ts_sub_ns[ts_unsent[i]] = now;
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = 0; i < ts_n_unsent; i++) {
+            TsRead *t = ts_unsent[i];
+            if (!t->mirror != pass) continue;   // the prologues first
+            ts_sub_ns[t->pair] = now;
+            vk_completion_add(t->fence, ts_read_cb, t);
+        }
     ts_n_unsent = 0;
 }
 
@@ -162,6 +175,7 @@ static void ts_read_cb(void *arg) {   // completion thread, in submission order
             if (e > from) {
                 int64_t ns = (int64_t)((double)(e - from) * ts_period);
                 plat_add64(&ts_busy_ns, ns);
+                if (t->mirror) plat_add64(&ts_mirror_ns, ns);
                 perf_gpu_busy((uint64_t)ns);
             }
             if (e > ts_last_end) ts_last_end = e;
@@ -188,23 +202,24 @@ static int ts_open(VkCommandBuffer cb) {
     return (int)p;
 }
 
-// At its end, before vkEndCommandBuffer; fence: the value whose completion covers it.
-static void ts_close(VkCommandBuffer cb, int pair, uint64_t fence) {
+// At its end, before vkEndCommandBuffer; fence: the value whose completion covers it. The read is queued at the
+// submit (ts_submitted).
+static void ts_close(VkCommandBuffer cb, int pair, uint64_t fence, int mirror) {
     if (pair < 0) return;
     vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ts_pool, 2 * (uint32_t)pair + 1);
     ts_sub_ns[pair] = 0;
-    if (ts_n_unsent < 4) ts_unsent[ts_n_unsent++] = pair;
     TsRead *t = malloc(sizeof *t);
     if (!t) rt_fatal("vk: out of memory");
-    t->pair = (uint32_t)pair;
-    vk_completion_add(fence, ts_read_cb, t);
+    *t = (TsRead){(uint32_t)pair, mirror, fence};
+    if (ts_n_unsent < 4) ts_unsent[ts_n_unsent++] = t;
+    else vk_completion_add(fence, ts_read_cb, t);   // more than a part and its prologue between two submits
 }
 
 // The pair of the part being recorded.
 static void ts_begin(VkCommandBuffer cb) { ts_cur = ts_open(cb); }
 
 static void ts_end(VkCommandBuffer cb, uint64_t fence) {
-    ts_close(cb, ts_cur, fence);
+    ts_close(cb, ts_cur, fence, 0);
     ts_cur = -1;
 }
 
@@ -227,6 +242,7 @@ static void gpu_stats(PerfGpu *g) {
     g->queued_ns = (uint64_t)plat_xchg64(&ts_queued_ns, 0);
     g->idle_gaps = (uint64_t)plat_xchg64(&ts_gaps, 0);
     g->max_gap_ns = (uint64_t)plat_xchg64(&ts_max_gap_ns, 0);
+    g->mirror_ns = (uint64_t)plat_xchg64(&ts_mirror_ns, 0);
 }
 
 // Weak stand-in for vk_exec.c's replay: only empty recordings ({OP_BEGIN, OP_END}) can be submitted.
@@ -359,7 +375,7 @@ static VkCommandBuffer prologue(VkCtx *c, uint64_t fence) {
     vkBeginCommandBuffer(cb, &bi);
     int pair = ts_open(cb);
     vk_mem_mirror_prologue(cb);
-    ts_close(cb, pair, fence);
+    ts_close(cb, pair, fence, 1);
     vkEndCommandBuffer(cb);
     return cb;
 }

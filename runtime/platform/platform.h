@@ -221,6 +221,9 @@ int plat_mem_protect(uint64_t addr, uint64_t n, int prot); // committed pages on
 // The page at addr: PLAT_PROT_* when committed, else PLAT_MEM_RESERVED or PLAT_MEM_FREE (not reserved by us). *end
 // gets the end of the run of pages in the same state, at most limit.
 int plat_mem_state(uint64_t addr, uint64_t limit, uint64_t *end);
+// The process's committed private memory and the part of it mapped write-combined (Windows PAGE_WRITECOMBINE: memory
+// the GPU driver maps uncached for the CPU), with the number of allocations that part spans. 0 where unsupported.
+int plat_mem_census(uint64_t *priv, uint64_t *wc, uint64_t *wc_allocs);
 // The pages of a watched reservation written since the last reset, up to max page addresses into pages, in address
 // order; reset: those reported start over as unwritten. UINT64_MAX when writes to the range are not tracked.
 uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t max, int reset);
@@ -294,6 +297,10 @@ int plat_file_replace(const char *from, const char *to);  // rename, replacing t
 // Writes path.<pid>.<tid>.tmp, flushes it to the disk and renames it over path: a crash leaves the old file or the new
 // one, never a torn or zero-filled one. 1 on success.
 int plat_file_write_atomic(const char *path, const void *data, size_t n);
+// Takes the file at path (made when missing) as a lock no other process can take, held until this process ends:
+// 1 held (again, when this process holds it already), 0 another process holds it, -1 the file cannot be made.
+int plat_lock_file(const char *path);
+void plat_unlock_file(const char *path);   // gives a lock plat_lock_file took back (probes, before deleting it)
 int plat_file_flush(const char *path);                   // flushes a written file's data to the disk; 1 on success
 int plat_file_sync(FILE *f);                              // fflush, then the file's data to the disk; 1 on success
 // fseek and ftell with 64-bit offsets (a long is 32 bits on Windows).
@@ -422,6 +429,8 @@ void plat_mem_info(float *used_mb, float *total_mb, float *proc_mb);
 // Commit charge in MB: this process's private bytes, the system's commit in use and its limit (RAM plus page files).
 // An allocation fails when the system's reaches the limit, however much physical memory is free. -1 when unknown.
 void plat_commit_info(double *proc_mb, double *used_mb, double *limit_mb);
+// Whether an allocation fails at that limit: always on Windows; on Linux only with vm.overcommit_memory = 2.
+int plat_commit_enforced(void);
 // This process's memory in bytes: resident (the working set) and private (Windows: committed private bytes; Linux: the
 // resident anonymous pages). 0 when unknown.
 void plat_process_memory(uint64_t *resident, uint64_t *private_bytes);

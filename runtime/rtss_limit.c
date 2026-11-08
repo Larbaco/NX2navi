@@ -265,8 +265,8 @@ static void worker(void *arg) {
             over = 0;
             if (r < 0) atomic_store(&failed, FAIL_READONLY), set_active(0, fail_reason(FAIL_READONLY));
             else if (r == 0) set_active(0, "RivaTuner Statistics Server refused this limit");
-            else set_active(hooked, "RivaTuner Statistics Server has not hooked the game yet");
-        } else {
+            else if (atomic_load(&want) == w) set_active(hooked, "RivaTuner Statistics Server has not hooked the game yet");
+        } else if (atomic_load(&want) == w) {   // a newer limit waits for the next poll (rtss_limit_want)
             set_active(hooked, "RivaTuner Statistics Server has not hooked the game yet");
             // RTSS's own count of the game's frames while the game's limiter stands aside: well above the limit for
             // three seconds means RTSS does not hold the game to it, and the game takes the limiting back for the run
@@ -311,7 +311,9 @@ static void start(void) {
 void rtss_limit_want(int64_t mhz) {
     if (!started && mhz < 0) return;   // kept out from the start, for the whole run (both reasons need a restart)
     if (!started) start();
-    atomic_store(&want, mhz);
+    // a new limit: the game's own limiter holds it until the worker had RTSS apply it, up to POLL_MS later (a movie's
+    // cap that waited for that ran the movie's 60 Hz count fast for half a second)
+    if (atomic_exchange(&want, mhz) != mhz) atomic_store(&active, 0);
 }
 
 int rtss_limit_active(void) { return atomic_load_explicit(&active, memory_order_relaxed); }

@@ -1,0 +1,93 @@
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+@@ -1795,19 +1795,25 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+             AstOperation operation,
+             Func<SpvInstruction, SpvInstruction, SpvInstruction, SpvInstruction, SpvInstruction, SpvInstruction> emitU)
+         {
+-            SpvInstruction elemPointer = GetStoragePointer(context, operation, out AggregateType varType);
++            SpvInstruction elemPointer = GetStoragePointer(context, operation, out AggregateType varType, out SpvInstruction twin);
+ 
+             SpvInstruction value = context.Get(varType, operation.GetSource(operation.SourcesCount - 1));
+ 
+             SpvInstruction one = context.Constant(context.TypeU32(), 1);
+             SpvInstruction zero = context.Constant(context.TypeU32(), 0);
+ 
+-            return new OperationResult(varType, emitU(context.GetType(varType), elemPointer, one, zero, value));
++            SpvInstruction result = emitU(context.GetType(varType), elemPointer, one, zero, value);
++            if (twin != null)
++            {
++                emitU(context.GetType(varType), twin, one, zero, value);   // NX2NAVI: guest memory's copy (GetDeviceAddressPointer)
++            }
++
++            return new OperationResult(varType, result);
+         }
+ 
+         private static OperationResult GenerateAtomicMemoryCas(CodeGenContext context, AstOperation operation)
+         {
+-            SpvInstruction elemPointer = GetStoragePointer(context, operation, out AggregateType varType);
++            SpvInstruction elemPointer = GetStoragePointer(context, operation, out AggregateType varType, out SpvInstruction twin);
+ 
+             SpvInstruction value0 = context.Get(varType, operation.GetSource(operation.SourcesCount - 2));
+             SpvInstruction value1 = context.Get(varType, operation.GetSource(operation.SourcesCount - 1));
+@@ -1815,7 +1821,14 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+             SpvInstruction one = context.Constant(context.TypeU32(), 1);
+             SpvInstruction zero = context.Constant(context.TypeU32(), 0);
+ 
+-            return new OperationResult(varType, context.AtomicCompareExchange(context.GetType(varType), elemPointer, one, zero, zero, value1, value0));
++            SpvInstruction result = context.AtomicCompareExchange(context.GetType(varType), elemPointer, one, zero, zero, value1, value0);
++            if (twin != null)
++            {
++                // NX2NAVI: the same exchange on guest memory's copy, which holds the same word while both are in step
++                context.AtomicCompareExchange(context.GetType(varType), twin, one, zero, zero, value1, value0);
++            }
++
++            return new OperationResult(varType, result);
+         }
+ 
+         private static OperationResult GenerateLoadOrStore(CodeGenContext context, AstOperation operation, bool isStore)
+@@ -1864,9 +1877,12 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+         // The pointer addresses the 32-bit word at the address's 4-byte-aligned word. Stores also go to the twin
+         // (GetDeviceAddressPointers): what the GPU writes into a mirror through the table is not recorded as a GPU write,
+         // so without it the CPU never saw it and a sync of a CPU-written page copied the stale guest page over it
+-        // (runtime/vk_gpa.c). Atomics do not: the twin's word may be stale (a counter the GPU reset with a buffer fill
+-        // went on counting from its old value in guest memory), and that page's next sync copied the wrong count into
+-        // the mirror, so culled instance lists drew garbage for a frame (flickering foliage).
++        // (runtime/vk_gpa.c). So do atomics (GenerateAtomicMemoryBinary, GenerateAtomicMemoryCas): the culling passes
++        // count instances with them into records the CPU rewrites other words of each frame, and with the counts in the
++        // mirror alone the sync of such a page copied the guest's zeros over them (foliage that flickered, went missing or
++        // stretched into columns). The twin's atomic leaves its result unused, so the driver can issue it without a round
++        // trip to guest memory. Buffer fills reach the twin at once (runtime/vk_exec_xfer.c clear_buf), so a counter the
++        // GPU resets with one counts on from the same value in both.
+         private static SpvInstruction GetDeviceAddressPointer(CodeGenContext context, int binding, SpvInstruction low, SpvInstruction high)
+         {
+             return GetDeviceAddressPointers(context, binding, low, high, out _);
+@@ -1983,19 +1999,27 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+         }
+ 
+         private static SpvInstruction GetStoragePointer(CodeGenContext context, AstOperation operation, out AggregateType varType)
++        {
++            return GetStoragePointer(context, operation, out varType, out _);
++        }
++
++        // twin: for a device address table pointer, the twin GetDeviceAddressPointers gives; null for any other storage.
++        private static SpvInstruction GetStoragePointer(CodeGenContext context, AstOperation operation, out AggregateType varType, out SpvInstruction twin)
+         {
+             StorageKind storageKind = operation.StorageKind;
++            twin = null;
+ 
+             // NX2NAVI: atomics on the device address table's pointers (GenerateDeviceAddressLoadOrStore covers loads and
+             // stores): sources are the table binding and the address's two words.
+             if (storageKind == StorageKind.GlobalMemory)
+             {
+                 varType = AggregateType.U32;
+-                return GetDeviceAddressPointer(
++                return GetDeviceAddressPointers(
+                     context,
+                     ((AstOperand)operation.GetSource(0)).Value,
+                     context.Get(AggregateType.U32, operation.GetSource(1)),
+-                    context.Get(AggregateType.U32, operation.GetSource(2)));
++                    context.Get(AggregateType.U32, operation.GetSource(2)),
++                    out twin);
+             }
+ 
+             StorageClass storageClass;

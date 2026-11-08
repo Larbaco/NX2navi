@@ -223,7 +223,11 @@ def build_harness(work, bodies, jobs, cflags):
     if any(p.wait() for p in procs):
         raise SystemExit('compile failed')
     exe = work / ('harness.exe' if os.name == 'nt' else 'harness')
-    subprocess.check_call([cc, '-fuse-ld=lld', '-o', str(exe)] + [str(o) for o in objs], env=env)
+    # lld when the toolchain has it beside the compiler; its default linker otherwise (an MSYS2 install without the lld
+    # package stopped every differential test at "invalid linker name")
+    cc_dir = os.path.dirname(shutil.which(cc, path=env.get('PATH')) or cc)
+    lld = ['-fuse-ld=lld'] if any(os.path.isfile(os.path.join(cc_dir, n)) for n in ('ld.lld', 'ld.lld.exe')) else []
+    subprocess.check_call([cc, *lld, '-o', str(exe)] + [str(o) for o in objs], env=env)
     return exe
 
 

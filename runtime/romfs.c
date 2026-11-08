@@ -455,7 +455,10 @@ static int mod_walk_cb(const char *leaf, int kind, uint64_t size, void *ctx) {
 // The files under dir (a mod's RomFS root; rel: the RomFS path of dir, "" at the root) as overlays of mod k.
 static void mod_walk(int k, int prio, const char *dir, const char *rel) {
     ModWalk w = {k, prio, dir, rel};
-    plat_fs_list(dir, mod_walk_cb, &w);
+    // a folder that cannot be listed (no permission, a path longer than Windows allows) loses its files: say so
+    if (plat_fs_list(dir, mod_walk_cb, &w) != PLAT_FS_OK)
+        rt_log("mods: %s: cannot list %s (error %d); its files are left out", mods_at(k)->name, dir,
+               plat_fs_os_error());
 }
 
 // What overlays compete on: the RomFS index, an added file's path; the higher prio first.

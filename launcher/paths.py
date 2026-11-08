@@ -38,6 +38,18 @@ def ansi_safe(path):
         return False
 
 
+def fixed_drive(drive):
+    """True when drive (X:\\) is a fixed disk (GetDriveTypeW DRIVE_FIXED), not a network, removable or optical drive.
+    True where that cannot be asked."""
+    if os.name != 'nt':
+        return True
+    try:
+        import ctypes
+        return ctypes.windll.kernel32.GetDriveTypeW(str(drive)) == 3
+    except (AttributeError, OSError):
+        return True
+
+
 class Layout:
     def __init__(self, root=None, app=None):
         self.app = Path(app or APP)
@@ -93,6 +105,8 @@ class Layout:
             import string
             for letter in string.ascii_uppercase[2:]:
                 drive = Path(f'{letter}:\\')
+                if not fixed_drive(drive):   # a mapped network share or a USB stick is no place for 30 GB of build
+                    continue
                 try:
                     free = shutil.disk_usage(drive).free
                 except OSError:

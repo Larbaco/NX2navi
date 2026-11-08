@@ -192,9 +192,9 @@ static void perf_gpu_line(uint64_t frame, double interval_ms, double pace_share,
     if (perf_gpu_stats) perf_gpu_stats(&g);
     double rw = plat_xchg64(&render_wait_ns, 0) / 1e6 / n, ow = plat_xchg64(&other_wait_ns, 0) / 1e6 / n;
     double gpu_ms = g.have_gpu ? g.gpu_ns / 1e6 / n : 0;
-    char gs[96], vs[96];
-    if (g.have_gpu) snprintf(gs, sizeof gs, "gpu avg %.2f ms (%llu parts timed, %llu not)", gpu_ms,
-                             (unsigned long long)g.gpu_parts, (unsigned long long)g.gpu_missed);
+    char gs[160], vs[96];
+    if (g.have_gpu) snprintf(gs, sizeof gs, "gpu avg %.2f ms (%llu parts timed, %llu not; copies into VRAM mirrors %.2f ms)",
+                             gpu_ms, (unsigned long long)g.gpu_parts, (unsigned long long)g.gpu_missed, g.mirror_ns / 1e6 / n);
     else snprintf(gs, sizeof gs, "gpu avg n/a");
     if (g.have_vram) snprintf(vs, sizeof vs, "vram %.0f of %.0f MiB%s", g.vram_used / 1048576.0, g.vram_budget / 1048576.0,
                               g.vram_exact ? "" : " (own allocations of the heap size)");

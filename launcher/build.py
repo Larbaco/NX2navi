@@ -3,6 +3,7 @@ and cancelling it with every compiler it started."""
 import json
 import os
 import signal
+import stat
 import subprocess
 import threading
 
@@ -100,17 +101,26 @@ class Run:
 
 
 def game_running(game_dir, exe='ocarina.exe'):
-    """True when the built game runs from game_dir: Windows refuses to open a running exe for writing."""
+    """True when the built game runs from game_dir: Windows refuses to open a running exe for writing. A read-only
+    exe (a copy restored from a backup or read-only media) is refused too, though nothing runs it: its read-only
+    attribute is cleared and the open tried again, as the next build replaces the file anyway."""
     path = os.path.join(str(game_dir), exe)
     if os.name != 'nt' or not os.path.isfile(path):
         return False
-    try:
-        with open(path, 'r+b'):
+    for attempt in range(2):
+        try:
+            with open(path, 'r+b'):
+                return False
+        except PermissionError:
+            if attempt or not os.stat(path).st_file_attributes & stat.FILE_ATTRIBUTE_READONLY:
+                return True
+            try:
+                os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
+            except OSError:
+                return True
+        except OSError:
             return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
+    return True
 
 
 def build_state(game_dir):

@@ -100,8 +100,8 @@ def prepare_sources() -> Path:
     for junk in list(src.glob("src/*/obj")) + list(src.glob("src/*/bin")):
         shutil.rmtree(junk)
     patches = sorted((XLATE / "patches").glob("*.patch"))
-    if len(patches) != 35:
-        sys.exit(f"expected 35 patches, found {len(patches)}")
+    if len(patches) != 36:
+        sys.exit(f"expected 36 patches, found {len(patches)}")
     # BUILD may sit inside a git work tree (the default build/xlate does). git apply then treats the paths as the
     # enclosing repository's and skips a patch with a `diff --git` header while still exiting 0 (it may print
     # "Skipped patch" or nothing), so a patch that creates a file is dropped silently. The ceiling hides every

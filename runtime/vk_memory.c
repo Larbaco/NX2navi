@@ -63,6 +63,8 @@ typedef struct PoolRec {
     VmaAllocation malloc_;
     uint32_t acc_sub;                  // replay: the last submission that synced the mirror (mirror_sync)
     uint32_t wb_sub;                   // replay: the last submission that wrote mirror bytes back to guest memory
+    uint32_t vd_wrote_sub, vd_use_sub; // verify mode: the last submission that bound it written / used its mirror
+    uint64_t vd_wrote_n;               // verify mode: written bindings of it so far
     uint32_t mgen;                     // gen_lock: every page write stamped up to this generation is in the mirror
                                        // (or in a copy queued before its next use)
     FlushRange fl[FLUSH_RANGES + 1];   // flush_lock: nvnMemoryPoolFlushMappedRange pages not copied yet (flush_add)
@@ -1213,7 +1215,7 @@ static void dirty_frame(uint64_t frame) {
 // another pool or the allocation fails.
 #define VERIFY_BYTES (4u << 20)
 #define VERIFY_SAMPLES 64
-#define VERIFY_LOG 16
+#define VERIFY_LOG 200
 enum { MR_BUDGET, MR_UNTRACKED, MR_OVERLAP, MR_ALLOC, MR_N };
 
 int vk_mirror_on;
@@ -1502,6 +1504,7 @@ void vk_mem_use(VkMemSpan *sp) {
     if (r->mstate == MS_NONE) mirror_create(r);
     if (r->mstate != MS_ON) return;
     if (r->acc_sub != msub) mirror_sync(r);
+    r->vd_use_sub = msub;
     sp->buffer = r->mbuf;
 }
 
@@ -1510,6 +1513,11 @@ void vk_mem_pick(VkMemSpan *sp) {
     if (!r || r->mstate != MS_ON) return;
     if (r->acc_sub != msub) mirror_sync(r);
     sp->buffer = r->mbuf;
+}
+
+VkBuffer vk_mem_guest_twin(const VkMemSpan *sp) {
+    const PoolRec *r = sp->pool;
+    return r && r->mstate == MS_ON && sp->buffer == r->mbuf ? r->buf : VK_NULL_HANDLE;
 }
 
 int vk_mem_mirror_probe(uint64_t addr) {
@@ -1755,6 +1763,7 @@ static void snap_free(void *arg) {   // completion thread: the submission is don
 static void gpu_wrote(const VkMemSpan *sp, uint64_t size, int shader) {
     PoolRec *r = sp->pool;
     if (!r || r->mstate != MS_ON || sp->buffer != r->mbuf || !size) return;
+    r->vd_wrote_sub = msub, r->vd_wrote_n++;
     // A binding to the end of its pool (no size) can span hundreds of MiB: those stay copies.
     if (shader && !(sp->offset & 3) && !(size & 3) && size <= MERGE_MAX && merging() && snap_add(r, sp->offset, size))
         return;
@@ -1948,6 +1957,13 @@ static void verify_cb(void *arg) {   // completion thread
                 rt_log("mem: verify mismatch: pool %#llx+%#llx (%s) offset %#llx: bytes %#x..%#x of the page differ, "
                        "mirror %02x guest %02x at the first (submission %u)", (unsigned long long)r->lo,
                        (unsigned long long)r->size, f, (unsigned long long)(a - r->lo), k, e, m[k], g[k], j->sub);
+                const uint32_t *gs = gen_slot(a & ~((1ull << GEN_PAGE_SHIFT) - 1), 0);
+                char mh[100], gh[100];
+                for (int b = 0; b < 16; b++) snprintf(mh + 3 * b, 4, "%02x ", m[b]), snprintf(gh + 3 * b, 4, "%02x ", g[b]);
+                rt_log("mem: verify mismatch detail: written binds %llu, last %u; used %u; written back %u; gpa record %u; "
+                       "page cpu stamp %u (synced to %u, now %u); mirror %s| guest %s",
+                       (unsigned long long)r->vd_wrote_n, r->vd_wrote_sub, r->vd_use_sub, wb, r->gpa_rec, gs ? *gs : 0,
+                       s->mgen, gen_now, mh, gh);
             }
         }
     }
@@ -2088,6 +2104,84 @@ static void mirror_log(uint64_t frame) {
            a.flush_bytes / f / M, a.flush_calls / f, a.flush_sum / f / M);
 }
 
+// After vram_log: every heap's usage as the driver reports it (VK_EXT_memory_budget) beside VMA's share of it, VMA by
+// memory type, and the process's private commit with its write-combined part (host-visible memory the driver maps
+// uncached), to tell which memory a long session grows. When the write-combined total (VMA's blocks where that is not
+// known) grew by 2 GiB since the last look, VMA's detailed map goes to vma-frame<N>.json beside the log, 4 at most.
+// The process's part walks the whole address space (plat_mem_census), 100-240 ms in a long session, so it runs on a
+// thread of its own (census_main) and logs a line of its own; a look while the last walk still runs goes without it.
+typedef struct { VkCtx *c; uint64_t frame; } CensusJob;
+static volatile int32_t census_busy;
+
+static void census_main(void *arg) {
+    CensusJob j = *(CensusJob *)arg;
+    free(arg);
+    const double M = 1048576.0;
+    uint64_t priv = 0, wc = 0, wcn = 0, now;
+    int have = plat_mem_census(&priv, &wc, &wcn);
+    if (have) {
+        rt_log("mem: process frame %llu: private %.0f MiB, write-combined %.0f MiB in %llu allocations",
+               (unsigned long long)j.frame, priv / M, wc / M, (unsigned long long)wcn);
+        now = wc;
+    } else {
+        VmaBudget vb[VK_MAX_MEMORY_HEAPS];
+        vmaGetHeapBudgets(j.c->vma, vb);
+        now = 0;
+        for (uint32_t h = 0; h < j.c->mem_props.memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++) now += vb[h].statistics.blockBytes;
+    }
+    static uint64_t base;
+    static int dumps = -1;   // -1: no baseline yet
+    if (dumps < 0) base = now, dumps = 0;
+    else if (dumps < 4 && now >= base + (2ull << 30) && rt_log_path()) {
+        base = now, dumps++;
+        const char *lp = rt_log_path(), *sl = strrchr(lp, '/'), *bs = strrchr(lp, '\\');
+        if (bs && (!sl || bs > sl)) sl = bs;
+        char path[1024];
+        snprintf(path, sizeof path, "%.*svma-frame%llu.json", sl ? (int)(sl - lp) + 1 : 0, lp, (unsigned long long)j.frame);
+        char *json = NULL;
+        vmaBuildStatsString(j.c->vma, &json, VK_TRUE);
+        FILE *f = json ? fopen(path, "wb") : NULL;
+        int ok = f && fputs(json, f) >= 0;
+        if (f && fclose(f)) ok = 0;
+        rt_log("mem: vma detailed map %s %s", ok ? "written to" : "not written:", path);
+        if (json) vmaFreeStatsString(j.c->vma, json);
+    }
+    plat_xchg32(&census_busy, 0);
+}
+
+static void heap_log(VkCtx *c, uint64_t frame, const VmaBudget *vb) {
+    const double M = 1048576.0;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT bp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    if (c->has_memory_budget) {
+        VkPhysicalDeviceMemoryProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &bp};
+        vkGetPhysicalDeviceMemoryProperties2(c->phys, &p2);
+    }
+    char line[1536];
+    int o = snprintf(line, sizeof line, "mem: heaps frame %llu:", (unsigned long long)frame);
+    for (uint32_t h = 0; h < c->mem_props.memoryHeapCount && h < VK_MAX_MEMORY_HEAPS && o < (int)sizeof line - 160; h++)
+        o += snprintf(line + o, sizeof line - (size_t)o, " heap %u (%s) used %.0f of %.0f MiB, vma %u blocks %.0f MiB, %u allocations %.0f MiB;",
+                      h, c->mem_props.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? "device" : "host",
+                      (c->has_memory_budget ? bp.heapUsage[h] : vb[h].usage) / M,
+                      (c->has_memory_budget ? bp.heapBudget[h] : vb[h].budget) / M, vb[h].statistics.blockCount,
+                      vb[h].statistics.blockBytes / M, vb[h].statistics.allocationCount, vb[h].statistics.allocationBytes / M);
+    rt_log("%s", line);
+    VmaTotalStatistics ts;
+    vmaCalculateStatistics(c->vma, &ts);
+    o = snprintf(line, sizeof line, "mem: vma by type frame %llu:", (unsigned long long)frame);
+    for (uint32_t t = 0; t < c->mem_props.memoryTypeCount && t < VK_MAX_MEMORY_TYPES && o < (int)sizeof line - 120; t++) {
+        const VmaDetailedStatistics *d = &ts.memoryType[t];
+        if (!d->statistics.blockCount) continue;
+        o += snprintf(line + o, sizeof line - (size_t)o, " type %u: %u blocks %.0f MiB, %u allocations %.0f MiB, largest %.1f MiB;", t,
+                      d->statistics.blockCount, d->statistics.blockBytes / M, d->statistics.allocationCount,
+                      d->statistics.allocationBytes / M, d->allocationSizeMax / M);
+    }
+    rt_log("%s", line);
+    if (plat_xchg32(&census_busy, 1)) return;
+    CensusJob *j = malloc(sizeof *j);
+    if (j) *j = (CensusJob){c, frame};
+    if (!j || !plat_thread_spawn(census_main, j, "mem census", 0)) free(j), plat_xchg32(&census_busy, 0);
+}
+
 // With NX2NAVI_TRACE=perf every 600 frames: what holds device-local memory, to see what grows over a long session.
 // VMA's blocks and allocations on the device-local heaps, texture entries with their own memory, the VRAM mirrors and
 // the objects waiting for their last submission to retire.
@@ -2110,6 +2204,7 @@ static void vram_log(uint64_t frame) {
            alloc_bytes / M, (unsigned long long)t.live, (unsigned long long)t.own_live, t.bytes_live / M,
            (unsigned long long)t.released, (unsigned long long)t.own_released, t.bytes_released / M, (long long)m_live_n,
            m_live_bytes / M, dead_pending());
+    heap_log(c, frame, vb);
 }
 
 // Device class: INTEGRATED -> uma; a discrete GPU with a DEVICE_LOCAL heap of 1 GiB or more beside a

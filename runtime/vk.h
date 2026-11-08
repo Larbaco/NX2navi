@@ -167,6 +167,7 @@ void vk_hdr_metadata(VkSwapchainKHR sc, int new_sc);
 void vk_hdr_set_active(int on);
 int vk_hdr_active(void);
 VkImage vk_hdr_encode(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, const int crop[4]);
+int vk_hdr_native_picture(VkFormat f);   // vk_hdr_native, and f is the format of the game's PQ picture
 VkImageView vk_hdr_ui_target(VkCommandBuffer cb, uint32_t w, uint32_t h);
 void vk_hdr_ui_compose(VkCommandBuffer cb, VkImageView dst_view, VkFormat fmt, uint32_t w, uint32_t h);
 void vk_hdr_to_srgb8(const uint8_t *in, uint8_t *out, size_t px, int a2r);
@@ -254,6 +255,7 @@ void vk_mem_dirty_submit(void);                   // vk_sync_submit, under its l
 extern int vk_mirror_on;
 void vk_mem_use(VkMemSpan *sp);
 void vk_mem_pick(VkMemSpan *sp);
+VkBuffer vk_mem_guest_twin(const VkMemSpan *sp);   // a VRAM mirror span: the pool's imported buffer (guest memory), same offset; else none
 #define VK_MEM_USE(sp) do { if (vk_mirror_on && (sp).pool) vk_mem_use(&(sp)); } while (0)
 #define VK_MEM_PICK(sp) do { if (vk_mirror_on && (sp).pool) vk_mem_pick(&(sp)); } while (0)
 void vk_mem_gpu_wrote(const VkMemSpan *sp, uint64_t size);
@@ -588,6 +590,9 @@ int vk_pipeline_async_on(void);   // 1 after vk_pipeline_async_enable: graphics 
 // cached under the current translator from their stored inputs, and builds every recorded pipeline, on all cores.
 // No-op without vk_pipeline_async_enable, with NX2NAVI_PIPE_PREBUILD=0 or with NX2NAVI_GPU=null.
 void vk_pipeline_prewarm(void);
+// Ends the boot prebuild's crash marker (vk_pipeline.c, "boot prebuild crash marker"): boot_wait calls it when it lets
+// the game start while the prewarm goes on, so a crash in play is not taken for one in the boot's builds.
+void vk_pipeline_prewarm_marker_clear(void);
 typedef struct {
     int phase;                            // 0 starting (device, key file), 1 shaders, 2 pipelines, 3 done
     int64_t sh_done, sh_total, sh_translated;   // gfx_shader_prewarm_progress

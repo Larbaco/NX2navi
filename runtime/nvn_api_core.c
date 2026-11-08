@@ -612,6 +612,7 @@ NVN_API(nvnQueueFinish) {
 // lod_entered / lod_issued count submits that entered QueueSubmitCommands / reached the back end; lod_fence holds
 // the fence of the last LOD_RING. NX2NAVI_LOD_GUARD=0 turns the wait off.
 #define LOD_RING 64
+_Thread_local uintptr_t gfx_submit_queue;
 int nvn_submits_in_frame;   // nvnQueueSubmitCommands calls since the last nvnQueuePresentTexture (NX2NAVI_SUBMIT_FINISH)
 static uint64_t lod_entered, lod_issued, lod_fence[LOD_RING];
 
@@ -635,12 +636,16 @@ NVN_API(nvnQueueSubmitCommands) {
         if (!hs) rt_fatal("nvn: out of memory (submit of %d handles)", n);
         plat_mutex_lock(&submit_lock);
         nvn_submit_prepare_async(h, hs, n);
+        gfx_submit_queue = (uintptr_t)q;
         f = gfx_backend()->submit(hs, n);
+        gfx_submit_queue = 0;
         plat_mutex_unlock(&submit_lock);
         if (hs != local) free(hs);
     } else {
         nvn_submit_prepare(h, n);
+        gfx_submit_queue = (uintptr_t)q;
         f = gfx_backend()->submit(h, n);
+        gfx_submit_queue = 0;
     }
     uint64_t prev = __atomic_load_n(&last_fence, __ATOMIC_RELAXED);
     while (f > prev && !__atomic_compare_exchange_n(&last_fence, &prev, f, 1, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {}

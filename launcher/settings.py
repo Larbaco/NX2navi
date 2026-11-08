@@ -1,6 +1,7 @@
 """data/launcher.json: the player's choices and what the launcher remembers between runs."""
 import json
 import os
+import shutil
 from pathlib import Path
 
 DEFAULTS = {
@@ -22,12 +23,21 @@ class Settings(dict):
     def __init__(self, path):
         super().__init__(DEFAULTS)
         self.path = Path(path)
+        self.unreadable = False   # the file is there but is no JSON; a copy of it is kept as launcher.json.bad
         try:
-            data = json.loads(self.path.read_text(encoding='utf-8'))
+            # utf-8-sig: the docs ask players to edit the file by hand, and an editor may save it with a BOM
+            data = json.loads(self.path.read_text(encoding='utf-8-sig'))
             if isinstance(data, dict):
                 self.update({k: v for k, v in data.items() if k in DEFAULTS and type(v) is type(DEFAULTS[k])})
-        except (OSError, ValueError):
+        except OSError:
             pass
+        except ValueError:
+            # a typo made by hand: keep what the player wrote before the next save() replaces it with the defaults
+            self.unreadable = True
+            try:
+                shutil.copyfile(self.path, self.path.with_name(self.path.name + '.bad'))
+            except OSError:
+                pass
 
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)

@@ -680,10 +680,14 @@ static int init(VkCtx *c) {
     return H.ok = 1;
 }
 
+// The game's own HDR picture: PQ codes in A2B10G10R10, the format of NVN's RGB10A2 (vk_formats.c); no guest format
+// becomes A2R10G10B10.
+int vk_hdr_native_picture(VkFormat f) { return vk_hdr_native() && f == VK_FORMAT_A2B10G10R10_UNORM_PACK32; }
+
 VkImage vk_hdr_encode(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, const int crop[4]) {
     VkCtx *c = vk_ctx();
     // native HDR: the game's picture holds PQ codes already; the present scales it into the swapchain as it is
-    if (vk_hdr_native() && (fmt == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || fmt == VK_FORMAT_A2R10G10B10_UNORM_PACK32)) {
+    if (vk_hdr_native_picture(fmt)) {
         static int told;
         if (!told++) rt_log("hdr: native: the game's own HDR10 picture goes to the swapchain as it is");
         return VK_NULL_HANDLE;

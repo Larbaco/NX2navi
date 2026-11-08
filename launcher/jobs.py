@@ -239,7 +239,13 @@ class Job:
             elif kind == 'error':
                 self.error = ev.get('message', '')
 
+        # Cancel pressed before the build started (while the tools were checked) found no process to stop: it stops
+        # here, and one pressed while the process starts stops it at once
+        if self.cancelled():
+            raise net.Cancelled()
         self.proc = build.Run(build.command(self.ctx.layout, args), on_event, self.log)
+        if self.cancelled():
+            self.proc.cancel()
         code = self.proc.wait()
         err = self.proc.error
         self.proc = None

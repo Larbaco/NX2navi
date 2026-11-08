@@ -15,7 +15,7 @@
 #define ST_FREE 0u
 #define ST_STACK 0xBu
 #define PERM_RW 3u
-#define PROGRAM_ID 0x0100f2c0115b6000ull
+#define PROGRAM_ID 0x0400486024dec000ull   // the game's title id (GetInfo 18); fs_host.c NX2NAVI_APPLICATION_ID is the same
 
 static uint64_t g_svcs;
 void (*volatile svc_test_exit_hook)(unsigned code);

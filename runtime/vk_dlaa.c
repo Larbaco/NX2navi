@@ -1370,6 +1370,12 @@ static int scene_color(VkFormat f) {
 // DLAA (DLSS's picture goes back into the light target, which the tonemap then reads).
 static int srgb8(VkFormat f) { return f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_B8G8R8A8_SRGB; }
 
+// The output target DLAA runs at. With the game's own HDR (vk_hdr.c vk_hdr_native) the same pass, at the same point of
+// the frame, tonemaps into its PQ picture (vk_hdr.c vk_hdr_native_picture) instead of the 8-bit sRGB one; matching sRGB
+// alone left DLAA off for the whole run there (no frame anti-aliased) and with it the frame generation that takes
+// DLAA's depth and motion.
+static int output_target(VkFormat f) { return srgb8(f) || vk_hdr_native_picture(f); }
+
 void vk_dlaa_pass(VkExec *ex) {
     const VkExecTarget *c = &ex->color[0], *z = &ex->depth;
     if (!dl_active() || D.done) return;
@@ -1420,7 +1426,7 @@ void vk_dlaa_pass(VkExec *ex) {
         if (one && c->width > D.color.width && c->height > D.color.height) {
             D.ended = D.done = D.up = 1;
             evaluate(ex, c);
-        } else if (one && srgb8(c->format) && c->width == D.color.width &&
+        } else if (one && output_target(c->format) && c->width == D.color.width &&
                    c->height == D.color.height) {
             D.ended = D.done = 1;
             evaluate(ex, NULL);

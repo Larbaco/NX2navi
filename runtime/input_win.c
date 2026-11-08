@@ -31,8 +31,10 @@ static int key_vk(int key) {
     case KEY_DOWN: return VK_DOWN;
     case KEY_LEFT: return VK_LEFT;
     case KEY_RIGHT: return VK_RIGHT;
-    case KEY_MOUSE_L: return VK_LBUTTON;
-    case KEY_MOUSE_R: return VK_RBUTTON;
+    // GetAsyncKeyState reads the physical buttons: with Windows' "switch primary and secondary buttons" on, the
+    // primary (left) button is the physical right one, as the window's own WM_LBUTTONDOWN has it
+    case KEY_MOUSE_L: return GetSystemMetrics(SM_SWAPBUTTON) ? VK_RBUTTON : VK_LBUTTON;
+    case KEY_MOUSE_R: return GetSystemMetrics(SM_SWAPBUTTON) ? VK_LBUTTON : VK_RBUTTON;
     case KEY_MOUSE_M: return VK_MBUTTON;
     case KEY_MOUSE_X1: return VK_XBUTTON1;
     case KEY_MOUSE_X2: return VK_XBUTTON2;

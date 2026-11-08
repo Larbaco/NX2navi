@@ -23,6 +23,7 @@ import json
 import os
 import shutil
 import ssl
+import stat
 import struct
 import subprocess
 import sys
@@ -38,7 +39,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / 'tools'))
 
-from launcher import build, feed, gamefiles, jobs, net, saves, settings, toolchain, updater, versions  # noqa: E402
+from launcher import build, feed, gamefiles, jobs, net, saves, settings, toolchain, updater, versions, winsys  # noqa: E402
 from launcher.context import Context  # noqa: E402
 from launcher.paths import Layout  # noqa: E402
 
@@ -267,6 +268,63 @@ class SettingsTest(Tmp):
         s = settings.Settings(self.layout.settings)
         self.assertEqual((s['auto_check'], s['channel']), (True, 'preview'))
         self.assertNotIn('junk', s)
+
+    def test_bom_and_typo(self):
+        # a file saved by an editor with a BOM reads as written; one with a typo keeps a copy before a save replaces it
+        self.layout.settings.write_bytes(b'\xef\xbb\xbf' + json.dumps({'game_dir': 'D:/g'}).encode())
+        s = settings.Settings(self.layout.settings)
+        self.assertEqual(s['game_dir'], 'D:/g')
+        self.assertFalse(s.unreadable)
+        typo = '{"game_dir": "D:/g", "github_token": "t",}'
+        self.layout.settings.write_text(typo, encoding='utf-8')
+        s = settings.Settings(self.layout.settings)
+        self.assertTrue(s.unreadable)
+        self.assertEqual(s['game_dir'], '')
+        s.save()
+        self.assertEqual(self.layout.settings.with_name('launcher.json.bad').read_text(encoding='utf-8'), typo)
+
+
+class UninstallTest(Tmp):
+    def tree(self, root, rels):
+        for rel in rels:
+            p = root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text('x')
+
+    def test_plan_keeps_the_game_and_what_is_not_ours(self):
+        from types import SimpleNamespace
+        root = self.tmp / 'NX2navi'
+        self.tree(root, ('NX2navi.exe', 'app/current.txt', 'python.old-3/x', 'game/profile/save/1/a.sav', 'mine.txt'))
+        layout = SimpleNamespace(root=root, toolchain=root / 'toolchain')
+        gone, empty = winsys.uninstall_plan(layout)
+        self.assertNotIn(root / 'game', gone)
+        self.assertNotIn(root, gone)
+        self.assertIn(root / 'python.old-3', gone)
+        self.assertEqual(empty, [root])
+        gone, _ = winsys.uninstall_plan(layout, str(root / 'game'))
+        self.assertEqual(gone[0], root / 'game')
+        # the toolchain moved to C:\NX2navi: that folder goes only when nothing else is left in it
+        other = self.tmp / 'C NX2navi' / 'toolchain'
+        gone, empty = winsys.uninstall_plan(SimpleNamespace(root=root, toolchain=other))
+        self.assertIn(other, gone)
+        self.assertNotIn(other.parent, gone)
+        self.assertEqual(empty, [root, other.parent])
+
+    @unittest.skipUnless(os.name == 'nt', 'runs the cmd.exe script')
+    def test_script_on_windows(self):
+        from types import SimpleNamespace
+        root = self.tmp / 'NX2navi ÿ x'   # spaces and a character outside ASCII
+        self.tree(root, ('NX2navi.exe', 'app/1/VERSION', 'python/pythonw.exe', 'python.old-12/x', 'pydeps/z',
+                         'data/launcher.json', 'toolchain/msys64/a', 'game/profile/save/1/a.sav', 'mine.txt'))
+        layout = SimpleNamespace(root=root, toolchain=root / 'toolchain')
+        script = winsys.uninstall_script(*winsys.uninstall_plan(layout)).replace('ping -n 3 127.0.0.1 >nul', 'echo')
+        subprocess.run(f'cmd.exe /c "{script}"', capture_output=True)
+        self.assertEqual(sorted(p.name for p in root.iterdir()), ['game', 'mine.txt'])
+        self.assertTrue((root / 'game/profile/save/1/a.sav').is_file())
+        (root / 'mine.txt').unlink()
+        script = winsys.uninstall_script(*winsys.uninstall_plan(layout, str(root / 'game')))
+        subprocess.run(f'cmd.exe /c "{script.replace("ping -n 3 127.0.0.1 >nul", "echo")}"', capture_output=True)
+        self.assertFalse(root.exists())
 
 
 # ---------------------------------------------------------------- toolchain
@@ -1133,6 +1191,52 @@ class SavesTest(unittest.TestCase):
         finally:
             saves.os.replace = real
         self.assertEqual((acct / 'save.dat').read_bytes(), b'old')
+
+    def test_a_failed_swap_keeps_the_finished_commit(self):
+        # the account folder cannot be moved aside (a file in it held open): the newer finished commit stays in
+        # save-tx, where the game loads it first, instead of going into the backup
+        acct = saves.account_dir(self.game)
+        self.files(acct, {'save.dat': b'older'})
+        tx = self.game / 'profile' / 'save-tx'
+        self.files(tx, {'ready-4/save.dat': b'newest'})
+        src = self.files(self.tmp / 'mine', {'save.dat': b'imported'})
+        real = saves.os.replace
+
+        def replace(a, b):
+            if Path(a) == acct:
+                raise PermissionError(32, 'The process cannot access the file')
+            return real(a, b)
+        saves.os.replace = replace
+        try:
+            with self.assertRaises(PermissionError):
+                saves.import_save(self.game, src, log=lambda m: None)
+        finally:
+            saves.os.replace = real
+        self.assertEqual((tx / 'ready-4' / 'save.dat').read_bytes(), b'newest')
+        self.assertEqual((acct / 'save.dat').read_bytes(), b'older')
+        self.assertFalse((tx / 'import').exists())
+
+    @unittest.skipUnless(os.name == 'nt', 'the running check is Windows only')
+    def test_a_read_only_exe_is_not_a_running_game(self):
+        exe = self.game / 'ocarina.exe'
+        exe.write_bytes(b'MZ')
+        os.chmod(exe, stat.S_IREAD)
+        self.assertFalse(build.game_running(self.game))
+        self.assertFalse(saves.game_running(self.game))
+        self.assertTrue(os.access(exe, os.W_OK))
+
+    def test_read_only_files_import_writable(self):
+        acct = saves.account_dir(self.game)
+        self.files(acct, {'save.dat': b'old'})
+        src = self.files(self.tmp / 'mine', {'save.dat': b'imported'})
+        os.chmod(src / 'save.dat', stat.S_IREAD)
+        os.chmod(acct / 'save.dat', stat.S_IREAD)   # the save it replaces: deleted after the swap all the same
+        try:
+            saves.import_save(self.game, src, log=lambda m: None)
+            self.assertTrue(os.access(acct / 'save.dat', os.W_OK))
+            self.assertEqual([p.name for p in (self.game / 'profile' / 'save-tx').iterdir()], [])
+        finally:
+            os.chmod(src / 'save.dat', stat.S_IREAD | stat.S_IWRITE)
 
     def test_another_installs_finished_commit_is_its_save(self):
         other = self.files(self.tmp / 'other', {'profile/save/' + 'b' * 32 + '/save.dat': b'older',

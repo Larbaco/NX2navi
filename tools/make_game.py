@@ -236,7 +236,14 @@ class Source:
                     fail(f'{d} is not a folder')
             self.exefs = {name: self.exefs_dir / name for name in EXEFS_FILES if (self.exefs_dir / name).is_file()}
             self.romfs = [(p.relative_to(self.romfs_dir).as_posix(), p) for p in self.romfs_dir.rglob('*') if p.is_file()]
-            self.identity = f'folders {self.exefs_dir.resolve()} {self.romfs_dir.resolve()} {len(self.romfs)}'
+            # every file's size and modification time, not only their count: a RomFS extracted again (or edited)
+            # with the same number of files, or a replaced sdk, kept the old unpacked files ("done before")
+            h = hashlib.sha256()
+            for rel, f in sorted([(n, self.exefs[n]) for n in self.exefs] + self.romfs):
+                st = f.stat()
+                h.update(f'{rel}\0{st.st_size}\0{st.st_mtime_ns}\n'.encode('utf-8', 'surrogateescape'))
+            self.identity = (f'folders {self.exefs_dir.resolve()} {self.romfs_dir.resolve()} {len(self.romfs)} '
+                             f'{h.hexdigest()[:32]}')
         missing = [x for x in EXEFS_FILES if x not in self.exefs]
         if missing:
             fail(f'the ExeFS lacks {", ".join(missing)} (or holds something else under that name)')
@@ -1184,7 +1191,8 @@ def main():
         except ImportError:
             fail(f'the Python package {mod} is missing: pip install numpy lz4 zstandard zbic')
     cache.mkdir(parents=True, exist_ok=True)
-    if state.get('version') != STATE_VERSION or state.get('input') != src.identity:
+    reset = state.get('version') != STATE_VERSION or state.get('input') != src.identity
+    if reset:
         state = {'version': STATE_VERSION, 'input': src.identity, 'steps': {}}
     state['kit'] = kit_version()
     keep_awake()
@@ -1196,8 +1204,17 @@ def main():
     state_lock = threading.Lock()   # the RomFS step records itself from its own thread
 
     def save():
+        # whole or not at all: a cut write (a full disk, Cancel ending the process) would leave a state.json that
+        # loads as {}, and the launcher would take the built game for none and ask for the dump again
         with state_lock:
-            state_path.write_text(json.dumps(state, indent=1), encoding='utf-8')
+            tmp = state_path.with_name(state_path.name + '.tmp')
+            tmp.write_text(json.dumps(state, indent=1), encoding='utf-8')
+            os.replace(tmp, state_path)
+
+    if reset:
+        # on disk at once: the exefs step rewrites <out>/exefs in place, and a run cut short there would leave the
+        # old state.json saying the old game's steps are done, which --rebuild trusts
+        save()
 
     def run(name):
         t = time.time()
