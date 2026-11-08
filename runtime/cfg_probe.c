@@ -323,6 +323,15 @@ int probe_cfg(void) {
           "prompts: 0.1.9's pad_layout = xbox_prompts means Xbox while prompts is unset");
     CHECK(!input_prompts_folder(PROMPTS_NINTENDO, "nintendo") && !input_prompts_folder(PROMPTS_NINTENDO, "xbox"),
           "prompts: the game's own need no folder");
+    CHECK(input_prompts_pick("PlayStation", "nintendo") == PROMPTS_PLAYSTATION &&
+              EQ(input_prompts_folder(PROMPTS_PLAYSTATION, "nintendo"), "romfs-patches-playstation") &&
+              EQ(input_prompts_folder(PROMPTS_PLAYSTATION, "xbox"), "romfs-patches-playstation-label") &&
+              EQ(input_prompts_folder(PROMPTS_PLAYSTATION, "auto"), "romfs-patches-playstation-label"),
+          "prompts: playstation by the pad layout, A on Circle under Nintendo and on Cross under the others");
+    CHECK(input_prompts_pick("steamdeck", "xbox") == PROMPTS_STEAMDECK &&
+              EQ(input_prompts_folder(PROMPTS_STEAMDECK, "nintendo"), "romfs-patches-steamdeck") &&
+              EQ(input_prompts_folder(PROMPTS_STEAMDECK, "auto"), "romfs-patches-steamdeck-label"),
+          "prompts: steamdeck by the pad layout, as the Xbox ones");
     CHECK(EQ(input_prompts_folder(PROMPTS_XBOX, "nintendo"), "romfs-patches-xbox") &&
               EQ(input_prompts_folder(PROMPTS_XBOX, "xbox_prompts"), "romfs-patches-xbox") &&
               EQ(input_prompts_folder(PROMPTS_XBOX, "xbox"), "romfs-patches-xbox-label") &&

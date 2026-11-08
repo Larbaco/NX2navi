@@ -17,8 +17,25 @@ amplitude before the strength (0.2 to 1.5, default 0.6; lower makes weak pulses 
 - `auto`: `nintendo` for a pad whose east button SDL reports labelled A (Switch Pro Controller, Nintendo-layout pads), `xbox` for the others.
 
 The log names the layout in effect (`input: gamepad layout ...`) and each gamepad's first press
-(`input: gamepad "...": first press`); the menu shows the layout under *Automatic*. The game's prompts show the Switch
-letters.
+(`input: gamepad "...": first press`); the menu shows the layout under *Automatic*.
+
+`NX2NAVI_PROMPTS` (`prompts`, the *Button prompts* row under it, after a restart) picks the buttons the game's prompts
+show:
+
+- `nintendo` (default): the game's own Switch letters.
+- `playstation`: Cross, Circle, Square and Triangle, L1 R1 L2 R2, Options for Plus, Create for Minus and a d-pad cross.
+- `steamdeck`: the A B X Y letters as a Steam Deck labels them, L1 R1 L2 R2, Menu for Plus, View for Minus and a d-pad
+  cross.
+
+The face buttons follow the layout above: with `nintendo` the prompts for A show the right button (Circle, or B on a
+Steam Deck), with `xbox` and `auto` the bottom one (Cross, or A).
+
+The PlayStation and Steam Deck prompts are the game's button font (`Font2/Scalable/External.Nin_Ounce_NVN2.bfotf.zs`) redrawn on the
+player's machine by `tools/ocarina_prompts.py`, which `tools/make_game.py` runs in its `prompts` step (it needs
+fontTools). It writes four RomFS overlay folders beside the game, `romfs-patches-playstation` and
+`romfs-patches-steamdeck` for the `nintendo` layout and their `-label` twins for the others, each with the font and the resource size table that makes room
+for it; `runtime/romfs.c` loads the one the settings pick at start. The sticks, Home and the console keep the game's
+icons, and a button remapped in Controls keeps its old prompt.
 
 The actions are the game's own, as its *Basic Controls* screen (Plus menu, System) names them:
 

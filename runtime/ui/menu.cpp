@@ -1059,6 +1059,15 @@ static void tab_controls(float scale) {
     opt_begin("##controls", scale);
     static const UiTextId layout[] = {UI_MENU_PAD_LAYOUT_AUTO, UI_MENU_PAD_LAYOUT_NINTENDO, UI_MENU_PAD_LAYOUT_XBOX};
     opt_choice("NX2NAVI_PAD_LAYOUT", UI_MENU_PAD_LAYOUT, layout, 3, UI_MENU_PAD_LAYOUT_DESC, pad_layout_note());
+    // Ocarina's prompts: the game's own, PlayStation or Steam Deck (tools/ocarina_prompts.py); the Xbox and PC ones are drawn from
+    // TotK's files only (tools/make_romfs_patches.py), so they are not offered. The note says when a restart is needed;
+    // the bottom row's Restart button does it.
+    static const char *const prompt_values[] = {"nintendo", "playstation", "steamdeck"};
+    const char *prompt_names[] = {menu_text(UI_MENU_PROMPTS_NINTENDO), menu_text(UI_MENU_PROMPTS_PLAYSTATION),
+                                  menu_text(UI_MENU_PROMPTS_STEAMDECK)};
+    bool restart;
+    const char *note = prompts_note(&restart);
+    opt_choice_list("NX2NAVI_PROMPTS", UI_MENU_PROMPTS, prompt_values, prompt_names, 3, UI_MENU_PROMPTS_PS_DESC, -1, note);
     opt_toggle("NX2NAVI_MOTION", UI_MENU_MOTION, UI_MENU_MOTION_DESC);
     opt_slider("NX2NAVI_RUMBLE_STRENGTH", UI_MENU_RUMBLE_STRENGTH, 0, 300, UI_MENU_RUMBLE_STRENGTH_DESC, 10, "%.0f %%");
     opt_slider("NX2NAVI_RUMBLE_CURVE", UI_MENU_RUMBLE_CURVE, 0.2f, 1.5f, UI_MENU_RUMBLE_CURVE_DESC, 0.05f, "%.2f");

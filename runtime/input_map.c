@@ -296,16 +296,23 @@ int input_pad_layout_pick(const char *setting, int east_labelled_a) {
 
 int input_prompts_pick(const char *prompts, const char *pad_layout) {
     if (prompts && *prompts)
-        return !strcasecmp(prompts, "xbox") ? PROMPTS_XBOX : !strcasecmp(prompts, "pc") ? PROMPTS_PC : PROMPTS_NINTENDO;
+        return !strcasecmp(prompts, "xbox")          ? PROMPTS_XBOX
+               : !strcasecmp(prompts, "pc")          ? PROMPTS_PC
+               : !strcasecmp(prompts, "playstation") ? PROMPTS_PLAYSTATION
+               : !strcasecmp(prompts, "steamdeck")   ? PROMPTS_STEAMDECK
+                                                     : PROMPTS_NINTENDO;
     return pad_layout && !strcasecmp(pad_layout, "xbox_prompts") ? PROMPTS_XBOX : PROMPTS_NINTENDO;
 }
 
 const char *input_prompts_folder(int prompts, const char *pad_layout) {
     if (prompts == PROMPTS_PC) return "romfs-patches-pc";
-    if (prompts != PROMPTS_XBOX) return NULL;
+    if (prompts != PROMPTS_XBOX && prompts != PROMPTS_PLAYSTATION && prompts != PROMPTS_STEAMDECK) return NULL;
     // The folders are read at start, before a pad is open: auto counts as Xbox, as for a pad without Nintendo labels.
     // A Nintendo-labelled pad under auto plays by label too (its A is on the button labelled A), so it matches as well.
-    return input_pad_layout_pick(pad_layout, 0) == PAD_LAYOUT_NINTENDO ? "romfs-patches-xbox" : "romfs-patches-xbox-label";
+    int nintendo = input_pad_layout_pick(pad_layout, 0) == PAD_LAYOUT_NINTENDO;
+    if (prompts == PROMPTS_PLAYSTATION) return nintendo ? "romfs-patches-playstation" : "romfs-patches-playstation-label";
+    if (prompts == PROMPTS_STEAMDECK) return nintendo ? "romfs-patches-steamdeck" : "romfs-patches-steamdeck-label";
+    return nintendo ? "romfs-patches-xbox" : "romfs-patches-xbox-label";
 }
 
 uint64_t input_map_pad_buttons(const uint8_t down[PAD_COUNT], int layout) {

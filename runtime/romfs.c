@@ -777,7 +777,8 @@ static void camera_overlay(void) {
 // did not load (ROMFS_PROMPTS_*). The menu compares them with the settings in effect (ui/menu.cpp prompts_note).
 // romfs-patches-pc keeps that name, but at a game resolution of another shape than 16:9 its files come from pc_dir,
 // romfs-patches-pc-<w>x<h> (overlay_init).
-static struct { const char *name; int ready; } prompts_folders[3];
+enum { PROMPTS_FOLDERS = 7 };   // the two Xbox folders, the PC one, the two PlayStation ones, the two Steam Deck ones
+static struct { const char *name; int ready; } prompts_folders[PROMPTS_FOLDERS];
 static const char *prompts_wanted, *prompts_loaded;
 static int prompts_off;
 static char pc_dir[64];
@@ -785,7 +786,7 @@ static char pc_dir[64];
 const char *romfs_prompts(void) { return prompts_loaded; }
 
 int romfs_prompts_ready(const char *folder) {
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < PROMPTS_FOLDERS; i++)
         if (folder && prompts_folders[i].name && !strcmp(prompts_folders[i].name, folder)) return prompts_folders[i].ready;
     return 0;
 }
@@ -844,9 +845,13 @@ static void overlay_init(void) {
                    "(tools/make_romfs_patches.py --aspect %ux%u)", out[0], out[1], out[0], out[1]);
         }
     }
-    static const char *const layouts[2] = {"nintendo", "xbox"};   // one of each Xbox folder, then the PC one
-    for (int i = 0; i < 3; i++) {
-        const char *name = i < 2 ? input_prompts_folder(PROMPTS_XBOX, layouts[i]) : input_prompts_folder(PROMPTS_PC, 0);
+    // one of each Xbox folder, the PC one, then one of each PlayStation and Steam Deck folder (tools/ocarina_prompts.py)
+    static const char *const layouts[2] = {"nintendo", "xbox"};
+    for (int i = 0; i < PROMPTS_FOLDERS; i++) {
+        const char *name = i < 2   ? input_prompts_folder(PROMPTS_XBOX, layouts[i])
+                           : i == 2 ? input_prompts_folder(PROMPTS_PC, 0)
+                           : i < 5  ? input_prompts_folder(PROMPTS_PLAYSTATION, layouts[i - 3])
+                                    : input_prompts_folder(PROMPTS_STEAMDECK, layouts[i - 5]);
         const char *dir = name;
         if (i == 2) {
             if (wide) snprintf(pc_dir, sizeof pc_dir, "%s-%ux%u", name, out[0], out[1]);
@@ -859,7 +864,10 @@ static void overlay_init(void) {
     }
     const char *layout = cfg_value("NX2NAVI_PAD_LAYOUT");
     int pick = input_prompts_pick(cfg_get("NX2NAVI_PROMPTS"), layout), shaped = wide && pick == PROMPTS_PC;
-    const char *style = pick == PROMPTS_PC ? "keyboard and mouse" : "Xbox";
+    const char *style = pick == PROMPTS_PC ? "keyboard and mouse" : pick == PROMPTS_PLAYSTATION ? "PlayStation"
+                      : pick == PROMPTS_STEAMDECK ? "Steam Deck" : "Xbox";
+    const char *setting = pick == PROMPTS_PC ? "pc" : pick == PROMPTS_PLAYSTATION ? "playstation"
+                        : pick == PROMPTS_STEAMDECK ? "steamdeck" : "xbox";
     prompts_wanted = input_prompts_folder(pick, layout);
     prompts_off = !prompts_wanted                         ? ROMFS_PROMPTS_OK
                   : wide && !shaped                       ? ROMFS_PROMPTS_SHAPE
@@ -880,7 +888,7 @@ static void overlay_init(void) {
             rt_log("RomFS overlay: %s failed its check (run the setup again); romfs-patches loads instead", path);
         }
     } else if (prompts_wanted) {
-        rt_log("RomFS overlay: prompts = %s, but %s; Switch prompts stay", pick == PROMPTS_PC ? "pc" : "xbox",
+        rt_log("RomFS overlay: prompts = %s, but %s; Switch prompts stay", setting,
                prompts_off == ROMFS_PROMPTS_SHAPE     ? (shaped ? "the game resolution has no romfs-patches-pc-<w>x<h> "
                                                                   "(tools/make_romfs_patches.py --prompts pc --aspect)"
                                                              : "the game resolution takes its own UI layout")

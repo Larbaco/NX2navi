@@ -15,7 +15,9 @@ Steps, each skipped when a run before finished it for the same inputs (state in 
   4. lift     recomp/gen.py with recomp/patches-v111.txt -> <out>/build-cache/lift, plus the two SDK bring-up fixes
   5. compile  the lifted C and runtime/ with MSYS2's clang, linked into <out>/ocarina.exe; the MSYS2 DLLs it loads,
               the shader translator and romfs-index.bin beside it
-  6. shaders  every shader in the game files (tools/prepare_shaders.py, default bind state) translated, and each one's
+  6. prompts  the PlayStation and Steam Deck button prompts (tools/ocarina_prompts.py) -> <out>/romfs-patches-
+              playstation(-label) and romfs-patches-steamdeck(-label); skipped with a note when fontTools is missing
+  7. shaders  every shader in the game files (tools/prepare_shaders.py, default bind state) translated, and each one's
               GPU driver build done once, so play does not stop to compile them (`ocarina.exe --prepare-shaders`)
 
 The exefs and romfs steps depend only on the game files; lift and compile depend on this kit's code too. A newer kit
@@ -67,7 +69,7 @@ EXEFS_FILES = ('main', 'main.npdm', 'sdk', 'subsdk0', 'rtld')
 MODULES = ('main', 'sdk', 'subsdk0', 'rtld')
 ALIGN = 16
 STATE_VERSION = 2
-STEPS = ('exefs', 'romfs', 'lift', 'compile', 'shaders')
+STEPS = ('exefs', 'romfs', 'lift', 'compile', 'prompts', 'shaders')
 
 # Bring-up fixes in the lifted SDK, each anchored on exact generated text that must occur once.
 LIFT_FIXES = [
@@ -980,6 +982,25 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None):
 
 # ---------------------------------------------------------------- main
 
+PROMPT_STYLES = ('playstation', 'playstation-label', 'steamdeck', 'steamdeck-label')
+
+
+def step_prompts(out):
+    """The PlayStation and Steam Deck prompts' overlay folders from the RomFS image (tools/ocarina_prompts.py).
+    Optional: without fontTools the step says so and the game keeps its own prompts, as with prompts = nintendo."""
+    try:
+        import fontTools  # noqa: F401
+        import compression.zstd  # noqa: F401
+    except ImportError as e:
+        say(f'  skipped: {e.name} is missing (pip install fonttools; Python 3.14), so prompts = playstation or '
+            'steamdeck keeps the Switch prompts')
+        return
+    for style in PROMPT_STYLES:
+        if subprocess.run(py_cmd(KIT / 'tools' / 'ocarina_prompts.py', '--romfs', out / 'romfs', '--style', style,
+                                 '--out', out / f'romfs-patches-{style}')).returncode:
+            fail('the button prompts could not be written (see above)')
+
+
 def step_shaders(out):
     """Every shader of the game files into the game's shader cache and the driver's own cache, before the first start."""
     cmd = [sys.executable, str(KIT / 'tools' / 'prepare_shaders.py'), str(out), '--romfs', str(out / 'romfs'),
@@ -1056,6 +1077,9 @@ def step_key(step, identity, out=None):
                    f'|cpu {cpu_tag()}')
     if step == 'compile':
         return compile_key
+    if step == 'prompts':   # the RomFS image and the tool that draws them
+        return (f'prompts-1|{identity}|{sha256_file(KIT / "tools" / "ocarina_prompts.py")}'
+                f'|{sha256_file(KIT / "tools" / "button_icons.py")}')
     # shaders: the built game and the translator that prepared them
     return f'shaders-1|{compile_key}|{sha256_file(KIT / "tools" / "prepare_shaders.py")}|{sha256_file(KIT / "bin" / "nx2navi_xlate.id")}'
 
@@ -1119,7 +1143,7 @@ def main():
     romfs_job = None
     runs = {'exefs': lambda: step_exefs(src, out), 'romfs': lambda: step_romfs(src, out, min(a.jobs, 8)),
             'lift': lambda: step_lift(out, cache), 'compile': lambda: step_compile(out, cache, msys, a.jobs, romfs_job),
-            'shaders': lambda: step_shaders(out)}
+            'prompts': lambda: step_prompts(out), 'shaders': lambda: step_shaders(out)}
     state_lock = threading.Lock()   # the RomFS step records itself from its own thread
 
     def save():
@@ -1148,7 +1172,7 @@ def main():
                         state['steps'].pop(later, None)
                 say(f'{name}:')
                 emit('step', step=name, state='start')
-                if name == 'shaders' and romfs_job:   # the shaders come out of the RomFS image
+                if name in ('prompts', 'shaders') and romfs_job:   # both come out of the RomFS image
                     romfs_job.join()
                 if name == 'romfs' and a.until != 'romfs':
                     # The RomFS image is mostly disk work, the lift and the compile are processor work: they run side
