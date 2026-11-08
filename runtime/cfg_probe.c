@@ -144,6 +144,8 @@ int probe_cfg(void) {
     CHECK(m && EQ(m->def, "auto") && !m->values && !m->live, "meta: monitor is auto by default, free text, read at start");
     m = cfg_meta("PERF_OVERLAY");
     CHECK(m && EQ(m->def, "off") && EQ(m->values, "off|fps|full") && m->live, "meta: perf_overlay is live, off by default");
+    m = cfg_meta("AUDIO_DEVICE");
+    CHECK(m && EQ(m->def, "default") && m->values == NULL && !m->live, "meta: audio_device is free text, default, needs a restart");
     CHECK(cfg_meta("BIND_A") == NULL && cfg_meta("FPS_COUNTER") == NULL && cfg_meta("NO_SUCH") == NULL,
           "meta: keys the menu does not show are NULL");
 

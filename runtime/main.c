@@ -1,11 +1,16 @@
 ﻿// nx2navi.exe entry: reserves the guest address space, parses the command line and runs one mode.
 //
-//   nx2navi.exe [--exefs DIR] [--romfs DIR] [--profile DIR] [--monitor VALUE] <mode>
+//   nx2navi.exe [--exefs DIR] [--romfs DIR] [--profile DIR] [--monitor VALUE] [--audio-device VALUE] <mode>
 //     --monitor VALUE   open the game window on one monitor: sets NX2NAVI_MONITOR before the settings are read, so it wins
 //                       over nx2navi.ini's `monitor =`. VALUE is auto (default), primary, a 1-based index as --list-monitors
 //                       prints it, or part of a GDI device name (DISPLAY3) or of a monitor's name, case-insensitive
 //     --list-monitors   print each monitor's index, GDI device name, name, desktop rectangle, primary flag and DPI;
 //                       needs no game files
+//     --audio-device VALUE   play the sound on one output device: sets NX2NAVI_AUDIO_DEVICE before the settings are read, so
+//                       it wins over nx2navi.ini's `audio_device =`. VALUE is default (the system default device),
+//                       a 1-based index as --list-audio-devices prints it (devices sorted by name), or part of a device name, case-insensitive
+//     --list-audio-devices   print each playback device's index, name, channels and frequency, mark the system default and
+//                       show which device NX2NAVI_AUDIO_DEVICE picks; needs no game files
 //     --selftest        layout, dispatch table and host-function registry; needs no game files
 //     --probe-mods      the mods folder scan, order and switches (mods.c); needs no game files
 //     --probe-loader    load and relocate the modules, check them against the measured 1.2.1 values
@@ -477,7 +482,7 @@ static int probe_crash(int null) {
 }
 
 static int usage(const char *argv0) {
-    fprintf(stderr, "usage: %s [--exefs DIR] [--romfs DIR] [--profile DIR] [--monitor VALUE] [--list-monitors | --selftest | --probe-loader | "
+    fprintf(stderr, "usage: %s [--exefs DIR] [--romfs DIR] [--profile DIR] [--monitor VALUE] [--audio-device VALUE] [--list-monitors | --list-audio-devices | --selftest | --probe-loader | "
                     "--probe-cfg | --probe-dpi | --probe-mods | --probe-kernel | --probe-ipc | --probe-services | --probe-fs | --probe-gfx-abi | "
                     "--probe-nvn | --probe-nvn-tex | --probe-window | --probe-shader | --probe-vkmem | "
                     "--probe-vkexec | --probe-astc | --probe-movie | --probe-crash-call | --probe-crash-null | --probe-discord | "
@@ -553,6 +558,12 @@ int main(int argc, char **argv) {
             // to nx2navi.ini, so "auto" is the spelling for "no monitor choice" on the command line.
             if (++i == argc || !*argv[i]) return usage(argv[0]);
             plat_setenv("NX2NAVI_MONITOR", argv[i]);
+        } else if (!strcmp(argv[i], "--audio-device")) {
+            // Same approach as every setting: NX2NAVI_AUDIO_DEVICE is read from the environment first (cfg.c raw_get), and
+            // nothing has read it yet because the audio renderer opens in rt_boot. An empty value would remove the variable
+            // (plat_setenv) and hand the choice back to nx2navi.ini, so "default" is the spelling for the system default.
+            if (++i == argc || !*argv[i]) return usage(argv[0]);
+            plat_setenv("NX2NAVI_AUDIO_DEVICE", argv[i]);
         } else if (!strcmp(argv[i], "--seconds")) {
             char *end;
             if (++i == argc) return usage(argv[0]);
@@ -579,6 +590,7 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(mode, "--selftest")) return selftest();
     if (!strcmp(mode, "--list-monitors")) return list_monitors();
+    if (!strcmp(mode, "--list-audio-devices")) return list_audio_devices();
     if (!strcmp(mode, "--probe-loader")) return probe_loader();
     if (!strcmp(mode, "--probe-crash-call")) return probe_crash(0);
     if (!strcmp(mode, "--probe-crash-null")) return probe_crash(1);

@@ -273,6 +273,12 @@
 # Speakers: stereo, 5.1 or auto (5.1 when the Windows speaker setup has six or more channels, stereo otherwise). The
 # game is told the same channel count and mixes for it. Takes effect at the next start.
 # audio_channels = stereo
+# Which output device the sound plays on. default (the default): the system default device, which the game follows when
+# the Windows default changes. Or a number, counting from 1 in the order `nx2navi.exe --list-audio-devices` prints; or part
+# of a device's name, ignoring case (`headphones`). When nothing matches, or the device will not open, the log lists the
+# devices and the game plays on the system default. With audio_channels = auto, the channel count is the chosen device's.
+# The command line `--audio-device <value>` overrides this for one run. Takes effect at the next start.
+# audio_device = default
 
 [input]
 # Gamepad motion controls (0 = off) and vibration (0 = off).
