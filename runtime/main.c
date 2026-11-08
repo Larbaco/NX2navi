@@ -538,6 +538,15 @@ int main(int argc, char **argv) {
     // Timed guest waits (kernel.c block_inner) sleep in whole milliseconds; at the default 15.6 ms tick a 1 ms wait
     // costs a full tick. NX2NAVI_TIMER_1MS=0 keeps the default for comparison.
     if (cfg_bool("NX2NAVI_TIMER_1MS")) plat_timer_1ms();
+    {   // NX2NAVI_POWER_FULL=0 leaves Windows' power throttling of an unfocused window in place (A/B runs)
+        const char *pf = cfg_get("NX2NAVI_POWER_FULL");
+        if (!(pf && !strcmp(pf, "0"))) {
+            int got = plat_power_full();
+            rt_log("power: %s", got == 2 ? "full speed and the 1 ms timer kept when the window is not in front"
+                               : got == 1 ? "full speed kept when the window is not in front (no timer control here)"
+                                          : "the OS throttling of an unfocused window stays as it is");
+        }
+    }
     cfg = (RtConfig){.exefs = rt_default_exefs, .romfs = rt_default_romfs, .profile = rt_default_profile,
                      .gpu = cfg_get("NX2NAVI_GPU")};
     portable_paths(&cfg);   // command-line paths below still win

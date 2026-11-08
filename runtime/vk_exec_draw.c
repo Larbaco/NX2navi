@@ -1483,13 +1483,45 @@ static void feedback_barrier(VkExec *ex) {
     vk_exec_frame.fb_barriers++;
 }
 
-// Marks the attachments the draw with state s writes: colour targets with a nonzero effective write mask, depth with
-// depth writes or the stencil test on.
-static void feedback_written(VkExec *ex, const VkPipeState *s) {
-    if (vk_ctx()->feedback == VK_FEEDBACK_OFF) return;
-    if (ex->depth.image && !(ex->fb_dirty & 0x100) && ((s->ds.dt && s->ds.dw) || s->ds.st)) ex->fb_dirty |= 0x100;
+// Write after read inside the open pass: the GPU orders attachment writes after earlier attachment writes, not after
+// earlier draws' texture reads of the same image (feedback layout), so a draw or clear writing a target an earlier
+// draw of the pass sampled could land before those reads finish and they read the new value (a band of the picture
+// a frame out: the fog's flat colour, a dark shadow band). A by-region barrier from fragment shader reads to
+// attachment writes orders them; written: the attachments about to be written (bit i colour i, bit 8 depth).
+void vk_exec_feedback_war(VkExec *ex, uint32_t written) {
+    if (!(written & ex->fb_read)) return;
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                           .srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                           .srcAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                           .dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                           VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                           .dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT,
+                           .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(ex->cb, &di);
+    ex->recorded++;
+    ex->fb_read = 0;
+    vk_exec_frame.fb_war_barriers++;
+}
+
+// The attachments the draw with state s writes: colour targets with a nonzero effective write mask, depth with depth
+// writes or the stencil test on.
+static uint32_t feedback_writes(const VkExec *ex, const VkPipeState *s) {
+    uint32_t w = ex->depth.image && ((s->ds.dt && s->ds.dw) || s->ds.st) ? 0x100u : 0;
     for (uint32_t i = 0; i < ex->pass_ncolor; i++)
-        if (ex->color[i].image && !(ex->fb_dirty >> i & 1) && vk_pipeline_target_wmask(s, (int)i)) ex->fb_dirty |= 1u << i;
+        if (ex->color[i].image && vk_pipeline_target_wmask(s, (int)i)) w |= 1u << i;
+    return w;
+}
+
+// Marks the attachments the draw with state s writes, after ordering them behind earlier draws' reads of them
+// (vk_exec_feedback_war); sampled: what this draw itself samples in the feedback layout, which a later write must wait
+// for in turn (a draw reading and writing one target is the game's own feedback loop, ordered by region as it is).
+static void feedback_written(VkExec *ex, const VkPipeState *s, uint32_t sampled) {
+    if (vk_ctx()->feedback == VK_FEEDBACK_OFF) return;
+    uint32_t w = feedback_writes(ex, s);
+    vk_exec_feedback_war(ex, w);
+    ex->fb_dirty |= w;
+    ex->fb_read |= sampled;
 }
 
 static void tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage, int separate,
@@ -2999,7 +3031,7 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
     repeat_stats(ex, info);
     bind_resources(ex, info);
     if (fbl & ex->fb_dirty) feedback_barrier(ex);
-    feedback_written(ex, &s);
+    feedback_written(ex, &s, fbl);
     if (!mesh) bind_vertex_buffers(ex);
     if (vk_dump_armed && !mesh) vk_dump_draw(ex, &s, p, info);
     if (vk_hdr_track) vk_hdr_draw(ex, info);
@@ -4319,6 +4351,8 @@ static void op_update_ub(VkExec *ex, const p_update_ub *u) {
     VkMemSpan sp;
     if (!vk_mem_resolve(u->dst, u->size, &sp)) return warn_once(W_UB, "UpdateUniformBuffer to %#llx is not backed: dropped", (unsigned long long)u->dst);
     cb_res(ex);
+    vk_exec_frame.ub_updates++;
+    if (ex->in_pass) vk_exec_frame.ub_pass_breaks++;
     vk_exec_barrier(ex);   // earlier draws finished with the old contents
     VkBuffer b;
     VkDeviceSize o;

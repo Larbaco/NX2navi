@@ -270,11 +270,15 @@ static void completion_main(void *arg) {
             plat_mutex_lock(&st_lock);
         }
         if (reached > done) {
+            // The waiters go first (a fence wait, the frame's first submission, the acquire): freeing what the
+            // finished submissions held (vk_mem_collect: upload batches, destroyed images, views and buffers, each
+            // checked against the timeline itself) is nothing they read, and it takes cmd_lock, which the upload
+            // path holds, so done waited behind uploads.
+            __atomic_store_n(&done, reached, __ATOMIC_RELEASE);
+            plat_cond_broadcast(&cv_done);
             plat_mutex_unlock(&st_lock);
             vk_mem_collect();
             plat_mutex_lock(&st_lock);
-            __atomic_store_n(&done, reached, __ATOMIC_RELEASE);
-            plat_cond_broadcast(&cv_done);
         }
     }
     plat_mutex_unlock(&st_lock);

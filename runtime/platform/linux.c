@@ -474,6 +474,7 @@ uint64_t plat_counter_hz(void) { return 1000000000u; }
 // The timer slack (50 us by default) is how late the kernel may wake a sleeping thread to batch wakeups. New threads
 // inherit it from the thread that creates them.
 void plat_timer_1ms(void) { prctl(PR_SET_TIMERSLACK, 1000ul, 0, 0, 0); }
+int plat_power_full(void) { return 0; }   // no per-process power throttling to opt out of
 
 // clock_nanosleep wakes within the timer slack (50 us by default) of its deadline; the last PLAT_SPIN_NS are spent
 // yielding so the deadline is met closely, as on Windows.

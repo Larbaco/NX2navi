@@ -347,6 +347,23 @@ uint64_t plat_counter_hz(void) { return qpc_freq(); }
 // The default timer tick is 15.6 ms; a 1 ms wait would cost a full tick.
 void plat_timer_1ms(void) { timeBeginPeriod(1); }
 
+// Windows 11 runs a process whose window is not in front (another window focused, a second monitor's overlay) at
+// efficiency speed (EcoQoS, the E-cores of a hybrid CPU) and may ignore its timer resolution request, which turns the
+// 1 ms waits the pacing and short sleeps rely on into 15.6 ms ones. Opting out keeps full speed and the 1 ms timer.
+// The ignore-timer-resolution control needs Windows 11; on Windows 10 the call fails and execution speed alone is asked.
+#ifndef PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+#define PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION 0x4
+#endif
+int plat_power_full(void) {
+    PROCESS_POWER_THROTTLING_STATE st = {.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+                                         .ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED |
+                                                        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+                                         .StateMask = 0};
+    if (SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &st, sizeof st)) return 2;
+    st.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    return SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &st, sizeof st) ? 1 : 0;
+}
+
 static PlatScale qpc_ns;   // set before main, so no thread reads it half written
 
 __attribute__((constructor)) static void qpc_ns_init(void) { qpc_ns = plat_scale(1000000000u, qpc_freq()); }

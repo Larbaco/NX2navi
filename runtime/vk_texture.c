@@ -58,6 +58,8 @@ typedef struct Tex {
     uint8_t listed;               // in owned[]
     uint8_t *snap;                // a texture that fills no page: its storage bytes when the GPU write was recorded
     uint32_t wt_n;                // WriteTexels into the storage since the last upload
+    uint64_t chash;               // content_hash of the storage at its last upload (small textures, CHASH_MAX)
+    uint8_t chash_ok;             // chash holds it
     struct Tex *rel_prev, *rel_next;   // while released: the list of released entries, oldest first
 } Tex;
 
@@ -93,6 +95,7 @@ static Tex *rel_head, *rel_tail;   // released entries in release order (sweep_r
 static uint64_t n_uploads, n_reuploads;
 // Re-uploads since the last perf line (tex_lock): all, and those of textures a WriteTexels wrote since their last upload.
 static uint64_t ru_n, ru_bytes, ru_ns, ru_wt_n, ru_wt_bytes, ru_wt_ns;
+static uint64_t ru_same_n, ru_same_bytes;   // re-uploads skipped: the pages were written, the texture's bytes were not
 // NX2NAVI_TEX_ALIAS (default on; =0: a new image over live storage starts empty): a new descriptor over the storage of a
 // live image that the GPU wrote gets that image's content (alias_copy). Counts since the last log line.
 static int tex_alias = -1;
@@ -755,6 +758,25 @@ static void astc_check(const Tex *e, const uint8_t *raw, const VkAstcRegion *ar,
 // 8 GB of shared memory and the game closed before the title screen.
 #define UPLOAD_PART (32ull << 20)   // fits the staging pool (vk_staging takes up to half of its 64 MiB block)
 
+// A texture of at most CHASH_MAX bytes keeps a hash of its storage as it was uploaded. A write to its pages then
+// re-uploads it only when its own bytes changed: Ocarina's frames rewrite hundreds of small textures' pages (shared
+// with data the CPU writes, or written with the same bytes), about 420 re-uploads a frame of 1.5 KiB each, and one
+// costs a staging buffer, a copy and a barrier, several microseconds, where hashing 1.5 KiB takes a fraction of one.
+// A CPU write during the hash sets the pages' write bits again, so the next check sees it.
+enum { CHASH_MAX = 64 << 10 };
+static uint64_t content_hash(const void *p, uint64_t n) {
+    const uint8_t *b = p;
+    uint64_t h = 0x9e3779b97f4a7c15ull ^ n, i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w;
+        memcpy(&w, b + i, 8);
+        h = (h ^ w) * 0xbf58476d1ce4e5b9ull;
+        h ^= h >> 29;
+    }
+    for (; i < n; i++) h = (h ^ b[i]) * 0x94d049bb133111ebull;
+    return h ^ (h >> 31);
+}
+
 // Copies the whole storage into the image (every level and layer the image has).
 static void upload(Tex *e) {
     static volatile int32_t n_bad, n_undecoded, n_split;
@@ -771,6 +793,8 @@ static void upload(Tex *e) {
         e->uploaded = 1;
         return;
     }
+    e->chash_ok = e->t.L.size <= CHASH_MAX;   // the hash of what this upload copies (make_fresh_snap compares it)
+    if (e->chash_ok) e->chash = content_hash((const void *)(uintptr_t)e->pub.addr, e->t.L.size);
     static __thread char ctx[160];   // what this thread copies, for a crash report
     snprintf(ctx, sizeof ctx, "texture upload %#llx (%llu bytes, fmt %#x %ux%u)", (unsigned long long)e->pub.addr,
              (unsigned long long)e->t.L.size, d->format, d->width, d->height);
@@ -946,6 +970,17 @@ static int storage_rewritten(const Tex *e, uint32_t since, uint32_t *now) {
     return 0;
 }
 
+// The pages of an uploaded texture show a write (or are not tracked): whether its own bytes are still those it was
+// uploaded with (upload, content_hash). WriteTexels since the upload always counts as a change.
+static int same_content(const Tex *e) {
+    static int on = -1;   // NX2NAVI_TEX_SAME=0: every write to the pages uploads again (diagnosis)
+    if (on < 0) { const char *v = cfg_get("NX2NAVI_TEX_SAME"); on = !(v && !strcmp(v, "0")); }
+    if (!on || !e->chash_ok || e->wt_n || e->t.L.size > CHASH_MAX) return 0;
+    if (content_hash((const void *)(uintptr_t)e->pub.addr, e->t.L.size) != e->chash) return 0;
+    ru_same_n++, ru_same_bytes += e->t.L.size;
+    return 1;
+}
+
 // A mirrored texture is uploaded on first use and again when its storage pages carry a newer write generation.
 static void make_fresh(Tex *e) {
     if (!e->pub.mirrored || e->pub.gpu_owned) return;
@@ -959,7 +994,7 @@ static void make_fresh(Tex *e) {
     int ch = vk_mem_changed(e->pub.addr, size, e->wgen, &now);
     e->wgen = now;
     e->last_ch = ch;
-    if (ch) upload(e);   // 1 written, -1 not tracked: both upload again
+    if (ch && !same_content(e)) upload(e);   // 1 written, -1 not tracked: both upload again, unless the bytes match
 }
 
 // make_fresh for draw bindings: the page check answers from this submission's write-watch snapshot (vk_memory.c
@@ -973,7 +1008,7 @@ static void make_fresh_snap(Tex *e) {
     e->wgen = now;
     if (!e->uploaded) { upload(e); return; }
     e->last_ch = ch;
-    if (ch) upload(e);
+    if (ch && !same_content(e)) upload(e);
 }
 
 // ---------------------------------------------------------------- aliases (NX2NAVI_TEX_ALIAS)
@@ -1109,6 +1144,7 @@ static Tex *entry_of(const tex_t *t) {
                     e->uploaded = 1;
                     e->pub.gpu_owned = 1;
                 }
+                e->chash_ok = 0;
             } else {
                 init_image(e, vk_upload_begin());
                 vk_upload_end();
@@ -1183,6 +1219,7 @@ void vk_texture_gpu_written(const tex_t *t) {
     if (e) {
         make_fresh(e);   // a partial render keeps what the storage held before
         e->pub.gpu_owned = 1;
+        e->chash_ok = 0;   // the image now holds the GPU's content: matching storage bytes no longer mean "unchanged"
         uint64_t f = vk_exec_recording_fence();
         if (f > e->wr_fence) e->wr_fence = f;
         if (e->pub.mirrored) {
@@ -1479,10 +1516,12 @@ void vk_texture_new_submit(void) {
                (unsigned long long)f * 60, (unsigned long long)n_alias_copied, (unsigned long long)n_alias_upload,
                (unsigned long long)n_alias_uninit);
         n_alias_copied = n_alias_upload = n_alias_uninit = 0;
-        rt_log("perf: frame %llu: texture re-uploads %llu (%.1f MiB, %.2f ms), after WriteTexels %llu (%.1f MiB, %.2f ms)",
+        rt_log("perf: frame %llu: texture re-uploads %llu (%.1f MiB, %.2f ms), after WriteTexels %llu (%.1f MiB, %.2f ms); "
+               "skipped with unchanged bytes %llu (%.1f MiB)",
                (unsigned long long)f * 60, (unsigned long long)ru_n, ru_bytes / 1048576.0, ru_ns / 1e6,
-               (unsigned long long)ru_wt_n, ru_wt_bytes / 1048576.0, ru_wt_ns / 1e6);
-        ru_n = ru_bytes = ru_ns = ru_wt_n = ru_wt_bytes = ru_wt_ns = 0;
+               (unsigned long long)ru_wt_n, ru_wt_bytes / 1048576.0, ru_wt_ns / 1e6, (unsigned long long)ru_same_n,
+               ru_same_bytes / 1048576.0);
+        ru_n = ru_bytes = ru_ns = ru_wt_n = ru_wt_bytes = ru_wt_ns = ru_same_n = ru_same_bytes = 0;
         uint64_t ck, calls, untr;
         vk_mem_snap_stats(&ck, &calls, &untr);
         rt_log("perf: frame %llu: binding storage checks %llu (texture %llu), write-watch snapshot queries %llu, untracked %llu",

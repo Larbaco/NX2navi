@@ -113,6 +113,8 @@ typedef struct VkExec {
     uint32_t fbl_mask;                   // attachments of the open pass in that layout: bit i colour i, bit 8 depth
     uint32_t fb_dirty;                   // attachments of the open pass written by a draw or clear since the pass began
                                          // or the last in-pass barrier
+    uint32_t fb_read;                    // attachments of the open pass a draw sampled (feedback layout) since the pass
+                                         // began or the last in-pass read-to-write barrier (feedback_war)
     const void *fb_fs;                   // feedback_scan's memo: fragment shader, texture bind serial, pass serial
     uint32_t fb_serial, fb_pass, fb_sampled;
     uint32_t tex_serial, pass_serial;    // bumped by every texture or image bind and pass begin
@@ -145,6 +147,9 @@ extern int vk_hdr_track;
 void vk_hdr_draw(VkExec *ex, const VkPipeInfo *info);
 // Scissor 0 clipped to the render area of the open pass; extent 0: nothing to draw.
 VkRect2D vk_exec_scissor(const VkExec *ex);
+// vk_exec_draw.c: orders the open pass's earlier sampled reads of the attachments in written (bit i colour i, bit 8
+// depth) before a draw or clear writes them; nothing when none of them was sampled since the last such barrier.
+void vk_exec_feedback_war(VkExec *ex, uint32_t written);
 void vk_exec_noatt_dims(const VkExec *ex, uint32_t *w, uint32_t *h);   // pass size when no attachment is set
 // 1: every target of the current pass (any 1: at least one, and not only the depth target while a colour target is
 // rendered for the first time) was rendered in the previous presented frame (per-frame targets); 0 otherwise, or when
@@ -159,6 +164,8 @@ typedef struct {
     uint64_t fb_draws, fb_barriers, fb_restarts, fb_layouts;   // feedback loops: draws sampling a written target of
                                                                // their pass, in-pass barriers, pass restarts, layout
                                                                // transitions
+    uint64_t fb_war_barriers;            // in-pass barriers before a write to a target an earlier draw sampled
+    uint64_t ub_updates, ub_pass_breaks; // inline uniform updates, and those that ended an open pass
 } VkExecFrame;
 extern VkExecFrame vk_exec_frame;
 void vk_exec_frame_written(const tex_t *t);                    // vk_texture_gpu_written: t rendered or copied into

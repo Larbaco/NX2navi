@@ -72,13 +72,15 @@ void vk_exec_frame_log(const tex_t *p, uint64_t frame) {
                                   fw[i].h, fw[i].fmt, fw[i].n);
     }
     rt_log("frame %llu: submits %llu passes %llu draws %llu/%llu clears %llu copies %llu dispatches %llu; present %p "
-           "%ux%u/%#x written %d; feedback draws %llu barriers %llu restarts %llu layouts %llu; targets%s",
+           "%ux%u/%#x written %d; feedback draws %llu barriers %llu restarts %llu layouts %llu read-before-write %llu; "
+           "uniform updates %llu (%llu ended a pass); targets%s",
            (unsigned long long)frame, (unsigned long long)f->submits,
            (unsigned long long)f->passes, (unsigned long long)f->draws, (unsigned long long)f->draws_seen,
            (unsigned long long)f->clears, (unsigned long long)f->copies, (unsigned long long)f->dispatches,
            p ? (const void *)p->mem : NULL, p ? p->d.width : 0, p ? p->d.height : 0, p ? (uint32_t)p->d.format : 0,
            hit, (unsigned long long)f->fb_draws, (unsigned long long)f->fb_barriers, (unsigned long long)f->fb_restarts,
-           (unsigned long long)f->fb_layouts, list);
+           (unsigned long long)f->fb_layouts, (unsigned long long)f->fb_war_barriers, (unsigned long long)f->ub_updates,
+           (unsigned long long)f->ub_pass_breaks, list);
     memset(f, 0, sizeof *f);
     nfw = 0;
 }
@@ -600,6 +602,7 @@ void vk_exec_pass_begin(VkExec *ex) {
     barrier_to(ex, want, wasp, nwant);   // passes, clears, copies and dispatches see each other's results
     ex->fbl_mask = fbl;
     ex->fb_dirty = 0;
+    ex->fb_read = 0;
     ex->pass_serial++;
     VkRenderingAttachmentInfo ca[8], da = {0}, sa = {0};
     for (uint32_t i = 0; i < ex->pass_ncolor; i++) {
@@ -731,9 +734,11 @@ static void clear_attachment(VkExec *ex, const VkClearAttachment *a) {
     vk_exec_pass_begin(ex);
     VkClearRect cr = {vk_exec_scissor(ex), 0, ex->pass_layers};
     if (!cr.rect.extent.width || !cr.rect.extent.height) return;
+    uint32_t bit = a->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT ? 1u << a->colorAttachment : 0x100u;
+    vk_exec_feedback_war(ex, bit);   // a draw of this pass sampled it: its reads finish before the clear writes
     vkCmdClearAttachments(ex->cb, 1, a, 1, &cr);
     ex->recorded++;
-    ex->fb_dirty |= a->aspectMask & VK_IMAGE_ASPECT_COLOR_BIT ? 1u << a->colorAttachment : 0x100u;
+    ex->fb_dirty |= bit;
 }
 
 // NX2NAVI_LOG_RCOND=1: clears issued under a render condition (the first 400), run or skipped, with their target.
