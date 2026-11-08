@@ -2198,7 +2198,7 @@ static class AmpereLowering
         }
 
         // I2F: source signed (bit 74) and size (84-85: 8/16/32 bits, its byte or half in 60-61), destination size
-        // (75-76: F16, F32, F64), rounding 78-79. Maxwell I2F: ISrcFmt (size code, +4 signed), ByteSel, DstFmt.
+        // (75-76: F16, F32, F64), rounding 78-79. Maxwell I2F: ISrcFmt (size code in 10-11, signed in bit 13), ByteSel, DstFmt.
         void I2f(uint op)
         {
             const uint known = 1u << 10 | 3u << 11 | 3u << 14 | 3u << 20;
@@ -2207,7 +2207,7 @@ static class AmpereLowering
             if ((w2 & ~known) != 0 || src == 3 || dst == 0 || (op != 0xb06 && (_i.W1 & 0xcfffff00u) != 0)) throw Fail("I2F format");
             int b = op == 0xb06 ? Plain(1, SB) : op == 0xd06 ? Ur(_i.Bits(32, 8)) : Gpr(_i.Bits(32, 8));
             uint bytesel = src == 0 ? sel : src == 1 ? sel * 2 : 0;
-            EmitG(0x5cb8000000000000UL | ((ulong)dst << 8) | ((ulong)(src | (_i.Bit(74) ? 4u : 0u)) << 10) | ((ulong)b << 20)
+            EmitG(0x5cb8000000000000UL | ((ulong)dst << 8) | ((ulong)src << 10) | (_i.Bit(74) ? 1UL << 13 : 0) | ((ulong)b << 20)
                   | ((ulong)bytesel << 41) | ((ulong)_i.Bits(78, 2) << 39) | (uint)Gpr((uint)Dst));
         }
 
