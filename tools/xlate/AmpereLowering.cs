@@ -446,12 +446,14 @@ static class AmpereLowering
                 case 0x234: case 0x434: Hsetp2(); return;
                 case 0x803: case 0x804: PredicateRegister(op == 0x803); return;
                 case 0x59f: Sured(); return;
+                case 0x593: Suatom(); return;
                 case 0x3c4: Redux(); return;
                 case 0x81a: Sgxt(); return;
                 case 0x806: case 0x886: Vote(op == 0x886); return;
                 case 0x3a1: Match(); return;
                 case 0xf8c: AtomsPopcInc(); return;
                 case 0x3a8: case 0x9a8: Atomg(op == 0x9a8); return;
+                case 0x3a9: AtomgCas(); return;
                 case 0x38c: Atoms(); return;
                 case 0x98e: Red(); return;
                 case 0x389: case 0x589: case 0x989: case 0xf89: Shfl(op); return;
@@ -956,14 +958,24 @@ static class AmpereLowering
 
         // ISBERD Rd, [Ra + imm]: a stage buffer read (fields as ISBEWR's, bit 79 clear). Address 0 of region 15 (a mesh
         // program without a task stage, a task program) or of region 7 (a mesh program after a task stage) is the
-        // workgroup's index; region 7 elsewhere is the task payload.
+        // workgroup's index; region 7 elsewhere is the task payload. With bit 79 (.O, nvdisasm SM86 "ISBERD.O.ATTR") it
+        // reads back the program's own output, where ISBEWR writes it: a task program's payload (region 7), a mesh
+        // program's vertex outputs (region 15).
         void Isberd()
         {
             if (_mesh == null) throw Fail("ISBERD outside a task or mesh program");
             uint region = _i.Bits(75, 4), offset = _i.Bits(40, 24);
-            if (_i.Bit(79) || (_i.W2 & ~0x7800u) != 0 || _i.Bits(32, 8) != 0 || _i.Bits(64, 8) != 0 || offset >= 0x10000) throw Fail("ISBERD mode");
+            if ((_i.W2 & ~0xf800u) != 0 || _i.Bits(32, 8) != 0 || _i.Bits(64, 8) != 0 || offset >= 0x10000) throw Fail("ISBERD mode");
             int a = Gpr(_i.Bits(24, 8)), d = Gpr((uint)Dst);
             if (d == RZ) return;
+            if (_i.Bit(79))
+            {
+                int at = _mesh.Stage == 6 && region == 7 ? _mesh.Pay + (int)offset
+                       : _mesh.Stage == 7 && region == 15 ? _mesh.Attr + (int)offset
+                       : throw Fail($"ISBERD.O region {region} in a stage {_mesh.Stage} program");
+                EmitG(0xef48000000000000UL | (uint)d | ((ulong)a << 8) | ((ulong)(uint)at << 20) | (4UL << 48));
+                return;
+            }
             if ((region == 15 || region == 7) && a == RZ && offset == 0)
             {
                 Put(0xf0c8000000000000UL | (0x25UL << 20) | (uint)d, true);   // S2R SR_CTAID.X
@@ -1169,7 +1181,9 @@ static class AmpereLowering
             int ra = (int)_i.Bits(24, 8);
             if (!uniformForm)
             {
-                if (store ? (_i.W2 & ~0xe00u) != 0x0010a100 : (_i.W2 & ~0x2e00u) != 0x001e8100) throw Fail("global access mode");
+                // ordering 77-79 (.CONSTANT, .STRONG.SM, .STRONG.GPU, .PRIVATE; nvdisasm SM86) as plain accesses: loads
+                // any of them, stores .STRONG.SM and .STRONG.GPU
+                if (store ? (_i.W2 & ~0x4e00u) != 0x0010a100 : (_i.W2 & ~0x6e00u) != 0x001e8100) throw Fail("global access mode");
                 if (ra != RZ && ((ra & 1) != 0)) throw Fail("global address pair");
                 return ra == RZ ? RZ : Gpr((uint)ra);
             }
@@ -1177,7 +1191,7 @@ static class AmpereLowering
             bool descriptor = store ? (_i.W2 & ~(0x3fu | 0xe00u)) == 0x0c101100
                                     : (_i.W2 & ~(0x3fu | 0xe00u)) == 0x0c1e1100 || _i.W2 == 0x0c1ebd00;
             uint plain = store ? 0x0810a100u : 0x081e8100u;
-            if (!descriptor && (_i.W2 & ~(0x04000000u | 0x3fu | 0xe00u | (store ? 0u : 0x2000u))) != plain) throw Fail("global access uniform mode");
+            if (!descriptor && (_i.W2 & ~(0x04000000u | 0x3fu | 0xe00u | (store ? 0x4000u : 0x6000u))) != plain) throw Fail("global access uniform mode");
             if (!store && _i.Bits(38, 2) != 0) throw Fail("global access uniform mode");
             if (descriptor)
             {
@@ -1222,18 +1236,21 @@ static class AmpereLowering
         }
 
         // TLD (texel fetch, integer coordinates): fields as TEX; LOD mode 87-89 is 1 (.LZ) or 3 (.LL, the level after
-        // the coordinates), offsets bit 76. Maxwell TLD takes its operands as Maxwell TEX does.
+        // the coordinates), offsets bit 76, multisample bit 78 (.MS, nvdisasm SM86: the sample index after the level and
+        // the offsets, Maxwell TLD's bit 50, the operand order Ryujinx's EmitTex reads). Maxwell TLD takes its operands
+        // as Maxwell TEX does.
         void Tld()
         {
             uint dim = _i.Bits(61, 3), lod = _i.Bits(87, 3), mask = _i.Bits(72, 4);
-            bool offsets = _i.Bit(76);
-            if (dim == 6 || _i.Bits(77, 3) != 0 || _i.Bits(81, 3) != 7 || _i.Bit(59) || lod is not 1 and not 3 || mask == 0)
+            bool offsets = _i.Bit(76), ms = _i.Bit(78);
+            if (dim == 6 || _i.Bit(77) || _i.Bit(79) || _i.Bits(81, 3) != 7 || _i.Bit(59) || lod is not 1 and not 3 || mask == 0
+                || (ms && (dim is not 1 and not 5 || lod != 1)))   // MS: 2D or ARRAY_2D, .LZ only
                 throw Fail("TLD mode");
             uint handle = Handle(false), bank = _i.Bits(54, 5);
             if (handle > 0x1fff) throw Fail("TLD descriptor offset");
             if (!TexBank(bank)) throw Fail($"TLD descriptor bank {bank}");
             int coords = TexCoords[dim];
-            int count = coords + (lod == 3 ? 1 : 0) + (offsets ? 1 : 0);
+            int count = coords + (lod == 3 ? 1 : 0) + (offsets ? 1 : 0) + (ms ? 1 : 0);
             int inA = count <= 4 ? (count + 1) / 2 : 4;
             int ra = (int)_i.Bits(24, 8), rb = (int)_i.Bits(32, 8);
             int Value(int k) => k < inA ? (ra == RZ ? RZ : Gpr((uint)(ra + k))) : (rb == RZ ? RZ : Gpr((uint)(rb + k - inA)));
@@ -1241,9 +1258,10 @@ static class AmpereLowering
             int next = coords, meta = TexMeta;
             if (lod == 3) Mov(meta++, Value(next++), false);
             if (offsets) Mov(meta++, Value(next++), false);
+            if (ms) Mov(meta++, Value(next++), false);
             EmitG(0xdc00000000000000UL | TexOut | ((ulong)TexCoord << 8) | ((ulong)(meta == TexMeta ? RZ : TexMeta) << 20)
                   | ((ulong)TexMaxwellDim[dim] << 28) | ((ulong)mask << 31) | (offsets ? 1UL << 35 : 0) | ((ulong)handle << 36)
-                  | ((ulong)_i.Bits(90, 1) << 49) | (7UL << 51) | (lod == 3 ? 1UL << 55 : 0));
+                  | ((ulong)_i.Bits(90, 1) << 49) | (ms ? 1UL << 50 : 0) | (7UL << 51) | (lod == 3 ? 1UL << 55 : 0));
             TexResults(mask, false);
         }
 
@@ -1349,6 +1367,19 @@ static class AmpereLowering
                   | ((ulong)dim << 33) | ((ulong)handle << 36));
         }
 
+        // SUATOM.D.op U32/S32 (bound descriptor, op 0x593): SURED's fields plus a result register (16-23), S32 at bit 73,
+        // the result predicate 81-83 PT, ordering 77-79 (.STRONG.GPU / .SM) and the dimension 61-63 in Maxwell's surface
+        // numbering (nvdisasm SM86: 0x001ee000 is ADD.STRONG.GPU). Maxwell SUATOM.D (11101010x0, Ryujinx InstSuatom):
+        // Rd 0-7, Ra 8-15, Rb 20-27, op 29-32, dim 33-35, descriptor 36-48, size 51-53.
+        void Suatom()
+        {
+            uint dim = _i.Bits(61, 3), op = _i.Bits(87, 4), handle = Handle(true), bank = _i.Bits(54, 5);
+            if ((_i.W2 & ~((0xfu << 23) | 0x200u | 0x6000u)) != 0x001e8000u || op > 8 || dim > 5 || _i.Bits(59, 2) != 0 || handle > 0x1fff || !TexBank(bank))
+                throw Fail("SUATOM mode");
+            EmitG(0xea00000000000000UL | (uint)Gpr((uint)Dst) | ((ulong)Gpr(_i.Bits(24, 8)) << 8) | ((ulong)Gpr(_i.Bits(32, 8)) << 20)
+                  | ((ulong)op << 29) | ((ulong)dim << 33) | ((ulong)handle << 36) | ((ulong)_i.Bits(73, 1) << 51));
+        }
+
         // REDUX URd, Ra: Ra reduced over the warp's active lanes into a uniform register. Mode (bits 78-80): SUM 3
         // (modulo 2^32), MIN 4, MAX 5 (unsigned, signed with bit 73), OR 1, XOR 2. Lowered as VOTE.ANY (the active-lane
         // mask) and one SHFL.IDX per lane; an inactive lane contributes the operation's identity.
@@ -1420,13 +1451,19 @@ static class AmpereLowering
         // ATOMS.POPC.INC RZ, [Ra + URb + offset] (op 0xf8c, mode word 0x0d000000; the increment of Ocarina's aggregated
         // shared counters after MATCH and REDUX): memory goes up by the number of active lanes. With no result register
         // that is one ATOMS.ADD of 1 per active lane, which is what this emits; a form that wants the per-lane result (its
-        // rank among the active lanes) is not taken.
+        // rank among the active lanes) is not taken. Bits 78-79 scale Ra as LDS/STS's stride does (.X4 .X8 .X16, nvdisasm
+        // SM86: 0x0d00c03f is [R14.X16+URZ]).
         void AtomsPopcInc()
         {
-            uint offset = _i.Bits(40, 24), ur = _i.Bits(64, 6);
-            if ((_i.W2 & ~0x3fu) != 0x0d000000u || _i.Bits(32, 8) != 0 || Dst != RZ || (offset & 3) != 0 || offset >= (1u << 22))
+            uint offset = _i.Bits(40, 24), ur = _i.Bits(64, 6), stride = _i.Bits(78, 2);
+            if ((_i.W2 & ~0xc03fu) != 0x0d000000u || _i.Bits(32, 8) != 0 || Dst != RZ || (offset & 3) != 0 || offset >= (1u << 22))
                 throw Fail("ATOMS.POPC.INC mode");
             int addr = Gpr(_i.Bits(24, 8));
+            if (stride != 0 && addr != RZ)
+            {
+                Emit(Unguarded(0x3848000000000000UL | ((ulong)(stride + 1) << 20) | ((ulong)addr << 8) | SA));   // SHL imm
+                addr = SA;
+            }
             if (ur != 0x3f)
             {
                 Iadd3(SA, addr, Ur(ur), RZ, false);
@@ -1475,6 +1512,19 @@ static class AmpereLowering
             if (operation > 8 || offset < -0x80000 || offset > 0x7ffff) throw Fail("ATOMG operation/offset");
             EmitG(0xed00000000000000UL | (uint)Gpr((uint)Dst) | ((ulong)addr << 8) | ((ulong)Gpr(_i.Bits(32, 8)) << 20)
                   | ((ulong)((uint)offset & 0xfffff) << 28) | (1UL << 48) | ((ulong)operation << 52));
+        }
+
+        // ATOMG.E.CAS.STRONG.GPU Pu, Rd, [Ra.64 + offset], Rb (compare), Rc (swap) (op 0x3a9, nvdisasm SM86: mode word
+        // 0x001ee100 with Rc in 64-71). Maxwell ATOM.E.CAS (111011101111) takes the swap value in Rb+1, so the two go
+        // through the scratch pair SA:SB. Ryujinx's front end had no AtomCas (patch 0036 adds it); the rest of the
+        // translator lowered a global compare-and-swap already.
+        void AtomgCas()
+        {
+            int offset = (int)(_i.Bits(40, 24) << 8) >> 8;
+            if ((_i.W2 & ~(0xffu | 0x6000u)) != 0x001e8100u || offset != 0 || (_i.Bits(24, 8) & 1) != 0) throw Fail("ATOMG.CAS mode");
+            Mov(SA, Gpr(_i.Bits(32, 8)), false);
+            Mov(SB, Gpr(_i.Bits(64, 8)), false);
+            EmitG(0xeef0000000000000UL | (uint)Gpr((uint)Dst) | ((ulong)Gpr(_i.Bits(24, 8)) << 8) | ((ulong)SA << 20) | (1UL << 48));
         }
 
         // RED.E (global reduction, no result): op 87-89 (ADD MIN MAX INC DEC AND OR XOR), type 73-75 (U32, S32, F32 add),
