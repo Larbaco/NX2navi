@@ -3,6 +3,11 @@
 // picture's white, "paper white") and NX2NAVI_HDR_UI_NITS (the HUD's and this menu's white), the three read when the
 // settings change. With NX2NAVI_HDR=0 nothing here runs and the present is what it was.
 //
+// A display without an HDR10 surface format gets the same: vk_hdr_surface_format switches the setting off for the run
+// (vk_hdr_off) when the first swapchain finds none. rt_boot (boot.c) makes that first swapchain before the shader
+// prewarm, so no shader is swapped (vk_hdr_shader_swap) for an output that does not exist. A window moved to another
+// monitor later keeps the first answer: the swapped shaders are in the pipelines by then.
+//
 // The game's picture (docs/architecture.md, "HDR"). The game tonemaps its scene into an r11g11b10f target, upscales it
 // and draws the HUD into a second one (float, nothing in these passes clamps), and one last draw copies that into the
 // 8-bit sRGB window texture it presents. So:
@@ -61,6 +66,10 @@ int vk_hdr_native(void) {
 }
 
 void vk_hdr_off(void) { g_wanted = 0; }
+
+// Set when vk_hdr_surface_format turned the setting off because the display has no HDR10 format (the menu says so).
+static int g_no_display;
+int vk_hdr_no_display(void) { return g_no_display; }
 
 // The three nits, read again when the settings change. The replay (every draw's support buffer) and the present
 // thread read them: an update fills the snapshot not in use and then publishes it.
@@ -497,8 +506,8 @@ void vk_hdr_image_gone(VkImage image) {   // a texture image went away: forget i
 
 // ---- swapchain
 
-// With NX2NAVI_HDR=1, the HDR10 format among the surface's (10-bit UNORM, ST 2084): 1 with *out set, else 0 and the
-// reason logged once.
+// With NX2NAVI_HDR=1, the HDR10 format among the surface's (10-bit UNORM, ST 2084): 1 with *out set, else 0. The first
+// call decides for the run: with no such format the setting goes off here (vk_hdr_off), the reason logged once.
 int vk_hdr_surface_format(const VkSurfaceFormatKHR *f, uint32_t n, VkSurfaceFormatKHR *out) {
     if (!vk_hdr_wanted()) return 0;
     static int logged;
@@ -518,9 +527,13 @@ int vk_hdr_surface_format(const VkSurfaceFormatKHR *f, uint32_t n, VkSurfaceForm
                 logged = 1;
                 return 1;
             }
-    if (!logged)
-        rt_log("hdr: the display offers no HDR10 format, so the picture stays SDR (Windows: turn on \"Use HDR\" in the "
-               "display settings; Linux: a Wayland compositor with colour management and HDR on)");
+    if (!logged) {
+        rt_log("hdr: the display offers no HDR10 format, so Enhanced HDR is off for this run and the picture is SDR as "
+               "with HDR = 0 (Windows: turn on \"Use HDR\" in the display settings; Linux: a Wayland compositor with "
+               "colour management and HDR on)");
+        g_no_display = 1;
+        vk_hdr_off();   // the tonemap swap, the support buffer and the native-HDR report all read vk_hdr_wanted
+    }
     logged = 1;
     return 0;
 }

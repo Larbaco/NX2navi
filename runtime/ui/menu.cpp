@@ -61,6 +61,7 @@ int res_adjustable(void);
 int wide_available(void);
 const char *const *vk_color_preset(const char *name);
 int vk_hdr_wanted(void);
+int vk_hdr_no_display(void);
 int vk_hdr_active(void);
 double frame_step_limit_hz(void);
 int frame_limit_adjustable(void);
@@ -838,7 +839,7 @@ static void row_upscaling(void) {
 // Windows' HDR switch is off, vk_hdr_surface_format); else the restart note.
 static const char *hdr_note(void) {
     const char *restart = menu_text(UI_MENU_HDR_NOTE);
-    if (!vk_hdr_wanted() || vk_hdr_active() || !*gfx_window_present_mode() || !cfg_bool("NX2NAVI_HDR")) return restart;
+    if (!(vk_hdr_wanted() || vk_hdr_no_display()) || vk_hdr_active() || !*gfx_window_present_mode() || !cfg_bool("NX2NAVI_HDR")) return restart;
     static char note[96];
     snprintf(note, sizeof note, menu_text(UI_MENU_PRESENT_IN_USE), menu_text(UI_MENU_FRAMEGEN_OFF));
     return note;

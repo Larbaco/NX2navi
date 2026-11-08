@@ -392,6 +392,11 @@ static void boot_wait(PlatThread *warm, uint64_t cap_ms) {
 void rt_boot(void) {
     check_npdm();
     if (!rt_config()->shot) vk_pipeline_async_enable();   // a --shot image must not depend on build timing
+    // NX2NAVI_HDR needs to know whether the display has an HDR10 format before any shader is translated: the first
+    // swapchain decides (vk_hdr_surface_format) and the prewarm swaps the tonemap for the answer. gfx_window_start makes
+    // that swapchain now, the same one the boot screen or the first frame would make later.
+    const char *gpu = rt_config()->gpu;
+    if (vk_hdr_wanted() && !(gpu && !strcmp(gpu, "null"))) gfx_window_start();
     // Shaders and pipelines recorded in earlier runs are made ready while the modules load; the guest waits for them.
     PlatThread *warm = plat_thread_new(prewarm_main, NULL, "prewarm");
     ldr_load(rt_config()->exefs);
