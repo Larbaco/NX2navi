@@ -158,6 +158,7 @@ def start_game(exe):
 
 
 def start_detached(cmd, cwd=None):
+    """Start cmd, an argument list or on Windows a whole command line, and do not wait for it."""
     flags = {'creationflags': DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP} if os.name == 'nt' \
         else {'start_new_session': True}
     subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -212,7 +213,11 @@ def uninstall(layout, remove_game='', log=print):
         if layout.toolchain.parent != layout.root:
             targets.append(str(layout.toolchain.parent))
         script = 'ping -n 3 127.0.0.1 >nul & ' + ' & '.join(f'rmdir /s /q "{t}"' for t in targets)
-        start_detached(['cmd.exe', '/c', script], cwd=os.environ.get('TEMP', 'C:\\'))
+        # One command line written here, not an argument list: subprocess would pass the script as one quoted
+        # argument with its inner quotes escaped as \", which cmd.exe does not read, so every rmdir got a broken path
+        # and nothing was removed. /s makes cmd.exe drop only the outer pair of quotes and run the rest as written;
+        # /d skips the AutoRun commands of the registry.
+        start_detached(f'cmd.exe /d /s /c "{script}"', cwd=os.environ.get('TEMP', 'C:\\'))
     else:
         log('uninstall: remove these folders yourself: ' + ', '.join([str(layout.root), str(remove_game)]))
 
