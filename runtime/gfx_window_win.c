@@ -31,7 +31,7 @@ static HWND g_hwnd;
 static PlatEvent g_wnd_ready;   // manual-reset: the window thread made the window or gave up
 static int g_wnd_failed;
 static int g_background;                   // NX2NAVI_BACKGROUND_WINDOW: the window stays behind the user's windows
-static int g_fs_pending;                   // window thread: NX2NAVI_FULLSCREEN waits for the first activation
+static int g_fs_pending;                   // window thread: NX2NAVI_FULLSCREEN did not apply before the first show; retried at the first activation
 static volatile int32_t g_dpi = USER_DEFAULT_SCREEN_DPI;   // the window's DPI, set by the window thread
 
 HWND gfx_window_handle(void) { return g_hwnd; }
@@ -51,7 +51,7 @@ int gfx_window_vk_presentable(VkInstance inst, VkPhysicalDevice pd, uint32_t fam
 // ---- window thread
 #define WND_STYLE WS_OVERLAPPEDWINDOW
 #define WM_APP_SETTINGS (WM_APP + 1)
-#define WM_APP_FULLSCREEN (WM_APP + 2)   // the fullscreen setting, held back until the window is first activated
+#define WM_APP_FULLSCREEN (WM_APP + 2)   // the fullscreen setting, retried at the first activation
 
 static WINDOWPLACEMENT g_saved_place = {sizeof g_saved_place};   // the window behind fullscreen (window thread)
 
@@ -107,6 +107,17 @@ static void toggle_fullscreen(HWND h) {
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED |
                          (g_background ? SWP_NOACTIVATE : 0));
     }
+}
+
+// Window thread, before the window is first shown: gives it the outer size ow x oh (the windowed size F11 returns to)
+// and then makes it fullscreen on the monitor it was created on, so the first thing on screen is the fullscreen window.
+// toggle_fullscreen saves the placement of a window that was never visible, which is its normal rectangle as just set.
+// The window stays hidden here; the caller shows it. Returns whether the window is fullscreen now.
+static int fullscreen_before_show(HWND h, int ow, int oh) {
+    SetWindowPos(h, NULL, 0, 0, ow, oh, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    toggle_fullscreen(h);
+    g_saved_place.showCmd = SW_SHOWNORMAL;   // a hidden window may report SW_HIDE, which F11 would restore as hidden
+    return is_fullscreen(h);
 }
 
 // The window size and fullscreen state last taken from the settings (window thread). apply_settings acts on a change of
@@ -613,7 +624,9 @@ static void window_main(void *arg) {
     // The window opens behind the user's windows first and is then raised (raise_window): a game started by a frontend
     // has no other way to reach it. The game counts itself in focus until the first WM_ACTIVATEAPP, so loading goes on,
     // and keyboard input waits for the foreground (input_win.c). If Windows still refuses the foreground, the taskbar
-    // button flashes, and NX2NAVI_FULLSCREEN waits for the first activation.
+    // button flashes. With NX2NAVI_FULLSCREEN the window is made fullscreen on the monitor it was created on before it
+    // is first shown (fullscreen_before_show), so no framed window appears; the windowed rectangle stays in g_saved_place
+    // for F11. If that fails, g_fs_pending retries at the first activation (wnd_proc, WM_ACTIVATEAPP).
     // NX2NAVI_BACKGROUND_WINDOW=1 (test runs): no flashing, never fullscreen at start, and F11 keeps the window's place.
     int background = g_background = cfg_get("NX2NAVI_BACKGROUND_WINDOW") && atoi(cfg_get("NX2NAVI_BACKGROUND_WINDOW"));
     g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"NX2navi", WND_STYLE, x, y, ow, oh, NULL, NULL,
@@ -636,14 +649,19 @@ static void window_main(void *arg) {
         outer_size(g_hwnd, cw, ch, &nw, &nh);
         if (on_mon && (nw != ow || nh != oh)) center_in(&mon.work, nw, nh, &nx, &ny);
         else flags |= SWP_NOMOVE;
-        SetWindowPos(g_hwnd, HWND_BOTTOM, nx, ny, nw, nh, flags);
+        int fs = !background && cfg_fullscreen();
+        if (fs) {   // the hidden window gets its windowed rectangle first: fullscreen_before_show saves it for F11
+            SetWindowPos(g_hwnd, NULL, nx, ny, nw, nh, (flags & SWP_NOMOVE) | SWP_NOZORDER | SWP_NOACTIVATE);
+            fs = fullscreen_before_show(g_hwnd, nw, nh);
+        }
+        SetWindowPos(g_hwnd, HWND_BOTTOM, nx, ny, nw, nh, flags | (fs ? SWP_NOMOVE | SWP_NOSIZE : 0));
         if (on_mon && MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST) != mon.h)
             rt_log("gfx: the window is not on the chosen monitor; F11 fullscreen covers the monitor it is on");
         if (!background) {
             raise_window(g_hwnd);   // a frontend's player may have no way to reach a window left behind
             FLASHWINFO fw = {.cbSize = sizeof fw, .hwnd = g_hwnd, .dwFlags = FLASHW_TRAY | FLASHW_TIMERNOFG};
             FlashWindowEx(&fw);
-            g_fs_pending = cfg_fullscreen();
+            g_fs_pending = cfg_fullscreen() && !fs;
         }
         note_applied();
         refresh_rate_update(g_hwnd, 1);
