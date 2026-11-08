@@ -17,6 +17,9 @@
 #include "input.h"
 #include "input_map.h"
 #include "input_wsys.h"
+#ifdef _WIN32
+#include "input_ds3.h"
+#endif
 #include "nvn_api.h"
 #include "ui/menu.h"
 #include "vk.h"
@@ -685,11 +688,42 @@ static int xinput_read(uint8_t pd[PAD_COUNT], int32_t *raw) {
 }
 #endif
 
+#ifdef _WIN32
+// 1 when the DualShock 3 reader (input_ds3_win.c) has input beyond rest: a button down or a stick past half way.
+static int ds3_pressed(const uint8_t pd[PAD_COUNT], const int32_t raw[4]) {
+    for (int p = PAD_SOUTH; p < PAD_COUNT; p++)
+        if (pd[p]) return 1;
+    for (int i = 0; i < 4; i++)
+        if (abs(raw[i]) > PAD_USED) return 1;
+    return 0;
+}
+
+// Under lock: the DualShock 3 reader's inputs when it is the controller the game follows, else 0. Next to an SDL
+// gamepad the one pressed last is followed, as between two SDL gamepads (pad_follow); the same DualShock 3 that a driver
+// also presents to SDL is two sources of one device, and either one gives the same presses.
+static int ds3_primary(uint8_t pd[PAD_COUNT], int32_t raw[4], int sdl_pad) {
+    if (!ds3_read(pd, raw)) return 0;
+    if (!sdl_pad) return 1;
+    static int follow = 1;
+    if (ds3_pressed(pd, raw)) follow = 1;
+    else if (pad_active(pad)) follow = 0;
+    return follow;
+}
+#endif
+
 static int pad_read(uint64_t *b, int32_t sl[2], int32_t sr[2]) {
     uint8_t pd[PAD_COUNT] = {0};
 #ifdef _WIN32
-    if (!pad_physical(pd)) {
-        int32_t raw[4];
+    int sdl = pad_physical(pd);
+    uint8_t dd[PAD_COUNT] = {0};
+    int32_t raw[4];
+    if (ds3_primary(dd, raw, sdl)) {
+        *b |= input_map_pad_buttons(dd, pad_layout_get());
+        input_pad_stick(raw[0], raw[1], stick_dead_get(0), sl);
+        input_pad_stick(raw[2], raw[3], stick_dead_get(1), sr);
+        return 1;
+    }
+    if (!sdl) {
         if (!xinput_read(pd, raw)) return 0;
         *b |= input_map_pad_buttons(pd, pad_layout_get());
         input_pad_stick(raw[0], raw[1], stick_dead_get(0), sl);
@@ -709,6 +743,15 @@ int input_pad_stick_percent(double pct[2]) {
     int ok = 0;
     pct[0] = pct[1] = 0;
     plat_mutex_lock(&lock);
+#ifdef _WIN32
+    uint8_t dd[PAD_COUNT];
+    int32_t raw[4];
+    if (state == 1 && ds3_primary(dd, raw, pad && SDL_GamepadConnected(pad))) {
+        pct[0] = input_stick_percent(raw[0], raw[1]);
+        pct[1] = input_stick_percent(raw[2], raw[3]);
+        ok = 1;
+    } else
+#endif
     if (state == 1 && pad && SDL_GamepadConnected(pad)) {   // the game's poll keeps the state fresh (SDL_UpdateGamepads)
         pct[0] = input_stick_percent(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX),
                                      SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY));
@@ -897,6 +940,14 @@ int input_capture(int reset, int *id) {
     plat_mutex_lock(&lock);
     if (!state) start();
     if (state == 1) pad_physical(p);
+#ifdef _WIN32
+    if (state == 1) {   // a DualShock 3 the reader has: its presses can be bound too
+        uint8_t dd[PAD_COUNT];
+        int32_t raw[4];
+        if (ds3_read(dd, raw))
+            for (int i = 1; i < PAD_COUNT; i++) p[i] |= dd[i];
+    }
+#endif
     plat_mutex_unlock(&lock);
     int got = INPUT_CAPTURE_NONE;
     if (!reset) {
@@ -926,6 +977,9 @@ int input_rumble(uint16_t low, uint16_t high, uint32_t ms) {
         ok = SDL_RumbleGamepad(pad, low, high, ms);
         if (triggers) SDL_RumbleGamepadTriggers(pad, high, high, ms);   // unsupported pads return false: ignored
     }
+#ifdef _WIN32
+    if (state == 1 && ds3_rumble(low, high, ms)) ok = 1;   // no-op unless the DualShock 3 reader has a controller
+#endif
     plat_mutex_unlock(&lock);
     return ok;
 }

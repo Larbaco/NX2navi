@@ -8,7 +8,7 @@ disables both (automated runs). `NX2NAVI_*` settings can also be set in `nx2navi
 `motion = 0`, `rumble = 0`); the environment overrides the file. `NX2NAVI_RUMBLE_STRENGTH` is the rumble strength in
 percent (0 to 300, default 130; 0 is the same as `rumble = 0`). `NX2NAVI_RUMBLE_CURVE` is the exponent applied to the
 amplitude before the strength (0.2 to 1.5, default 0.6; lower makes weak pulses stronger, 1 is linear).
-`NX2NAVI_RUMBLE_TRIGGERS=1` also drives the impulse triggers of an Xbox pad.
+`NX2NAVI_RUMBLE_TRIGGERS=1` also drives the impulse triggers of an Xbox pad. `NX2NAVI_DS3=0` turns off the direct reader for a DualShock 3 (see PlayStation 3 controllers).
 
 `NX2NAVI_PAD_LAYOUT` (`pad_layout`, the *Button layout* row on the Controls tab, live) picks which face button is Switch A:
 
@@ -113,6 +113,21 @@ The stick direction bits (`StickLLeft` to `StickRDown`) are derived from the sti
 ## Nintendo Switch 2 controllers
 
 Windows does not present the Switch 2 Pro Controller as a gamepad SDL can open (the log says `input: no gamepad`), so it needs a bridge program that wakes it and creates a virtual gamepad, for example one that emulates a DualSense: that gives buttons, rumble, gyro and accelerometer. The log then shows `input: gamepad "DualSense Wireless Controller" ... (rumble, gyro and accelerometer, ...)` and `input: motion sensors on`. Bridges that output a DualShock 4 whose gyro and accelerometer never change give buttons and rumble but no motion. Run one bridge at a time; Steam Input can also claim the controller, so close Steam if the bridge does not find it. With several virtual and real gamepads connected the game follows whichever one is pressed.
+
+## PlayStation 3 controllers
+
+A DualShock 3 on Windows is read directly (`runtime/input_ds3_win.c`) when no driver presents it to SDL or XInput as a gamepad. Plug it in by USB, or pair it with a Bluetooth driver that exposes it as a HID device with its own name, "PLAYSTATION(R)3 Controller"; the log then shows `input: DualShock 3 opened`, the controller's first player light turns on and `input: DualShock 3 is reporting` follows. The reader sends the controller the command that makes it start reporting, which it does not do on its own. It looks for a controller every three seconds while none is open, so one plugged in or switched on later is found without a restart.
+
+| Switch | DualShock 3 by position |
+|---|---|
+| A, B, X, Y | circle, cross, triangle, square (east, south, north, west: the button layout setting applies as for any pad) |
+| ZL, ZR | L2, R2 (over 50% pressure) |
+| L, R | L1, R1 |
+| Left, right stick click | L3, R3 |
+| Plus, Minus | Start, Select |
+| D-pad | D-pad |
+
+The PS button is not used. The Controls tab binds and remaps its buttons like any other pad's, with the same pad names. Vibration works through the strength, curve and *Vibration* settings: the controller's light motor can only be on or off, so it comes on from a sixteenth of the amplitude the game asks of it. The accelerometer and the single gyro axis are not used: the game's motion controls need all three gyro axes, so a DualShock 3 gives no motion. `NX2NAVI_DS3=0` (`ds3 = 0` in `nx2navi.ini`, live) turns the reader off. A controller that a driver presents in a generic gamepad mode, with another name or report layout, is not recognised by the reader and goes through SDL or XInput instead, as before.
 
 ## Scripted input
 

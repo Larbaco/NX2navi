@@ -289,6 +289,10 @@
 # rumble_strength = 130
 # rumble_curve = 0.6
 # rumble_triggers = 0
+# PlayStation 3 controller (DualShock 3), Windows: 1 reads its buttons, sticks and rumble directly from the controller
+# when no driver presents it to the game as a gamepad; 0 leaves it to SDL and XInput. Changes while the game runs take
+# effect at once.
+# ds3 = 1
 # Which gamepad button is Switch A: nintendo (the default: the Switch's buttons by position on any pad, east A,
 # south B, west Y, north X), xbox (south A, east B, west X, north Y, as an Xbox pad labels them; cross A on a
 # PlayStation pad) or auto (nintendo for a pad with Nintendo labels, xbox for the others). The bind_ lines below apply
