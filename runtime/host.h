@@ -330,6 +330,7 @@ void rt_boot(void);                                        // boot.c
 // Modes of nx2navi.exe. main.c has run mem_init and parsed the paths; each mode calls ldr_load itself if it needs the
 // modules, registers its host functions, then seals (hostfn_seal, or implicitly at the first rt_call). Return the
 // process exit code.
+int list_audio_devices(void);                              // audio_mixer.c: --list-audio-devices (SDL3 on every window back end)
 int probe_cfg(void);                                       // cfg_probe.c
 int probe_dpi(void);                                       // dpi_probe_win.c (Windows only)
 int probe_mods(void);                                      // mods_probe.c

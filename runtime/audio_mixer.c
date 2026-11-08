@@ -9,7 +9,7 @@
 // with NX2NAVI_AUDIO_CHANNELS, output_channels) into a single-producer single-consumer ring. The SDL audio thread drains
 // that ring without taking any lock: an empty ring
 // plays silence and never blocks the render thread or the guest. NX2NAVI_AUDIO=none (or NX2NAVI_AUDIO_OFF) mixes without a
-// device; NX2NAVI_AUDIO_PREFILL_MS (0..500, default 20, 60 on Linux) is the queued audio the output waits for after start or underrun.
+// device; NX2NAVI_AUDIO_DEVICE picks the playback device (resolve_audio_device); NX2NAVI_AUDIO_PREFILL_MS (0..500, default 20, 60 on Linux) is the queued audio the output waits for after start or underrun.
 // The device's clock paces the render thread, as the audio hardware paces the Switch's DSP (audio_mixer_pace_ns): a
 // frame is rendered when the ring holds less than the output target, max(prefill, two device periods), so the queue and
 // the delay from the game to the speakers stay there and the host and device clocks cannot drift apart.
@@ -54,6 +54,9 @@ typedef struct Mixer {
     int *offset;                                   // first mix buffer of each mix id
     SplitInfo *split; int nsplit; SplitDest *dest; int ndest;
     SDL_AudioStream *stream; int device_ok, rate;
+    SDL_AudioDeviceID device;                      // the explicitly chosen device, 0 while the system default is open
+    char device_name[128];                         // its name, for the log when it goes away
+    uint64_t watch_ns;                             // render thread: when device_check last looked
     int channels;                                  // output channels, 2 or 6 (output_channels)
     float ring[RING_FRAMES * OUT_MAX];
     _Atomic uint64_t wr, rd, underruns, overruns, missing_frames, callback_frames, callback_nonzero, skipped_frames;
@@ -109,8 +112,116 @@ static int prefill_blocks_for(const char *e) {
     return (int)ceil(ms / 5.0);
 }
 
+// ---- playback device choice (NX2NAVI_AUDIO_DEVICE)
+// SDL's playback device ids sorted by name (ties by id), the order --list-audio-devices prints them and the numbering of
+// the index form. SDL's own order is not stable: it differed between two enumerations in one process, so an index into it
+// would pick another device from one start to the next. Free the result with SDL_free. SDL audio must be initialised.
+// *count is 0 when SDL reports none.
+static int device_order(const void *x, const void *y) {
+    SDL_AudioDeviceID a = *(const SDL_AudioDeviceID *)x, b = *(const SDL_AudioDeviceID *)y;
+    const char *na = SDL_GetAudioDeviceName(a), *nb = SDL_GetAudioDeviceName(b);
+    int c = SDL_strcasecmp(na ? na : "", nb ? nb : "");
+    return c ? c : a < b ? -1 : a > b;
+}
+static SDL_AudioDeviceID *playback_devices(int *count) {
+    SDL_AudioDeviceID *ids = SDL_GetAudioPlaybackDevices(count);
+    if (!ids) *count = 0;
+    else qsort(ids, (size_t)*count, sizeof *ids, device_order);
+    return ids;
+}
+
+// One line describing device `id` ("name, 2 ch, 48000 Hz"), without a leading index.
+static void describe_device(char *buf, size_t n, SDL_AudioDeviceID id) {
+    SDL_AudioSpec spec = {0};
+    const char *name = SDL_GetAudioDeviceName(id);
+    if (SDL_GetAudioDeviceFormat(id, &spec, NULL)) snprintf(buf, n, "%s, %d ch, %d Hz", name ? name : "?", spec.channels, spec.freq);
+    else snprintf(buf, n, "%s", name ? name : "?");
+}
+
+static void log_playback_devices(void) {
+    int count;
+    SDL_AudioDeviceID *ids = playback_devices(&count);
+    if (!count) rt_log("audio: SDL reports no playback devices");
+    for (int i = 0; i < count; i++) {
+        char line[256];
+        describe_device(line, sizeof line, ids[i]);
+        rt_log("audio:   %d: %s", i + 1, line);
+    }
+    SDL_free(ids);
+}
+
+// NX2NAVI_AUDIO_DEVICE `want` to the SDL device to open, with `how` saying which rule decided. default (or empty) gives
+// SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, which SDL keeps pointed at the system default when Windows changes it. An all-digit
+// value is a 1-based index into playback_devices; any other text is a case-insensitive substring of SDL_GetAudioDeviceName,
+// and the first device in list order that contains it wins. A value that matches nothing also gives the default device
+// (the game is never silent because of this setting); `say` then logs the playback devices. SDL audio must be initialised.
+static SDL_AudioDeviceID resolve_audio_device(const char *want, char *how, size_t how_n, int say) {
+    if (!want || !*want || !SDL_strcasecmp(want, "default")) {
+        snprintf(how, how_n, "NX2NAVI_AUDIO_DEVICE=default: the system default playback device");
+        return SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK;
+    }
+    int count, matches = 0;
+    SDL_AudioDeviceID *ids = playback_devices(&count), pick = 0;
+    if (want[strspn(want, "0123456789")] == 0) {
+        long index = strtol(want, NULL, 10);   // more digits than a long holds: out of range either way
+        if (index >= 1 && index <= count) {
+            pick = ids[index - 1];
+            snprintf(how, how_n, "NX2NAVI_AUDIO_DEVICE=%s: index %ld in the device list", want, index);
+        } else {
+            snprintf(how, how_n, "NX2NAVI_AUDIO_DEVICE=%s: no device has that index (%d playback devices), using the system "
+                                 "default", want, count);
+        }
+    } else {
+        for (int i = 0; i < count; i++) {
+            const char *name = SDL_GetAudioDeviceName(ids[i]);
+            if (!name || !SDL_strcasestr(name, want)) continue;
+            if (!pick) pick = ids[i];
+            matches++;
+        }
+        if (pick)
+            snprintf(how, how_n, "NX2NAVI_AUDIO_DEVICE=%s: the first of %d device name%s containing it", want, matches,
+                     matches == 1 ? "" : "s");
+        else
+            snprintf(how, how_n, "NX2NAVI_AUDIO_DEVICE=%s: no device name contains it, using the system default", want);
+    }
+    SDL_free(ids);
+    if (!pick && say) {
+        rt_log("audio: %s; playback devices:", how);
+        log_playback_devices();
+    }
+    return pick ? pick : SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK;
+}
+
+// --list-audio-devices (main.c): each playback device with its index, name, channels and frequency, the one the system
+// default points at, then what NX2NAVI_AUDIO_DEVICE would pick. Needs no game files. Returns the exit code.
+int list_audio_devices(void) {
+    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+        fprintf(stderr, "SDL audio init failed: %s\n", SDL_GetError());
+        return 1;
+    }
+    int count;
+    SDL_AudioDeviceID *ids = playback_devices(&count);
+    const char *def = SDL_GetAudioDeviceName(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK);
+    char defname[128] = "";
+    if (def) snprintf(defname, sizeof defname, "%s", def);
+    if (!count) printf("no playback devices\n");
+    for (int i = 0; i < count; i++) {
+        char line[256];
+        const char *name = SDL_GetAudioDeviceName(ids[i]);
+        describe_device(line, sizeof line, ids[i]);
+        printf("%d: %s%s\n", i + 1, line, *defname && name && !strcmp(name, defname) ? "  (default)" : "");
+    }
+    SDL_free(ids);
+    char how[256];
+    SDL_AudioDeviceID id = resolve_audio_device(cfg_value("NX2NAVI_AUDIO_DEVICE"), how, sizeof how, 0);
+    const char *name = SDL_GetAudioDeviceName(id);
+    printf("%s -> '%s'\n", how, name ? name : "?");
+    SDL_QuitSubSystem(SDL_INIT_AUDIO);
+    return 0;
+}
+
 // NX2NAVI_AUDIO_CHANNELS: the output channels of this run, decided once. stereo gives 2; 5.1 gives 6 (FL FR C LFE RL RR,
-// the device sink's order and SDL's); auto gives 6 when the default playback device has at least six channels (a 5.1
+// the device sink's order and SDL's); auto gives 6 when the chosen playback device (NX2NAVI_AUDIO_DEVICE; the system default unless set) has at least six channels (a 5.1
 // or 7.1 speaker setup in Windows; SDL places 5.1 on 7.1) and 2 otherwise. IAudioDevice reports the same count to the
 // game (GetActiveChannelCount), which picks its sink layout from it. NX2NAVI_AUDIO=none: 2, without touching SDL.
 static int output_channels(void) {
@@ -123,9 +234,14 @@ static int output_channels(void) {
     else if (!strcmp(want, "stereo")) n = 2;
     else {
         SDL_AudioSpec dev = {0};
-        n = SDL_InitSubSystem(SDL_INIT_AUDIO) && SDL_GetAudioDeviceFormat(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &dev, NULL) &&
-            dev.channels >= 6 ? 6 : 2;
-        rt_log("audio: NX2NAVI_AUDIO_CHANNELS=auto: the default device has %d channels, output %s", dev.channels,
+        char how[256];
+        n = 2;
+        if (SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+            // The choice output_open makes again (only that one logs the playback devices when nothing matches).
+            SDL_AudioDeviceID id = resolve_audio_device(cfg_value("NX2NAVI_AUDIO_DEVICE"), how, sizeof how, 0);
+            if (SDL_GetAudioDeviceFormat(id, &dev, NULL) && dev.channels >= 6) n = 6;
+        }
+        rt_log("audio: NX2NAVI_AUDIO_CHANNELS=auto: the chosen device has %d channels, output %s", dev.channels,
                n == 6 ? "5.1" : "stereo");
     }
     int expected = 0;
@@ -209,6 +325,25 @@ static void SDLCALL sdl_pull(void *user, SDL_AudioStream *stream, int additional
     }
 }
 
+static void output_timing(Mixer *m, int rate);
+
+// Opens an SDL stream on `dev` and starts it. Returns 0 with the reason in `err` otherwise (no stream is left behind).
+static int stream_open(Mixer *m, int rate, SDL_AudioDeviceID dev, char *err, size_t err_n) {
+    SDL_AudioSpec spec = {SDL_AUDIO_F32, m->channels, rate};
+    m->stream = SDL_OpenAudioDeviceStream(dev, &spec, sdl_pull, m);
+    if (!m->stream) {
+        snprintf(err, err_n, "opening the device failed: %s", SDL_GetError());
+        return 0;
+    }
+    if (!SDL_ResumeAudioStreamDevice(m->stream)) {
+        snprintf(err, err_n, "starting the output failed: %s", SDL_GetError());
+        SDL_DestroyAudioStream(m->stream);
+        m->stream = NULL;
+        return 0;
+    }
+    return 1;
+}
+
 static void output_open(Mixer *m, int rate) {
     const char *mode = cfg_get("NX2NAVI_AUDIO");
     if ((mode && !strcmp(mode, "none")) || cfg_get("NX2NAVI_AUDIO_OFF")) {
@@ -219,19 +354,31 @@ static void output_open(Mixer *m, int rate) {
         rt_log("audio: SDL audio init failed (%s): mixing without sound", SDL_GetError());
         return;
     }
-    SDL_AudioSpec spec = {SDL_AUDIO_F32, m->channels, rate};
-    m->stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, sdl_pull, m);
-    if (!m->stream) {
-        rt_log("audio: no output device (%s): mixing without sound", SDL_GetError());
-        return;
+    char how[256], err[256];
+    SDL_AudioDeviceID dev = resolve_audio_device(cfg_value("NX2NAVI_AUDIO_DEVICE"), how, sizeof how, 1);
+    const char *chosen = dev == SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK ? NULL : SDL_GetAudioDeviceName(dev);
+    if (chosen) snprintf(m->device_name, sizeof m->device_name, "%s", chosen);
+    int ok = stream_open(m, rate, dev, err, sizeof err);
+    if (!ok && chosen) {   // the chosen device would not open: the default device, so the game still has sound
+        rt_log("audio: %s: '%s' %s; using the system default, playback devices:", how, m->device_name, err);
+        log_playback_devices();
+        dev = SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK;
+        m->device_name[0] = 0;
+        ok = stream_open(m, rate, dev, err, sizeof err);
+    } else {
+        rt_log("audio: %s", how);
     }
-    if (!SDL_ResumeAudioStreamDevice(m->stream)) {
-        rt_log("audio: starting the output failed (%s): mixing without sound", SDL_GetError());
-        SDL_DestroyAudioStream(m->stream);
-        m->stream = NULL;
+    if (!ok) {
+        rt_log("audio: no output device (%s): mixing without sound", err);
         return;
     }
     m->device_ok = 1;
+    m->device = dev == SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK ? 0 : dev;
+    output_timing(m, rate);
+}
+
+// After stream_open: the device's period, the output target that follows from it, and the stall limit. Logs the device.
+static void output_timing(Mixer *m, int rate) {
     SDL_AudioSpec dev = {0};
     int period = 0;
     if (!SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(m->stream), &dev, &period) || period <= 0) period = m->frame;
@@ -246,11 +393,40 @@ static void output_open(Mixer *m, int rate) {
            dev.channels, m->prefill * 5, period, m->target * 1000.0 / rate);
 }
 
+// Render thread, from audio_mixer_pace_ns while the device takes nothing. An explicitly chosen device (NX2NAVI_AUDIO_DEVICE)
+// can disappear (a virtual sink removed, a USB headset unplugged); SDL keeps only the system default device alive across
+// that, so the stream of a chosen one just stops being pulled, and nothing in this file polls SDL's event queue for the
+// removal. This looks once a second whether SDL still knows the device and, if not, moves the output to the system
+// default; if that fails too, the mixer goes on without a device, as with NX2NAVI_AUDIO=none. Destroying the stream waits
+// for the SDL callback (sdl_pull), which takes no lock the render thread holds.
+static void device_check(Mixer *m, uint64_t now) {
+    if (now - m->watch_ns < 1000000000ull) return;
+    m->watch_ns = now;
+    if (SDL_GetAudioDeviceName(m->device)) return;
+    rt_log("audio: device '%s' is gone; moving the output to the system default device", m->device_name);
+    SDL_DestroyAudioStream(m->stream);
+    m->stream = NULL;
+    m->device = 0;
+    m->device_name[0] = 0;
+    m->ready = 0;
+    atomic_store_explicit(&m->pulled_ns, 0, memory_order_release);
+    char err[256];
+    if (stream_open(m, m->rate, SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, err, sizeof err)) {
+        output_timing(m, m->rate);
+    } else {
+        m->device_ok = 0;
+        rt_log("audio: no output device (%s): mixing without sound", err);
+    }
+}
+
 int64_t audio_mixer_pace_ns(AudioRenderer *r, uint64_t now) {
     Mixer *m = r->mixer;
     if (!m || !m->device_ok || !atomic_load_explicit(&m->playing, memory_order_acquire)) return -1;
     uint64_t pulled = atomic_load_explicit(&m->pulled_ns, memory_order_acquire);
-    if (!pulled || (now > pulled && now - pulled > m->stall_ns)) return -1;
+    if (!pulled || (now > pulled && now - pulled > m->stall_ns)) {
+        if (m->device) device_check(m, now);
+        return -1;
+    }
     uint64_t have = atomic_load(&m->wr) - atomic_load_explicit(&m->rd, memory_order_acquire);
     if (have < (uint64_t)m->target) return 0;
     int64_t ns = (int64_t)((have - (uint64_t)m->target + 1) * 1000000000ull / (uint64_t)m->rate);
