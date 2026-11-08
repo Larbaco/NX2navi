@@ -1546,7 +1546,24 @@ int vk_mem_mirror_probe(uint64_t addr) {
 #define SNAP_CHUNK (1u << 20)
 #define MERGE_SPAN (64ull << 20)   // the bytes of one pool a merge dispatch binds at most
 #define MERGE_WORDS (65535u * 64u) // the words one merge dispatch covers at most
-#define MERGE_MAX (4ull << 20)     // larger written ranges stay plain copies
+// Larger written ranges stay plain copies (NX2NAVI_WB_MERGE_MAX, MiB, default 16, at most what one dispatch covers).
+// A plain copy writes the whole range over PCIe at the end of each submission even when the shader changed a few words;
+// a merge copies it within video memory and writes only the words that changed. With a 4 MiB limit the field ran about
+// 46 MiB of plain write-back a frame in ranges of about 5.5 MiB, just above it; at 16 the same outdoor route went from a
+// median 47.5 to 67.3 fps and from 11.3 to 7.2 ms of GPU time a frame (RTX 4080 SUPER, 120 fps limit, 2026-11-08).
+#define MERGE_MAX_CAP ((uint64_t)MERGE_WORDS * 4u)
+static uint64_t merge_max(void) {
+    static uint64_t m;
+    if (!m) {
+        const char *e = cfg_get("NX2NAVI_WB_MERGE_MAX");
+        uint64_t mib = e && *e ? (uint64_t)strtoull(e, NULL, 10) : 16;
+        m = mib << 20;
+        if (!m) m = 1;
+        if (m > MERGE_MAX_CAP) m = MERGE_MAX_CAP;
+        rt_log("mem: write-back merge covers ranges up to %.1f MiB (NX2NAVI_WB_MERGE_MAX)", m / 1048576.0);
+    }
+    return m;
+}
 typedef struct { PoolRec *r; uint64_t off, size, soff; int chunk; } SnapRange;
 typedef struct { VkBuffer buf; VmaAllocation alloc; uint64_t size, used; int host; } SnapChunk;
 typedef struct { int n; SnapChunk c[]; } SnapFree;   // a submission's chunks and range lists, pooled at its fence
@@ -1558,8 +1575,8 @@ static int nchunks, cchunks;
 // the pool holds the frames in flight: a VMA allocation that needs a new memory block costs 8-11 ms on the replay
 // thread. Chunk sizes are powers of two so that one fits the next request; what the pool cannot hold is destroyed.
 #define SNAP_LIST_MIN (64u << 10)
-#define SNAP_POOL_N 32
-#define SNAP_POOL_BYTES (16ull << 20)
+#define SNAP_POOL_N 64
+#define SNAP_POOL_BYTES (256ull << 20)   // room for merges of multi-MiB ranges across the submissions in flight
 static PlatMutex snap_pool_lock = PLAT_MUTEX_INIT;
 static SnapChunk snap_pool[SNAP_POOL_N];
 static int nsnap_pool;
@@ -1765,7 +1782,7 @@ static void gpu_wrote(const VkMemSpan *sp, uint64_t size, int shader) {
     if (!r || r->mstate != MS_ON || sp->buffer != r->mbuf || !size) return;
     r->vd_wrote_sub = msub, r->vd_wrote_n++;
     // A binding to the end of its pool (no size) can span hundreds of MiB: those stay copies.
-    if (shader && !(sp->offset & 3) && !(size & 3) && size <= MERGE_MAX && merging() && snap_add(r, sp->offset, size))
+    if (shader && !(sp->offset & 3) && !(size & 3) && size <= merge_max() && merging() && snap_add(r, sp->offset, size))
         return;
     range_add(&wbl, &nwbl, &cwbl, r, sp->offset, size);
 }

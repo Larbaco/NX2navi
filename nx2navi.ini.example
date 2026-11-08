@@ -403,3 +403,7 @@
 # names each dirty target that stays on the GPU ("fence write-back skipped-drawn-every-frame") and each one over 65536
 # bytes that went back ("over-default"). Raising it costs a copy per such target and wait.
 # wb_fence_limit = 65536
+# Written storage-buffer ranges up to this size in MiB (1 to 16) go back to game memory as a merge: copied within video
+# memory and only the words that changed written over PCIe. Larger ones are copied back whole at the end of every
+# submission. Raising it from 4 to 16 took a 5.5 MiB range off the plain copies (about 46 MiB a frame in the field).
+# wb_merge_max = 16
