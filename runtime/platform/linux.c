@@ -1,6 +1,8 @@
 // Linux implementation of platform.h: pthreads, CLOCK_MONOTONIC, futex locks and condition variables, POSIX files,
 // /proc and sysfs for the load counters, posix_spawn for child processes.
 #define _GNU_SOURCE
+#define UNW_LOCAL_ONLY
+#include <libunwind.h>
 #include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -312,6 +314,7 @@ __asm__(".text\n"
         ".type plat_fiber_entry, @function\n"
         ".p2align 4\n"
         "plat_fiber_entry:\n"
+        "    andq $-16, %rsp\n"   /* reached by ret, not call: align for the call (local fix) */
         "    movq %r13, %rdi\n"
         "    callq *%r12\n"
         "    ud2\n"
@@ -969,10 +972,51 @@ void plat_mem_fault_hook(int (*fn)(uint64_t addr)) {
 
 void plat_crash_context(const char *s) { (void)s; }   // the Windows crash notes only
 
-int plat_frame_capture(PlatJmp *out, int (*want)(uintptr_t rip, void *arg), void *arg) {   // not on Linux yet
-    (void)out, (void)want, (void)arg;
+// Local Linux port of win32.c's plat_frame_capture, walking the host stack with libunwind (the .eh_frame of the
+// lifted code). The System V ABI keeps rbx, rbp, r12-r15, rsp, MXCSR's control bits and the x87 control word.
+int plat_frame_capture(PlatJmp *out, int (*want)(uintptr_t rip, void *arg), void *arg) {
+    unw_context_t uc;
+    unw_cursor_t cur;
+    if (unw_getcontext(&uc) || unw_init_local(&cur, &uc)) return 0;
+    for (int i = 0; i < 256 && unw_step(&cur) > 0; i++) {
+        unw_word_t ip = 0;
+        if (unw_get_reg(&cur, UNW_REG_IP, &ip) || !ip) return 0;
+        if (!want((uintptr_t)ip, arg)) continue;
+        static const int regs[6] = {UNW_X86_64_RBX, UNW_X86_64_RBP, UNW_X86_64_R12, UNW_X86_64_R13, UNW_X86_64_R14,
+                                    UNW_X86_64_R15};
+        for (int k = 0; k < 6; k++) {
+            unw_word_t v = 0;
+            if (unw_get_reg(&cur, regs[k], &v)) return 0;
+            out->f.gpr[k] = v;
+        }
+        unw_word_t sp = 0;
+        if (unw_get_reg(&cur, UNW_REG_SP, &sp)) return 0;
+        out->f.gpr[6] = sp, out->f.gpr[7] = ip;
+        uint16_t cw;
+        __asm__ volatile("stmxcsr %0\n\tfnstcw %1" : "=m"(out->f.mxcsr), "=m"(cw));
+        out->f.fpcw = cw;
+        return 1;
+    }
     return 0;
 }
+
+__asm__(".text\n"
+        ".globl plat_frame_go_regs\n"
+        ".type plat_frame_go_regs, @function\n"
+        ".p2align 4\n"
+        "plat_frame_go_regs:\n"
+        "    movq 0(%rdi), %rbx\n"
+        "    movq 8(%rdi), %rbp\n"
+        "    movq 16(%rdi), %r12\n"
+        "    movq 24(%rdi), %r13\n"
+        "    movq 32(%rdi), %r14\n"
+        "    movq 40(%rdi), %r15\n"
+        "    ldmxcsr 64(%rdi)\n"
+        "    fldcw 68(%rdi)\n"
+        "    movq 48(%rdi), %rsp\n"
+        "    movl $1, %eax\n"
+        "    jmpq *56(%rdi)\n"
+        ".size plat_frame_go_regs, .-plat_frame_go_regs\n");
 
 void plat_crash_hook(void (*fn)(const PlatCrash *c)) {
     crash_fn = fn;

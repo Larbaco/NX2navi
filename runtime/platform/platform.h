@@ -74,9 +74,15 @@ int plat_jmp_save(PlatJmp *j) __attribute__((returns_twice, nothrow));
 _Noreturn void plat_jmp_go(PlatJmp *j);
 #else
 #include <setjmp.h>
-typedef struct { jmp_buf b; } PlatJmp;
+// f: a frame plat_frame_capture found (rbx, rbp, r12-r15, rsp, rip, mxcsr, x87 control word), resumed by plat_frame_go.
+typedef struct { jmp_buf b; struct { uint64_t gpr[8]; uint32_t mxcsr, fpcw; } f; } PlatJmp;
 #define plat_jmp_save(j) setjmp((j)->b)
 #define plat_jmp_go(j) longjmp((j)->b, 1)
+_Noreturn void plat_frame_go_regs(void *f);
+#define plat_frame_go(j) plat_frame_go_regs(&(j)->f)
+#endif
+#ifdef _WIN32
+#define plat_frame_go(j) plat_jmp_go(j)
 #endif
 // The host state of a caller further up this thread's stack, as it will be when the call it is making returns: the
 // stack is unwound frame by frame (from the caller of this function) until want(return address, arg) accepts one, and

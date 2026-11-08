@@ -58,6 +58,46 @@ run the same command again: finished steps are skipped.
 When it says `finished`, start `C:\Games\Ocarina\ocarina.exe`. You can delete `C:\Games\Ocarina\build-cache` (about
 5 GB) afterwards.
 
+## Linux
+
+The same command builds a native Linux `ocarina` on an x86-64 Linux 6.7 or later (the write watch needs
+`PAGEMAP_SCAN`) with a Vulkan 1.3 driver that has `VK_EXT_external_memory_host` and `VK_EXT_mesh_shader` (NVIDIA,
+RADV). It takes clang, clang++ and lld from `PATH` and links against the system's libraries; `--msys` is not used.
+
+1. Packages, on Arch and its derivatives (other distributions: the same libraries and their `-dev` headers):
+
+   ```sh
+   sudo pacman -S --needed clang lld sdl3 opus libvpx dav1d zstd libunwind vulkan-headers vulkan-icd-loader \
+       python fonttools python-numpy python-lz4 python-zstandard dotnet-sdk
+   ```
+
+   Python 3.14 or later (the RomFS step and the PlayStation prompts use its `compression.zstd`), then `zbic`, which the
+   kit only calls (GPL-2.0): `pip install --user zbic`, or in a virtual environment with the packages above.
+   Vulkan Memory Allocator is one header: the system's (AUR `vulkan-memory-allocator`), else the build fetches the
+   pinned 3.4.0 into `toolchain/vma/` and checks its hash.
+
+2. The shader translator: a kit with `bin/nx2navi_xlate` has it; from a source checkout, build it once with
+   `python tools/build_xlate.py` (needs the .NET 10 SDK). The build copies it beside the game.
+
+3. Build, then play:
+
+   ```sh
+   python3 -I tools/make_game.py --nup "/path/to/your game.nup" --out ~/Games/Ocarina
+   ~/Games/Ocarina/ocarina
+   ```
+
+With 16 GB of RAM, add `--jobs 4`: the compiles run beside the 26 GB RomFS image, and one clang per logical
+processor can fill memory and swap until the kernel stops processes of the desktop session (about 10 minutes on a
+12-thread Ryzen with 4 jobs). Do not play or prepare shaders while it builds.
+
+On NVIDIA, start the game with `NX2NAVI_SHADOW=0` if the 3D world stays black while the HUD draws (issue #72). The
+profile, logs and settings are in the `--out` folder as on Windows.
+
+`tools/make_appimage.py` packs this kit into one `NX2navi-Linux-<version>-x86_64.AppImage` with its own Python, for
+players without a source checkout: it checks for the packages above, installs zbic with pip on its first run, picks
+`--jobs` from the memory, builds into `~/Games/Ocarina` (or the folder given after the dump) and writes `play.sh`
+beside the game.
+
 ## Playing
 
 - **F1** opens the settings menu. Settings are saved in `nx2navi.ini` beside the game; saves go to `profile\`.
@@ -80,5 +120,7 @@ When it says `finished`, start `C:\Games\Ocarina\ocarina.exe`. You can delete `C
 | `not game version 1.1.1` | Install the 1.1.1 update and dump the game again |
 | `the Python package ... is missing` | Run the `pip install` line above |
 | `...\clang.exe is missing` | Run the `pacman` line above in MSYS2 UCRT64 |
+| `clang is not on PATH` (Linux) | Install the packages under "Linux" |
+| `nx2navi_xlate is missing` (Linux) | Build the translator with `python tools/build_xlate.py` |
 | `needs ... GB free` | Free space on the `--out` disk, or build to another one |
 | The game opens and closes | Update your graphics driver, then send `logs\nx2navi.log` |

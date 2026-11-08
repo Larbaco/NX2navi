@@ -161,7 +161,7 @@ static void ov_longjmp(Cpu *c) {
     for (int i = 0; i < 8; i++) c->v[8 + i] = e.d[i];
     c->sp = e.sp;
     c->x[0] = val ? val : 1;
-    plat_jmp_go(&e.frame);
+    plat_frame_go(&e.frame);
 }
 
 HOST_OVERRIDE("setjmp", ov_setjmp);
