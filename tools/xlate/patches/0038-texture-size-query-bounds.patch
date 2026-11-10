@@ -1,0 +1,40 @@
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+@@ -1677,7 +1677,13 @@
+                     result = context.ImageQuerySize(resultType, image);
+                 }
+ 
+-                if (dimensions != 1)
++                if (texOp.Index >= dimensions)
++                {
++                    // A 1D/2D/cube texture has no size component beyond its dimensions; the
++                    // missing component (depth for 1D/2D/cube) is 1.
++                    result = context.Constant(context.TypeS32(), 1);
++                }
++                else if (dimensions != 1)
+                 {
+                     result = context.CompositeExtract(context.TypeS32(), result, texOp.Index);
+                 }
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Glsl/Instructions/InstGenMemory.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Glsl/Instructions/InstGenMemory.cs
+@@ -466,7 +466,19 @@
+                 bool hasLod = !definition.Type.HasFlag(SamplerType.Multisample) && (definition.Type & SamplerType.Mask) != SamplerType.TextureBuffer;
+                 string texCall;
+ 
+-                if (hasLod)
++                int dimensions = (definition.Type & SamplerType.Mask) == SamplerType.TextureCube ? 2 : definition.Type.Dimensions;
++
++                if (definition.Type.HasFlag(SamplerType.Array))
++                {
++                    dimensions++;
++                }
++
++                if (texOp.Index >= dimensions)
++                {
++                    // A 1D/2D/cube texture has no size component beyond its dimensions.
++                    texCall = "1";
++                }
++                else if (hasLod)
+                 {
+                     IAstNode lod = operation.GetSource(srcIndex);
+                     string lodExpr = GetSourceExpr(context, lod, GetSrcVarType(operation.Inst, srcIndex));

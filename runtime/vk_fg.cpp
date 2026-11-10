@@ -25,6 +25,7 @@ extern "C" {
 #include "platform/platform.h"
 #include "vk.h"
 #include "vk_dlaa.h"
+#include "vk_dlssg.h"
 #include "vk_ffx.h"
 #include "vk_fg.h"
 #include "ui/menu.h"
@@ -33,7 +34,6 @@ extern "C" {
 namespace {
 
 struct {
-    int wanted = -1;
     VkQueue present = VK_NULL_HANDLE, acquire = VK_NULL_HANDLE;
     ffxContext sc = nullptr;   // the swapchain context
     ffxContext fg = nullptr;   // the frame generation context
@@ -78,18 +78,17 @@ void fail(const char *what, unsigned r) {
 
 }  // namespace
 
+// Follows the setting: gfx_present.c's window_settings_live remakes the swapchain when this stops matching vk_fg_active.
+// It needs DLSS's or FSR 3.1's motion vectors, so it also needs one of them on. Not on a device made through
+// Streamline's proxies (NVIDIA's frame generation set at the start, vk_dlssg_dpa): AMD's swapchain there crashed in
+// NVIDIA's driver when the menu switched from NVIDIA's frame generation to AMD's. That switch waits for a restart,
+// as the menu says (menu.cpp row_framegen).
 extern "C" int vk_fg_wanted(void) {
-    if (F.wanted < 0) {
-        F.wanted = !strcmp(cfg_value("NX2NAVI_FRAMEGEN"), "fsr3");
-        if (F.wanted && !vk_dlaa_wanted()) {
-            rt_log("fg: frame generation needs DLSS or FSR 3.1 upscaling (any mode): off");
-            F.wanted = 0;
-        }
-    }
-    return F.wanted;
+    return !strcmp(cfg_value("NX2NAVI_FRAMEGEN"), "fsr3") && cfg_bool("NX2NAVI_DLAA") && vk_dlaa_wanted() && !vk_dlssg_dpa();
 }
 
-extern "C" uint32_t vk_fg_queue_count(void) { return vk_fg_wanted() ? 3 : 1; }
+// Always the three queues: the setting can be switched on during a run, and idle queues cost nothing.
+extern "C" uint32_t vk_fg_queue_count(void) { return 3; }
 
 extern "C" void vk_fg_queues(VkQueue present, VkQueue acquire) { F.present = present, F.acquire = acquire; }
 
@@ -268,4 +267,5 @@ extern "C" void vk_fg_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt,
 extern "C" void vk_fg_release(void) {
     if (F.fg) vk_ffx_destroy(&F.fg), F.fg = nullptr;
     if (F.sc) vk_ffx_destroy(&F.sc), F.sc = nullptr;
+    __atomic_store_n(&F.on, 0, __ATOMIC_RELAXED);
 }

@@ -8,34 +8,40 @@ disables both (automated runs). `NX2NAVI_*` settings can also be set in `nx2navi
 `motion = 0`, `rumble = 0`); the environment overrides the file. `NX2NAVI_RUMBLE_STRENGTH` is the rumble strength in
 percent (0 to 300, default 130; 0 is the same as `rumble = 0`). `NX2NAVI_RUMBLE_CURVE` is the exponent applied to the
 amplitude before the strength (0.2 to 1.5, default 0.6; lower makes weak pulses stronger, 1 is linear).
-`NX2NAVI_RUMBLE_TRIGGERS=1` also drives the impulse triggers of an Xbox pad. `NX2NAVI_DS3=0` turns off the direct reader for a DualShock 3 (see PlayStation 3 controllers).
+`NX2NAVI_RUMBLE_TRIGGERS=1` also drives the impulse triggers of an Xbox pad. `NX2NAVI_DS3=1` turns on the direct reader for a DualShock 3 (see PlayStation 3 controllers).
 
 `NX2NAVI_PAD_LAYOUT` (`pad_layout`, the *Button layout* row on the Controls tab, live) picks which face button is Switch A:
 
 - `nintendo` (default): by position, as on a Switch (the table below).
 - `xbox`: south A, east B, west X, north Y, as an Xbox pad labels them; on a PlayStation pad cross is A, circle B, square X, triangle Y.
+- `playstation`: the same buttons as `xbox` under the PlayStation name: cross A, circle B, square X, triangle Y.
 - `auto`: `nintendo` for a pad whose east button SDL reports labelled A (Switch Pro Controller, Nintendo-layout pads), `xbox` for the others.
 
 The log names the layout in effect (`input: gamepad layout ...`) and each gamepad's first press
-(`input: gamepad "...": first press`); the menu shows the layout under *Automatic*.
+(`input: gamepad "...": first press`); the menu shows the layout under *Automatic*. The game's prompts show the Switch
+letters unless *Button prompts* says otherwise (below).
 
-`NX2NAVI_PROMPTS` (`prompts`, the *Button prompts* row under it, after a restart) picks the buttons the game's prompts
-show:
+## Button prompts
 
-- `nintendo` (default): the game's own Switch letters.
-- `playstation`: Cross, Circle, Square and Triangle, L1 R1 L2 R2, Options for Plus, Create for Minus and a d-pad cross.
-- `steamdeck`: the A B X Y letters as a Steam Deck labels them, L1 R1 L2 R2, Menu for Plus, View for Minus and a d-pad
-  cross.
+`NX2NAVI_PROMPTS` (`prompts`, the *Button prompts* row on the Controls tab) picks the buttons the game's prompts show: `nintendo` (default, the game's own), `xbox`, `playstation` or `pc` (*Keyboard and mouse*). It changes three things the game draws:
 
-The face buttons follow the layout above: with `nintendo` the prompts for A show the right button (Circle, or B on a
-Steam Deck), with `xbox` and `auto` the bottom one (Cross, or A).
+- the button font every prompt in text uses (dialogue, the button guides, the controls screen): A B X Y, L R ZL ZR, Plus and Minus, the d-pad and the sticks with their directions become that pad's buttons (LB RB LT RT, Menu and View; L1 R1 L2 R2, Options and Create; its d-pad and sticks), or the keys. Power, Home and the console stay;
+- the letter in the action prompt (top right);
+- the ocarina's note buttons.
 
-The PlayStation and Steam Deck prompts are the game's button font (`Font2/Scalable/External.Nin_Ounce_NVN2.bfotf.zs`) redrawn on the
-player's machine by `tools/ocarina_prompts.py`, which `tools/make_game.py` runs in its `prompts` step (it needs
-fontTools). It writes four RomFS overlay folders beside the game, `romfs-patches-playstation` and
-`romfs-patches-steamdeck` for the `nintendo` layout and their `-label` twins for the others, each with the font and the resource size table that makes room
-for it; `runtime/romfs.c` loads the one the settings pick at start. The sticks, Home and the console keep the game's
-icons, and a button remapped in Controls keeps its old prompt.
+A, B, X and Y show the button the *Button layout* presses: with `nintendo` (by position) Switch A is the right face button, so its prompts show B or circle, B shows A or cross, X shows Y or triangle and Y shows X or square; with `xbox`, `playstation` and `automatic` (by label) A shows A or cross, B shows B or circle, X shows X or square and Y shows Y or triangle.
+
+`pc` shows the first key each Switch button has (the table above, or the `bind_` lines of `nx2navi.ini` when the tool runs): E, Ctrl, Space, the mouse with its left button for Y, Q, R, the mouse with its right button for ZL, F, Tab, M, V and C for the stick clicks, 1 to 4 for the d-pad, and W A S D for moving, the directions the prompt means set out as on the keyboard. The camera's prompts show the mouse moving. It follows no *Button layout*.
+
+The game reads the font and the interface textures once at start, so a change shows after a restart (the row says so; the menu's Restart button restarts). A button or key remapped on this tab keeps its old prompt until the folders are made again.
+
+The prompts live in overlay folders next to the exe, `romfs-patches-xbox`, `romfs-patches-xbox-label`, `romfs-patches-playstation` and `romfs-patches-playstation-label` (by position and by label) and `romfs-patches-pc`, which `runtime/romfs.c` loads in place of the game's files. `tools/pad_prompts.py` draws them on the player's machine from the player's own RomFS and a folder of button art, which the repository does not hold. A launcher release or build kit made with `--prompt-art` carries that art (`prompt-art`, `tools/prompt_art.py`), and `tools/make_game.py` draws every folder in its last step, again whenever the art, the tools or the `bind_` lines change (so a rebuild after rebinding keys brings the keyboard prompts up to date). By hand:
+
+```
+python tools\pad_prompts.py --art <art pack>\Source --game <install folder>
+```
+
+`--style xbox|playstation|pc` makes one style; the keys come from `<install folder>\nx2navi.ini` (`--binds` names another). The art folder holds `XGamepad/Default`, `XGamepad/Light`, `P5Gamepad/Default`, `P5Gamepad/Light`, `Keyboard_Mouse/Dark` and `Keyboard_Mouse/White` with the file names of `STYLES` and `KEY_ART` in the tool; a key it has no picture of is written on `Keyboard_Mouse/Blanks`. Without the folders the row says *prompt files missing* and the Switch prompts stay; so they do when a RomFS mod replaces one of the same files (*off: a RomFS mod replaces their files*). The log has a `RomFS overlay: ... button prompts` line for the folder in use. The tool needs fontTools, Pillow and zstandard (`tools/requirements-py314.txt`).
 
 The actions are the game's own, as its *Basic Controls* screen (Plus menu, System) names them:
 
@@ -70,7 +76,7 @@ The game's *Swap Jump Controls* option trades B and X (jump on B, put away on X)
 | F10 | L3 + R3 (both stick clicks) | performance overlay: off, frame rate, full panel |
 | F11 | | borderless fullscreen on or off, saved to `nx2navi.ini` |
 
-The window opens on the monitor `NX2NAVI_MONITOR` (`monitor` in `nx2navi.ini`) names, and F11 fullscreen covers the monitor the window is on. `nx2navi.exe --list-monitors` prints each monitor's index, device name, name, desktop rectangle, primary flag and DPI without game files; `nx2navi.exe --monitor <value>` sets `NX2NAVI_MONITOR` for one run and wins over the file. The value is `auto` (default), `primary`, an index from the list (counting from 1), or part of a device name (`display3`) or monitor name; when nothing matches, the log lists the monitors and the window is placed as with `auto`. Windows only.
+The window opens on the monitor `NX2NAVI_MONITOR` (`monitor` in `nx2navi.ini`) names, and F11 fullscreen covers the monitor the window is on. `nx2navi.exe --list-monitors` prints each monitor's index, name (on Windows its device name too), desktop rectangle, primary flag and DPI without game files; `nx2navi.exe --monitor <value>` sets `NX2NAVI_MONITOR` for one run and wins over the file. The value is `auto` (default), `primary`, an index from the list (counting from 1), or part of a monitor name (on Windows also a device name such as `display3`; on Linux the name carries the connector, such as `dp-2`); when nothing matches, the log lists the monitors and the window is placed as with `auto`. On Wayland a window cannot place itself: only fullscreen (`fullscreen = 1`) opens on the chosen monitor, and a windowed window opens where the compositor puts it.
 
 The Minus+Plus combo never reaches the game. In the menu the arrow keys, the D-pad or the left stick move, Enter or A selects, Q and E or L and R switch tabs, Esc or B goes back (Switch button names, as in the table above).
 
@@ -116,7 +122,7 @@ Windows does not present the Switch 2 Pro Controller as a gamepad SDL can open (
 
 ## PlayStation 3 controllers
 
-A DualShock 3 on Windows is read directly (`runtime/input_ds3_win.c`) when no driver presents it to SDL or XInput as a gamepad. Plug it in by USB, or pair it with a Bluetooth driver that exposes it as a HID device with its own name, "PLAYSTATION(R)3 Controller"; the log then shows `input: DualShock 3 opened`, the controller's first player light turns on and `input: DualShock 3 is reporting` follows. The reader sends the controller the command that makes it start reporting, which it does not do on its own. It looks for a controller every three seconds while none is open, so one plugged in or switched on later is found without a restart.
+With `ds3 = 1` in `nx2navi.ini` (off by default), a DualShock 3 on Windows is read directly (`runtime/input_ds3_win.c`) when no driver presents it to SDL or XInput as a gamepad. Plug it in by USB, or pair it with a Bluetooth driver that exposes it as a HID device with its own name, "PLAYSTATION(R)3 Controller"; the log then shows `input: DualShock 3 opened`, the controller's first player light turns on and `input: DualShock 3 is reporting` follows. The reader sends the controller the command that makes it start reporting, which it does not do on its own. It looks for a controller every three seconds while none is open, so one plugged in or switched on later is found without a restart.
 
 | Switch | DualShock 3 by position |
 |---|---|
@@ -127,7 +133,7 @@ A DualShock 3 on Windows is read directly (`runtime/input_ds3_win.c`) when no dr
 | Plus, Minus | Start, Select |
 | D-pad | D-pad |
 
-The PS button is not used. The Controls tab binds and remaps its buttons like any other pad's, with the same pad names. Vibration works through the strength, curve and *Vibration* settings: the controller's light motor can only be on or off, so it comes on from a sixteenth of the amplitude the game asks of it. The accelerometer and the single gyro axis are not used: the game's motion controls need all three gyro axes, so a DualShock 3 gives no motion. `NX2NAVI_DS3=0` (`ds3 = 0` in `nx2navi.ini`, live) turns the reader off. A controller that a driver presents in a generic gamepad mode, with another name or report layout, is not recognised by the reader and goes through SDL or XInput instead, as before.
+The PS button is not used. The Controls tab binds and remaps its buttons like any other pad's, with the same pad names. Vibration works through the strength, curve and *Vibration* settings: the controller's light motor can only be on or off, so it comes on from a sixteenth of the amplitude the game asks of it. The accelerometer and the single gyro axis are not used: the game's motion controls need all three gyro axes, so a DualShock 3 gives no motion. `ds3 = 0` in `nx2navi.ini` (the default, live) turns the reader off. A controller that a driver presents in a generic gamepad mode, with another name or report layout, is not recognised by the reader and goes through SDL or XInput instead, as before.
 
 ## Scripted input
 

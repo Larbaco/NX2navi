@@ -61,6 +61,7 @@ static volatile LONG stop, written;
 static uintptr_t exe_lo, exe_hi;
 static int only_render;             // NX2NAVI_PROFILE_RENDER=1: sample the render thread only
 static int only_main;               // NX2NAVI_PROFILE_MAIN=1: sample the guest main thread only
+static int only_replay;             // NX2NAVI_PROFILE_REPLAY=1: sample the replay thread only, without call chains
 static int chains;                  // call chains are kept: NX2NAVI_PROFILE_RENDER or NX2NAVI_PROFILE_CHAINS
 static volatile uint64_t cur_frame; // last presented frame
 static uint64_t frame_lo, frame_hi; // NX2NAVI_PROFILE_FRAMES=<lo>-<hi>: sample only while presents lo..hi-1 are pending
@@ -262,7 +263,8 @@ static DWORD WINAPI sampler_main(void *arg) {
         uint64_t now = slow_ns ? kern_now_ns() : 0;
         for (int i = 0; i < n_threads; i++) {
             ThreadSlot *t = &threads[i];
-            if ((only_render && t->tid != render_tid) || (only_main && t->tid != main_tid)) continue;
+            if ((only_render && t->tid != render_tid) || (only_main && t->tid != main_tid) || (only_replay && t->tid != replay_tid))
+                continue;
             uint64_t cyc = 0;
             if (slow_ns && t->depth && QueryThreadCycleTime(t->h, &cyc) && cyc == t->cycles) {   // still waiting
                 Sample *s = &ring[ring_n++ & (SLOW_RING - 1)];
@@ -365,6 +367,7 @@ int prof_sampler_start(void) {
     }
     only_render = cfg_get("NX2NAVI_PROFILE_RENDER") != NULL;
     only_main = !only_render && cfg_get("NX2NAVI_PROFILE_MAIN") != NULL;
+    only_replay = !only_render && !only_main && cfg_get("NX2NAVI_PROFILE_REPLAY") != NULL;
     const char *ch = cfg_get("NX2NAVI_PROFILE_CHAINS");
     const char *sl = cfg_get("NX2NAVI_PROFILE_SLOW");
     slow_ns = sl && atoi(sl) > 0 ? (uint64_t)atoi(sl) * 1000000ull : 0;
@@ -389,6 +392,68 @@ int prof_sampler_start(void) {
     return 1;
 }
 
+// NX2NAVI_TRACE=perf (perf.c): the process's committed memory by kind, and outside the guest's address range the
+// allocations holding the most private memory, so a log shows what grows: guest memory, a heap, the graphics driver's
+// mappings or loaded images. A walk of the address space with VirtualQuery: tens of milliseconds, so only now and then.
+#define CENSUS_TOP 12
+typedef struct { uint64_t base, bytes; DWORD protect; } CensusRun;
+
+static void census_keep(CensusRun *top, int *nt, const CensusRun *r) {   // top[] stays sorted, largest first
+    if (!r->bytes || (*nt == CENSUS_TOP && r->bytes <= top[*nt - 1].bytes)) return;
+    int k = *nt < CENSUS_TOP ? (*nt)++ : *nt - 1;
+    for (; k > 0 && top[k - 1].bytes < r->bytes; k--) top[k] = top[k - 1];
+    top[k] = *r;
+}
+
+void prof_commit_census(uint64_t frame) {
+    // Allocations by committed size: under 256 KiB, under 4 MiB, under 64 MiB, larger. A few large ones growing is a
+    // pool or cache; many small ones is a stream of allocations that are not freed.
+    static const uint64_t edge[3] = {256ull << 10, 4ull << 20, 64ull << 20};
+    uint64_t bcount[4] = {0}, bbytes[4] = {0};
+    uint64_t t0 = GetTickCount64(), guest = 0, priv = 0, mapped = 0, image = 0, regions = 0;
+    CensusRun top[CENSUS_TOP], cur = {0};
+    int nt = 0;
+    MEMORY_BASIC_INFORMATION mi;
+    for (uint8_t *a = NULL; VirtualQuery(a, &mi, sizeof mi) == sizeof mi; a = (uint8_t *)mi.BaseAddress + mi.RegionSize) {
+        regions++;
+        uint64_t base = (uint64_t)(uintptr_t)mi.AllocationBase, at = (uint64_t)(uintptr_t)mi.BaseAddress;
+        int committed = mi.State == MEM_COMMIT, outside = committed && mi.Type == MEM_PRIVATE && at >= RT_ADDRESS_LIMIT;
+        if (committed) {
+            if (mi.Type == MEM_IMAGE) image += mi.RegionSize;
+            else if (mi.Type == MEM_MAPPED) mapped += mi.RegionSize;
+            else if (at < RT_ADDRESS_LIMIT) guest += mi.RegionSize;
+            else priv += mi.RegionSize;
+        }
+        // An allocation's regions are contiguous: its run ends where the next allocation begins, reserved gaps inside
+        // it (a heap segment's uncommitted tail) included.
+        if (cur.bytes && base != cur.base) {
+            int k = cur.bytes < edge[0] ? 0 : cur.bytes < edge[1] ? 1 : cur.bytes < edge[2] ? 2 : 3;
+            bcount[k]++, bbytes[k] += cur.bytes;
+            census_keep(top, &nt, &cur), cur.bytes = 0;
+        }
+        if (outside) {
+            if (!cur.bytes) cur.base = base, cur.protect = mi.AllocationProtect;
+            cur.bytes += mi.RegionSize;
+        }
+        if (at + mi.RegionSize < at) break;   // the top of the address space
+    }
+    if (cur.bytes) {
+        int k = cur.bytes < edge[0] ? 0 : cur.bytes < edge[1] ? 1 : cur.bytes < edge[2] ? 2 : 3;
+        bcount[k]++, bbytes[k] += cur.bytes;
+        census_keep(top, &nt, &cur);
+    }
+    rt_log("mem: commit census at frame %llu: guest %.0f MiB, other private %.0f MiB, mapped %.0f MiB, images %.0f MiB "
+           "(%llu regions walked in %llu ms)", (unsigned long long)frame, guest / 1048576.0, priv / 1048576.0,
+           mapped / 1048576.0, image / 1048576.0, (unsigned long long)regions, (unsigned long long)(GetTickCount64() - t0));
+    rt_log("mem:   other private by allocation size: under 256 KiB %llu allocations %.0f MiB, under 4 MiB %llu %.0f MiB, "
+           "under 64 MiB %llu %.0f MiB, larger %llu %.0f MiB; the largest:",
+           (unsigned long long)bcount[0], bbytes[0] / 1048576.0, (unsigned long long)bcount[1], bbytes[1] / 1048576.0,
+           (unsigned long long)bcount[2], bbytes[2] / 1048576.0, (unsigned long long)bcount[3], bbytes[3] / 1048576.0);
+    for (int i = 0; i < nt; i++)
+        rt_log("mem:   %#llx %.1f MiB committed (protect %#lx)", (unsigned long long)top[i].base, top[i].bytes / 1048576.0,
+               (unsigned long)top[i].protect);
+}
+
 // perf_present, every present: the frame the sampler's NX2NAVI_PROFILE_FRAMES window counts, and a NX2NAVI_PROFILE_SLOW
 // dump of a present at least slow_ns after the previous one (d 0 on the first present).
 void prof_sampler_frame(uint64_t frame, uint64_t now, uint64_t d) {
@@ -396,7 +461,7 @@ void prof_sampler_frame(uint64_t frame, uint64_t now, uint64_t d) {
     // the end of a NX2NAVI_PROFILE_FRAMES window writes the profile then: a test run ended by a timeout never reaches
     // the exit handlers (prof_write)
     if (frame_hi && frame > frame_hi && !written) prof_sampler_write();
-    if (slow_ns && d >= slow_ns && !dump_hi) {
+    if (slow_ns && d >= slow_ns && !dump_hi && frame >= frame_lo && (!frame_hi || frame <= frame_hi)) {
         dump_lo = (LONG64)(now - d - 20000000ull);
         dump_frame = (LONG64)frame;
         InterlockedExchange64(&dump_hi, (LONG64)now);

@@ -185,6 +185,13 @@ static class SwshXlate
                         // carry 0 there while the payload is used (the task writes the mesh count at +4, the mesh reads
                         // ISBERD region 7 at 0x10 and 0x14): a payload under 256 bytes rounds down. One unit covers it.
                         if ((mesh.Stage == 6 || mesh.HasTask) && mesh.PayloadBytes == 0) mesh.PayloadBytes = 256;
+                        // The size field counts the program's own data, which starts after the buffer's header (the mesh
+                        // count at +4, the words at 0x10 and 0x14): an Ocarina foliage task with a size of 3072 writes
+                        // three 1024-byte arrays from 0x18, up to byte 3096. A payload cut at 3072 bytes lost the last
+                        // entries of the third array, and its mesh programs read past the end of their buffer there, a
+                        // different value on every run: a few leaves of each dense patch moved between the depth pre-pass
+                        // and the colour pass and left white specks. The header comes on top, rounded to 16 bytes.
+                        if (mesh.Stage == 6 || mesh.HasTask) mesh.PayloadBytes += 0x20;
                         code = AmpereLowering.Lower(code, size, false, out int meshLocal, null, mesh);
                         if (meshLocal != 0) job["local_mem"] = meshLocal;
                         job["local"] = new JsonArray(mesh.Threads, 1, 1);

@@ -10,6 +10,7 @@
 #include "input.h"
 #include "input_map.h"
 #include "platform/platform.h"
+#include "vk_dlssg.h"
 
 static int fails;
 #define CHECK(c, what) do { if (!(c)) { fails++; fprintf(stderr, "FAIL cfg: %s\n", what); } } while (0)
@@ -36,8 +37,8 @@ int probe_cfg(void) {
         "no_such_setting = 1\r\n"
         "no equals sign\r\n"
         "last = no newline at the end";
-    plat_setenv("NX2NAVI_LOCALE", NULL);
-    plat_setenv("NX2NAVI_FPS60", NULL);
+    cfg_setenv("NX2NAVI_LOCALE", NULL);
+    cfg_setenv("NX2NAVI_FPS60", NULL);
     CHECK(plat_file_write(path, ini, sizeof ini - 1), "write the probe ini");
     CHECK(cfg_load(path) == 1, "load the probe ini");
     CHECK(EQ(cfg_get("NX2NAVI_FPS60"), "0"), "value read, whitespace trimmed, lower-case key");
@@ -49,9 +50,9 @@ int probe_cfg(void) {
     CHECK(cfg_get("NX2NAVI_CLOTH_REALTIME") == NULL, "absent key is NULL");
     CHECK(cfg_get("NX2NAVI_comment") == NULL, "comment is not a key");
     CHECK(EQ(cfg_get("NX2NAVI_NO_SUCH_SETTING"), "1"), "unknown key is still readable");
-    plat_setenv("NX2NAVI_FPS60", "1");
+    cfg_setenv("NX2NAVI_FPS60", "1");
     CHECK(EQ(cfg_get("NX2NAVI_FPS60"), "1"), "environment overrides the file");
-    plat_setenv("NX2NAVI_FPS60", NULL);
+    cfg_setenv("NX2NAVI_FPS60", NULL);
     CHECK(EQ(cfg_get("NX2NAVI_FPS60"), "0"), "file value returns when the variable is removed");
     plat_file_delete(path);
     CHECK(cfg_load(path) == 0, "missing file is not an error");
@@ -91,9 +92,9 @@ int probe_cfg(void) {
         "\r\n"
         "[audio]\r\n"
         "volume = 40\r\n";
-    plat_setenv("NX2NAVI_MOTION", NULL);
-    plat_setenv("NX2NAVI_VOLUME", NULL);
-    plat_setenv("NX2NAVI_RUMBLE_STRENGTH", NULL);
+    cfg_setenv("NX2NAVI_MOTION", NULL);
+    cfg_setenv("NX2NAVI_VOLUME", NULL);
+    cfg_setenv("NX2NAVI_RUMBLE_STRENGTH", NULL);
     CHECK(plat_file_write(path, before, sizeof before - 1), "write the save ini");
     CHECK(cfg_load(path) == 1, "load the save ini");
     unsigned v0 = cfg_version();
@@ -118,11 +119,11 @@ int probe_cfg(void) {
           EQ(cfg_get("NX2NAVI_RUMBLE_STRENGTH"), "80") && EQ(cfg_get("NX2NAVI_VOLUME"), "40") &&
           EQ(cfg_get("NX2NAVI_ROMFS_MODS"), "C:\\mods"), "the saved file reads back");
     const char *held = cfg_get("NX2NAVI_VOLUME");
-    plat_setenv("NX2NAVI_VOLUME", "70");
+    cfg_setenv("NX2NAVI_VOLUME", "70");
     cfg_set("NX2NAVI_VOLUME", "90");
     CHECK(cfg_from_env("NX2NAVI_VOLUME") && EQ(cfg_get("NX2NAVI_VOLUME"), "70"), "environment wins over cfg_set");
     CHECK(EQ(held, "40"), "a pointer cfg_get handed out stays valid after cfg_set");
-    plat_setenv("NX2NAVI_VOLUME", NULL);
+    cfg_setenv("NX2NAVI_VOLUME", NULL);
     CHECK(!cfg_from_env("NX2NAVI_VOLUME") && EQ(cfg_get("NX2NAVI_VOLUME"), "90"), "cfg_set value returns without the variable");
     plat_file_delete(path);
     CHECK(cfg_save_to(path) == 1, "cfg_save_to creates a missing file");
@@ -161,11 +162,29 @@ int probe_cfg(void) {
     CHECK(m && EQ(m->def, "default") && m->values == NULL && !m->live, "meta: audio_device is free text, default, needs a restart");
     CHECK(cfg_meta("BIND_A") == NULL && cfg_meta("FPS_COUNTER") == NULL && cfg_meta("NO_SUCH") == NULL,
           "meta: keys the menu does not show are NULL");
+    m = cfg_meta("FRAMEGEN_MULTIPLIER");
+    CHECK(m && EQ(m->def, "2") && EQ(m->values, "2|3|4") && m->live, "meta: framegen_multiplier is 2|3|4, 2 by default, live");
+
+    // DLSS frame generation's multiplier (vk_dlssg.c): the setting clamped to what the GPU and driver allow, with the
+    // reason vk_dlssg_frame logs when it is not taken as it is
+    const char *why = "";
+    CHECK(vk_dlssg_multiplier_of("3", 4, &why) == 3 && !why, "multiplier: 3 where 4x runs");
+    CHECK(vk_dlssg_multiplier_of("4x", 4, &why) == 4 && !why, "multiplier: 4x reads as 4");
+    CHECK(vk_dlssg_multiplier_of("4", 2, &why) == 2 && why, "multiplier: 4 where 2x is the most is 2, with a reason");
+    CHECK(vk_dlssg_multiplier_of("4", 3, &why) == 3 && why, "multiplier: 4 where 3x is the most is 3, with a reason");
+    CHECK(vk_dlssg_multiplier_of("9", 0, &why) == 4 && why, "multiplier: above 4 is 4, with a reason");
+    CHECK(vk_dlssg_multiplier_of("1", 4, &why) == 2 && why, "multiplier: below 2 is 2, with a reason");
+    CHECK(vk_dlssg_multiplier_of("fast", 4, &why) == 2 && why, "multiplier: not a number is 2, with a reason");
+    CHECK(vk_dlssg_multiplier_of("3y", 4, &why) == 2 && why, "multiplier: a number with other text after it is 2");
+    CHECK(vk_dlssg_multiplier_of("", 3, &why) == 2 && !why && vk_dlssg_multiplier_of(NULL, 3, NULL) == 2,
+          "multiplier: unset is 2");
+    CHECK(vk_dlssg_multiplier_of("4", 0, &why) == 4 && !why, "multiplier: kept as it is while the GPU's limit is not known");
+    CHECK(vk_dlssg_multiplier_max(NULL) == 0 && vk_dlssg_multiplier() == 1, "multiplier: 1, no limit, while DLSS-G does not run");
 
     // cfg_reset: the key's active lines leave nx2navi.ini, the commented example stays
     static const char rbase[] = "[audio]\n# volume = 100\n[input]\nmotion = 0\n";
     static const char *const vol[] = {"VOLUME"};
-    plat_setenv("NX2NAVI_VOLUME", NULL);
+    cfg_setenv("NX2NAVI_VOLUME", NULL);
     CHECK(plat_file_write(path, rbase, sizeof rbase - 1), "write the reset ini");
     CHECK(cfg_load(path) == 1, "load the reset ini");
     cfg_set("NX2NAVI_VOLUME", "40");
@@ -204,9 +223,9 @@ int probe_cfg(void) {
 
     // a key the environment sets is skipped and keeps its file line
     CHECK(cfg_load(path) == 1 && EQ(cfg_get("NX2NAVI_VOLUME"), "60"), "reset: reload");
-    plat_setenv("NX2NAVI_VOLUME", "70");
+    cfg_setenv("NX2NAVI_VOLUME", "70");
     CHECK(cfg_reset(vol, 1) == 0, "reset: an environment-set key is skipped");
-    plat_setenv("NX2NAVI_VOLUME", NULL);
+    cfg_setenv("NX2NAVI_VOLUME", NULL);
     CHECK(EQ(cfg_get("NX2NAVI_VOLUME"), "60"), "reset: the skipped key keeps its value");
     CHECK(cfg_save_to(path) == 1, "reset: save after a skip");
     got = plat_file_read(path, &got_n);
@@ -299,19 +318,19 @@ int probe_cfg(void) {
           "pad stick: a square gate's corner stays on the unit circle");
     input_pad_stick(0, 32767 / 2 + 1, 0.2f, st);
     CHECK(abs(st[1] - 32767 * 3 / 8) <= 3, "pad stick: half deflection past a 20% zone is (0.5 - 0.2) / 0.8 of full");
-    plat_setenv("NX2NAVI_STICK_DEADZONE", "12");
-    plat_setenv("NX2NAVI_LSTICK_DEADZONE", NULL);
-    plat_setenv("NX2NAVI_RSTICK_DEADZONE", NULL);
+    cfg_setenv("NX2NAVI_STICK_DEADZONE", "12");
+    cfg_setenv("NX2NAVI_LSTICK_DEADZONE", NULL);
+    cfg_setenv("NX2NAVI_RSTICK_DEADZONE", NULL);
     CHECK(fabsf(input_pad_deadzone(0) - 0.12f) < 1e-6f && fabsf(input_pad_deadzone(1) - 0.12f) < 1e-6f,
           "pad dead zone: both sticks follow stick_deadzone while lstick/rstick are unset");
-    plat_setenv("NX2NAVI_RSTICK_DEADZONE", "20");
+    cfg_setenv("NX2NAVI_RSTICK_DEADZONE", "20");
     CHECK(fabsf(input_pad_deadzone(0) - 0.12f) < 1e-6f && fabsf(input_pad_deadzone(1) - 0.20f) < 1e-6f,
           "pad dead zone: rstick_deadzone sets the right stick alone");
-    plat_setenv("NX2NAVI_LSTICK_DEADZONE", "80");
+    cfg_setenv("NX2NAVI_LSTICK_DEADZONE", "80");
     CHECK(fabsf(input_pad_deadzone(0) - 0.5f) < 1e-6f, "pad dead zone: clamped to 50%");
-    plat_setenv("NX2NAVI_STICK_DEADZONE", NULL);
-    plat_setenv("NX2NAVI_LSTICK_DEADZONE", NULL);
-    plat_setenv("NX2NAVI_RSTICK_DEADZONE", NULL);
+    cfg_setenv("NX2NAVI_STICK_DEADZONE", NULL);
+    cfg_setenv("NX2NAVI_LSTICK_DEADZONE", NULL);
+    cfg_setenv("NX2NAVI_RSTICK_DEADZONE", NULL);
     CHECK(input_stick_percent(32767, 0) > 99.99 && input_stick_percent(32767, 0) < 100.01 &&
               input_stick_percent(0, 0) == 0 && fabs(input_stick_percent(3000, -4000) - 5000 * 100.0 / 32767) < 1e-9,
           "stick percent: an axis's end is 100%, the centre 0%, round in between");
@@ -323,6 +342,8 @@ int probe_cfg(void) {
     CHECK(input_pad_layout_pick("xbox_prompts", 0) == PAD_LAYOUT_NINTENDO &&
               input_pad_layout_pick("Xbox_Prompts", 1) == PAD_LAYOUT_NINTENDO,
           "pad layout: 0.1.9's xbox_prompts keeps the Nintendo positions (only the prompts change, romfs.c overlay_init)");
+    CHECK(input_pad_layout_pick("PlayStation", 1) == PAD_LAYOUT_XBOX && input_pad_layout_pick("playstation", 0) == PAD_LAYOUT_XBOX,
+          "pad layout: playstation plays by label as xbox does (cross A), whatever the pad's labels");
     // Button prompts (input_map.c)
     CHECK(input_prompts_pick(NULL, "auto") == PROMPTS_NINTENDO && input_prompts_pick("", "xbox") == PROMPTS_NINTENDO &&
               input_prompts_pick("Xbox", "nintendo") == PROMPTS_XBOX && input_prompts_pick("nintendo", "xbox") == PROMPTS_NINTENDO,
@@ -336,29 +357,32 @@ int probe_cfg(void) {
           "prompts: 0.1.9's pad_layout = xbox_prompts means Xbox while prompts is unset");
     CHECK(!input_prompts_folder(PROMPTS_NINTENDO, "nintendo") && !input_prompts_folder(PROMPTS_NINTENDO, "xbox"),
           "prompts: the game's own need no folder");
-    CHECK(input_prompts_pick("PlayStation", "nintendo") == PROMPTS_PLAYSTATION &&
-              EQ(input_prompts_folder(PROMPTS_PLAYSTATION, "nintendo"), "romfs-patches-playstation") &&
-              EQ(input_prompts_folder(PROMPTS_PLAYSTATION, "xbox"), "romfs-patches-playstation-label") &&
-              EQ(input_prompts_folder(PROMPTS_PLAYSTATION, "auto"), "romfs-patches-playstation-label"),
-          "prompts: playstation by the pad layout, A on Circle under Nintendo and on Cross under the others");
-    CHECK(input_prompts_pick("steamdeck", "xbox") == PROMPTS_STEAMDECK &&
-              EQ(input_prompts_folder(PROMPTS_STEAMDECK, "nintendo"), "romfs-patches-steamdeck") &&
-              EQ(input_prompts_folder(PROMPTS_STEAMDECK, "auto"), "romfs-patches-steamdeck-label"),
-          "prompts: steamdeck by the pad layout, as the Xbox ones");
     CHECK(EQ(input_prompts_folder(PROMPTS_XBOX, "nintendo"), "romfs-patches-xbox") &&
               EQ(input_prompts_folder(PROMPTS_XBOX, "xbox_prompts"), "romfs-patches-xbox") &&
               EQ(input_prompts_folder(PROMPTS_XBOX, "xbox"), "romfs-patches-xbox-label") &&
               EQ(input_prompts_folder(PROMPTS_XBOX, "auto"), "romfs-patches-xbox-label") &&
               EQ(input_prompts_folder(PROMPTS_XBOX, NULL), "romfs-patches-xbox-label"),
           "prompts: the face buttons by position for the Nintendo layout, by label for xbox and auto");
-    // romfs-patches-xbox shows A as B (tests/romfs_prompts_test.py checks the folders' contents). It is right exactly
-    // where the layout puts A on the east button, which an Xbox pad labels B.
+    CHECK(input_prompts_pick("PlayStation", "nintendo") == PROMPTS_PLAYSTATION &&
+              input_prompts_pick("playstation", "xbox_prompts") == PROMPTS_PLAYSTATION &&
+              input_prompts_pick("ps", "nintendo") == PROMPTS_NINTENDO,
+          "prompts: playstation in any case; an unknown value is the game's own");
+    CHECK(EQ(input_prompts_folder(PROMPTS_PLAYSTATION, "nintendo"), "romfs-patches-playstation") &&
+              EQ(input_prompts_folder(PROMPTS_PLAYSTATION, "xbox_prompts"), "romfs-patches-playstation") &&
+              EQ(input_prompts_folder(PROMPTS_PLAYSTATION, "xbox"), "romfs-patches-playstation-label") &&
+              EQ(input_prompts_folder(PROMPTS_PLAYSTATION, "auto"), "romfs-patches-playstation-label") &&
+              EQ(input_prompts_folder(PROMPTS_PLAYSTATION, NULL), "romfs-patches-playstation-label"),
+          "prompts: the PlayStation face buttons by position for the Nintendo layout, by label for xbox and auto");
+    // romfs-patches-xbox shows A as B and romfs-patches-playstation A as circle (tools/pad_prompts.py FACE). That is
+    // right exactly where the layout puts A on the east button, which an Xbox pad labels B and a PlayStation pad circle.
     input_map_reset();
-    static const char *const layouts[] = {"nintendo", "xbox", "auto", "xbox_prompts"};
-    for (int i = 0; i < 4; i++) {
+    static const char *const layouts[] = {"nintendo", "xbox", "playstation", "auto", "xbox_prompts"};
+    for (int i = 0; i < 5; i++) {
         int a_east = input_map_pad_buttons((uint8_t[PAD_COUNT]){[PAD_EAST] = 1}, input_pad_layout_pick(layouts[i], 0)) == 1ull << B_A;
         CHECK(a_east == EQ(input_prompts_folder(PROMPTS_XBOX, layouts[i]), "romfs-patches-xbox"),
               "prompts: the folder names A as B exactly when the layout puts A on the button labelled B");
+        CHECK(a_east == EQ(input_prompts_folder(PROMPTS_PLAYSTATION, layouts[i]), "romfs-patches-playstation"),
+              "prompts: the folder names A as circle exactly when the layout puts A on the circle button");
     }
     // The default layout is the Switch's own buttons by position, whatever the pad's labels (an Xbox pad's east button
     // is labelled B and does Switch A): A right, B bottom, X top, Y left, L/R the bumpers, ZL/ZR the triggers.
@@ -448,27 +472,27 @@ int probe_cfg(void) {
     CHECK(!strcmp(line, "none"), "edit: a stick direction without keys is none");
     // defaults live in the CfgMeta table: cfg_value and the typed accessors fall back to it
     cfg_load("cfg-probe-missing.ini");
-    plat_setenv("NX2NAVI_FPS60", NULL);
-    plat_setenv("NX2NAVI_MOUSE_SENS", NULL);
-    plat_setenv("NX2NAVI_FREE_CORES", NULL);
+    cfg_setenv("NX2NAVI_FPS60", NULL);
+    cfg_setenv("NX2NAVI_MOUSE_SENS", NULL);
+    cfg_setenv("NX2NAVI_FREE_CORES", NULL);
     CHECK(cfg_bool("NX2NAVI_FPS60") == 1, "default: unset FPS60 is on");
     CHECK(EQ(cfg_value("NX2NAVI_VK_PRESENT"), "mailbox") && cfg_int("NX2NAVI_SPLIT_DRAWS") == 64, "default: text and integer");
-    plat_setenv("NX2NAVI_MOUSE_SENS", "2.5");
+    cfg_setenv("NX2NAVI_MOUSE_SENS", "2.5");
     CHECK(cfg_double("NX2NAVI_MOUSE_SENS") == 2.5, "double: the environment value");
-    plat_setenv("NX2NAVI_MOUSE_SENS", "fast");
+    cfg_setenv("NX2NAVI_MOUSE_SENS", "fast");
     CHECK(cfg_double("NX2NAVI_MOUSE_SENS") == 1.0, "double: a value that does not parse gives the default");
-    plat_setenv("NX2NAVI_MOUSE_SENS", NULL);
+    cfg_setenv("NX2NAVI_MOUSE_SENS", NULL);
     cfg_set("NX2NAVI_MOUSE_SENS", "3");
     CHECK(cfg_double("NX2NAVI_MOUSE_SENS") == 3.0 && cfg_int("NX2NAVI_MOUSE_SENS") == 3, "a cfg_set value beats the default");
     CHECK(cfg_bool("NX2NAVI_FREE_CORES") == 0, "free_cores unset: off");
-    plat_setenv("NX2NAVI_FREE_CORES", "0");
+    cfg_setenv("NX2NAVI_FREE_CORES", "0");
     CHECK(cfg_bool("NX2NAVI_FREE_CORES") == 0, "free_cores 0 gives the same as unset");
-    plat_setenv("NX2NAVI_FREE_CORES", "1");
+    cfg_setenv("NX2NAVI_FREE_CORES", "1");
     CHECK(cfg_bool("NX2NAVI_FREE_CORES") == 1, "free_cores 1: on");
-    plat_setenv("NX2NAVI_FREE_CORES", NULL);
+    cfg_setenv("NX2NAVI_FREE_CORES", NULL);
     // 0.1.9's pad_layout = xbox_prompts (cfg.c migrate): read as the Nintendo layout with the Xbox prompts, saved so
-    plat_setenv("NX2NAVI_PAD_LAYOUT", NULL);
-    plat_setenv("NX2NAVI_PROMPTS", NULL);
+    cfg_setenv("NX2NAVI_PAD_LAYOUT", NULL);
+    cfg_setenv("NX2NAVI_PROMPTS", NULL);
     static const char old_layout[] = "[input]\r\npad_layout = xbox_prompts\r\n";
     CHECK(plat_file_write(path, old_layout, sizeof old_layout - 1) && cfg_load(path) == 1 &&
               EQ(cfg_get("NX2NAVI_PAD_LAYOUT"), "nintendo") && EQ(cfg_get("NX2NAVI_PROMPTS"), "xbox"),
@@ -492,7 +516,7 @@ int probe_cfg(void) {
         listed++;
         char name[96];
         snprintf(name, sizeof name, "NX2NAVI_%s", m->key);
-        plat_setenv(name, "");
+        cfg_setenv(name, "");
         CHECK(EQ(cfg_value(name), m->def), "cfg_value returns the table default");
         int ok = 0;
         if (!m->values) ok = 1;

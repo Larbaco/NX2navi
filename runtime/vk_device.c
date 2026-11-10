@@ -13,6 +13,9 @@
 #include "vk_fg.h"
 #include "vk_dlssg.h"
 
+// The loader's vkGetDeviceProcAddr until Streamline is on the device (see vk.h).
+PFN_vkGetDeviceProcAddr vk_dpa = vkGetDeviceProcAddr;
+
 static uint32_t g_gfx_queues = 1;   // queues the graphics family offers (pick_device)
 
 static VkCtx g_vk;
@@ -233,6 +236,10 @@ typedef struct {
     VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT fbl;
     VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR lr;
     VkPhysicalDeviceMeshShaderFeaturesEXT mesh;
+    VkPhysicalDeviceFragmentShadingRateFeaturesKHR vrs;
+    VkPhysicalDeviceShaderMaximalReconvergenceFeaturesKHR mrc;
+    VkPhysicalDeviceMaintenance5FeaturesKHR m5;
+    VkPhysicalDevicePipelineBinaryFeaturesKHR pbin;
 } FeatureChain;
 
 static int create_device(void) {
@@ -269,6 +276,23 @@ static int create_device(void) {
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT);
     // NVN2 task and mesh programs (gameplay geometry) draw through VK_EXT_mesh_shader (vk_exec_draw.c op_draw_mesh)
     OPTIONAL_EXT(has_mesh_shader, VK_EXT_MESH_SHADER_EXTENSION_NAME, mesh, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT);
+    // The foliage's far shadow cascades shade one fragment per 2x2 pixels (vk_exec_draw.c mesh_shading_rate)
+    OPTIONAL_EXT(has_vrs, VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME, vrs, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR);
+    // Guest shaders that use warp-wide operations after divergent code run with their threads reconverged
+    // (vk_pipeline.c spirv_reconverge)
+    OPTIONAL_EXT(has_maximal_reconvergence, VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME, mrc,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MAXIMAL_RECONVERGENCE_FEATURES_KHR);
+    // Compiled pipelines kept under the runtime's own keys (vk_pipeline.c pipe_create): VK_KHR_pipeline_binary, which
+    // needs VK_KHR_maintenance5 (core only from Vulkan 1.4; the instance asks for 1.3). NX2NAVI_PIPE_BINARIES=0 leaves
+    // both off.
+    if (cfg_bool("NX2NAVI_PIPE_BINARIES") && has_ext(ep, ne, VK_KHR_PIPELINE_BINARY_EXTENSION_NAME) &&
+        has_ext(ep, ne, VK_KHR_MAINTENANCE_5_EXTENSION_NAME)) {
+        g_vk.has_pipeline_binary = 1;
+        ext[n_ext++] = VK_KHR_MAINTENANCE_5_EXTENSION_NAME;
+        ext[n_ext++] = VK_KHR_PIPELINE_BINARY_EXTENSION_NAME;
+        CHAIN(m5, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR);
+        CHAIN(pbin, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR);
+    }
     // Feedback loops (vk.h VkCtx.feedback): the layout, and barriers inside dynamic rendering
     int has_fbl = 0, has_lr = 0;
     if (has_ext(ep, ne, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
@@ -281,8 +305,9 @@ static int create_device(void) {
     }
     vk_dlaa_device_exts(ep, ne, ext, &n_ext, 40);   // NGX's; the eight slots after it stay for the eight below
     // FSR 3.1 (vk_ffx.cpp): its Vulkan back end looks vkGetBufferMemoryRequirements2KHR up by that name, which resolves
-    // only with the extension enabled (the core function has no suffix); without it the back end called address 0
-    if ((vk_dlaa_fsr3() || vk_fg_wanted() || vk_dlssg_wanted()) && has_ext(ep, ne, VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME))
+    // only with the extension enabled (the core function has no suffix); without it the back end called address 0.
+    // Always asked for: FSR 3.1 can be switched on in the menu during a run
+    if (has_ext(ep, ne, VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME))
         ext[n_ext++] = VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME;
     // DLSS Frame Generation (vk_dlssg.c): Streamline's plugins look functions of extensions core in Vulkan 1.3 up by
     // their suffixed names too, which resolve only with the extension itself enabled
@@ -347,13 +372,25 @@ static int create_device(void) {
     else if (!h->textureCompressionBC) miss = "textureCompressionBC";
     if (miss) { rt_log("vk: required feature missing on %s: %s", g_vk.props.deviceName, miss); free(c); return 0; }
     if (!c->fault.deviceFault) g_vk.has_device_fault = 0;
+    if (g_vk.has_vrs) {   // the rate is set per draw; no rate attachment and no per-primitive rates
+        c->vrs.attachmentFragmentShadingRate = c->vrs.primitiveFragmentShadingRate = VK_FALSE;
+        if (!c->vrs.pipelineFragmentShadingRate) g_vk.has_vrs = 0;
+        rt_log("vk: fragment shading rate: %s", g_vk.has_vrs ? "per draw" : "not supported");
+    }
     if (g_vk.has_mesh_shader) {
         // these two need features that are not enabled (multiview, primitive fragment shading rate)
         c->mesh.multiviewMeshShader = c->mesh.primitiveFragmentShadingRateMeshShader = VK_FALSE;
-        c->mesh.meshShaderQueries = VK_FALSE;
+        // Mesh queries for two diagnoses: NX2NAVI_GPU_PASSES (vk_crumbs.c) and the dump's primitive counts
+        // (vk_dump.c vk_dump_mesh_begin), which also need pipeline statistics and host query reset.
+        const char *gp = cfg_get("NX2NAVI_GPU_PASSES"), *dmp = cfg_get("NX2NAVI_DUMP");
+        int want = (gp && *gp && strcmp(gp, "0")) || (dmp && *dmp);
+        g_vk.has_mesh_queries = want && c->mesh.meshShaderQueries && h->pipelineStatisticsQuery && c->f12.hostQueryReset;
+        c->mesh.meshShaderQueries = g_vk.has_mesh_queries ? VK_TRUE : VK_FALSE;
         if (!c->mesh.meshShader || !c->mesh.taskShader) g_vk.has_mesh_shader = 0;
         rt_log("vk: mesh shaders: %s", g_vk.has_mesh_shader ? "VK_EXT_mesh_shader" : "not supported (task/mesh draws are skipped)");
     }   // vkGetDeviceFaultInfoEXT needs the feature, not just the extension
+    if (g_vk.has_maximal_reconvergence && !c->mrc.shaderMaximalReconvergence) g_vk.has_maximal_reconvergence = 0;
+    if (g_vk.has_pipeline_binary && !(c->pbin.pipelineBinaries && c->m5.maintenance5)) g_vk.has_pipeline_binary = 0;
     g_vk.has_buffer_device_address = c->f12.bufferDeviceAddress;
     g_vk.has_astc_ldr = h->textureCompressionASTC_LDR;
     {
@@ -385,6 +422,10 @@ static int create_device(void) {
     free(c);
     if (r != VK_SUCCESS) { rt_log("vk: vkCreateDevice failed (%d)", (int)r); return 0; }
     vk_dlssg_device_ready(g_vk.device);
+    if (vk_dlssg_dpa()) {   // Streamline's, so its plugins hook every entry point the replay fetches
+        vk_dpa = vk_dlssg_dpa();
+        rt_log("vk: device entry points come through Streamline's interposer (DLSS Frame Generation)");
+    }
     vkGetDeviceQueue(g_vk.device, g_vk.gfx_family, 0, &g_vk.gfx_queue);
     if (nq_gfx >= 2) {
         VkQueue present, acquire;
@@ -405,6 +446,7 @@ static int create_device(void) {
                                  .vulkanApiVersion = VK_API_VERSION_1_3,
                                  .flags = (g_vk.has_buffer_device_address ? VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT : 0) |
                                           (g_vk.has_memory_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0),
+                                 .preferredLargeHeapBlockSize = vk_vma_block_size(),
                                  .pDeviceMemoryCallbacks = vk_headroom_callbacks()};
     if ((r = vmaCreateAllocator(&ai, &g_vk.vma)) != VK_SUCCESS) { rt_log("vk: vmaCreateAllocator failed (%d)", (int)r); return 0; }
 
@@ -424,6 +466,7 @@ static long g_errors_total;     // outlives the device so the probe can print it
 static void destroy_all(void) {
     gfx_window_release_vk();
     if (g_vk.device) vkDeviceWaitIdle(g_vk.device);
+    if (g_vk.device) vk_dlaa_release();   // the DLSS features and NGX: the allocator and the device still live
     if (g_vk.device) vk_astc_release();
     if (g_vk.device) vk_crumbs_release();
     if (g_vk.timeline) vkDestroySemaphore(g_vk.device, g_vk.timeline, NULL);
@@ -488,7 +531,7 @@ void vk_device_fault_report(VkResult r) {
     vk_pass_marks_report();
     VkCtx *c = vk_ctx();
     PFN_vkGetDeviceFaultInfoEXT get =
-        c && c->has_device_fault ? (PFN_vkGetDeviceFaultInfoEXT)vkGetDeviceProcAddr(c->device, "vkGetDeviceFaultInfoEXT")
+        c && c->has_device_fault ? (PFN_vkGetDeviceFaultInfoEXT)vk_dpa(c->device, "vkGetDeviceFaultInfoEXT")
                                  : NULL;
     if (!get) {
         rt_log("vk: device lost; no fault report (VK_EXT_device_fault %s)", c && c->has_device_fault ? "has no entry point"

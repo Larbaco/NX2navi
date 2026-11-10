@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cfg.h"
 #include "gfx.h"
 #include "host.h"
 #include "nvn_api.h"
@@ -44,6 +45,99 @@ static int stop;
 static Pending *queue;            // side effects in the order they were added
 static int qhead, qn, qcap;
 
+// ---- submit batching
+// Every game submission used to be its own vkQueueSubmit2, about 150 a frame, each a trip into the driver on the render
+// thread. Now up to hold_max of them are held and go to the queue together, as one vkQueueSubmit2 with one
+// VkSubmitInfo2 each, in the order they were made; a part of a long submission (vk_sync_split) goes at once, with what
+// is held before it, since it was split off to start the GPU early. Queue order is what orders them with everything
+// else, so held work goes to the queue before anything else does or is waited for:
+// - every other submitter, and every idle wait, takes the queue lock through vk_queue_lock, which flushes first;
+// - a fence wait for a value still held flushes (fence_wait_impl), as do vk_sync_finish and shutdown;
+// - the completion thread flushes what has been held for HOLD_NS, so a guest that polls memory a held submission
+//   writes, instead of waiting on its fence, still sees it soon; it only tries the lock, never waits for it.
+// H is guarded by the queue lock. NX2NAVI_SUBMIT_BATCH=0 (or 1) hands each to the queue at once; =N holds up to N.
+#define HOLD_CAP 16
+#define HOLD_NS 500000ull
+static struct {
+    int n;
+    VkSubmitInfo2 si[HOLD_CAP];
+    VkCommandBufferSubmitInfo cbi[HOLD_CAP][2];
+    VkSemaphoreSubmitInfo sig[HOLD_CAP];
+    uint64_t last;                    // the newest timeline value a held submission signals, 0 none
+    uint64_t batches, subs;           // vkQueueSubmit2 calls and the submissions they carried
+} H;
+static volatile int32_t held_n;       // H.n, for readers without the lock
+static volatile uint64_t held_t0;     // when the oldest held submission was held (kern_now_ns)
+static volatile uint64_t queued_v;    // the newest timeline value handed to the queue
+static int hold_max = -1;
+
+static void hold_flush_locked(VkCtx *c) {
+    if (!H.n) return;
+    VkResult r = vkQueueSubmit2(c->gfx_queue, (uint32_t)H.n, H.si, VK_NULL_HANDLE);
+    if (r != VK_SUCCESS) {
+        vk_device_fault_report(r);
+        rt_fatal("vk: vkQueueSubmit2 of %d held submissions up to value %llu failed (%d)", H.n,
+                 (unsigned long long)H.last, (int)r);
+    }
+    if (H.last) __atomic_store_n(&queued_v, H.last, __ATOMIC_RELEASE);
+    H.batches++, H.subs += (uint64_t)H.n;
+    H.n = 0, H.last = 0;
+    __atomic_store_n(&held_n, 0, __ATOMIC_RELEASE);
+}
+
+void vk_sync_flush_held(void) {
+    if (!H.n) return;   // queue lock held: H is stable
+    VkCtx *c = vk_ctx();
+    if (c) hold_flush_locked(c);
+}
+
+// The replay's submission si (signalling value, 0 for a part without a signal), held or handed to the queue.
+static void queue_submit(VkCtx *c, const VkSubmitInfo2 *si, uint64_t value) {
+    if (hold_max < 0) {
+        const char *e = cfg_get("NX2NAVI_SUBMIT_BATCH");
+        int v = e && *e ? atoi(e) : 4;
+        hold_max = v < 1 ? 1 : v > HOLD_CAP ? HOLD_CAP : v;
+        rt_log("vk: up to %d submissions handed to the queue together (NX2NAVI_SUBMIT_BATCH)", hold_max);
+    }
+    // The present holds this lock for its whole flip. A slow flip (frame generation allocating, a swapchain remade) makes
+    // the submitting thread wait here; counted as a present wait, so the slow-frame line no longer shows such a frame
+    // with nothing blocked.
+    uint64_t p0 = perf_begin();
+    vk_queue_lock_raw();
+    perf_end(PERF_FENCE, p0);
+    if (H.n == HOLD_CAP) hold_flush_locked(c);
+    int i = H.n++;
+    H.si[i] = *si;
+    if (si->commandBufferInfoCount)
+        memcpy(H.cbi[i], si->pCommandBufferInfos, sizeof H.cbi[i][0] * si->commandBufferInfoCount);
+    H.si[i].pCommandBufferInfos = H.cbi[i];
+    if (si->signalSemaphoreInfoCount) H.sig[i] = si->pSignalSemaphoreInfos[0], H.si[i].pSignalSemaphoreInfos = &H.sig[i];
+    if (value) H.last = value;
+    uint64_t now = kern_now_ns();
+    if (i == 0) __atomic_store_n(&held_t0, now, __ATOMIC_RELEASE);
+    __atomic_store_n(&held_n, H.n, __ATOMIC_RELEASE);
+    // A part of a long submission (no value) goes at once with whatever is held: parts exist to start the GPU early.
+    // So do held submissions that have waited HOLD_NS, and a full batch.
+    if (H.n >= hold_max || !value || now - __atomic_load_n(&held_t0, __ATOMIC_ACQUIRE) >= HOLD_NS) hold_flush_locked(c);
+    vk_queue_unlock();
+}
+
+// Hands the held submissions to the queue when value is among them (a waiter needs it) or they have waited HOLD_NS
+// (aged). The completion thread passes try_only: it never waits for the queue lock, whose holders may wait for it.
+static void hold_release(uint64_t value, int aged, int try_only) {
+    if (!__atomic_load_n(&held_n, __ATOMIC_ACQUIRE)) return;
+    int due = value > __atomic_load_n(&queued_v, __ATOMIC_ACQUIRE) ||
+              (aged && kern_now_ns() - __atomic_load_n(&held_t0, __ATOMIC_ACQUIRE) >= HOLD_NS);
+    if (!due) return;
+    if (try_only) {
+        if (!vk_queue_trylock_raw()) return;   // the holder's thread is submitting: it flushes or holds on
+    } else {
+        vk_queue_lock_raw();
+    }
+    vk_sync_flush_held();
+    vk_queue_unlock();
+}
+
 // ---- GPU time (NX2NAVI_TRACE=perf): each submission part (vk_sync_split) writes a timestamp when it starts and when it
 // ends, into a ring of query pairs. The completion thread reads a pair once the part's value is reached and adds the
 // part's interval to the busy time, counting overlap with the previous part once. Off (one log line) when the queue
@@ -58,6 +152,9 @@ static volatile uint8_t ts_busy[TS_PAIRS]; // written until the completion threa
 static int ts_cur = -1;                    // the pair of the part being recorded, -1 untimed
 static uint64_t ts_last_end;               // completion thread: end of the latest part read (ticks)
 static volatile int64_t ts_busy_ns, ts_parts, ts_missed;
+// The same durations, never reset: dynamic resolution differences it across presented frames (the perf window
+// consumes ts_busy_ns, so a reader that sampled it would steal from the perf line and see a reset every window).
+static volatile int64_t ts_busy_all;
 // GPU idle (with calibrated timestamps): the gap before each timed part, split by whether the part was submitted after
 // the previous one had ended (the GPU waited for the CPU: starved) or before (it waited for untimed work or a wait).
 static uint64_t ts_sub_ns[TS_PAIRS];       // CPU time the part was handed to vkQueueSubmit2
@@ -103,7 +200,7 @@ static void ts_setup(VkCtx *c) {
 static int cal_refresh(VkCtx *c) {
     if (!c->has_calibrated) return 0;
     if (!cal_fn) {
-        cal_fn = (PFN_vkGetCalibratedTimestampsKHR)vkGetDeviceProcAddr(c->device, c->has_calibrated == 2 ? "vkGetCalibratedTimestampsKHR"
+        cal_fn = (PFN_vkGetCalibratedTimestampsKHR)vk_dpa(c->device, c->has_calibrated == 2 ? "vkGetCalibratedTimestampsKHR"
                                                                                                         : "vkGetCalibratedTimestampsEXT");
         if (!cal_fn) { c->has_calibrated = 0; return 0; }
     }
@@ -176,6 +273,7 @@ static void ts_read_cb(void *arg) {   // completion thread, in submission order
                 int64_t ns = (int64_t)((double)(e - from) * ts_period);
                 plat_add64(&ts_busy_ns, ns);
                 if (t->mirror) plat_add64(&ts_mirror_ns, ns);
+                plat_add64(&ts_busy_all, ns);
                 perf_gpu_busy((uint64_t)ns);
             }
             if (e > ts_last_end) ts_last_end = e;
@@ -230,6 +328,8 @@ static void ts_drop(void) {
     ts_cur = -1;
 }
 
+uint64_t vk_gpu_busy_all(void) { return (uint64_t)__atomic_load_n(&ts_busy_all, __ATOMIC_RELAXED); }
+
 static void gpu_stats(PerfGpu *g) {
     g->have_gpu = ts_state == 1;
     g->gpu_ns = (uint64_t)plat_xchg64(&ts_busy_ns, 0);
@@ -267,9 +367,13 @@ static void completion_main(void *arg) {
         if (issued > done) {
             uint64_t want = done + 1;
             plat_mutex_unlock(&st_lock);
+            // Held submissions that have waited long enough go to the queue; while some are held, the wait is short so
+            // their age is checked again (submit batching).
+            hold_release(0, 1, 1);
+            uint64_t tmo = __atomic_load_n(&held_n, __ATOMIC_ACQUIRE) ? HOLD_NS : 100000000ull;
             VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1,
                                       .pSemaphores = &c->timeline, .pValues = &want};
-            VkResult r = vkWaitSemaphores(c->device, &wi, 100000000ull);   // 100 ms: stop is checked between waits
+            VkResult r = vkWaitSemaphores(c->device, &wi, tmo);   // 100 ms: stop is checked between waits
             if (r != VK_SUCCESS && r != VK_TIMEOUT) {
                 vk_device_fault_report(r);
                 rt_fatal("vk: vkWaitSemaphores failed (%d; device lost?)", (int)r);
@@ -383,6 +487,7 @@ static VkCommandBuffer prologue(VkCtx *c, uint64_t fence) {
 VkCommandBuffer vk_sync_split(void) {
     VkCtx *c = vk_ctx();
     VkCommandBuffer cb = slots[cur_slot].cb;
+    vk_gpu_passes_part(cb, 1);
     ts_end(cb, cur_fence);
     if (!rec_end_cb(cb, 0, 0)) vkEndCommandBuffer(cb);   // every command of the part is in cb, ended by its recorder
     vk_upload_flush(0);   // the uploads this part asked for precede it in queue order
@@ -392,13 +497,7 @@ VkCommandBuffer vk_sync_split(void) {
     VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = pro ? 2 : 1,
                         .pCommandBufferInfos = pro ? cbi : cbi + 1};
     ts_submitted();
-    vk_queue_lock();
-    VkResult r = vkQueueSubmit2(c->gfx_queue, 1, &si, VK_NULL_HANDLE);
-    vk_queue_unlock();
-    if (r != VK_SUCCESS) {
-        vk_device_fault_report(r);
-        rt_fatal("vk: vkQueueSubmit2 of a part of value %llu failed (%d)", (unsigned long long)cur_fence, (int)r);
-    }
+    queue_submit(c, &si, 0);         // held or handed to the queue (submit batching)
     vk_mem_note_submit(cur_fence);   // objects destroyed from here on may be in use by the part just submitted
     CmdSlot *s = take_slot(c, cur_fence);   // the submitted part keeps its slot until the value is reached
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -407,6 +506,7 @@ VkCommandBuffer vk_sync_split(void) {
     vk_crumb(s->cb, VK_CRUMB_SUBMIT, cur_fence);
     ts_begin(s->cb);
     rec_begin(s->cb, cur_fence);
+    vk_gpu_passes_part(s->cb, 0);
     return s->cb;
 }
 
@@ -431,18 +531,25 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n) {
     CmdSlot *s = take_slot(c, fence);
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-    uint64_t t0 = perf_begin();
+    // NX2NAVI_REPLAY_TIME: the replaying thread's CPU time over the replay too (perf_replay_cpu), against its wall time
+    static int cpu_on = -1;
+    if (cpu_on < 0) cpu_on = cfg_bool("NX2NAVI_REPLAY_TIME");
+    uint32_t me = plat_thread_id();
+    uint64_t t0 = perf_begin(), cpu0 = cpu_on ? plat_thread_cpu_ns(me) : 0;
     vkBeginCommandBuffer(s->cb, &bi);
     vk_crumb(s->cb, VK_CRUMB_SUBMIT, fence);
     ts_begin(s->cb);
     rec_begin(s->cb, fence);
+    vk_gpu_passes_part(s->cb, 0);
     int recorded = vk_exec_record(s->cb, handles, n, fence);
     s = &slots[cur_slot];   // the last part (vk_sync_split)
+    vk_gpu_passes_part(s->cb, 1);
     if (recorded) ts_end(s->cb, fence);
     else ts_drop();
     // The recorder is done with the part: the end-of-submission crumb, then the end, by the recorder when it records.
     if (!rec_end_cb(s->cb, VK_CRUMB_SUBMIT_END, fence)) vkEndCommandBuffer(s->cb);
     perf_replay(t0);
+    if (cpu0) perf_replay_cpu(plat_thread_cpu_ns(me) - cpu0);
     // After the recording: the uploads it asked for (and every earlier one) precede it in queue order.
     vk_upload_flush(0);
     VkCommandBuffer pro = prologue(c, fence);
@@ -456,13 +563,7 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n) {
                         .pCommandBufferInfos = pro ? cbi : cbi + 1, .signalSemaphoreInfoCount = 1,
                         .pSignalSemaphoreInfos = &sig};
     ts_submitted();
-    vk_queue_lock();
-    VkResult r = vkQueueSubmit2(c->gfx_queue, 1, &si, VK_NULL_HANDLE);
-    vk_queue_unlock();
-    if (r != VK_SUCCESS) {
-        vk_device_fault_report(r);
-        rt_fatal("vk: vkQueueSubmit2 of value %llu failed (%d)", (unsigned long long)fence, (int)r);
-    }
+    queue_submit(c, &si, fence);   // held or handed to the queue (submit batching)
     s->fence = recorded ? fence : 0;
     vk_mem_note_submit(fence);
     plat_mutex_lock(&st_lock);
@@ -470,7 +571,12 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n) {
     plat_cond_broadcast(&cv_work);
     plat_mutex_unlock(&st_lock);
     static unsigned subs;
-    if (++subs % 4096 == 0) rec_stats_log();
+    if (++subs % 4096 == 0) {
+        rec_stats_log();
+        if (subs % (4096 * 8) == 4096)   // statistics only: read without the queue lock
+            rt_log("vk: submit batching: %llu submissions in %llu queue calls (%.2f each)", (unsigned long long)H.subs,
+                   (unsigned long long)H.batches, H.batches ? (double)H.subs / (double)H.batches : 0.0);
+    }
     plat_mutex_unlock(&sub_lock);
     return fence;
 }
@@ -507,6 +613,7 @@ int vk_sync_fence_wait(uint64_t value, uint64_t timeout_ns) {
 
 static int fence_wait_impl(uint64_t value, uint64_t timeout_ns) {
     vk_sync_start();
+    hold_release(value, 0, 0);   // a held submission the waiter needs goes to the queue now
     plat_mutex_lock(&st_lock);
     int ok;
     if (value > issued && value > reserved) {

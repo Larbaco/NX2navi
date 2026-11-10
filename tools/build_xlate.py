@@ -18,7 +18,6 @@ translator change re-keys the cache without a hand-made KEY_VERSION bump. --id-o
 import argparse
 import hashlib
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -100,37 +99,25 @@ def prepare_sources() -> Path:
     for junk in list(src.glob("src/*/obj")) + list(src.glob("src/*/bin")):
         shutil.rmtree(junk)
     patches = sorted((XLATE / "patches").glob("*.patch"))
-    if len(patches) != 36:
-        sys.exit(f"expected 36 patches, found {len(patches)}")
-    # BUILD may sit inside a git work tree (the default build/xlate does). git apply then treats the paths as the
-    # enclosing repository's and skips a patch with a `diff --git` header while still exiting 0 (it may print
-    # "Skipped patch" or nothing), so a patch that creates a file is dropped silently. The ceiling hides every
-    # directory above BUILD from git's repository search, so it runs as it does outside a repository; apply_patch()
-    # then checks the result instead of trusting the exit code.
-    env = dict(os.environ, GIT_CEILING_DIRECTORIES=str(BUILD.parent))
+    if len(patches) != 37:
+        sys.exit(f"expected 37 patches, found {len(patches)}")
+    # build/xlate is inside this checkout, and git inside a repository reads a "diff --git" patch's paths from the
+    # repository's top: those hunks fall outside the directory handed to --directory, git skips every file of the patch
+    # and still exits 0. GIT_CEILING_DIRECTORIES stops git from walking up to the checkout, so it reads each patch as it
+    # would outside a repository, and a "Skipped patch" line fails the build (including 0021's PRMT implementation).
+    env = dict(os.environ, GIT_CEILING_DIRECTORIES=str(BUILD.parent), LC_ALL="C")
     for patch in patches:
-        apply_patch(patch, src, env)
+        for extra in (["--check"], []):
+            r = subprocess.run(
+                ["git", "apply", *extra, "--verbose", "--whitespace=nowarn",
+                 "--directory", str(src.relative_to(BUILD)), str(patch)],
+                cwd=BUILD, capture_output=True, text=True, env=env,
+            )
+            skipped = "Skipped patch" in r.stdout or "Skipped patch" in r.stderr
+            if r.returncode != 0 or skipped:
+                sys.exit(f"patch does not apply: {patch.name}\n{r.stdout}{r.stderr}")
         print(f"applied {patch.name}")
     return src
-
-
-def apply_patch(patch: Path, src: Path, env: dict[str, str]) -> None:
-    """Apply one patch to src (git apply works outside a repository when given a directory; --check first so a
-    failure names the patch). Fails when git reports a skipped patch or a file the patch creates is missing: inside a
-    repository git skips such a patch, exits 0 and may say nothing at all."""
-    cmd = ["git", "apply", "--whitespace=nowarn", "--directory", str(src.relative_to(BUILD)), str(patch)]
-    for extra in (["--check"], []):
-        r = subprocess.run([*cmd[:2], *extra, *cmd[2:]], cwd=BUILD, env=env, capture_output=True, text=True)
-        if r.returncode != 0:
-            sys.exit(f"patch does not apply: {patch.name}\n{r.stdout}{r.stderr}")
-        if "Skipped patch" in r.stdout + r.stderr:
-            sys.exit(f"git skipped part of {patch.name}:\n{r.stdout}{r.stderr}")
-    lines = patch.read_text(encoding="utf-8").splitlines()
-    for old, new in zip(lines, lines[1:]):
-        if old.startswith("--- /dev/null") and new.startswith("+++ b/"):
-            created = src / new[len("+++ b/"):].split("\t")[0]
-            if not created.is_file():
-                sys.exit(f"{patch.name} should have created {created.relative_to(BUILD)}, but git left it out")
 
 
 # What the identity covers besides the sources: the publish settings in main(). Change it with them.

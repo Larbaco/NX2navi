@@ -257,9 +257,13 @@ static void scene_overlay(float w, float h, float scale) {
     p.version = "NX2navi 0.5.0, game 1.1.1";
     snprintf(p.picture[0], 64, "1920x1080");
     snprintf(p.picture[1], 64, "2560x1440");
-    snprintf(p.picture[3], 64, "bilinear");
+    snprintf(p.picture[3], 64, "AMD FSR 3.1 Performance");
     snprintf(p.picture[4], 64, "60 FPS");
-    snprintf(p.picture[5], 64, "VSync");
+    snprintf(p.picture[5], 64, "%s", menu_text(UI_MENU_ON));
+    snprintf(p.picture[6], 64, "21:9");
+    snprintf(p.picture[7], 64, "1440p");
+    snprintf(p.picture[8], 64, "%s", menu_text(UI_MENU_HDR_TONEMAPPED));
+    snprintf(p.picture[9], 64, "%s", menu_text(UI_MENU_FRAMEGEN_OFF));
     p.scene_known = false, p.fg_fps = 60, p.under_menu = false;
     perf_panel_draw(&p, w, scale);
 }
@@ -271,7 +275,7 @@ static void scene_boot(float w, float h, float scale, ImFont *title) {
     char step[160];
     snprintf(step, sizeof step, ui_text(UI_BOOT_PIPELINES), 1603LL, 3235LL);
     skin_boot_panel(ImGui::GetForegroundDrawList(), title, title->FontSize, ImGui::GetFont(), ImGui::GetFontSize(),
-                    ui_text(UI_BOOT_TITLE), step, ui_text(UI_BOOT_HINT), 1603.0f / 3235.0f, 0, w, h, scale);
+                    ui_text(UI_BOOT_TITLE), step, 1603.0f / 3235.0f, 0, w, h, scale);
 }
 
 // ---- the rasteriser: every triangle of the draw lists, its colour times the font atlas, blended over the image

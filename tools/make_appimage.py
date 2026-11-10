@@ -52,7 +52,7 @@ case "$1" in ""|-h|--help) usage; exit 0 ;; esac
 
 missing=()
 for tool in clang clang++ ld.lld; do command -v "$tool" >/dev/null || missing+=("$tool"); done
-for h in SDL3/SDL.h vulkan/vulkan.h opus/opus.h vpx/vpx_decoder.h dav1d/dav1d.h zstd.h libunwind.h; do
+for h in SDL3/SDL.h vulkan/vulkan.h opus/opus.h vpx/vpx_decoder.h dav1d/dav1d.h zstd.h; do
     [ -e "/usr/include/$h" ] || [ -e "/usr/local/include/$h" ] || missing+=("$h")
 done
 if [ ${#missing[@]} -gt 0 ]; then
@@ -60,12 +60,12 @@ if [ ${#missing[@]} -gt 0 ]; then
 Missing: ${missing[*]}
 Install the compiler and libraries, then run this again:
   Arch, CachyOS, Manjaro, SteamOS (developer mode):
-    sudo pacman -S --needed clang lld sdl3 opus libvpx dav1d zstd libunwind vulkan-headers vulkan-icd-loader
+    sudo pacman -S --needed clang lld sdl3 opus libvpx dav1d zstd vulkan-headers vulkan-icd-loader
   Fedora:
-    sudo dnf install clang lld SDL3-devel opus-devel libvpx-devel libdav1d-devel libzstd-devel libunwind-devel \\
+    sudo dnf install clang lld SDL3-devel opus-devel libvpx-devel libdav1d-devel libzstd-devel \\
         vulkan-headers vulkan-loader-devel libstdc++-static libatomic
   Debian, Ubuntu:
-    sudo apt install clang lld libsdl3-dev libopus-dev libvpx-dev libdav1d-dev libzstd-dev libunwind-dev libvulkan-dev
+    sudo apt install clang lld libsdl3-dev libopus-dev libvpx-dev libdav1d-dev libzstd-dev libvulkan-dev
 EOF
     exit 1
 fi

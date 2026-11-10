@@ -12,6 +12,7 @@
 // is also fixed at init; they are looked up only after the flat table misses.
 #include "dispatch.h"
 #include "host.h"
+#include "prof.h"
 #include "platform/platform.h"
 
 #include <stdarg.h>
@@ -53,6 +54,7 @@ void rt_fatal(const char *fmt, ...) {
     plat_commit_info(&proc, &used, &limit);
     rt_log("fatal: memory commit: this process %.0f MB, the system %.0f of %.0f MB", proc, used, limit);
     kern_free_cores_note();
+    prof_sampler_write();   // NX2NAVI_PROFILE: what was sampled until now, else a crash loses the whole profile
     fflush(stdout);
     fflush(stderr);
     _Exit(70);

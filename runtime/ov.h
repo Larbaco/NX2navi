@@ -8,6 +8,7 @@
 #include "gfx.h"
 
 // ---- ov_system.c
+void ov_operation_mode_live(void);        // a changed NX2NAVI_OPERATION_MODE goes to the game
 int ov_handheld(void);                     // NX2NAVI_OPERATION_MODE=handheld (default docked); fatal on another value
 const char *ov_language(void);             // the game's language, a Switch language code ("en-US", "zh-Hans", ...)
 const char *ov_shared_font_dir(char *buf, size_t n);   // NX2NAVI_SHARED_FONTS, else <romfs>/../../firmware/shared-fonts

@@ -49,7 +49,7 @@ static int init(VkCtx *c) {
     if (!C.strength) return 0;
     const char *e = cfg_get("NX2NAVI_CONTACT_DEBUG");   // 1: the frame shows the contact shadow factor in grey
     C.debug = e && *e && strcmp(e, "0");
-    C.push = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(c->device, "vkCmdPushDescriptorSetKHR");
+    C.push = (PFN_vkCmdPushDescriptorSetKHR)vk_dpa(c->device, "vkCmdPushDescriptorSetKHR");
     VkDescriptorSetLayoutBinding b[2] = {
         {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1,
          .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},

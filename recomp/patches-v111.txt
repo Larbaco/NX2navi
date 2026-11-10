@@ -17,6 +17,7 @@ set wide_hud    NX2NAVI_PATCH_WIDE_HUD    0
 set wide_movie  NX2NAVI_PATCH_WIDE_MOVIE  0
 set res_fixed   NX2NAVI_PATCH_RES_FIXED   0
 set ostep       NX2NAVI_OCARINA_REALTIME  1
+set zstd        NX2NAVI_ZSTD_NATIVE       1
 
 # Real-time step: the framework's per-frame update (main+0x6e6be0) gives the time manager **[main+0x4c7e890] its
 # nominal frame through main+0x3b4e300 (+0x10 frames per update, +0x14 the inverse, +0x18 seconds, +0x1c the rate),
@@ -88,3 +89,16 @@ site wide_hud main 774368 ad401041 ad401041 @page:x16 fd404a10 6e040431 6e0c2491
 # Pre-rendered movies: the movie layer's draw (main+0x3b5c71c) builds a viewport over the whole picture (sead viewport
 # at x29 - 40: min x +8, max x +16); it moves in by the page's margin on each side, the middle 16:9 of the picture.
 site wide_movie main 3b5c758 a941a269 d100a3b0 bd400a10 bd401211 1e303a32 @page:x17 bd40c233 1e330a52 1e322a10 1e323a31 bd000a10 bd001211 a941a269   # movie layer viewport: ldp x9, x8, [x19, #0x18]
+
+# The game's zstd decoder (BSD zstd, statically linked into main) through the host's libzstd (runtime/ov_zstd.c): the
+# three calls of ZSTD_decompressMultiFrame (main+0xeb380: dctx, dst, capacity, src, size, dict, dict size, ddict) go to
+# the host function on the patch page (+0xff0). main+0xe910c is the file loader's call for a file that fits one read
+# chunk. The loading threads decode most of the data through the game's stream feed (main+0xf5c80: state, src, size,
+# ddict), called once per chunk read at main+0xf5c2c: that call goes to the host's stream decoder on the patch page
+# (+0xf80), which takes a stream from its first chunk or leaves it to the game (ov_zstd.c host_stream). Until a check
+# run has compared the two decoders on this build, the host functions pass every call on to the game's decoder unless
+# zstd_native = 1 is set (ov_zstd.c trusted).
+site zstd main e910c  9400089d 9536dfb9   # bl ZSTD_decompressMultiFrame -> page+0xff0
+site zstd main bf72e0 97d3d028 950aa744   # bl ZSTD_decompressMultiFrame -> page+0xff0
+site zstd main f50164 97c66c87 94fd43a3   # bl ZSTD_decompressMultiFrame -> page+0xff0
+site zstd main f5c2c  94000015 9536acd5   # bl the stream feed -> page+0xf80

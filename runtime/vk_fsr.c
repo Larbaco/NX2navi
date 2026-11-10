@@ -57,7 +57,7 @@ static VkPipeline make_pipeline(VkCtx *c, const uint32_t *code, size_t size) {
 
 static int init(VkCtx *c) {
     F.tried = 1;
-    F.push = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(c->device, "vkCmdPushDescriptorSetKHR");
+    F.push = (PFN_vkCmdPushDescriptorSetKHR)vk_dpa(c->device, "vkCmdPushDescriptorSetKHR");
     if (!F.push) {
         rt_log("vk: FSR off: no VK_KHR_push_descriptor; the present scales bilinearly");
         return 0;

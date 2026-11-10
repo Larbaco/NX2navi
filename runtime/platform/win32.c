@@ -300,6 +300,66 @@ uint64_t plat_thread_affinity(PlatThread *t, uint64_t mask) {
     return (uint64_t)SetThreadAffinityMask(t ? t->h : GetCurrentThread(), (DWORD_PTR)mask);
 }
 
+// The calling thread gets a core of its own through CPU sets: the process's default sets, which every thread without
+// sets of its own runs on (those started later too), leave the core out, and the caller's selected sets are that
+// core. The core is the highest-numbered one of the fastest efficiency class (a performance core on a hybrid CPU),
+// with both its logical processors when it has two; only processors in group 0 and in the process's affinity mask
+// count. CPU sets are soft: the scheduler may still use the core when nothing else wants it. Returns the logical
+// processors reserved, 0 when Windows has no CPU sets (before Windows 10) or fewer than two cores qualify.
+int plat_cpu_reserve(void) {
+    typedef BOOL(WINAPI * GetInfoFn)(PSYSTEM_CPU_SET_INFORMATION, ULONG, PULONG, HANDLE, ULONG);
+    typedef BOOL(WINAPI * SetProcFn)(HANDLE, const ULONG *, ULONG);
+    typedef BOOL(WINAPI * SetThreadFn)(HANDLE, const ULONG *, ULONG);
+    HMODULE k = GetModuleHandleW(L"kernel32.dll");
+    GetInfoFn get = (GetInfoFn)(void *)GetProcAddress(k, "GetSystemCpuSetInformation");
+    SetProcFn set_proc = (SetProcFn)(void *)GetProcAddress(k, "SetProcessDefaultCpuSets");
+    SetThreadFn set_thread = (SetThreadFn)(void *)GetProcAddress(k, "SetThreadSelectedCpuSets");
+    if (!get || !set_proc || !set_thread) return 0;
+    ULONG len = 0;
+    get(NULL, 0, &len, GetCurrentProcess(), 0);
+    uint8_t *buf = len ? malloc(len) : NULL;
+    if (!buf || !get((PSYSTEM_CPU_SET_INFORMATION)buf, len, &len, GetCurrentProcess(), 0)) {
+        free(buf);
+        return 0;
+    }
+    DWORD_PTR proc = 0, sys = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) || !proc) proc = ~(DWORD_PTR)0;
+    int best_class = -1, best_core = -1;
+    for (ULONG o = 0; o + sizeof(DWORD) * 2 <= len;) {   // the core: fastest class, then highest index
+        const SYSTEM_CPU_SET_INFORMATION *s = (const void *)(buf + o);
+        if (!s->Size) break;
+        if (s->Type == CpuSetInformation && s->CpuSet.Group == 0 && s->CpuSet.LogicalProcessorIndex < 64 &&
+            (proc >> s->CpuSet.LogicalProcessorIndex & 1)) {
+            int cls = s->CpuSet.EfficiencyClass, core = s->CpuSet.CoreIndex;
+            if (cls > best_class || (cls == best_class && core > best_core)) best_class = cls, best_core = core;
+        }
+        o += s->Size;
+    }
+    ULONG rest[64], mine[8];
+    int nrest = 0, nmine = 0;
+    for (ULONG o = 0; o + sizeof(DWORD) * 2 <= len;) {
+        const SYSTEM_CPU_SET_INFORMATION *s = (const void *)(buf + o);
+        if (!s->Size) break;
+        if (s->Type == CpuSetInformation && s->CpuSet.Group == 0 && s->CpuSet.LogicalProcessorIndex < 64 &&
+            (proc >> s->CpuSet.LogicalProcessorIndex & 1)) {
+            if (s->CpuSet.EfficiencyClass == best_class && s->CpuSet.CoreIndex == best_core) {
+                if (nmine < 8) mine[nmine++] = s->CpuSet.Id;
+            } else if (nrest < 64) {
+                rest[nrest++] = s->CpuSet.Id;
+            }
+        }
+        o += s->Size;
+    }
+    free(buf);
+    if (!nmine || nrest < 2) return 0;
+    if (!set_proc(GetCurrentProcess(), rest, (ULONG)nrest)) return 0;
+    if (!set_thread(GetCurrentThread(), mine, (ULONG)nmine)) {
+        set_proc(GetCurrentProcess(), NULL, 0);   // back to every processor
+        return 0;
+    }
+    return nmine;
+}
+
 uint32_t plat_cpu_count(void) {
     DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
     return n ? (uint32_t)n : 1;
@@ -405,11 +465,35 @@ void plat_sleep_ms(uint32_t ms) { Sleep(ms); }
 // ---- locks and condition variables
 
 void plat_mutex_init(PlatMutex *m) { InitializeSRWLock((PSRWLOCK)m); }
-void plat_mutex_lock(PlatMutex *m) { AcquireSRWLockExclusive((PSRWLOCK)m); }
+static _Thread_local PlatLockNote lock_note;   // plat_lock_timing
+void plat_lock_timing(PlatLockNote fn) { lock_note = fn; }
+
+void plat_mutex_lock_at(PlatMutex *m, void *site) {
+    if (!lock_note || TryAcquireSRWLockExclusive((PSRWLOCK)m)) {
+        if (!lock_note) AcquireSRWLockExclusive((PSRWLOCK)m);
+        return;
+    }
+    uint64_t t0 = plat_now_ns();
+    AcquireSRWLockExclusive((PSRWLOCK)m);
+    lock_note(site, plat_now_ns() - t0);
+}
+
+void plat_mutex_lock(PlatMutex *m) {
+    if (!lock_note) { AcquireSRWLockExclusive((PSRWLOCK)m); return; }
+    plat_mutex_lock_at(m, __builtin_return_address(0));
+}
 int plat_mutex_trylock(PlatMutex *m) { return TryAcquireSRWLockExclusive((PSRWLOCK)m) != 0; }
 void plat_mutex_unlock(PlatMutex *m) { ReleaseSRWLockExclusive((PSRWLOCK)m); }
 
-void plat_mutex_lock_shared(PlatMutex *m) { AcquireSRWLockShared((PSRWLOCK)m); }
+void plat_mutex_lock_shared(PlatMutex *m) {
+    if (!lock_note || TryAcquireSRWLockShared((PSRWLOCK)m)) {
+        if (!lock_note) AcquireSRWLockShared((PSRWLOCK)m);
+        return;
+    }
+    uint64_t t0 = plat_now_ns();
+    AcquireSRWLockShared((PSRWLOCK)m);
+    lock_note(__builtin_return_address(0), plat_now_ns() - t0);
+}
 int plat_mutex_trylock_shared(PlatMutex *m) { return TryAcquireSRWLockShared((PSRWLOCK)m) != 0; }
 void plat_mutex_unlock_shared(PlatMutex *m) { ReleaseSRWLockShared((PSRWLOCK)m); }
 
@@ -521,10 +605,10 @@ int plat_append_write(PlatAppend *f, const void *data, size_t n) {
     return WriteFile((HANDLE)f, data, (DWORD)n, &put, &o) && put == n;
 }
 
-int plat_file_replace(const char *from, const char *to) {
+int plat_file_replace(const char *from, const char *to, int durable) {
     wchar_t a[WPATH], b[WPATH];
     if (!widen(from, a, WPATH) || !widen(to, b, WPATH)) return 0;
-    return MoveFileExW(a, b, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+    return MoveFileExW(a, b, MOVEFILE_REPLACE_EXISTING | (durable ? MOVEFILE_WRITE_THROUGH : 0)) != 0;
 }
 
 static char lock_held[4][1100];
@@ -570,7 +654,8 @@ void plat_unlock_file(const char *path) {
     plat_mutex_unlock(&lock_lock);
 }
 
-int plat_file_write_atomic(const char *path, const void *data, size_t n) {
+// path.<pid>.<tid>.tmp renamed over path; durable: flushed to the disk before the rename, which is written through.
+static int write_swap(const char *path, const void *data, size_t n, int durable) {
     char tmp[WPATH + 48];
     wchar_t a[WPATH], b[WPATH];
     int len = snprintf(tmp, sizeof tmp, "%s.%u.%u.tmp", path, (unsigned)GetCurrentProcessId(), (unsigned)GetCurrentThreadId());
@@ -578,12 +663,16 @@ int plat_file_write_atomic(const char *path, const void *data, size_t n) {
     HANDLE h = CreateFileW(a, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return 0;
     DWORD put = 0;
-    int ok = WriteFile(h, data, (DWORD)n, &put, NULL) && put == n && FlushFileBuffers(h);
+    int ok = WriteFile(h, data, (DWORD)n, &put, NULL) && put == n && (!durable || FlushFileBuffers(h));
     CloseHandle(h);
-    if (ok && MoveFileExW(a, b, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return 1;
+    if (ok && MoveFileExW(a, b, MOVEFILE_REPLACE_EXISTING | (durable ? MOVEFILE_WRITE_THROUGH : 0))) return 1;
     DeleteFileW(a);
     return 0;
 }
+
+int plat_file_write_atomic(const char *path, const void *data, size_t n) { return write_swap(path, data, n, 1); }
+
+int plat_file_write_cached(const char *path, const void *data, size_t n) { return write_swap(path, data, n, 0); }
 
 int plat_file_flush(const char *path) {
     wchar_t w[WPATH];
@@ -718,14 +807,22 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
 }
 
 static int (*fault_hook)(uint64_t addr);
+static int (*access_hook)(uint64_t addr, int write, uint64_t ip);
 
-// A write access violation (ExceptionInformation[0] == 1) goes to the hook; registered first, before the crash handler.
+// A read or write access violation (ExceptionInformation[0] 0 or 1) goes to the access hook when there is one, then a
+// write to the write-fault hook; registered first, before the crash handler.
 static LONG CALLBACK fault_veh(EXCEPTION_POINTERS *ep) {
     const EXCEPTION_RECORD *er = ep->ExceptionRecord;
-    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2 || er->ExceptionInformation[0] != 1)
+    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2 || er->ExceptionInformation[0] > 1)
         return EXCEPTION_CONTINUE_SEARCH;
-    return fault_hook((uint64_t)er->ExceptionInformation[1]) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+    int write = er->ExceptionInformation[0] == 1;
+    uint64_t addr = (uint64_t)er->ExceptionInformation[1];
+    if (access_hook && access_hook(addr, write, (uint64_t)(uintptr_t)er->ExceptionAddress)) return EXCEPTION_CONTINUE_EXECUTION;
+    if (!write) return EXCEPTION_CONTINUE_SEARCH;
+    return fault_hook(addr) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
+
+void plat_mem_access_hook(int (*fn)(uint64_t addr, int write, uint64_t ip)) { access_hook = fn; }
 
 void plat_mem_fault_hook(int (*fn)(uint64_t addr)) {
     fault_hook = fn;
@@ -916,6 +1013,21 @@ void plat_crash_hook(void (*fn)(const PlatCrash *c)) {
     SetUnhandledExceptionFilter(crash_filter);   // replaces the C runtime's filter; crash_fn never returns
     signal(SIGABRT, abort_signal);
     _set_invalid_parameter_handler(invalid_parameter);
+}
+
+// The last-chance filter is set once, at the start, before the GPU driver, the window and audio libraries and the
+// movie decoder load. A DLL that sets its own filter later takes the place of crash_filter, and a fault outside this
+// executable then ends the process with no line in the log. This puts crash_filter back; when another filter had
+// taken its place, `who` gets the module and offset of that filter and the call returns 1.
+int plat_crash_filter_reassert(char *who, size_t n) {
+    LPTOP_LEVEL_EXCEPTION_FILTER prev = SetUnhandledExceptionFilter(crash_filter);
+    if (prev == crash_filter) return 0;
+    void *base = NULL;
+    if (prev) RtlPcToFileHeader((void *)prev, &base);
+    if (!prev) snprintf(who, n, "no filter (removed)");
+    else if (!base) snprintf(who, n, "%p, outside every module", (void *)prev);
+    else snprintf(who, n, "%s+%#llx", image_name(base), (unsigned long long)((uintptr_t)prev - (uintptr_t)base));
+    return 1;
 }
 
 // A fresh process gets a fresh layout: Windows places DLLs, heaps and thread stacks at random addresses. The parent
@@ -1790,6 +1902,21 @@ PlatChild *plat_child_start(const char *exe, const char *arg, uint32_t *err) {
         return NULL;
     }
     CloseHandle(pi.hThread);
+    // Every child goes into one job that ends its processes when its last handle closes, which is when this process
+    // ends: a translator stuck on a program would otherwise outlive a game that exited or crashed before stopping it.
+    // The handle is never closed by hand. A failure leaves the child as it was before.
+    static HANDLE job;
+    static INIT_ONCE job_once = INIT_ONCE_STATIC_INIT;
+    BOOL pending;
+    if (InitOnceBeginInitialize(&job_once, 0, &pending, NULL) && pending) {
+        HANDLE j = CreateJobObjectW(NULL, NULL);
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION li = {0};
+        li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (j && !SetInformationJobObject(j, JobObjectExtendedLimitInformation, &li, sizeof li)) CloseHandle(j), j = NULL;
+        job = j;
+        InitOnceComplete(&job_once, 0, NULL);
+    }
+    if (job) AssignProcessToJobObject(job, pi.hProcess);
     PlatChild *c = malloc(sizeof *c);
     if (!c) {
         TerminateProcess(pi.hProcess, 1);
@@ -1807,6 +1934,10 @@ void plat_child_stop(PlatChild *c) {
     TerminateProcess(c->proc, 1);
     CloseHandle(c->proc);
     free(c);
+}
+
+void plat_child_lower(PlatChild *c) {
+    if (c) SetPriorityClass(c->proc, IDLE_PRIORITY_CLASS);
 }
 
 int plat_child_write(PlatChild *c, const void *data, size_t n) {

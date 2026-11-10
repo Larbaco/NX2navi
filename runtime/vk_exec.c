@@ -9,6 +9,7 @@
 // until they change and skips clears while rendering is disabled. A pass has GENERAL-layout attachments, LOAD/STORE and
 // a render area from the smallest attachment, with a full barrier before it.
 // Contains code Copyright (c) 2026 jhaizhou, Copyright (c) 2026 Peiikai (MIT; see THIRD_PARTY_NOTICES.md).
+#include <limits.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -21,6 +22,7 @@
 #include "nvn_api.h"
 #include "nvn_tex.h"
 #include "platform/platform.h"
+#include "prof.h"
 #include "tex.h"
 #include "vk.h"
 #include "vk_exec.h"
@@ -78,7 +80,9 @@ void vk_exec_frame_log(const tex_t *p, uint64_t frame) {
     }
     rt_log("frame %llu: submits %llu passes %llu draws %llu/%llu clears %llu copies %llu dispatches %llu; present %p "
            "%ux%u/%#x written %d; feedback draws %llu barriers %llu restarts %llu layouts %llu read-before-write %llu; "
-           "uniform updates %llu (%llu ended a pass); event waits %llu (%llu before their signal: %llu "
+           "uniform updates %llu (%llu ended a pass); binds %llu in %.2f ms (textures %.2f, buffers %.2f, sig %.2f, push %.2f ms; "
+           "descriptors reused %llu, resolved %llu); dynamic state calls %llu (%llu unchanged, left out); "
+           "event waits %llu (%llu before their signal: %llu "
            "signalled later, %.1f submits later on average); targets%s",
            (unsigned long long)frame, (unsigned long long)f->submits,
            (unsigned long long)f->passes, (unsigned long long)f->draws, (unsigned long long)f->draws_seen,
@@ -86,7 +90,11 @@ void vk_exec_frame_log(const tex_t *p, uint64_t frame) {
            p ? (const void *)p->mem : NULL, p ? p->d.width : 0, p ? p->d.height : 0, p ? (uint32_t)p->d.format : 0,
            hit, (unsigned long long)f->fb_draws, (unsigned long long)f->fb_barriers, (unsigned long long)f->fb_restarts,
            (unsigned long long)f->fb_layouts, (unsigned long long)f->fb_war_barriers, (unsigned long long)f->ub_updates,
-           (unsigned long long)f->ub_pass_breaks, (unsigned long long)ew, (unsigned long long)eu, (unsigned long long)el,
+           (unsigned long long)f->ub_pass_breaks, (unsigned long long)f->bind_calls,
+           (double)(f->bind_ns) / 1e6, (double)(f->bind_tex_ns) / 1e6, (double)(f->bind_buf_ns) / 1e6,
+           (double)(f->bind_sig_ns) / 1e6, (double)(f->bind_push_ns) / 1e6, (unsigned long long)f->bind_reused,
+           (unsigned long long)f->bind_resolved, (unsigned long long)f->dyn_calls, (unsigned long long)f->dyn_left,
+           (unsigned long long)ew, (unsigned long long)eu, (unsigned long long)el,
            el ? (double)ed / (double)el : 0.0, list);
     memset(f, 0, sizeof *f);
     nfw = 0;
@@ -255,6 +263,7 @@ static void bc_copy_back(VkExec *ex, const VkExecTarget *t) {
                           .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, bcs[i].level, 0, 1},
                           .dstOffset = {0, 0, (int32_t)t->base_layer},
                           .extent = {bcs[i].w, bcs[i].h, t->layers}};   // texels of the uncompressed source
+        vk_gpu_gap_note(VK_GAP_BC_BACK, 0);
         vkCmdCopyImage(ex->cb, t->image, VK_IMAGE_LAYOUT_GENERAL, bcs[i].bc, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
         memory_barrier(ex->cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                        VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
@@ -430,9 +439,10 @@ static void resolve_rt(VkExec *ex) {
 }
 
 // The attachment view of a target. A registered texture's view lives as long as its image (vk_exec_target_view); any
-// other image's view is made for this command buffer and freed at its fence.
+// other image's view, and that of a texture destroyed since the target was resolved (gone: its record is freed only
+// after this submission, vk_defer_free), is made for this command buffer and freed at its fence.
 static VkImageView view_of(VkExec *ex, const VkExecTarget *t) {
-    if (t->img && t->img->image == t->image)
+    if (t->img && t->img->image == t->image && !t->img->gone)
         return vk_exec_target_view(t->img, t->format, t->view_type, t->aspect, t->level, t->base_layer, t->layers, t->blocks);
     ViewEnt *v = ex->views;
     for (int i = 0; i < ex->nviews; i++)
@@ -469,39 +479,54 @@ static void free_views(void *arg) {   // completion thread, once the submission 
 
 // ---- target history
 // The presented frame (gfx_counters.frames + 1; 0: never) each target subresource was last rendered into, and the one
-// before. prepare_draw lets a draw into a target the previous frame did not render (a one-shot draw: a volume or LUT
-// generated once) wait for its shaders and pipeline instead of skipping it. Per subresource, not per image: a volume
-// may be generated a few slices per frame. Direct-mapped: a slot another subresource took reads as not rendered, so a
-// collision makes a draw wait rather than skip.
+// before. prepare_draw lets a draw into a target no recent frame rendered (a one-shot draw: a volume or LUT generated
+// once) wait for its shaders and pipeline instead of skipping it. Per subresource, not per image: a volume may be
+// generated a few slices per frame.
+// Recent means within TFR_RECENT frames, not the frame before alone: the game's output images are a ring of three, its
+// probe and shadow layers are refreshed in turn every second to fourth frame, and the mips of its small effect buffers
+// alternate between images. Sets of TFR_WAYS, the oldest entry replaced: hundreds of subresources are rendered a
+// frame, and in a direct-mapped table of 1024 a fifth of the scene passes and most of the probe layers read as never
+// rendered because another subresource had taken their slot. Each misread made a draw whose pipeline was still
+// building wait for it (ONESHOT_WAIT_MS), so a new area was entered one pipeline at a time.
+#define TFR_SETS 1024
+#define TFR_WAYS 4
+#define TFR_RECENT 4
 typedef struct { VkImage image; uint32_t level, layer; uint64_t last, prev; } TargetFrames;
-static TargetFrames tfr[1024];
+static TargetFrames tfr[TFR_SETS * TFR_WAYS];
 
-static TargetFrames *tfr_slot(const VkExecTarget *t) {
+// The target's entry, or with make the entry it takes (the set's oldest, an empty one first); NULL without make
+// when it has none.
+static TargetFrames *tfr_find(const VkExecTarget *t, int make) {
     uint64_t h = ((uint64_t)(uintptr_t)t->image ^ (uint64_t)t->level << 56 ^ (uint64_t)t->base_layer << 40) *
                  0x9E3779B97F4A7C15ull;
-    return &tfr[h >> 54];
-}
-
-static int tfr_match(const TargetFrames *e, const VkExecTarget *t) {
-    return e->image == t->image && e->level == t->level && e->layer == t->base_layer;
+    TargetFrames *set = &tfr[(h >> 54) * TFR_WAYS], *oldest = set;
+    for (int i = 0; i < TFR_WAYS; i++) {
+        if (set[i].image == t->image && set[i].level == t->level && set[i].layer == t->base_layer) return &set[i];
+        if (set[i].last < oldest->last) oldest = &set[i];
+    }
+    if (!make) return NULL;
+    *oldest = (TargetFrames){t->image, t->level, t->base_layer, 0, 0};
+    return oldest;
 }
 
 static void tfr_note(const VkExecTarget *t, uint64_t stamp) {
-    TargetFrames *e = tfr_slot(t);
-    if (!tfr_match(e, t)) *e = (TargetFrames){t->image, t->level, t->base_layer, 0, 0};
+    TargetFrames *e = tfr_find(t, 1);
     if (e->last != stamp) e->prev = e->last, e->last = stamp;
 }
 
-static int tfr_recent(const VkExecTarget *t, uint64_t stamp) {
-    const TargetFrames *e = tfr_slot(t);
-    return tfr_match(e, t) && (e->last == stamp ? e->prev : e->last) == stamp - 1;
+// The frame before the current one that last rendered the target, 0 for none.
+static uint64_t tfr_before(const VkExecTarget *t, uint64_t stamp) {
+    const TargetFrames *e = tfr_find(t, 0);
+    return !e ? 0 : e->last == stamp ? e->prev : e->last;
 }
 
-// No frame before the current one rendered the target (a slot another subresource took reads the same).
-static int tfr_first(const VkExecTarget *t, uint64_t stamp) {
-    const TargetFrames *e = tfr_slot(t);
-    return !tfr_match(e, t) || !(e->last == stamp ? e->prev : e->last);
+static int tfr_recent(const VkExecTarget *t, uint64_t stamp) {
+    uint64_t before = tfr_before(t, stamp);
+    return before && stamp - before <= TFR_RECENT;
 }
+
+// No frame before the current one rendered the target.
+static int tfr_first(const VkExecTarget *t, uint64_t stamp) { return !tfr_before(t, stamp); }
 
 // With any, a recent depth target alone does not make the pass per-frame when a colour target is rendered for the
 // first time: the game's item icon capture (an inventory icon) draws into a new colour target with the
@@ -530,11 +555,10 @@ void vk_exec_targets_describe(VkExec *ex, char *buf, size_t cap) {
     for (int i = 0; i < 9 && n < cap; i++) {
         const VkExecTarget *t = i < 8 ? &ex->color[i] : &ex->depth;
         if (!t->image) continue;
-        const TargetFrames *e = tfr_slot(t);
-        int m = tfr_match(e, t);
+        const TargetFrames *e = tfr_find(t, 0);
         int w = snprintf(buf + n, cap - n, "%s%c%d fmt %d %ux%u L%u seen %llu/%llu", n ? "; " : "", i < 8 ? 'c' : 'd',
                          i < 8 ? i : 0, (int)t->format, t->width, t->height, t->base_layer,
-                         (unsigned long long)(m ? e->last : 0), (unsigned long long)(m ? e->prev : 0));
+                         (unsigned long long)(e ? e->last : 0), (unsigned long long)(e ? e->prev : 0));
         if (w < 0) break;
         n += (size_t)w;
     }
@@ -635,6 +659,7 @@ void vk_exec_pass_begin(VkExec *ex) {
     if (m) {
         m->step = ex->mark_passes++;
         m->w = ex->pass_w, m->h = ex->pass_h, m->d = ex->pass_layers;
+        m->layer = ex->depth.image ? ex->depth.base_layer : 0;
         m->ncolor = (uint8_t)(ex->pass_ncolor < 8 ? ex->pass_ncolor : 8);
         for (int i = 0; i < m->ncolor; i++) m->color[i] = ex->pass_color[i];
         m->depth = ex->pass_depth ? ex->pass_depth : ex->pass_stencil;
@@ -790,6 +815,7 @@ static void clear_color(VkExec *ex, const p_clear_color *c) {
     if (whole_target(ex, t)) {
         vk_exec_barrier(ex);
         VkImageSubresourceRange r = {VK_IMAGE_ASPECT_COLOR_BIT, t->level, 1, t->base_layer, t->layers};
+        vk_gpu_gap_note(VK_GAP_CLEAR_TARGET, (uint64_t)t->width * t->height);
         vkCmdClearColorImage(ex->cb, t->image, VK_IMAGE_LAYOUT_GENERAL, &cv, 1, &r);
         ex->recorded++;
         vk_texture_gpu_written(t->tex);
@@ -820,6 +846,7 @@ static void clear_ds(VkExec *ex, const p_clear_ds *c) {
     if (whole_target(ex, t)) {
         vk_exec_barrier(ex);
         VkImageSubresourceRange r = {asp, t->level, 1, t->base_layer, t->layers};
+        vk_gpu_gap_note(VK_GAP_CLEAR_TARGET, (uint64_t)t->width * t->height);
         vkCmdClearDepthStencilImage(ex->cb, t->image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r);
         ex->recorded++;
         vk_texture_gpu_written(t->tex);
@@ -846,13 +873,32 @@ static void set_rt(VkExec *ex, const p_set_rt *r) {
 // command-buffer state is lost there (bindings and dynamic state: vk_exec_draw_new_cb, ex->dirty); barriers, layouts and
 // queries are not: a barrier's first scope is everything earlier in submission order, image layouts belong to the image,
 // and occlusion queries end with their pass. Fences, completion callbacks and reports stay per submission: only the last
-// part signals the value.
+// part signals the value. The texture pool set a part binds is sealed when the part goes (vk_exec_pool_split): later
+// parts write and bind another, and a part is not split off while no other set is free of this submission.
 // A part also spans at least NX2NAVI_SPLIT_US (1000) of replay time: a split costs about 40 us of the render thread
 // (vkQueueSubmit2, a command buffer, the mirror prologue), and a fight frame of 2,000 draws made 15 parts on the 7900X;
 // a millisecond of recording is a fraction of a millisecond of GPU work, so the GPU still starts early.
-static int split_n = -1, split_draws, part_start;
+// With NX2NAVI_SPLIT_IDLE=1, neither limit holds the first part of a submission back while the GPU has run everything
+// submitted: it goes at the first pass boundary after a draw or dispatch. Each frame the game's thread waits for the GPU
+// to run the frame's first submission (nvn_api_core.c nvnQueueSubmitCommands, NX2NAVI_SUBMIT_FINISH), so the GPU is idle
+// when the next one replays, and waited for the first 64 draws and 1 ms of it in Kokiri Forest (2026-11-09). Off by
+// default: with it the foliage of Kokiri Forest flickered (RTX 5090, 2026-11-09), and the parts it cuts that early are
+// the one thing it changes; why they matter is not known yet.
+// Both limits also split inside a pass (NX2NAVI_SPLIT_IN_PASS, on): the pass ends there and the next draw begins it
+// again in the new part, as after a barrier (attachments load and store; occlusion queries continue in a new segment).
+// Kokiri Forest's two scene passes of ~500 draws take 2-4 ms each to replay and most of the frame's GPU time; split only
+// between passes, the GPU waited for each whole pass, idle up to 3.6 ms a frame (2026-11-09).
+// After the time limit held a part back, the clock is read again only 8 draws later (split_at): read after every
+// command, it was 4% of the replay in Kokiri Forest.
+static int split_n = -1, split_idle, split_in_pass, split_draws, split_at, part_start;
 static uint64_t split_ns, part_t0;
-static uint64_t n_parts, n_subs;
+static uint64_t n_parts, n_subs, n_idle_parts, n_pass_splits;
+
+static int split_wanted(void) {
+    if (split_draws >= split_at) return 1;
+    // the first part only: later parts of the submission run on the GPU, while done and issued stay as they were
+    return split_idle && split_draws && !part_start && vk_sync_fence_done() >= vk_sync_issued();
+}
 
 static void maybe_split(VkExec *ex) {
     if (split_n < 0) {
@@ -860,13 +906,29 @@ static void maybe_split(VkExec *ex) {
         if (split_n < 0) split_n = 0;
         int us = cfg_int("NX2NAVI_SPLIT_US");
         split_ns = us > 0 ? (uint64_t)us * 1000 : 0;
-        rt_log("vk: replay command buffer split every %d draws between passes, parts of at least %d us%s", split_n,
-               us > 0 ? us : 0, split_n ? "" : " (off)");
+        split_idle = split_n && cfg_bool("NX2NAVI_SPLIT_IDLE");
+        split_in_pass = split_n && cfg_bool("NX2NAVI_SPLIT_IN_PASS");
+        rt_log("vk: replay command buffer split every %d draws %s, parts of at least %d us%s%s", split_n,
+               split_in_pass ? "(inside passes too)" : "between passes", us > 0 ? us : 0, split_n ? "" : " (off)",
+               split_idle ? "; a first part at once while the GPU is idle" : "");
+        split_at = split_n ? split_n : INT_MAX;
     }
-    if (!split_n || ex->in_pass || split_draws < split_n) return;
-    if (split_ns && kern_now_ns() - part_t0 < split_ns) return;   // split_draws stays: the next draw asks again
+    if (!split_n) return;
+    // the first part while the GPU is idle: at a pass boundary only, where a split costs no pass restart
+    int idle = !ex->in_pass && split_idle && split_draws && !part_start && vk_sync_fence_done() >= vk_sync_issued();
+    if (!idle) {
+        if (ex->in_pass && !split_in_pass) return;
+        if (split_draws < split_n) return;
+        if (split_ns && kern_now_ns() - part_t0 < split_ns) {   // split_draws stays: a later draw asks again
+            split_at = split_draws + 8;
+            return;
+        }
+    }
     split_draws = 0;
-    if (ex->recorded == part_start) return;
+    split_at = split_n;
+    if (ex->recorded == part_start || !vk_exec_pool_split(ex->fence)) return;
+    if (idle) n_idle_parts++;
+    if (ex->in_pass) vk_exec_pass_end(ex), n_pass_splits++;   // the next draw begins the pass again, in the new part
     ex->cb = vk_sync_split();
     part_start = ex->recorded;
     part_t0 = kern_now_ns();
@@ -908,6 +970,7 @@ static int evo_on = -1, evo_in;     // knob; inside a continuation
 static uintptr_t evo_queue;         // queue of the stream being walked (0: it cannot stop at a wait)
 static int evo_pending;             // continuations held
 static uint64_t evo_held, evo_resumed, evo_forced, evo_switches;   // since the last perf line
+int vk_exec_held(void) { return evo_pending; }
 #define ST_LO offsetof(VkExec, rt)
 #define ST_HI offsetof(VkExec, views)
 
@@ -983,6 +1046,23 @@ static void st_swap(VkExec *ex, uint8_t *buf) {
 
 static int cont_ready(const Cont *c) {
     return !c->at || vk_exec_event_met(nvn_op_payload(c->at)) || vk_exec_submit_seq - c->since > CONT_MAX;
+}
+
+int vk_exec_held_ready(void) {
+    for (int s = 0; evo_pending && s < EVO_QUEUES; s++)
+        if (evq[s].head && cont_ready(evq[s].head)) return 1;
+    return 0;
+}
+
+// Held work that goes on in a submission without commands of its own (the present thread's empty one after its blit,
+// vk_backend.c present_main, or the one a waiting present makes, present_held) gets what any submission's recording
+// gets: the VRAM mirror sync before and the write-back after (vk_mem_mirror_begin/end), and a uniform copy (vk_usnap).
+// Without them its draws read mirrors that missed the CPU's writes since the last submission, and its GPU writes never
+// went back to guest memory: the next vk_mem_mirror_begin dropped the write-back list. NX2NAVI_HELD_SYNC=0: as before.
+static int held_sync(void) {
+    static int on = -1;
+    if (on < 0) on = rt_knob("HELD_SYNC", "1");
+    return on;
 }
 
 // Walks the continuation from where it stopped; 1 when it stopped at another wait (c->i, c->at updated), 0 when done.
@@ -1142,12 +1222,47 @@ static const op_hdr *walk(VkExec *ex, const op_hdr *h, int depth) {
         default: rt_fatal("vk: op %s has no replay handler", nvn_op_name(h->op));
         }
         if (vk_exec_signalled && depth == 0 && !evo_in) evo_resume(ex);
-        if (split_draws >= split_n) maybe_split(ex);
+        if (split_draws && split_wanted()) maybe_split(ex);
         h = nvn_op_next(h);
     }
 }
 
 int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t fence) {
+    // The replay records on the thread the game submitted from, and the kernel schedules that like any other guest
+    // thread: a preemption in the middle of a part leaves the submission late for the frame it belongs to (Kokiri
+    // Forest: 274 of 2,737 frames had a late submit). Recording keeps the highest priority so the scheduler prefers it
+    // over the guest's other cores; NX2NAVI_RECORDER_PRIO=0 leaves the guest's priorities alone.
+    static int prio_done;
+    static uint32_t rec_thread;   // the thread that got the priority and the core
+    if (!prio_done) {
+        prio_done = 1;
+        const char *e = cfg_get("NX2NAVI_RECORDER_PRIO");
+        if (!(e && !strcmp(e, "0"))) {
+            plat_thread_priority(PLAT_PRIO_HIGHEST);
+            rt_log("vk: the recording thread keeps the highest scheduling priority (NX2NAVI_RECORDER_PRIO=0 turns it off)");
+        }
+        // The recorder also gets a core of its own (plat_cpu_reserve): every other thread of the process, the guest's
+        // cores, the audio, the shader and pipeline workers, is kept off it, so nothing of this process preempts the
+        // recording. That core is then lost to the rest, so NX2NAVI_RECORDER_CORE=auto (the default) reserves it only
+        // with 12 or more logical processors; 1 always, 0 never.
+        const char *rc = cfg_value("NX2NAVI_RECORDER_CORE");
+        unsigned ncpu = plat_cpu_usable();
+        if (!strcmp(rc, "1") || (!strcmp(rc, "auto") && ncpu >= 12)) {
+            int n = plat_cpu_reserve();
+            if (n) rt_log("vk: the recording thread has a core of its own (%d logical processor%s of %u; "
+                          "NX2NAVI_RECORDER_CORE=0 turns it off)", n, n > 1 ? "s" : "", ncpu);
+            else rt_log("vk: could not reserve a core for the recording thread (NX2NAVI_RECORDER_CORE)");
+        }
+        rec_thread = plat_thread_id();
+    }
+    if (rec_thread && plat_thread_id() != rec_thread) {   // the priority and the core stay with the first thread
+        static int said;
+        if (!said++) rt_log("vk: a submission is recorded on another thread than the first one; it runs without the "
+                            "recorder's priority and core");
+    }
+    perf_lock_timing_here();   // NX2NAVI_LOCK_TIME
+    if (prof_replay_tid != plat_thread_id()) perf_replay_thread();   // the profiler follows the thread replaying now
+    perf_rec_waits = rec_wait_totals;
     VkExec *ex = &X;
     if (!x_ready) state_reset(ex), vk_dump_init(), x_ready = 1;
     const tex_t *keep[9];   // the render targets carry over to this submission (set_rt compares them by pointer)
@@ -1168,12 +1283,14 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     vk_exec_frame.submits++;
     vk_exec_submit_seq++;
     split_draws = part_start = 0;
+    split_at = split_n < 0 ? 0 : split_n ? split_n : INT_MAX;   // 0 until maybe_split reads the settings
     part_t0 = kern_now_ns();
     x_here = 1;
     int evo = evo_enabled() && gfx_submit_queue;
     int slot = evo ? evq_slot(gfx_submit_queue) : -1;
     if (evo && slot < 0) evo = 0;
-    if (n) {
+    int synced = n || (evo_pending && held_sync() && vk_exec_held_ready());   // held_sync
+    if (synced) {
         vk_mem_mirror_begin();
         if (evo_pending) {   // the uniform snapshot covers what held submissions bind too: they may go on here
             int tot = n;
@@ -1181,7 +1298,7 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
                 for (Cont *c = evq[s].head; c; c = c->next) tot += c->n;
             uint64_t *all = malloc(sizeof *all * (size_t)tot);
             if (!all) rt_fatal("vk: out of memory (snapshot handles)");
-            memcpy(all, handles, sizeof *all * (size_t)n);
+            if (n) memcpy(all, handles, sizeof *all * (size_t)n);
             int k = n;
             for (int s = 0; s < EVO_QUEUES; s++)
                 for (Cont *c = evq[s].head; c; c = c->next) memcpy(all + k, c->h, sizeof *all * (size_t)c->n), k += c->n;
@@ -1207,8 +1324,8 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     }
     vk_exec_pass_end(ex);
     x_here = 0;
-    if (ex->recorded) vk_exec_barrier(ex);   // later submissions see this one's writes
-    if (n) ex->recorded += vk_mem_mirror_end(ex->cb, fence), vk_usnap_end(fence);   // VRAM mirror bytes the GPU wrote go back to guest memory
+    if (ex->recorded) vk_exec_barrier(ex), vk_exec_pool_marks(ex);   // later submissions see this one's writes
+    if (synced) ex->recorded += vk_mem_mirror_end(ex->cb, fence), vk_usnap_end(fence);   // VRAM mirror bytes the GPU wrote go back to guest memory
     if (ex->nviews) {
         ViewList *l = malloc(sizeof *l + sizeof(VkImageView) * (size_t)ex->nviews);
         if (!l) rt_fatal("vk: out of memory");
@@ -1220,12 +1337,13 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     ex->cb = VK_NULL_HANDLE;
     if (n) n_subs++;
     if ((rt_trace & RT_TRACE_PERF) && n_subs >= 240) {
-        rt_log("perf: replay command buffer parts per submission %.2f; event order: held %llu, resumed %llu (%llu "
-               "without their signal), switches %llu, held now %d", (double)(n_subs + n_parts) / (double)n_subs,
-               (unsigned long long)evo_held, (unsigned long long)evo_resumed, (unsigned long long)evo_forced,
-               (unsigned long long)evo_switches, evo_pending);
+        rt_log("perf: replay command buffer parts per submission %.2f (%.2f first parts sent while the GPU was idle, %.2f "
+               "splits inside a pass); event order: held %llu, resumed %llu (%llu without their signal), switches %llu, "
+               "held now %d", (double)(n_subs + n_parts) / (double)n_subs, (double)n_idle_parts / (double)n_subs,
+               (double)n_pass_splits / (double)n_subs, (unsigned long long)evo_held, (unsigned long long)evo_resumed,
+               (unsigned long long)evo_forced, (unsigned long long)evo_switches, evo_pending);
         evo_held = evo_resumed = evo_forced = evo_switches = 0;
-        n_subs = n_parts = 0;
+        n_subs = n_parts = n_idle_parts = n_pass_splits = 0;
     }
     return ex->recorded - part_start;   // what the last part holds
 }

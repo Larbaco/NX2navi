@@ -31,6 +31,10 @@ void plat_thread_detach(PlatThread *t);   // frees t; the thread runs on
 // Restricts t (NULL: the calling thread) to the logical processors in mask (bit n = processor n of the first group).
 // Returns the previous mask, 0 on failure.
 uint64_t plat_thread_affinity(PlatThread *t, uint64_t mask);
+// The calling thread gets a core to itself: the process's other threads are kept off it and the caller on it (Windows:
+// CPU sets, a performance core; Linux: the last processor of the affinity mask). Returns the logical processors
+// reserved, 0 when it could not.
+int plat_cpu_reserve(void);
 uint32_t plat_cpu_count(void);            // logical processors of the machine (system info)
 uint32_t plat_cpu_usable(void);           // the ones this process may run on (its affinity mask): size thread pools by it
 uint64_t plat_thread_cpu_ns(uint32_t tid);  // CPU time of the thread with id tid (plat_thread_id) so far; 0 unknown
@@ -72,17 +76,17 @@ void plat_fiber_free(PlatFiber *f);       // a fiber nobody runs
 typedef struct { uint64_t gpr[10]; uint32_t mxcsr, fpcw; uint64_t pad; uint8_t xmm[160]; } PlatJmp;
 int plat_jmp_save(PlatJmp *j) __attribute__((returns_twice, nothrow));
 _Noreturn void plat_jmp_go(PlatJmp *j);
+#elif defined(__linux__) && defined(__x86_64__)
+// SysV: rbx, rbp, r12-r15, the caller's rsp and the return address, then MXCSR and the x87 control word (linux.c).
+// Not glibc's jmp_buf: it mangles rsp, rbp and rip, so plat_frame_capture could not fill one.
+typedef struct { uint64_t gpr[8]; uint32_t mxcsr, fpcw; } PlatJmp;
+int plat_jmp_save(PlatJmp *j) __attribute__((returns_twice, nothrow));
+_Noreturn void plat_jmp_go(PlatJmp *j);
 #else
 #include <setjmp.h>
-// f: a frame plat_frame_capture found (rbx, rbp, r12-r15, rsp, rip, mxcsr, x87 control word), resumed by plat_frame_go.
-typedef struct { jmp_buf b; struct { uint64_t gpr[8]; uint32_t mxcsr, fpcw; } f; } PlatJmp;
+typedef struct { jmp_buf b; } PlatJmp;
 #define plat_jmp_save(j) setjmp((j)->b)
 #define plat_jmp_go(j) longjmp((j)->b, 1)
-_Noreturn void plat_frame_go_regs(void *f);
-#define plat_frame_go(j) plat_frame_go_regs(&(j)->f)
-#endif
-#ifdef _WIN32
-#define plat_frame_go(j) plat_jmp_go(j)
 #endif
 // The host state of a caller further up this thread's stack, as it will be when the call it is making returns: the
 // stack is unwound frame by frame (from the caller of this function) until want(return address, arg) accepts one, and
@@ -160,7 +164,16 @@ void plat_cond_broadcast(PlatCond *c);
 typedef struct { PlatMutex m; uint32_t owner, depth; } PlatRMutex;
 #define PLAT_RMUTEX_INIT {PLAT_MUTEX_INIT, 0, 0}
 void plat_rmutex_lock(PlatRMutex *m);
+int plat_rmutex_trylock(PlatRMutex *m);   // 1 when acquired (or already held by this thread)
 void plat_rmutex_unlock(PlatRMutex *m);
+
+// Lock-wait timing (NX2NAVI_LOCK_TIME, perf.c): after plat_lock_timing(fn) on a thread, each plat_mutex_lock(_shared)
+// or plat_rmutex_lock there that has to wait calls fn with the address of the code that asked for the lock (for a
+// recursive mutex, the caller of plat_rmutex_lock) and the nanoseconds it waited. NULL turns it off. Windows only.
+typedef void (*PlatLockNote)(void *site, uint64_t ns);
+void plat_lock_timing(PlatLockNote fn);
+void plat_mutex_lock_at(PlatMutex *m, void *site);     // plat_mutex_lock reporting site as the asker
+void plat_rmutex_lock_at(PlatRMutex *m, void *site);   // plat_rmutex_lock reporting site as the asker
 
 // One-time initialisation: the first caller runs fn(arg), every other caller waits until it returned. Zero-initialised
 // (PLAT_ONCE_INIT) has not run.
@@ -230,6 +243,10 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
 // A write that faulted on a read-only page at addr goes to fn first; fn returns 1 when it made the page writable and
 // the write should run again, 0 to let the fault go on (to the crash handler). One hook per process.
 void plat_mem_fault_hook(int (*fn)(uint64_t addr));
+// A read or write that faulted at addr (write: 1 for a write; ip: the faulting instruction) goes to fn before the
+// write-fault hook; fn returns 1 when it made the page accessible and the access should run again, 0 to let the fault
+// go on. fn sees every access violation of the process and tells its own pages apart. One hook per process.
+void plat_mem_access_hook(int (*fn)(uint64_t addr, int write, uint64_t ip));
 // Starts this program again with the same arguments and ends this process with the new one's exit code (Windows), or
 // replaces this process with it (Linux). Environment changes made before the call are passed on.
 _Noreturn void plat_reexec(void);
@@ -258,6 +275,9 @@ void plat_crash_hook(void (*fn)(const PlatCrash *c));
 // What this thread is doing, named by the crash notes (a stack overflow leaves no room for the full report); NULL
 // clears it. s must stay valid until it is cleared.
 void plat_crash_context(const char *s);
+// Puts the crash hook's last-chance exception filter back in place. 1 when a DLL loaded later had set its own in its
+// place (who: that filter's module and offset), 0 when it was still there. Windows only; 0 elsewhere.
+int plat_crash_filter_reassert(char *who, size_t n);
 int plat_mem_read(uint64_t addr, void *out, size_t n);    // copies n bytes, 0 instead of faulting on unmapped memory
 int plat_mem_readable(uint64_t addr, uint64_t n);         // every page of [addr, addr + n) can be read; no fault
 void *plat_aligned_alloc(size_t size, size_t align);      // free with plat_aligned_free; NULL on failure
@@ -293,10 +313,15 @@ void plat_file_mkdir_p(const char *path);                 // creates every missi
 // Whole file into a malloc'd buffer with a NUL after the last byte; NULL when missing, empty or over 1 GiB.
 uint8_t *plat_file_read(const char *path, uint64_t *size);
 int plat_file_write(const char *path, const void *data, size_t n);   // create or truncate; 1 when all n bytes landed
-int plat_file_replace(const char *from, const char *to);  // rename, replacing to (write-through); 1 on success
+// Renames from over to, replacing it; durable: the rename is on the disk at return (written through). 1 on success.
+int plat_file_replace(const char *from, const char *to, int durable);
 // Writes path.<pid>.<tid>.tmp, flushes it to the disk and renames it over path: a crash leaves the old file or the new
 // one, never a torn or zero-filled one. 1 on success.
 int plat_file_write_atomic(const char *path, const void *data, size_t n);
+// The same without waiting for the disk: a crash of the process still leaves the old file or the new one, but a power
+// cut can leave a torn or zero-filled one. For files whose readers check them and that can be made again (the shader
+// cache). Each flush costs 1-5 ms on an NVMe drive and much more on a SATA SSD or a hard drive. 1 on success.
+int plat_file_write_cached(const char *path, const void *data, size_t n);
 // Takes the file at path (made when missing) as a lock no other process can take, held until this process ends:
 // 1 held (again, when this process holds it already), 0 another process holds it, -1 the file cannot be made.
 int plat_lock_file(const char *path);
@@ -441,6 +466,9 @@ typedef struct PlatChild PlatChild;
 // Children start one at a time so none inherits another pipe ends.
 PlatChild *plat_child_start(const char *exe, const char *arg, uint32_t *err);
 void plat_child_stop(PlatChild *c);                       // kills the child and frees c
+// Runs the child below every normal-priority process (Windows: the idle priority class; elsewhere nice 19), for work
+// that must not slow the game down (gfx_shader.c, the carry pass).
+void plat_child_lower(PlatChild *c);
 int plat_child_write(PlatChild *c, const void *data, size_t n);   // 1 when all n bytes were written
 #define PLAT_CHILD_READ_MS 120000   // plat_child_read gives up on a child that sends nothing for this long
 long plat_child_read(PlatChild *c, void *buf, size_t cap);        // bytes read (at least 1); 0 or negative: pipe broke or timed out

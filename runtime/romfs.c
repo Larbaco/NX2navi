@@ -85,6 +85,8 @@ static uint64_t handles[NH];         // file index + 1; 0 is free
 static uint32_t handle_ovl[NH];      // overlay slot + 1 of an open handle, 0 = original
 static PlatFile *handle_file[NH];    // the handle's open overlay file, when handle_ovl is set
 static Overlay *overlays;            // sorted by RomFS index after overlay_init
+static uint32_t *open_ms;            // open_note: per file, the last open and the opens in a row
+static uint16_t *open_n;
 static size_t noverlay, overlay_cap;
 static char **added;                 // RomFS paths of the added files, sorted; added[k] is index file_count + k
 static size_t nadded;
@@ -409,9 +411,13 @@ static void restbl_collect(void) {
         if (restbl_rel[0] && !strcmp(overlays[k].name, restbl_rel)) shipped_add(overlays[k].path, overlays[k].mod, 0);
 }
 
-typedef struct { int k, prio; const char *dir, *rel; } ModWalk;
+typedef struct { int k, prio, depth; const char *dir, *rel; } ModWalk;
 
-static void mod_walk(int k, int prio, const char *dir, const char *rel);
+// Folders nest at most this deep in a mod's RomFS folder: each level costs a stack frame (two 4 KiB paths here and
+// the listing's own), and no RomFS path of the game is deeper.
+#define MOD_WALK_DEPTH 32
+
+static void mod_walk(int k, int prio, int depth, const char *dir, const char *rel);
 
 // One entry of a mod's RomFS folder (mod_walk).
 static int mod_walk_cb(const char *leaf, int kind, uint64_t size, void *ctx) {
@@ -425,7 +431,8 @@ static int mod_walk_cb(const char *leaf, int kind, uint64_t size, void *ctx) {
         return 1;
     }
     if (kind == PLAT_FS_DIR) {
-        mod_walk(w->k, w->prio, file, path);
+        if (w->depth >= MOD_WALK_DEPTH) rt_log("mods: %s: %s nests too deep; left out", m->name, file);
+        else mod_walk(w->k, w->prio, w->depth + 1, file, path);
         return 1;
     }
     if (kind != PLAT_FS_FILE) return 1;
@@ -453,8 +460,8 @@ static int mod_walk_cb(const char *leaf, int kind, uint64_t size, void *ctx) {
 }
 
 // The files under dir (a mod's RomFS root; rel: the RomFS path of dir, "" at the root) as overlays of mod k.
-static void mod_walk(int k, int prio, const char *dir, const char *rel) {
-    ModWalk w = {k, prio, dir, rel};
+static void mod_walk(int k, int prio, int depth, const char *dir, const char *rel) {
+    ModWalk w = {k, prio, depth, dir, rel};
     // a folder that cannot be listed (no permission, a path longer than Windows allows) loses its files: say so
     if (plat_fs_list(dir, mod_walk_cb, &w) != PLAT_FS_OK)
         rt_log("mods: %s: cannot list %s (error %d); its files are left out", mods_at(k)->name, dir,
@@ -507,7 +514,7 @@ static void mods_overlay_init(void) {
     for (int k = 0; k < n; k++) {
         const ModInfo *m = mods_at(k);
         // a mod with ExeFS patches waits for the rebuild that applies them: half of a mod is worse than none
-        if (m->enabled && (m->kind & MOD_ROMFS) && m->problem == MOD_OK) mod_walk(k, 2 + (n - k), m->romfs, "");
+        if (m->enabled && (m->kind & MOD_ROMFS) && m->problem == MOD_OK) mod_walk(k, 2 + (n - k), 0, m->romfs, "");
     }
 }
 
@@ -780,7 +787,7 @@ static void camera_overlay(void) {
 // did not load (ROMFS_PROMPTS_*). The menu compares them with the settings in effect (ui/menu.cpp prompts_note).
 // romfs-patches-pc keeps that name, but at a game resolution of another shape than 16:9 its files come from pc_dir,
 // romfs-patches-pc-<w>x<h> (overlay_init).
-enum { PROMPTS_FOLDERS = 7 };   // the two Xbox folders, the PC one, the two PlayStation ones, the two Steam Deck ones
+#define PROMPTS_FOLDERS 5   // Xbox and PlayStation by position and by label, then PC
 static struct { const char *name; int ready; } prompts_folders[PROMPTS_FOLDERS];
 static const char *prompts_wanted, *prompts_loaded;
 static int prompts_off;
@@ -823,8 +830,9 @@ static void overlay_init(void) {
     // A game resolution that is not 16:9 takes romfs-patches-<w>x<h> instead when it is there: the same overlay with
     // the UI laid out for that shape (make_romfs_patches.py --aspect), when the game version has the camera aspect patch
     // the layout goes with (res_wants_wide_overlay).
-    // With prompts = xbox, the Xbox prompts' folder for the pad layout in its place (input_prompts_folder): the same
-    // patches with Xbox button icons (make_romfs_patches.py --prompts). The game reads the archives once at boot, so
+    // With prompts = xbox or playstation, that pad's prompts folder for the pad layout in its place
+    // (input_prompts_folder): the game's button font and interface textures with that pad's buttons drawn in
+    // (tools/pad_prompts.py). The game reads the font and the archives once at boot, so
     // the prompts stay until restart even though the layout itself changes live. Each folder replaces romfs-patches as
     // a whole and the setup builds no folder of another shape with Xbox prompts, so a game resolution that is not 16:9
     // keeps the Switch prompts. So does a RomFS mod (the NX2NAVI_ROMFS_MODS manifest or a player mod) that replaces one of
@@ -848,15 +856,13 @@ static void overlay_init(void) {
                    "(tools/make_romfs_patches.py --aspect %ux%u)", out[0], out[1], out[0], out[1]);
         }
     }
-    // one of each Xbox folder, the PC one, then one of each PlayStation and Steam Deck folder (tools/ocarina_prompts.py)
-    static const char *const layouts[2] = {"nintendo", "xbox"};
+    static const char *const layouts[2] = {"nintendo", "xbox"};   // each pad's two folders, then the PC one
+    static const int pads[2] = {PROMPTS_XBOX, PROMPTS_PLAYSTATION};
     for (int i = 0; i < PROMPTS_FOLDERS; i++) {
-        const char *name = i < 2   ? input_prompts_folder(PROMPTS_XBOX, layouts[i])
-                           : i == 2 ? input_prompts_folder(PROMPTS_PC, 0)
-                           : i < 5  ? input_prompts_folder(PROMPTS_PLAYSTATION, layouts[i - 3])
-                                    : input_prompts_folder(PROMPTS_STEAMDECK, layouts[i - 5]);
+        int pc = i == PROMPTS_FOLDERS - 1;
+        const char *name = pc ? input_prompts_folder(PROMPTS_PC, 0) : input_prompts_folder(pads[i / 2], layouts[i % 2]);
         const char *dir = name;
-        if (i == 2) {
+        if (pc) {
             if (wide) snprintf(pc_dir, sizeof pc_dir, "%s-%ux%u", name, out[0], out[1]);
             else snprintf(pc_dir, sizeof pc_dir, "%s", name);
             dir = pc_dir;
@@ -867,10 +873,7 @@ static void overlay_init(void) {
     }
     const char *layout = cfg_value("NX2NAVI_PAD_LAYOUT");
     int pick = input_prompts_pick(cfg_get("NX2NAVI_PROMPTS"), layout), shaped = wide && pick == PROMPTS_PC;
-    const char *style = pick == PROMPTS_PC ? "keyboard and mouse" : pick == PROMPTS_PLAYSTATION ? "PlayStation"
-                      : pick == PROMPTS_STEAMDECK ? "Steam Deck" : "Xbox";
-    const char *setting = pick == PROMPTS_PC ? "pc" : pick == PROMPTS_PLAYSTATION ? "playstation"
-                        : pick == PROMPTS_STEAMDECK ? "steamdeck" : "xbox";
+    const char *style = pick == PROMPTS_PC ? "keyboard and mouse" : pick == PROMPTS_PLAYSTATION ? "PlayStation" : "Xbox";
     prompts_wanted = input_prompts_folder(pick, layout);
     prompts_off = !prompts_wanted                         ? ROMFS_PROMPTS_OK
                   : wide && !shaped                       ? ROMFS_PROMPTS_SHAPE
@@ -891,12 +894,13 @@ static void overlay_init(void) {
             rt_log("RomFS overlay: %s failed its check (run the setup again); romfs-patches loads instead", path);
         }
     } else if (prompts_wanted) {
-        rt_log("RomFS overlay: prompts = %s, but %s; Switch prompts stay", setting,
+        rt_log("RomFS overlay: prompts = %s, but %s; Switch prompts stay",
+               pick == PROMPTS_PC ? "pc" : pick == PROMPTS_PLAYSTATION ? "playstation" : "xbox",
                prompts_off == ROMFS_PROMPTS_SHAPE     ? (shaped ? "the game resolution has no romfs-patches-pc-<w>x<h> "
                                                                   "(tools/make_romfs_patches.py --prompts pc --aspect)"
                                                              : "the game resolution takes its own UI layout")
                : prompts_off == ROMFS_PROMPTS_PATCHES ? "NX2NAVI_ROMFS_PATCHES is set"
-                                                      : "their folder has no manifest.tsv (run the setup again)");
+                                                      : "their folder has no manifest.tsv (tools/pad_prompts.py writes it)");
     }
     size_t prompts_end = noverlay;
     char plain[2100];   // romfs-patches, when it has a manifest
@@ -1015,6 +1019,7 @@ static void init_once(void *param) {
         }
     }
     overlay_init();
+    open_ms = calloc(file_count, sizeof *open_ms), open_n = calloc(file_count, sizeof *open_n);   // open_note
     rt_log("RomFS ready: %llu files, %zu overlays, %zu added, %.2f s", (unsigned long long)file_count, noverlay,
            nadded, now_s() - t0);
 #endif
@@ -1122,6 +1127,23 @@ static int movie_skipped(const char *p) {
     return 1;
 }
 
+// A file the game cannot load, damaged or refused for any other reason: its loader opens it again and again and in the
+// end does without it, and whatever needs it stays out of the world. tools/romfs_check.py finds damaged files before
+// play; this names the ones that still fail, in the log. One timestamp and one count per file, read and written only
+// here, where a file is opened (a few thousand times a session), without a lock: a race at worst logs a line twice.
+#define RETRY_OPENS 24             // opens each less than RETRY_GAP_MS after the last; a file reloaded in play stays far below
+#define RETRY_GAP_MS 3000
+
+static void open_note(uint64_t i, const char *path) {
+    if (!open_n || i >= file_count) return;
+    uint32_t now = (uint32_t)(plat_now_ns() / 1000000);
+    if (now - open_ms[i] > RETRY_GAP_MS) open_n[i] = 0;
+    open_ms[i] = now;
+    if (open_n[i] < RETRY_OPENS && ++open_n[i] == RETRY_OPENS)
+        rt_log("RomFS: the game keeps opening %s and cannot load it; what needs it stays out of the world "
+               "(romfs-check.json lists the files found damaged)", path);
+}
+
 uint32_t romfs_open(uint64_t *out, const char *path, int mode) {
     fs_trace("rom", path);
     if (!out || mode != FS_OPEN_READ) return FS_R_UNSUPPORTED_OPEN;
@@ -1135,6 +1157,7 @@ uint32_t romfs_open(uint64_t *out, const char *path, int mode) {
     }
     uint64_t i = file_index(p);
     if (i == UINT64_MAX) return FS_R_PATH_NOT_FOUND;
+    open_note(i, p);
     uint32_t ov = overlay_slot(i);
     PlatFile *f = NULL;
     if (ov) {

@@ -1,12 +1,15 @@
-"""The launcher's long tasks, run on a worker thread: install, update, rebuild and the update check. Each job is a
-list of steps the window shows as rows; the window reads the job's state on a timer (rev changes on every change)
-and never blocks on it. The same jobs run headless from launcher/cli.py."""
+"""The launcher's long tasks, run on a worker thread: install, update, rebuild, the update check and the background
+staging of an update. Each job is a list of steps the window shows as rows; the window reads the job's state on a
+timer (rev changes on every change) and never blocks on it. The same jobs run headless from launcher/cli.py.
+BackgroundUpdate decides when a staged update installs."""
 import collections
 import threading
 import time
 import traceback
 
-from . import build, feed, gamefiles, net, toolchain, updater, versions
+from . import build, feed, gamefiles, net, toolchain, updater, versions, winsys
+
+RECHECK = 3600   # seconds between update checks while the launcher stays open, hidden during play included
 
 PENDING, RUNNING, DONE, SKIPPED, FAILED = 'pending', 'running', 'done', 'skipped', 'failed'
 
@@ -22,15 +25,24 @@ STEPS = {
     'compile': ('Compile', 'Compiling the translated code and the port into a Windows program.'),
     'compile_changed': ('Compile Changed Files', 'Compiling the files this version changed. Files that did not '
                                                  'change are kept from the last build.'),
-    'shaders': ('Prepare the Shaders', "Translating every shader of the game ahead of time, so play does not stop to "
-                                       'compile them.'),
+    'shaders': ('Prepare the Shaders', "Building the game's known shaders for your graphics card ahead of time, so "
+                                       'play stops for them far less often.'),
+    'prompts': ('Draw the Button Prompts', 'Drawing the Xbox, PlayStation and keyboard and mouse button prompts the '
+                                           "game's Controls menu offers under Button prompts."),
+    'scan': ('Check the Game Files', 'Decompressing every game file once to find damage, and standing in for damaged '
+                                     'textures so the world still loads.'),
     'ready': ('Ready to Play', 'The game is built.'),
     'download': ('Download {ver}', 'Downloading the new version of NX2navi.'),
     'verify': ('Verify the Download', 'Checking the download against its checksum.'),
     'swap': ('Swap In the New Build', 'Linking the new build. It replaces the old one only once it is complete.'),
 }
 WEIGHTS = {'tools': 12, 'tools_update': 4, 'check': 1, 'exefs': 2, 'romfs': 14, 'lift': 14, 'compile': 55,
-           'compile_changed': 55, 'shaders': 18, 'ready': 0, 'download': 8, 'verify': 1, 'swap': 6}
+           'compile_changed': 55, 'shaders': 18, 'prompts': 4, 'scan': 5, 'ready': 0, 'download': 8, 'verify': 1, 'swap': 6}
+
+
+def prompt_rows(ctx):
+    """The prompts row, for a version with button art (make_game.py draws the prompts after the shaders), or none."""
+    return ['prompts'] if build.has_prompt_art(ctx.layout) else []
 
 
 def mmss(seconds):
@@ -44,6 +56,7 @@ class Step:
         self.id, self.label, self.desc = sid, label.format(ver=ver), desc
         self.state, self.value, self.fraction, self.detail = PENDING, 'Waiting', 0.0, ''
         self.t0, self.seconds = None, 0.0
+        self.pace = collections.deque(maxlen=400)   # (time, fraction) of recent progress, for Job.eta
 
 
 class Job:
@@ -86,11 +99,31 @@ class Job:
         return min(1.0, got / total)
 
     def eta(self):
-        f = self.overall()
-        elapsed = time.time() - self.started
-        if f < 0.08 or elapsed < 20:
+        # The step running now from its recent pace (its progress over the last minute), and the steps still to come
+        # from the seconds per weight of the steps already done. A job-wide fraction does not work: a step can take
+        # far more or less time than its weight says (Compile Changed Files is over half the weight of an update and
+        # can take seconds), and the shader step then read "about 1 minute left" with 20 minutes to go. A step's own
+        # average does not either: Prepare the Shaders fills the first half of its bar with the translation and the
+        # second with the much slower build into the driver's cache.
+        now = time.time()
+        if now - self.started < 20:
             return None
-        return elapsed * (1 - f) / f
+        cur = next((s for s in self.steps if s.state == RUNNING), None)
+        left = 0.0
+        if cur:
+            recent = [p for p in cur.pace if now - p[0] <= 60]
+            if len(recent) < 2 or recent[-1][0] - recent[0][0] < 10 or recent[-1][1] <= recent[0][1]:
+                return None
+            rate = (recent[-1][1] - recent[0][1]) / (recent[-1][0] - recent[0][0])   # fraction per second
+            left = (1 - cur.fraction) / rate
+        done_w = sum(WEIGHTS[s.id] for s in self.steps if s.state == DONE and s.seconds > 0)
+        done_s = sum(s.seconds for s in self.steps if s.state == DONE and s.seconds > 0)
+        todo_w = sum(WEIGHTS[s.id] for s in self.steps if s.state == PENDING)
+        if todo_w:
+            if not done_w:
+                return None
+            left += todo_w * done_s / done_w
+        return left
 
     def elapsed(self):
         return (self.finished or time.time()) - self.started
@@ -108,6 +141,7 @@ class Job:
         s = self.step(sid)
         if s and s.state != RUNNING:
             s.state, s.fraction, s.detail, s.t0, s.value = RUNNING, 0.0, detail, time.time(), '0%'
+            s.pace.clear()
             self._touch()
 
     def progress(self, sid, fraction, detail=''):
@@ -116,6 +150,7 @@ class Job:
             if s.state == PENDING:
                 self.begin(sid)
             s.fraction = max(0.0, min(1.0, fraction))
+            s.pace.append((time.time(), s.fraction))
             s.value = f'{int(s.fraction * 100)}%'
             if detail:
                 s.detail = detail
@@ -221,6 +256,8 @@ class Job:
                     self.skip(sid, 'Kept' if sid in ('exefs', 'romfs') else 'Unchanged')
                     if link_step and sid in ('compile', 'compile_changed'):
                         self.skip(link_step, 'Unchanged')
+            elif kind == 'progress' and sid and 'fraction' in ev:   # a step that words its own progress (shaders)
+                self.progress(sid, float(ev.get('fraction') or 0), ev.get('detail', ''))
             elif kind == 'progress' and sid:
                 done, total, unit = ev.get('done', 0), max(ev.get('total', 1), 1), ev.get('unit', '')
                 if unit == 'bytes':
@@ -260,15 +297,17 @@ class InstallJob(Job):
     title = 'Installing'
 
     def __init__(self, ctx, dump, game_dir):
-        super().__init__(ctx, ['tools', 'check', 'exefs', 'romfs', 'lift', 'compile', 'shaders', 'ready'])
+        super().__init__(ctx, ['tools', 'check', 'exefs', 'romfs', 'lift', 'compile', 'shaders', *prompt_rows(ctx),
+                               'scan', 'ready'])
         self.dump, self.game_dir = str(dump), str(game_dir)
 
     def run(self):
         self.ensure_tools('tools')
         self.make_game(build.install_args(self.ctx.layout, self.dump, self.game_dir),
-                       {s: s for s in ('check', 'exefs', 'romfs', 'lift', 'compile', 'shaders')})
-        if self.step('shaders').state == PENDING:
-            self.skip('shaders')
+                       {s: s for s in ('check', 'exefs', 'romfs', 'lift', 'compile', 'shaders', 'prompts', 'scan')})
+        for sid in ('shaders', 'prompts', 'scan'):
+            if self.step(sid) and self.step(sid).state == PENDING:
+                self.skip(sid)
         self.finish('ready', 'Ready')
         try:
             gamefiles.extract_fonts(self.ctx.layout, self.game_dir)
@@ -279,9 +318,10 @@ class InstallJob(Job):
 class RebuildJob(Job):
     kind = 'rebuild'
     title = 'Rebuilding'
+    retune = True   # Rebuild the Game: the game's code for this processor's level (build.rebuild_args)
 
     def __init__(self, ctx, game_dir, dump=''):
-        super().__init__(ctx, ['tools_update', 'lift', 'compile_changed', 'swap', 'shaders'])
+        super().__init__(ctx, ['tools_update', 'lift', 'compile_changed', 'swap', 'shaders', *prompt_rows(ctx), 'scan'])
         self.game_dir, self.dump = str(game_dir), dump
 
     def run(self):
@@ -290,14 +330,15 @@ class RebuildJob(Job):
         if build.game_running(self.game_dir):
             raise build.BuildError('the game is running: close it and try again')
         if build.can_rebuild(self.game_dir):
-            args = build.rebuild_args(layout, self.game_dir)
+            args = build.rebuild_args(layout, self.game_dir, self.retune)
         elif self.dump:
             args = build.install_args(layout, self.dump, self.game_dir)
         else:
             raise build.BuildError('the game folder has no earlier build: install the game again')
-        self.make_game(args, {'lift': 'lift', 'compile': 'compile_changed', 'shaders': 'shaders'}, link_step='swap')
-        for sid in ('lift', 'compile_changed', 'swap', 'shaders'):
-            if self.step(sid).state == PENDING:
+        self.make_game(args, {'lift': 'lift', 'compile': 'compile_changed', 'shaders': 'shaders', 'prompts': 'prompts', 'scan': 'scan'},
+                       link_step='swap')
+        for sid in ('lift', 'compile_changed', 'swap', 'shaders', 'prompts', 'scan'):
+            if self.step(sid) and self.step(sid).state == PENDING:
                 self.skip(sid)
 
 
@@ -334,11 +375,12 @@ class UpdateDownloadJob(Job):
 
 class ContinueUpdateJob(RebuildJob):
     """After the restart, in the new version: bring the tools to its lock and rebuild the game."""
+    retune = False   # an update keeps the compiled game's level, so it compiles only what changed
     kind = 'update'
 
     def __init__(self, ctx, game_dir, old, dump=''):
-        Job.__init__(self, ctx, ['download', 'verify', 'tools_update', 'lift', 'compile_changed', 'swap', 'shaders'],
-                     ctx.layout.version)
+        Job.__init__(self, ctx, ['download', 'verify', 'tools_update', 'lift', 'compile_changed', 'swap', 'shaders',
+                                 *prompt_rows(ctx), 'scan'], ctx.layout.version)
         self.game_dir, self.dump, self.old = str(game_dir), dump, old
         self.title = f'Updating to {versions.display(ctx.layout.version)}'
         for sid, value in (('download', 'Done'), ('verify', 'Checksum OK')):
@@ -349,7 +391,7 @@ class ContinueUpdateJob(RebuildJob):
             RebuildJob.run(self)
         else:
             self.ensure_tools('tools_update')
-            for sid in ('lift', 'compile_changed', 'swap', 'shaders'):
+            for sid in ('lift', 'compile_changed', 'swap', 'shaders', 'prompts', 'scan'):
                 self.skip(sid, 'No game yet')
         updater.prune(self.ctx.layout)
 
@@ -372,3 +414,124 @@ class CheckJob(Job):
 
 def update_available(ctx, release):
     return bool(release) and versions.newer(release.version, ctx.layout.version)
+
+
+class StageJob(Job):
+    """A release downloaded, checked and unpacked beside the running version without switching to it
+    (updater.stage), while the launcher runs and the game too. Its thread runs at background priority, so the game
+    shares only the network with it. No screen shows it: the home screen's Updates row reads it."""
+    kind = 'stage'
+
+    def __init__(self, ctx, release):
+        ver = versions.display(release.version)
+        super().__init__(ctx, ['download'], ver)
+        self.release, self.ver = release, ver
+
+    def run(self):
+        winsys.background_thread()
+        self.begin('download')
+        prog = lambda d, t: self.progress('download', d / max(t, 1), f'{d / 1e6:.1f} of {t / 1e6:.1f} MB')  # noqa: E731
+        updater.stage(self.ctx.layout, self.release, progress=prog, cancel=self.cancelled, version=self.ctx.version)
+        self.finish('download')
+
+
+class BackgroundUpdate:
+    """The update the launcher fetches by itself, and when it goes in (docs/launcher.md, "Updating"). The window
+    calls poll() on its timer, checked() after each update check, and install() when the launcher starts, when the
+    game exits, when a game that held an install up has closed, and when the player selects Updates.
+
+    A newer release is staged once per update check (StageJob); a staging that fails is logged and tried again after
+    the next check. A staged release installs only while no copy of the game runs, no job holds the window and no
+    staging is under way, and by itself only with Install Updates Automatically on. Installing switches
+    app/current.txt to it and restarts the launcher (restart(args), the stub), whose new version finishes in
+    ContinueUpdateJob. A checkout has nothing to switch to: there (enabled False) nothing is staged or installed."""
+
+    def __init__(self, ctx, restart, enabled=True):
+        self.ctx, self.restart, self.enabled = ctx, restart, enabled
+        self.job = None            # the StageJob running, or the last one
+        self.tried = ''            # the release staged, or found staged, since the last update check
+        self.asked = False         # the player selected Updates during the download: it installs once staged
+        self.waiting = False       # an install had to wait (the game ran, a download ran): the window tries again
+        self.restarting = False    # the last install restarted the launcher
+        self.error = ''            # why the last install failed
+
+    def staging(self):
+        return self.job is not None and self.job.result is None
+
+    def ready(self, release=None):
+        """The staged release an install would take now (updater.staged_info's dict), or None. With release (the
+        last check's answer), a staged release newer than it is passed over: the feed no longer offers it."""
+        if not self.enabled:
+            return None
+        s = self.ctx.settings
+        m = updater.staged(self.ctx.layout, s.get('channel', 'stable'), s.get('rolled_back', ''))
+        if m and release and versions.newer(m['version'], release.version):
+            return None
+        return m
+
+    def checked(self):
+        """An update check ended: the release it found is staged at the next poll, also one that failed before."""
+        self.tried = ''
+
+    def poll(self, release, busy=False):
+        """Report a staging that ended ('staged' or 'failed'), or start staging release when it is newer than the
+        running version and not staged yet ('started'); None when nothing changed. busy: a job holds the window
+        (an install, update or rebuild); staging waits for it, as an update's prune() clears the same folders."""
+        j = self.job
+        if j and j.result is not None and not getattr(j, 'seen', False):
+            j.seen = True
+            if j.result == 'ok':
+                self.ctx.log(f'background update: {j.ver} is staged')
+                return 'staged'
+            self.ctx.log(f'background update: {j.ver} was not staged ({j.result}: {j.error}); it is tried again '
+                         'after the next update check')
+            return 'failed'
+        if not self.enabled or busy or self.staging() or not release:
+            return None
+        ver = versions.display(release.version)
+        if ver == self.tried:
+            return None
+        self.tried = ver
+        if (not update_available(self.ctx, release) or ver == self.ctx.settings.get('rolled_back')
+                or updater.staged_info(self.ctx.layout, ver)):
+            return None
+        self.ctx.log(f'background update: staging {ver}')
+        self.job = StageJob(self.ctx, release).start()
+        return 'started'
+
+    def install(self, game_dir, release=None, why='', asked=False, running=False):
+        """Install the staged release now unless something stops it, and restart into it. asked: the player
+        selected Updates (now or during the download), which Install Updates Automatically off does not stop;
+        running: the window knows the game runs (the process it started); game_dir: a copy started elsewhere counts
+        too (build.game_running). Returns the version installed, or '' (then waiting says whether it is worth trying
+        again)."""
+        if not self.enabled or not (asked or self.asked or self.ctx.settings.get('auto_install')):
+            return ''
+        m = self.ready(release)
+        if not m:
+            return ''
+        ver = m['version']
+        why_not = ('the game is running' if running or (game_dir and build.game_running(game_dir)) else
+                   f'{self.job.ver} is downloading' if self.staging() else '')
+        if why_not:
+            if not self.waiting:
+                self.ctx.log(f'background update: {ver} waits: {why_not}')
+            self.waiting = True
+            return ''
+        old = versions.display(self.ctx.layout.version)
+        try:
+            updater.install_staged(self.ctx.layout, ver)
+        except (OSError, updater.UpdateError) as e:
+            self.error = str(e)
+            self.waiting = False
+            self.ctx.log(f'background update: {ver} could not be installed: {e}')
+            return ''
+        self.waiting = self.asked = False
+        self.error = ''
+        self.ctx.log(f'background update: installing {ver}' + (f' ({why})' if why else ''))
+        try:
+            self.restarting = bool(self.restart(['--continue-update', old]))
+        except OSError as e:   # the stub did not start: the new version runs at the launcher's next start
+            self.ctx.log(f'background update: the launcher could not restart: {e}')
+            self.restarting = False
+        return ver

@@ -1,9 +1,29 @@
 #version 450
+//
+// Copyright (c) 2025 Carlos Lopez Jr.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+// documentation files (the "Software"), to deal in the Software without restriction, including without limitation the
+// rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all copies or substantial portions of the
+// Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+// WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+// COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+//
 // HDR10 encode on the present (runtime/vk_hdr.c vk_hdr_encode): the game's picture, crop rectangle at offset, linear
 // Rec. 709 with the HUD's white at 1.0 (an sRGB view decodes the 8-bit window texture), into an RGBA16F image of PQ
-// code values in Rec. 2020 that FSR 1 or the blit then scale into the HDR10 swapchain. p.x: nits of 1.0, p.y: the
-// display's peak in nits, p.z: 1 when the source holds sRGB-encoded values in a UNORM format.
-// PQ: SMPTE ST 2084; the Rec. 709 to Rec. 2020 matrix: ITU-R BT.2087.
+// code values in Rec. 2020 that FSR 1 or the blit then scale into the HDR10 swapchain. In order: the gamma correction
+// (the game's sRGB-encoded look shown as a 2.2 or 2.4 display would: decode of the sRGB code with that power), the
+// conversion to Rec. 2020, a gamut compression that desaturates towards the grey of the same luminance until no
+// channel is negative (in a gamma-encoded space whose 50% is the scene's mid grey), the HUD's white in nits, the
+// largest channel scaled down to the peak, and PQ (SMPTE ST 2084).
+// p.x: nits of 1.0, p.y: the display's peak in nits, p.z: 1 when the source holds sRGB-encoded values in a UNORM
+// format, p.w: gamma correction (0 none, 1: 2.2, 2: 2.4).
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D src;
 layout(binding = 1, rgba16f) uniform writeonly image2D dst;
@@ -13,9 +33,23 @@ layout(push_constant) uniform P {
     vec4 p;
 } pc;
 
-vec3 srgb_decode(vec3 c) {
-    return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), greaterThan(c, vec3(0.04045)));
+vec3 copy_sign(vec3 mag, vec3 s) {
+    vec3 a = abs(mag);
+    return mix(a, -a, lessThan(s, vec3(0.0)));
 }
+
+vec3 sign_pow(vec3 x, float e) { return copy_sign(pow(abs(x), vec3(e)), x); }
+
+vec3 srgb_decode(vec3 c) {
+    return mix(pow((c + 0.055) / 1.055, vec3(2.4)), c / 12.92, lessThanEqual(c, vec3(0.04045)));
+}
+
+vec3 srgb_encode(vec3 c) {
+    return mix(1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, c * 12.92, lessThanEqual(c, vec3(0.0031308)));
+}
+
+// The colour an sRGB code shows on a display of power g, sign kept.
+vec3 gamma_correct(vec3 c, float g) { return copy_sign(pow(srgb_encode(abs(c)), vec3(g)), c); }
 
 vec3 pq(vec3 nits) {
     const float m1 = 0.1593017578125, m2 = 78.84375, c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;
@@ -26,9 +60,25 @@ vec3 pq(vec3 nits) {
 void main() {
     ivec2 at = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(at, pc.size))) return;
-    vec3 c = max(texelFetch(src, at + pc.offset, 0).rgb, vec3(0.0));
+    vec3 c = texelFetch(src, at + pc.offset, 0).rgb;
     if (pc.p.z > 0.5) c = srgb_decode(clamp(c, 0.0, 1.0));
-    const mat3 to2020 = mat3(0.6274, 0.0691, 0.0164, 0.3293, 0.9195, 0.0880, 0.0433, 0.0114, 0.8956);
-    vec3 nits = min(max(to2020 * c, vec3(0.0)) * pc.p.x, vec3(pc.p.y));
-    imageStore(dst, at, vec4(pq(nits), 1.0));
+    c = mix(c, vec3(0.0), isnan(c));
+    if (pc.p.w == 1.0) c = gamma_correct(c, 2.2);
+    else if (pc.p.w == 2.0) c = gamma_correct(c, 2.4);
+    // Rec. 709 to Rec. 2020 (rows)
+    c = c * mat3(0.6274038960, 0.3292830384, 0.0433130657,
+                 0.0690972894, 0.9195403951, 0.0113623156,
+                 0.0163914388, 0.0880133078, 0.8955952532);
+    float gray = dot(c, vec3(0.2627002120, 0.6779980715, 0.0593017165));
+    const float MID_GRAY_GAMMA = log(1.0 / pow(10.0, 0.75)) / log(0.5);   // about 2.49: 18% grey encodes to 50%
+    vec3 encoded = sign_pow(c, 1.0 / MID_GRAY_GAMMA);
+    float encoded_gray = pow(max(gray, 0.0), 1.0 / MID_GRAY_GAMMA);
+    float lowest = min(0.0, min(encoded.r, min(encoded.g, encoded.b)));
+    float distance = encoded_gray - lowest;
+    float ratio = distance == 0.0 ? 0.0 : -lowest / distance;
+    c = sign_pow(mix(vec3(encoded_gray), encoded, 1.0 - ratio), MID_GRAY_GAMMA);
+    c *= pc.p.x;
+    float max_channel = max(max(max(c.r, c.g), c.b), pc.p.y);
+    c *= pc.p.y / max_channel;
+    imageStore(dst, at, vec4(pq(max(c, vec3(0.0))), 1.0));
 }

@@ -195,6 +195,8 @@ int input_flight_key(void) {
     return w && w == GetForegroundWindow() && key_down(VK_F8);
 }
 
+int input_dump_key(void) { return key_down(VK_INSERT); }
+
 // ---- input_wsys.h
 int ikb_foreground(void) {
     HWND w = gfx_window_handle();

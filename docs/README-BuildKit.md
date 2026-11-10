@@ -21,11 +21,12 @@ downloads included, and keeps the game up to date. This page is the same build b
    in the installer. Then, in a Command Prompt:
 
    ```bat
-   py -m pip install numpy lz4 zstandard zbic
+   py -m pip install numpy lz4 zstandard zbic fonttools pillow
    ```
 
    `zbic` unpacks the game's compressed program files. It is a separate GPL-2.0 package you install yourself; the kit
-   only calls it.
+   only calls it. `fonttools` and `pillow` draw the Xbox, PlayStation and keyboard and mouse button prompts, when the
+   kit has a `prompt-art` folder.
 
 2. **MSYS2** from [msys2.org](https://www.msys2.org/), installed to the default `C:\msys64`. Open **MSYS2 UCRT64** from
    the Start menu and paste:
@@ -51,9 +52,10 @@ check that your dump is the right version, add `--check` (it builds nothing).
 The build checks the version, unpacks the program files, packs the 26 GB RomFS image (every file is checked against
 the dump's own checksums) while it turns the game's code into C and compiles it (about 6 minutes on a 16-thread
 Ryzen 7; longer on fewer cores), then prepares every one of the game's shaders for your graphics card (about 5 more
-minutes), so the game does not stop to compile shaders while you play. The game it builds is for this PC's processor.
-You can use your PC meanwhile. If it stops,
-run the same command again: finished steps are skipped.
+minutes), so the game does not stop to compile shaders while you play. When the kit has a `prompt-art` folder, it
+last draws the Xbox, PlayStation and keyboard and mouse button prompts from that art (about a minute) into the
+`romfs-patches-*` folders beside the game. The game it builds is for this PC's processor. You can use your PC
+meanwhile. If it stops, run the same command again: finished steps are skipped.
 
 When it says `finished`, start `C:\Games\Ocarina\ocarina.exe`. You can delete `C:\Games\Ocarina\build-cache` (about
 5 GB) afterwards.
@@ -67,12 +69,13 @@ RADV). It takes clang, clang++ and lld from `PATH` and links against the system'
 1. Packages, on Arch and its derivatives (other distributions: the same libraries and their `-dev` headers):
 
    ```sh
-   sudo pacman -S --needed clang lld sdl3 opus libvpx dav1d zstd libunwind vulkan-headers vulkan-icd-loader \
-       python fonttools python-numpy python-lz4 python-zstandard dotnet-sdk
+   sudo pacman -S --needed clang lld sdl3 opus libvpx dav1d zstd vulkan-headers vulkan-icd-loader \
+       python python-fonttools python-pillow python-numpy python-lz4 python-zstandard dotnet-sdk
    ```
 
-   Python 3.14 or later (the RomFS step and the PlayStation prompts use its `compression.zstd`), then `zbic`, which the
-   kit only calls (GPL-2.0): `pip install --user zbic`, or in a virtual environment with the packages above.
+   Python 3.10 or later (with 3.14 the RomFS step uses its own `compression.zstd`, else the `zstandard` package; the
+   button prompts need `fonttools` and `pillow` when the kit carries button art), then `zbic`, which the kit only calls
+   (GPL-2.0): `pip install --user zbic`, or in a virtual environment with the packages above.
    Vulkan Memory Allocator is one header: the system's (AUR `vulkan-memory-allocator`), else the build fetches the
    pinned 3.4.0 into `toolchain/vma/` and checks its hash.
 
@@ -105,11 +108,21 @@ beside the game.
   "Preparing shaders" once while the driver rebuilds them. With a driver that has Vulkan's graphics pipeline library
   it lasts at most about 20 seconds once the shaders are translated, and the remaining pipelines are built in the
   background while you play.
-- **Screen** in the menu has Upscaling (DLSS on NVIDIA RTX cards, FSR 3.1 on any card), Frame generation (FSR 3.1; it
-  needs DLSS or FSR 3.1 upscaling on), HDR (Native is the game's own HDR; turn HDR on in Windows first) and the
+- **Screen** in the menu has Upscaling (DLSS on NVIDIA RTX cards, FSR 3.1 on any card), Frame generation (NVIDIA DLSS
+  on RTX 40 and 50 cards, with a DLSS multiplier of 2x, or 3x and 4x on RTX 50 cards; FSR 3.1 on any card; it needs
+  DLSS or FSR 3.1 upscaling on, and the frame limit then counts the frames on screen; with no limit chosen it is the
+  display's refresh rate), HDR (the game's picture tone mapped to your display, with its own grading rows, or Native, the game's own HDR; turn HDR on in Windows first) and the
   resolution. Those marked "after restart" take effect when the game starts again.
-- DLSS needs `nvngx_dlss.dll` from NVIDIA beside `ocarina.exe` (the kit does not include it); FSR 3.1's
-  `amd_fidelityfx_vk.dll` is copied there by the build.
+- **Controls** in the menu has Button prompts: the game's own, or Xbox, PlayStation or keyboard and mouse ones when
+  the build drew them (a kit with `prompt-art`). It takes effect after a restart. The keyboard and mouse prompts show
+  the keys `nx2navi.ini` binds when the build runs: after rebinding keys, run
+  `py -I tools\make_game.py --rebuild --out "C:\Games\Ocarina"` to draw them again (it skips everything else).
+- The build copies NVIDIA's DLSS library `nvngx_dlss.dll` (with `nvngx_dlss-NOTICE.txt`, which names its licence)
+  and FSR 3.1's `amd_fidelityfx_vk.dll` beside `ocarina.exe` from the kit's `bin\`. To use another DLSS version, put
+  your own `nvngx_dlss.dll` there: later builds keep it.
+- A kit with `bin\dlssg\` (made with `tools/make_kit.py --dlssg`) also brings DLSS Frame Generation on GeForce RTX 40
+  and 50 cards: the build copies `nx2navi_dlssg.dll`, NVIDIA Streamline's runtime, `nvngx_dlssg.dll` and their licence
+  texts beside `ocarina.exe`, and Frame generation in the Screen menu then offers DLSS too.
 - Logs are in `logs\`. When reporting a problem, say where you were in the game and which graphics card you have, and
   attach `logs\nx2navi.log`. Never send game files.
 

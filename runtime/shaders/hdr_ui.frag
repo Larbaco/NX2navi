@@ -1,6 +1,7 @@
 #version 450
 // The in-game menu on an HDR10 swapchain (runtime/vk_hdr.c vk_hdr_ui_compose): ImGui drew it into an RGBA8 image,
-// premultiplied sRGB colour over a clear 0; this turns each pixel back into its colour, puts its white at p.x nits and
+// premultiplied sRGB colour over a clear 0; this turns each pixel back into its colour (with the picture's gamma
+// correction p.y: 0 none, 1: 2.2, 2: 2.4, as shaders/hdr_encode.comp applies it), puts its white at p.x nits and
 // writes the PQ code with its coverage, which the pipeline blends over the picture (in PQ code values, as the menu
 // blends in sRGB code values on an SDR swapchain). PQ: SMPTE ST 2084; Rec. 709 to Rec. 2020: ITU-R BT.2087.
 layout(location = 0) in vec2 uv;
@@ -21,7 +22,8 @@ vec3 pq(vec3 nits) {
 void main() {
     vec4 u = texture(ui, uv);
     if (u.a <= 0.0) discard;
-    vec3 c = srgb_decode(clamp(u.rgb / u.a, 0.0, 1.0));
+    vec3 code = clamp(u.rgb / u.a, 0.0, 1.0);
+    vec3 c = pc.p.y == 1.0 ? pow(code, vec3(2.2)) : pc.p.y == 2.0 ? pow(code, vec3(2.4)) : srgb_decode(code);
     const mat3 to2020 = mat3(0.6274, 0.0691, 0.0164, 0.3293, 0.9195, 0.0880, 0.0433, 0.0114, 0.8956);
     color = vec4(pq(max(to2020 * c, vec3(0.0)) * pc.p.x), u.a);
 }

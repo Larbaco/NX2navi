@@ -373,7 +373,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
     if (!S.dest[0]) {
         wchar_t base[PATHN];
         if (!known_folder(&FOLDERID_UserProgramFiles, base, PATHN)) {
-            if (!GetEnvironmentVariableW(L"LOCALAPPDATA", base, PATHN)) return 1;
+            // 0 when unset; PATHN or more when it does not fit (base is then left unwritten); room for \Programs
+            DWORD got = GetEnvironmentVariableW(L"LOCALAPPDATA", base, PATHN);
+            if (!got || got >= PATHN - 16) return 1;
             wcscat(base, L"\\Programs");
         }
         swprintf(S.dest, PATHN, L"%ls\\%ls", base, APP_NAME);

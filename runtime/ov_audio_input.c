@@ -1,5 +1,8 @@
-/* Polling audio input for the public nn::audio calls Ocarina imports.
-   SDL converts the default recording device to the format the caller requests. */
+// Audio input for the nn::audio input-stream calls the game imports (the Ocarina can be played into a microphone):
+// each stream reads the default recording device through audio_capture.c, which SDL converts to the format the game
+// asks for. The calls are overridden in the game (HOST_OVERRIDE) because the audio service refuses input streams. A
+// stream that failed to open is unknown to every call here, so purging or closing it is safe; before, the game purged
+// a stream that never opened and crashed. NX2NAVI_MICROPHONE=0 refuses every input stream, as the game saw before.
 #include "audio_capture.h"
 #include "host.h"
 #include "ipc.h"
@@ -8,7 +11,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define BAD_INPUT 0x70899u
+#define BAD_INPUT 0x70899u   // nn::audio's invalid-argument result (module 153, description 900), as audio_mixer.c
 typedef struct {
     uint64_t key;
     MicCapture *mic;
@@ -16,7 +19,15 @@ typedef struct {
     uint64_t frames_read, next_log;
 } Input;
 static Input inputs[8];
-static const char input_name[] = "WindowsDefaultMicrophone";
+static const char input_name[] = "DefaultMicrophone";   // the name the game is given for the default device
+static int mic_on(void) {   // NX2NAVI_MICROPHONE (default 1)
+    static int on = -1;
+    if (on < 0) {
+        on = rt_knob("MICROPHONE", "1") != 0;
+        if (!on) rt_log("mic: input streams refused (NX2NAVI_MICROPHONE=0)");
+    }
+    return on;
+}
 static Input *find(uint64_t key) {
     for (int i = 0; i < 8; i++)
         if (inputs[i].key == key && key)
@@ -29,10 +40,10 @@ static void name_out(uint64_t addr) {
     memcpy(p, input_name, sizeof input_name);
 }
 static void list_devices(Cpu *c) {
-    int n = mic_device_count();
+    int n = mic_on() ? mic_device_count() : 0;
     if ((int)c->x[1] > 0 && n > 0)
         name_out(c->x[0]);
-    rt_log("mic: input enumeration: %d Windows recording devices", n);
+    rt_log("mic: input enumeration: %d recording devices", n);
     ret_x(c, (int)c->x[1] > 0 && n > 0 ? 1 : 0);
 }
 static void default_device(Cpu *c) {
@@ -69,13 +80,13 @@ static void open_input(Cpu *c) {
             s = &inputs[i];
     uint64_t zero = 0;
     memcpy(ipc_guest(key, 8), &zero, 8);
-    if (!s) {
+    if (!s || !mic_on()) {
         ret_x(c, BAD_INPUT);
         return;
     }
     MicCapture *m = mic_open(f[0], f[1], f[2], frames);
     if (!m) {
-        rt_log("mic: cannot open Windows default input: %s", mic_error());
+        rt_log("mic: cannot open the default recording device: %s", mic_error());
         ret_x(c, BAD_INPUT);
         return;
     }
@@ -86,7 +97,7 @@ static void open_input(Cpu *c) {
     s->next_log = (uint64_t)f[2] * 5;
     uint64_t impl = key + 8;
     memcpy(ipc_guest(key, 8), &impl, 8);
-    rt_log("mic: Windows default input opened; bounded buffer %d frames", mic_capacity(m));
+    rt_log("mic: default recording device opened; bounded buffer %d frames", mic_capacity(m));
     ret_x(c, 0);
 }
 static void start_input(Cpu *c) {

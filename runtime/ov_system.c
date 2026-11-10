@@ -37,20 +37,25 @@ static void need(int ok, const char *what) {
 static const char *caller(Cpu *c, char *buf, int n) { return ldr_describe(c->x[30] - 4, buf, n); }
 
 // ==== nn::oe (services.c)
-// NX2NAVI_OPERATION_MODE, read once: 1 handheld (OperationMode 0, PerformanceMode Normal 0), 0 docked (1, Boost 1).
+// NX2NAVI_OPERATION_MODE: 1 handheld (OperationMode 0, PerformanceMode Normal 0), 0 docked (1, Boost 1). It follows the
+// setting; the game is told of a change as the console tells it (ov_operation_mode_live).
 int ov_handheld(void) {
-    static volatile int32_t v = -1;
-    int32_t h = v;
-    if (h < 0) {
-        const char *e = cfg_value("NX2NAVI_OPERATION_MODE");
-        if (!strcmp(e, "docked")) h = 0;
-        else if (!strcmp(e, "handheld")) h = 1;
-        else rt_fatal("NX2NAVI_OPERATION_MODE must be docked or handheld, not '%s'", e);
-        if (plat_cas32(&v, h, -1) == -1)
-            rt_log("oe: operation mode reported to the game: %s", h ? "handheld (performance normal)"
-                                                                  : "docked (performance boost)");
+    const char *e = cfg_value("NX2NAVI_OPERATION_MODE");
+    if (!strcmp(e, "docked")) return 0;
+    if (!strcmp(e, "handheld")) return 1;
+    rt_fatal("NX2NAVI_OPERATION_MODE must be docked or handheld, not '%s'", e);
+}
+
+// After a settings change (gfx_present.c window_settings_live): a new mode reaches the game through the applet messages
+// OperationModeChanged and PerformanceModeChanged, which make it read the mode again.
+void ov_operation_mode_live(void) {
+    static int was = -1;
+    int h = ov_handheld();
+    if (h != was) {
+        rt_log("oe: operation mode reported to the game: %s", h ? "handheld (performance normal)" : "docked (performance boost)");
+        if (was >= 0) oe_push_message(0x1e), oe_push_message(0x1f);
+        was = h;
     }
-    return (int)h;
 }
 
 // The Switch language for a BCP 47 tag; en-US for a language the game does not ship.

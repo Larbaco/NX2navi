@@ -137,8 +137,15 @@ void vk_exec_inline_end(int reopen);
 // vk_exec_draw.c: forget what the command buffer being recorded has bound (pipeline, sets, dynamic state, vertex
 // buffers): the replay continues in a new one (vk_sync_split).
 void vk_exec_draw_new_cb(void);
+// vk_exec_draw.c, before a part of submission fence goes to the queue (vk_exec.c maybe_split): 1 when it may go. The
+// texture pool set it binds is then sealed and the next draw that needs the pools takes another; 0 when every other set
+// is bound by this submission's earlier parts, and the replay keeps recording into the same part.
+int vk_exec_pool_split(uint64_t fence);
 // vk_exec_draw.c: the vertex and fragment shader of the last draw recorded into this command buffer (NULL: none yet).
 void vk_exec_draw_shaders(const GfxShader **vs, const GfxShader **fs);
+// vk_exec_draw.c "pool marks": at the end of a submission that recorded work, after its closing barrier. Hands the
+// mark copies the GPU completed to vk_texture.c and, every few such submissions, copies the marks out and clears them.
+void vk_exec_pool_marks(VkExec *ex);
 VkBuffer vk_exec_inline_buffer(VkDeviceSize size);
 // vk_exec.c: the stand-in a 3D BC render target is drawn through goes with its image (vk_exec_image_gone).
 void vk_exec_bc_gone(VkImage image);
@@ -166,6 +173,13 @@ typedef struct {
                                                                // transitions
     uint64_t fb_war_barriers;            // in-pass barriers before a write to a target an earlier draw sampled
     uint64_t ub_updates, ub_pass_breaks; // inline uniform updates, and those that ended an open pass
+    uint64_t bind_calls, bind_ns;        // bind_resources: calls and the time spent resolving and pushing their sets
+    uint64_t bind_tex_ns;                // of bind_ns, the texture descriptors' lookups
+    uint64_t bind_buf_ns;                // of bind_ns, the uniform and storage buffer descriptors' resolution
+    uint64_t bind_sig_ns;                // of bind_ns, the per-draw binding signature
+    uint64_t bind_push_ns;               // of bind_ns, the set packing, pushes and binds after the binding loop
+    uint64_t bind_reused, bind_resolved; // descriptors taken from the per-binding reuse (PB) and resolved again
+    uint64_t dyn_calls, dyn_left;        // dynamic state calls recorded, and left out as unchanged (B.dyn)
 } VkExecFrame;
 extern VkExecFrame vk_exec_frame;
 void vk_exec_frame_written(const tex_t *t);                    // vk_texture_gpu_written: t rendered or copied into
@@ -178,7 +192,12 @@ void vk_exec_frame_log(const tex_t *presented, uint64_t frame);
 extern int vk_dump_armed;
 void vk_dump_init(void);                 // reads the environment; vk_exec_record's first call
 void vk_dump_pass_end(VkExec *ex);       // after vkCmdEndRendering
-void vk_dump_draw(VkExec *ex, const VkPipeState *s, VkPipeline p, const VkPipeInfo *info);   // after a draw's binds
+// after a draw's binds; mesh: a mesh draw (s->vs is its mesh stage, s->ts its task stage or NULL)
+void vk_dump_draw(VkExec *ex, const VkPipeState *s, VkPipeline p, const VkPipeInfo *info, int mesh);
+// Around a mesh draw of the dumped frame (after vk_dump_draw): a primitives-generated query, listed in mesh_prims.txt.
+// begin returns the query, or -1 when none was begun; end takes that value.
+int vk_dump_mesh_begin(VkExec *ex);
+void vk_dump_mesh_end(VkExec *ex, int q);
 void vk_dump_dispatch(VkExec *ex, const GfxShader *cs, VkPipeline p, const VkPipeInfo *info, const p_dispatch *d);
 void vk_dump_copy(VkExec *ex, uint32_t op, const void *payload);   // before a copy or texture clear is replayed
 void vk_dump_present(uint64_t frame);    // vk_be_present: waits for the dump frame's copies and closes the logs
@@ -209,6 +228,8 @@ extern int vk_exec_signalled;                 // set by every replayed SignalEve
 // signal met, and the sum of how many submissions later it came.
 void vk_exec_event_stats(uint64_t *waits, uint64_t *unmet, uint64_t *late, uint64_t *late_subs);
 extern uint64_t vk_exec_submit_seq;   // replay thread: submissions replayed so far
+int vk_exec_held(void);               // replay thread: held submissions waiting for a signal (event order)
+int vk_exec_held_ready(void);         // ... and one of them can go on now (vk_backend.c present_held)
 // vk_dlaa.c: once DLSS has scaled the scene this frame, passes larger than the scene's light target vk_dlaa_swap_img
 // sample DLSS's output vk_dlaa_swap_view in its place, so the game's scaling draw scales DLSS's picture.
 extern const VkTexImage *vk_dlaa_swap_img;

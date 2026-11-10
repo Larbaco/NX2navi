@@ -7,6 +7,11 @@
 // then each texel takes the nearest of the four palette entries along that axis. Alpha: the eight-value BC3 alpha
 // block between the block's smallest and largest alpha. The bytes are what the texels hold, so an sRGB image keeps
 // sRGB-encoded values, as BC3_SRGB expects.
+//
+// The texel bytes are read as integers, so the alpha endpoints are exactly the block's least and greatest alpha: a
+// texel that is fully transparent or fully opaque keeps 0 or 255, wherever the source's own block edges fall inside
+// the 4x4 block, and an alpha test keeps the outline of cut-out foliage. Through unpackUnorm4x8 an opaque 255 could
+// come back as 254.99 on a GPU whose division is not exact and be cut to 254 by the conversion to uint.
 // Compiled to runtime/bc3_encode_spv.h by tools/build_shaders.py; vk_astc.c records the dispatch.
 #version 450
 
@@ -25,7 +30,8 @@ layout(push_constant) uniform Params {
 
 vec4 texel(uint x, uint y, uint z) {
     x = min(x, pc.width - 1u), y = min(y, pc.height - 1u);
-    return unpackUnorm4x8(px[pc.in_base + (z * pc.height + y) * pc.width + x]) * 255.0;
+    uint v = px[pc.in_base + (z * pc.height + y) * pc.width + x];
+    return vec4(uvec4(v, v >> 8, v >> 16, v >> 24) & 0xFFu);
 }
 
 uint to565(vec3 c) {

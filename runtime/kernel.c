@@ -13,6 +13,7 @@
 #include "cfg.h"
 #include "host.h"
 #include "kernel.h"
+#include "prof.h"
 #include "platform/platform.h"
 
 #define R_OK 0u
@@ -266,7 +267,7 @@ static uint32_t block_inner(RtThread *t, int kind, int64_t ns) {
         t->wkind = W_NONE;
         return R_TIMEOUT;
     }
-    uint64_t now = kern_now_ns();
+    uint64_t now = ns < 0 ? 0 : kern_now_ns();   // a wait without a timeout reads no clock (G is held here)
     int forever = ns < 0 || (uint64_t)ns > UINT64_MAX - now;
     uint64_t deadline = forever ? 0 : now + (uint64_t)ns;
     while (!t->woke) {
@@ -1186,6 +1187,8 @@ void kern_core_stats(int *held_now, int *held_max) {
     unlock();
 }
 
+int kern_cores(void) { return g_active_cores; }
+
 void kern_core_stats_reset(void) {
     lock();
     g_held_max = 0;
@@ -1675,7 +1678,7 @@ static void cv_hook(void) {
     if (h) h();
 }
 
-int kern_svc(Cpu *c, uint32_t imm) {
+static int kern_svc_inner(Cpu *c, uint32_t imm) {
     uint64_t *x = c->x;
     if (g_diag > 0 && tcur) tcur->dg_svc = imm;
     switch (imm) {
@@ -1746,12 +1749,21 @@ int kern_svc(Cpu *c, uint32_t imm) {
             unlock();
             return 1;
         }
-        // Yield: hand the core to a waiting thread of equal or better priority.
+        // Yield: hand the core to a waiting thread of equal or better priority. Most yields find nobody waiting for a
+        // core: those take neither G nor the priority scan over every blocked thread (prio_of), which the game's yield
+        // loops paid thousands of times a second. The look is as racy as rt_spin_gate's: a thread that queues for a
+        // core right after it is found by the next yield, and kicks the owner itself in core_take meanwhile.
+        if (!__atomic_load_n(&g_core_wait, __ATOMIC_RELAXED)) {
+            plat_yield();
+            return 1;
+        }
         lock();
-        int give = 0;
-        int tp = prio_of(t);
+        int give = 0, tp = -1;
         for (RtThread *w = g_core_wait; w && !give; w = w->cnext)
-            give = t->cur_core >= 0 && core_allowed(w, t->cur_core) && prio_of(w) <= tp;
+            if (t->cur_core >= 0 && core_allowed(w, t->cur_core)) {
+                if (tp < 0) tp = prio_of(t);   // only once a waiter may run on this core
+                give = prio_of(w) <= tp;
+            }
         if (give) {
             core_put(t);
             core_take(t);
@@ -2397,3 +2409,21 @@ HOST_OVERRIDE(KERN_SYM_INITIALIZE_FIBER, kern_fiber_initialize);
 HOST_OVERRIDE(KERN_SYM_FINALIZE_FIBER, kern_fiber_finalize);
 HOST_OVERRIDE(KERN_SYM_SWITCH_TO_FIBER, kern_fiber_switch);
 HOST_OVERRIDE(KERN_SYM_GET_CURRENT_FIBER, kern_fiber_current);
+
+// NX2NAVI_SVC_SLOW_MS (default 0, off): logs each kernel service that blocks longer than that, with the service number.
+// A stalled frame shows up as time in the replay; this says whether the guest was waiting in a service, and which one,
+// instead of leaving it to a sampler to find.
+int kern_svc(Cpu *c, uint32_t imm) {
+    static double lim = -1;
+    if (lim < 0) lim = strtod(cfg_value("NX2NAVI_SVC_SLOW_MS"), NULL);
+    if (lim <= 0) return kern_svc_inner(c, imm);
+    uint64_t t0 = plat_now_ns();
+    int r = kern_svc_inner(c, imm);
+    double ms = (plat_now_ns() - t0) / 1e6;
+    if (ms >= lim) {
+        uint32_t tid = plat_thread_id();
+        rt_log("kernel: service %#x blocked %.1f ms on thread %u%s", imm, ms, tid,
+               tid == prof_replay_tid ? " (the replay thread)" : "");
+    }
+    return r;
+}

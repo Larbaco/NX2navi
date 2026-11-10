@@ -8,7 +8,8 @@ The window is one Tk canvas at 1000 x 640 logical pixels, scaled to the display.
 flat cells and the orange choices are canvas items. Screens:
 
     first_run   the dump, the install folder, three choices and Begin Installation
-    home        Play, Updates, the game folder, Rebuild the Game, Settings
+    home        Play, Updates, the game folder, Saves, Rebuild the Game, Settings
+    saves       Export Save (a zip for a bug report or another player), Import a Save (such a zip), a save folder
     job         the steps of an install, update or rebuild, with their progress, and Cancel; after a failure Try Again
                 and Copy Report
     settings    the launcher's choices, the folders, the logs and Uninstall
@@ -26,7 +27,7 @@ import tkinter.font as tkfont
 from pathlib import Path
 from tkinter import filedialog
 
-from .. import NAME, build, feed, gamefiles, jobs, saves, versions, winsys
+from .. import NAME, build, feed, gameini, gamefiles, jobs, saves, versions, winsys
 from ..context import Context
 from . import art
 
@@ -86,6 +87,46 @@ def free_gb(path):
         return 0.0
 
 
+# Exit codes that end the game, and what they mean. The game exits with 70 after a FATAL line of its own: an error it
+# cannot go on from, most often an allocation that failed because the memory ran out (runtime/dispatch.c rt_fatal), or
+# a failed re-run of itself (runtime/platform/win32.c plat_reexec). Its crash report exits with 71 after writing its
+# FATAL lines (runtime/main.c crash_handler). The others come from Windows when something ends the process before or
+# around that report.
+EXIT_CODES = {
+    70: 'a fatal error: the FATAL line near the end of its log says which, often memory that ran out',
+    71: 'the crash report ended the game',
+    0xC0000005: 'access violation',
+    0xC00000FD: 'stack overflow',
+    0xC0000142: 'a DLL failed to start',
+    0xC0000374: 'heap corruption',
+    0xC0000409: 'fail-fast: a security check or abort ended the process without an exception',
+    0xC0000417: 'invalid parameter to a C runtime function',
+    0xC000041D: 'a fault inside a Windows callback',
+    0xE06D7363: 'a C++ exception no one caught',
+}
+
+
+def exit_code_text(code):
+    """The exit code as the game's log and Windows show it: hex for a Windows status, with its meaning when known."""
+    code &= 0xFFFFFFFF
+    meaning = EXIT_CODES.get(code)
+    shown = f'0x{code:08X}' if code >= 0x80000000 else str(code)
+    return f'{shown} ({meaning})' if meaning else shown
+
+
+def note_exit_in_log(game_dir, text):
+    """Adds the exit code to the end of the game's log, so a log a player sends shows how the run ended even when the
+    process died before it could write a line itself."""
+    if not game_dir:
+        return
+    log = Path(game_dir) / 'logs' / 'nx2navi.log'
+    try:
+        with open(log, 'a', encoding='utf-8') as f:
+            f.write(f'[launcher] the game ended with code {text} at {time.strftime("%Y-%m-%d %H:%M:%S")}\n')
+    except OSError:
+        pass
+
+
 def drive_of(path):
     return Path(path).anchor.rstrip('\\/') or str(Path(path).parent)
 
@@ -106,8 +147,15 @@ class App:
         self.release = None
         self.check_error = ''
         self.checked_at = 0.0
+        self.check_started = 0.0
+        # the update fetched in the background and installed when the game is not running; a checkout and the
+        # selftest have nothing to switch to
+        self.bg = jobs.BackgroundUpdate(ctx, lambda a: winsys.restart(self.layout, a),
+                                        enabled=not self.layout.dev and not args.selftest)
+        self.row_gap = GAP
         self.message = ''
-        self.save_message = ''   # the last Import Saves result, shown in its description
+        self.save_message = ''   # the last import's result, shown in the import rows' descriptions
+        self.export_message = ''   # the last Export Save result, shown in its description
         self.dumps = None
         self.dump_search = None
         self.uninstall_game = False
@@ -133,6 +181,7 @@ class App:
         self.root.after(80, self.animate)
         self.root.after(150, self.tick)
         self.root.after(50, self.poll_gamepad)
+        self.root.after(60000, self.minute)
         self.center()
         self.framed = not winsys.frameless(root)   # Windows: the band is the title bar
         self.root.after(60, self.native_window)
@@ -319,7 +368,7 @@ class App:
 
     def poll_gamepad(self):
         try:
-            for b in self.gamepad.poll():
+            for b in self.gamepad.poll(winsys.in_front(self.root)):
                 {'up': lambda: self.move(-1), 'down': lambda: self.move(1), 'left': lambda: self.side(-1),
                  'right': lambda: self.side(1), 'a': self.activate, 'b': self.back,
                  'y': lambda: self.check_now(force=True)}.get(b, lambda: None)()
@@ -377,6 +426,8 @@ class App:
             self.show('home')
         elif self.screen == 'uninstall':
             self.show('settings')
+        elif self.screen == 'saves':
+            self.show('home', next((i for i, r in enumerate(self.rows_home()) if r.label == 'Saves'), None))
         elif self.screen == 'job' and self.job and self.job.result is None:
             self.cancel_job()
         elif self.screen == 'job':
@@ -386,7 +437,7 @@ class App:
         for i, r in enumerate(self.rows):
             if r.rect and r.focusable:
                 x0, y0, x1, y1 = r.rect
-                if x0 <= x <= x1 and y0 - self.X(GAP / 2) <= y <= y1 + self.X(GAP / 2):
+                if x0 <= x <= x1 and y0 - self.X(self.row_gap / 2) <= y <= y1 + self.X(self.row_gap / 2):
                     return i
         return None
 
@@ -458,6 +509,8 @@ class App:
     def on_close(self):
         if self.job and self.job.result is None:
             self.job.cancel()
+        if self.bg.staging():   # what it downloaded is resumed, and its unfinished folder replaced, next time
+            self.bg.job.cancel()
         self.root.destroy()
 
     # ---------------------------------------------------------------- screens
@@ -467,6 +520,8 @@ class App:
         gd = self.settings.get('game_dir')
         if a.rolled_back:
             self.ctx.log(f'the stub went back from {a.rolled_back} to {self.layout.version}')
+            self.settings['rolled_back'] = versions.display(a.rolled_back)   # never installed again by itself
+            self.settings.save()
         for old in self.layout.root.glob('python.old*'):   # the Python an update replaced (launcher/native/nx2navi.c)
             shutil.rmtree(old, ignore_errors=True)
         if gd or self.settings.get('dump'):
@@ -481,6 +536,8 @@ class App:
         elif gd and build.built_version(gd):
             self.show('home')
             self.after_update_notice()
+            if self.install_staged('a staged update waited for the launcher to start'):
+                return
             if self.settings.get('auto_check'):
                 self.check_now()
         else:
@@ -562,8 +619,9 @@ class App:
             self.toggle('Desktop Shortcut', 'desktop_shortcut',
                         'Put an NX2navi shortcut on the desktop. The Start menu always has one.'),
             self.toggle('Check for Updates at Start', 'auto_check',
-                        'Look for a new version of NX2navi each time the launcher opens. Nothing is installed '
-                        'until you choose Update.'),
+                        'Look for a new version of NX2navi when the launcher opens, and every hour while it stays '
+                        'open. A new version downloads in the background and installs when you are not playing; '
+                        'Settings can make it wait until you choose Updates.'),
             self.channel_row(),
             Row('divider'),
             Row('action', 'Begin Installation', on=self.begin_install, desc=begin_desc, enabled=True),
@@ -587,6 +645,25 @@ class App:
                    left=flip, right=flip,
                    desc=('Stable gets each finished release. Preview also gets test builds before they are '
                          'released, which may have new problems.',))
+
+    def discord_row(self, game_dir):
+        """The game's discord_rpc setting (runtime/discord_rpc.c), kept in the game's nx2navi.ini as the game's own
+        menu keeps it; the game reads it when it starts. On unless the file says 0, as the game reads it (cfg_bool,
+        default on)."""
+        def on(v):
+            try:
+                gameini.put(game_dir, 'discord', 'discord_rpc', '1' if v else '0')
+            except OSError as e:
+                self.message = f'The game\'s settings could not be written: {e}'
+
+        def get():
+            try:
+                return gameini.get(game_dir, 'discord_rpc') != '0'
+            except OSError:   # nx2navi.ini there but unreadable: the game's default
+                return True
+        return Row('toggle', 'Discord Status', on=on, get=get,
+                   desc=('Show "Playing NX2navi" with your play time in your Discord status while the game runs. '
+                         'The game\'s menu switches it too (Game tab).',))
 
     def choose_dump(self):
         start = str(Path(self.settings.get('dump')).parent) if self.settings.get('dump') else str(Path.home())
@@ -640,7 +717,14 @@ class App:
         built = build.built_version(gd)
         mine = versions.display(self.layout.version)
         play_value = 'Ocarina of Time'
-        if self.release and jobs.update_available(self.ctx, self.release):
+        staged = self.bg.ready(self.release)
+        if staged:
+            upd = Row('value', 'Updates', f'Ready · {staged["version"]}', 'orange_arrow', big=True, icon='refresh',
+                      badge=True, on=self.start_update, focus_value=True, desc=lambda: self.staged_desc(staged))
+        elif self.bg.staging():
+            upd = Row('value', 'Updates', f'Downloading {self.bg.job.ver}', 'orange_arrow', big=True,
+                      icon='refresh', on=self.start_update, focus_value=True, desc=self.staging_desc)
+        elif self.release and jobs.update_available(self.ctx, self.release):
             nv = versions.display(self.release.version)
             upd = Row('value', 'Updates', f'Version {nv}', 'orange_arrow', big=True, icon='refresh', badge=True,
                       on=self.start_update, focus_value=True, desc=self.update_desc)
@@ -665,6 +749,8 @@ class App:
         play_desc = ('Start Ocarina of Time. The launcher steps aside while you play and comes back when you quit.',)
         if built and versions.display(built) != mine:
             play_desc += (f'The game was built with {versions.display(built)}. Rebuild the Game brings it to {mine}.',)
+        if staged and self.settings.get('auto_install'):
+            play_desc += (f'NX2navi {staged["version"]} is downloaded and installs after you quit the game.',)
         if self.message:
             play_desc = (self.message,) + play_desc
         return [
@@ -673,7 +759,7 @@ class App:
             Row('divider'),
             Row('value', 'Game Folder', gd, on=lambda: self.open(gd),
                 desc=('Open the game folder. The game keeps your save in its profile folder, its settings in '
-                      'nx2navi.ini and its logs in logs. Its saves folder is for saves to import.',)),
+                      'nx2navi.ini and its logs in logs. Its saves folder holds saves to import and backups.',)),
             self.saves_row(gd),
             Row('value', 'Rebuild the Game', rebuild_value, rebuild_style, on=self.start_rebuild,
                 desc=('Build the game again from the files of the last build. Only what changed is compiled. Use it '
@@ -682,24 +768,107 @@ class App:
                 desc=('Updates, the game folder, the logs and uninstalling.',)),
         ]
 
-    def saves_row(self, gd):
-        """Import Saves: a save put into the game folder's saves folder, else a folder the player picks."""
-        ready = False
+    def save_waiting(self, gd):
+        """A save put into the game folder's saves folder (a shared zip, a save folder), waiting to be imported."""
         if gd and Path(gd).is_dir():
             try:
                 saves.ensure_saves_dir(gd)
-                ready = saves.waiting(gd)[0] is not None
+                return saves.waiting(gd)[0] is not None
             except OSError:
                 pass
-        desc = ('Bring in a save from a Switch save backup, an emulator or another NX2navi install. Put it into the '
-                'saves folder of the game folder and select this row, or select this row and choose its folder.',
-                'Your current save is copied to the saves folder first.')
-        if self.save_message:
-            desc = (self.save_message,) + desc
-        return Row('value', 'Import Saves', 'From the Saves Folder' if ready else 'Choose a Folder',
-                   'orange_arrow' if ready else 'arrow', on=self.import_saves, desc=desc)
+        return False
 
-    def import_saves(self):
+    def saves_row(self, gd):
+        """Saves: the screen that exports and imports saves; orange while a save waits in the saves folder."""
+        ready = self.save_waiting(gd)
+        desc = ('Export your save into one zip, to attach to a bug report or give to another player, or import a '
+                'save someone shared, a Switch save backup or an emulator\'s save.',)
+        if ready:
+            desc += ('A save waits in the saves folder of the game folder: select this row, then Import a Save.',)
+        return Row('value', 'Saves', 'Import Waiting' if ready else '', 'orange_arrow' if ready else 'arrow',
+                   on=lambda: self.show('saves'), desc=desc)
+
+    # ---- saves
+
+    def export_dir(self):
+        d = self.settings.get('save_export_dir')
+        return Path(d) if d and Path(d).is_dir() else saves.default_export_dir()
+
+    def rows_saves(self):
+        gd = self.settings.get('game_dir')
+        ready = self.save_waiting(gd)
+        out = self.export_dir()
+        export_desc = ('Write your save into one zip file, to attach to a bug report or give to another player: every '
+                       'save slot and a note of the NX2navi and game versions, never your keys or game files. The '
+                       'folder opens with the zip selected.',)
+        if self.export_message:
+            export_desc = (self.export_message,) + export_desc
+        import_desc = ('Make a save someone shared (an NX2navi-save zip) your save: every slot is replaced. Put the zip '
+                       'into the saves folder of the game folder and select this row, or select this row and choose '
+                       'the zip.', 'Your current save is copied to the saves folder first.')
+        if gd and saves.pending_import(gd):
+            import_desc += ('A save imported in the game\'s menu waits for the game\'s next start; an import here '
+                            'replaces it.',)
+        folder_desc = ('Bring in a save folder: a Switch save backup, an emulator\'s save, another NX2navi install, or '
+                       'one save slot (a folder named slot_00 to slot_05: only that slot is replaced).',
+                       'Your current save is copied to the saves folder first.')
+        if self.save_message:
+            import_desc, folder_desc = (self.save_message,) + import_desc, (self.save_message,) + folder_desc
+
+        def report(v):
+            self.settings['export_with_log'] = bool(v)
+            self.settings.save()
+        return [
+            Row('value', 'Export Save', out.name or str(out), on=self.export_save, desc=export_desc),
+            Row('toggle', 'Add Log and Settings', on=report, get=lambda: bool(self.settings.get('export_with_log')),
+                desc=('On: the zip also holds the game\'s latest log (logs\\nx2navi.log) and its settings '
+                      '(nx2navi.ini), which show what happened and with which settings. Keep it on for a bug report.',
+                      'Off: the save alone, to give to another player.')),
+            Row('value', 'Export To', str(out), on=self.choose_export_dir,
+                desc=(f'Export Save writes into {out}.', 'Select this row to choose another folder.')),
+            Row('divider'),
+            Row('value', 'Import a Save', 'From the Saves Folder' if ready else 'Choose a Zip',
+                'orange_arrow' if ready else 'arrow', on=lambda: self.import_saves(folder=False), desc=import_desc),
+            Row('value', 'Import a Save Folder', 'Choose a Folder', 'arrow',
+                on=lambda: self.import_saves(folder=True), desc=folder_desc),
+            Row('value', 'Open Saves Folder', '', 'arrow',
+                on=lambda: gd and Path(gd).is_dir() and self.open(saves.ensure_saves_dir(gd)),
+                desc=('The saves folder of the game folder: saves to import, and a backup of each save an import '
+                      'replaced.',)),
+            Row('action', 'Back', on=lambda: self.show('home'), height=40, desc=('Back to the main menu.',)),
+        ]
+
+    def choose_export_dir(self):
+        d = filedialog.askdirectory(parent=self.root, title='Choose where Export Save writes its zip',
+                                    initialdir=str(self.export_dir()), mustexist=True)
+        if d:
+            self.settings['save_export_dir'] = str(Path(d))
+            self.settings.save()
+        self.show('saves', self.focus)
+
+    def export_save(self):
+        gd = self.settings.get('game_dir')
+        if not gd or not Path(gd).is_dir():
+            self.export_message = 'Install the game first.'
+        else:
+            try:
+                r = saves.export_save(gd, self.export_dir(), bug_report=bool(self.settings.get('export_with_log')),
+                                      version=versions.display(build.built_version(gd) or self.layout.version),
+                                      log=self.ctx.log)
+            except (saves.SaveError, OSError) as e:
+                self.export_message = f'The save was not exported: {e}'
+            else:
+                extra = ' with the game\'s log and settings' if r['extras'] else ''
+                self.export_message = f'Exported {r["files"]} files{extra} to {r["path"]}.'
+                try:
+                    winsys.reveal(r['path'])
+                except OSError:
+                    pass
+        self.show('saves', self.focus)
+
+    def import_saves(self, folder):
+        """Import a Save (folder False): what waits in the saves folder, else a zip the player picks. Import a Save
+        Folder (folder True): a folder the player picks; the saves folder itself takes what waits there."""
         gd = self.settings.get('game_dir')
         if not gd or not Path(gd).is_dir():
             self.save_message = 'Install the game first.'
@@ -707,19 +876,37 @@ class App:
             self.save_message = 'Quit the game first: it keeps its save open while it runs.'
         else:
             try:
-                folder = None
-                if saves.waiting(gd)[0] is None:
-                    folder = filedialog.askdirectory(parent=self.root, title='Choose the folder with the save',
-                                                     initialdir=str(saves.ensure_saves_dir(gd)), mustexist=True)
-                    if not folder:
+                src = None
+                if folder:
+                    src = filedialog.askdirectory(parent=self.root, title='Choose the folder with the save',
+                                                  initialdir=str(saves.ensure_saves_dir(gd)), mustexist=True)
+                    if not src:
                         return
-                r = saves.import_save(gd, folder, log=self.ctx.log)
+                elif saves.waiting(gd)[0] is None:
+                    src = filedialog.askopenfilename(parent=self.root, title='Choose the save to import',
+                                                     initialdir=str(self.export_dir()),
+                                                     filetypes=[('NX2navi save', '*.zip'), ('All files', '*.*')])
+                    if not src:
+                        return
+                r = saves.import_save(gd, src, log=self.ctx.log)
             except (saves.SaveError, OSError) as e:
                 self.save_message = f'The save was not imported: {e}'
             else:
-                self.save_message = (f'Save imported: {r["files"]} files from {r["source"].name}.'
-                                     + (f' Your old save is in saves\\{r["backup"].name}.' if r['backup'] else ''))
-        self.show('home', self.focus)
+                self.save_message = self.imported_text(r)
+        self.show('saves', self.focus)
+
+    @staticmethod
+    def imported_text(r):
+        """What an import did, for the import rows' descriptions."""
+        m = r.get('manifest')
+        if m:
+            text = (f'Save imported from {r["source"].name} (exported {str(m.get("exported", ""))[:10]} with NX2navi '
+                    f'{m.get("nx2navi") or "?"}).')
+        elif r['slot']:
+            text = f'Save imported into {r["slot"]}.'
+        else:
+            text = f'Save imported: {r["files"]} files from {r["source"].name}.'
+        return text + (f' Your old save is in saves\\{r["backup"].name}.' if r['backup'] else '')
 
     def update_desc(self):
         r = self.release
@@ -729,6 +916,32 @@ class App:
                 'text': [f'You have {mine}. Updating downloads the new version and rebuilds the game in a few '
                          f'minutes. Your saves and settings stay as they are.'],
                 'divider': bool(notes), 'subtitle': "What's New" if notes else '', 'bullets': notes}
+
+    def staged_desc(self, m):
+        """The Updates row of a release downloaded in the background (BackgroundUpdate.ready)."""
+        nv, mine = m['version'], versions.display(self.layout.version)
+        notes = feed.plain_notes(m.get('notes', ''), 4)
+        if self.settings.get('auto_install'):
+            text = (f'You have {mine}. Version {nv} is downloaded and installs when you are not playing: after you '
+                    'quit the game, or when NX2navi next opens. Select this row to install it now.')
+        else:
+            text = f'You have {mine}. Version {nv} is downloaded. Select this row to install it.'
+        return {'title': f'Version {nv} Is Ready', 'text': [text],
+                'divider': bool(notes), 'subtitle': "What's New" if notes else '', 'bullets': notes,
+                'note': 'Installing restarts the launcher and rebuilds the game in a few minutes. Your saves and '
+                        'settings stay as they are.'}
+
+    def staging_desc(self):
+        nv, mine = self.bg.job.ver, versions.display(self.layout.version)
+        if self.bg.asked:
+            then = 'It installs as soon as the download is done.'
+        elif self.settings.get('auto_install'):
+            then = 'It installs when you are not playing. Select this row to install it as soon as it is downloaded.'
+        else:
+            then = 'Select this row to install it as soon as it is downloaded.'
+        return {'title': f'Downloading Version {nv}',
+                'text': [f'You have {mine}. Version {nv} is downloading in the background; you can play meanwhile. '
+                         f'{then}']}
 
     def ago(self, t):
         d = time.time() - t
@@ -744,12 +957,14 @@ class App:
         if not force and time.time() - self.settings.get('last_check', 0) < 600 and self.release:
             return
         self.check_error = ''
+        self.check_started = time.time()
         self.check = jobs.CheckJob(self.ctx).start()
         if self.screen == 'home':
             self.show('home', self.focus)
 
     def check_done(self):
         c = self.check
+        self.bg.checked()   # the release found is staged at the next tick, also one whose staging failed before
         if c.result == 'ok':
             self.release = c.release
             self.checked_at = time.time()
@@ -773,6 +988,10 @@ class App:
             return
         if self.game_proc and self.game_proc.poll() is None:
             return
+        if saves.game_running(gd):   # a copy this launcher did not start (another launcher, a shortcut, a test run)
+            self.message = 'The game is already running.'
+            self.render()
+            return
         try:
             self.game_proc = winsys.start_game(exe)
         except OSError as e:
@@ -785,7 +1004,9 @@ class App:
         self.root.after(1000, self.watch_game)
 
     def watch_game(self):
-        if self.game_proc and self.game_proc.poll() is None:
+        # The game's own Restart ends the process started here and starts another (gfx_present.c gfx_window_closed)
+        gd = self.settings.get('game_dir')
+        if (self.game_proc and self.game_proc.poll() is None) or (gd and saves.game_running(gd)):
             self.root.after(1000, self.watch_game)
             return
         code = self.game_proc.returncode if self.game_proc else 0
@@ -793,7 +1014,12 @@ class App:
         self.root.deiconify()
         self.root.lift()
         if code not in (0, None):
-            self.message = f'The game ended with code {code}. Its log is logs\\nx2navi.log in the game folder.'
+            text = exit_code_text(code)
+            self.ctx.log(f'the game ended with code {text}')
+            self.message = f'The game ended with code {text}. Its log is logs\\nx2navi.log in the game folder.'
+            note_exit_in_log(self.game_dir(), text)
+        if self.install_staged('the game exited'):
+            return
         self.show('home', self.focus)
 
     def open(self, path):
@@ -804,14 +1030,61 @@ class App:
             self.render()
 
     def start_update(self):
-        if not self.release:
-            return
+        """The Updates row: install the release staged in the background, have the one downloading install once it
+        is staged, or else download it here with its steps on screen (as when the background download failed)."""
         gd = self.settings.get('game_dir')
         if gd and build.game_running(gd):
             self.message = 'Close the game first: the update rebuilds it.'
             self.show('home', self.focus)
             return
+        if self.bg.staging():
+            self.bg.asked = True
+            self.message = f'Version {self.bg.job.ver} installs as soon as it is downloaded.'
+            self.show('home', self.focus)
+            return
+        if self.bg.ready(self.release):
+            if not self.install_staged('selected', asked=True):
+                self.message = f'The update could not be installed: {self.bg.error or "see the launcher log"}.'
+                self.show('home', self.focus)
+            return
+        if not self.release:
+            return
         self.run_job(jobs.UpdateDownloadJob(self.ctx, self.release), 'home')
+
+    def install_staged(self, why, asked=False):
+        """Install the release staged in the background when nothing stops it (BackgroundUpdate.install) and close
+        for the restart into it; True when it was installed."""
+        if self.job and self.job.result is None:
+            return False
+        running = bool(self.game_proc and self.game_proc.poll() is None)
+        ver = self.bg.install(self.settings.get('game_dir'), self.release, why, asked=asked, running=running)
+        if not ver:
+            return False
+        if self.bg.restarting:
+            self.message = f'Installing NX2navi {ver}…'
+            self.root.after(200, self.root.destroy)
+        else:
+            self.message = f'NX2navi {ver} is installed: start NX2navi again to finish it.'
+        if self.screen == 'home':
+            self.show('home', self.focus)
+        return True
+
+    def background_event(self, ev):
+        """A background staging started or ended (BackgroundUpdate.poll)."""
+        if ev in ('staged', 'failed') and (self.bg.asked or self.bg.waiting):
+            if self.install_staged('the download finished'):
+                return
+            if ev == 'failed' and self.bg.asked:
+                # the player chose to update: download it here instead, where its error and Try Again show
+                self.bg.asked = False
+                gd = self.settings.get('game_dir')
+                if (self.screen == 'home' and self.release and jobs.update_available(self.ctx, self.release)
+                        and not (self.game_proc and self.game_proc.poll() is None)
+                        and not (gd and build.game_running(gd))):
+                    self.run_job(jobs.UpdateDownloadJob(self.ctx, self.release), 'home')
+                    return
+        if self.screen == 'home':
+            self.show('home', self.focus)
 
     def start_rebuild(self):
         gd = self.settings.get('game_dir')
@@ -824,14 +1097,19 @@ class App:
         dump = self.settings.get('dump')
         return [
             self.toggle('Check for Updates at Start', 'auto_check',
-                        'Look for a new version of NX2navi each time the launcher opens. Nothing is installed '
-                        'until you choose Update.'),
+                        'Look for a new version of NX2navi when the launcher opens, and every hour while it stays '
+                        'open (also while you play). A new version downloads in the background.'),
+            self.toggle('Install Updates Automatically', 'auto_install',
+                        'Install a downloaded update by itself when you are not playing: after you quit the game, '
+                        'or when NX2navi opens. Off: it waits until you select Updates. Updates download in the '
+                        'background either way.'),
             self.toggle('Hide Launcher While Playing', 'hide_while_playing',
                         'Hide this window while the game runs; it comes back when you quit the game.'),
             self.toggle('Keep Build Cache', 'keep_cache',
                         'Keep the translated code and compiled files (about 5 GB) in the game folder, so an update '
                         'compiles only what changed. Off: they are deleted after each build.'),
             self.channel_row(),
+            *([self.discord_row(gd)] if gd and Path(gd).is_dir() else []),
             Row('divider'),
             Row('value', 'Game Folder', gd or 'Not chosen', on=lambda: gd and self.open(gd),
                 desc=('Open the game folder: saves in profile, the game\'s settings in nx2navi.ini, its logs in '
@@ -950,7 +1228,7 @@ class App:
         return {'tools': 'Gathering Build Tools', 'tools_update': 'Updating Build Tools', 'check': 'Inspecting Your Game',
                 'exefs': 'Unpacking the Program', 'romfs': 'Packing the Game Data', 'lift': 'Translating the Code',
                 'compile': 'Compiling', 'compile_changed': 'Compiling Changed Files', 'shaders': 'Preparing the Shaders',
-                'ready': 'Ready to Play',
+                'prompts': 'Drawing the Button Prompts', 'scan': 'Checking the Game Files', 'ready': 'Ready to Play',
                 'download': 'Downloading', 'verify': 'Verifying', 'swap': 'Swapping In the New Build'}.get(st.id,
                                                                                                          st.label)
 
@@ -1045,6 +1323,9 @@ class App:
             if self.check and self.check.result is not None and not getattr(self.check, 'seen', False):
                 self.check.seen = True
                 self.check_done()
+            ev = self.bg.poll(self.release, busy=bool(self.job and self.job.result is None))
+            if ev:
+                self.background_event(ev)
             if self.screen == 'job' and self.job:
                 if self.job.rev != self.job_rev:
                     self.job_rev = self.job.rev
@@ -1060,6 +1341,21 @@ class App:
         except Exception as e:   # a drawing error must not stop the timer
             self.ctx.log(f'tick: {e!r}')
         self.root.after(150, self.tick)
+
+    def minute(self):
+        """Once a minute, also while the window is hidden during play: look for a new version an hour after the last
+        look (a new one then downloads in the background), and install a staged release that waited for a copy of
+        the game the launcher did not start to close."""
+        try:
+            if not self.args.selftest and self.screen in ('home', 'settings'):
+                last = max(self.settings.get('last_check', 0.0), self.check_started)
+                if self.settings.get('auto_check') and time.time() - last >= jobs.RECHECK:
+                    self.check_now()
+                if self.bg.waiting and not (self.game_proc and self.game_proc.poll() is None):
+                    self.install_staged('the game closed')
+        except Exception as e:
+            self.ctx.log(f'minute: {e!r}')
+        self.root.after(60000, self.minute)
 
     def animate(self):
         if self.cursor_frames:
@@ -1078,12 +1374,33 @@ class App:
             if not (0 <= self.focus < len(self.rows)) or not self.rows[self.focus].focusable:
                 self.focus = self.job_focus()
         x0, x1, y = ROWS
-        for i, r in enumerate(self.rows):
-            self.draw_row(r, self.X(x0), self.X(y), self.X(x1), self.X(y + r.h))
-            y += r.h + GAP
+        heights, self.row_gap = self.fit_rows(y, H - 46 if self.screen == 'job' else H - 12)
+        for r, h in zip(self.rows, heights):
+            self.draw_row(r, self.X(x0), self.X(y), self.X(x1), self.X(y + h))
+            y += h + self.row_gap
         self.draw_status()
         self.draw_cursor()
         self.draw_desc()
+
+    def fit_rows(self, top, bottom):
+        """The height of each row and the gap between rows (logical pixels) that end the rows above bottom. A screen
+        with more rows than the window holds (Settings with every row, a job with every step) narrows its gaps
+        first, then its dividers, and last makes its rows a little lower."""
+        rows = self.rows
+        hs = [r.h for r in rows]
+        gaps = max(1, len(rows) - 1)
+        room = bottom - top
+        for stage in ('gaps', 'dividers', 'rows'):
+            if stage == 'dividers':
+                hs = [min(h, 14) if r.kind == 'divider' else h for r, h in zip(rows, hs)]
+            elif stage == 'rows':
+                over = sum(hs) + 6 * gaps - room
+                cut = -(-over // max(1, sum(1 for r in rows if r.kind != 'divider')))
+                hs = [h if r.kind == 'divider' else max(30, h - cut) for r, h in zip(rows, hs)]
+            gap = min(GAP, (room - sum(hs)) // gaps)
+            if gap >= 6:
+                return hs, gap
+        return hs, 6
 
     def draw_status(self):
         if self.screen != 'job' or not self.job:
@@ -1188,6 +1505,7 @@ class App:
         elif r.style == 'orange_arrow':
             self.orange(ix0, iy0, ix1, iy1)
             cw, ch = X(9), X(12)
+            vfont = self.fit_font(vfont, r.value, (ix1 - ix0) - X(30) - cw, 0.8)
             label_w = vfont.measure(r.value)
             total = label_w + X(10) + cw
             sx = cx - total // 2

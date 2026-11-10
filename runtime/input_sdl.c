@@ -19,7 +19,7 @@
 
 static SDL_Window *win;
 static volatile uint8_t key_held[KEY_COUNT];
-static volatile int32_t esc_held, f8_held, focused;
+static volatile int32_t esc_held, f8_held, insert_held, focused;
 static volatile int32_t mouse_dx, mouse_dy;   // relative motion since the last ikb_mouse_take, whole counts
 static float rem_x, rem_y;                    // window thread: the fractions SDL reported beyond them
 static volatile int32_t captured;             // relative mouse mode is on
@@ -116,6 +116,8 @@ uint32_t input_key_char(int key) {
 
 int input_flight_key(void) { return focused && f8_held; }
 
+int input_dump_key(void) { return focused && insert_held; }
+
 // ---- the cursor (window thread)
 static void cursor_apply(void) {
     __atomic_store_n(&cur_pending, 0, __ATOMIC_RELAXED);
@@ -176,6 +178,7 @@ void input_sdl_event(const SDL_Event *e) {
             if (down && !e->key.repeat && !(cur_rel & CUR_REL)) plat_xchg32(&cur_rel, CUR_REL | CUR_ESC);
         }
         if (e->key.scancode == SDL_SCANCODE_F8) plat_xchg32(&f8_held, down);
+        if (e->key.scancode == SDL_SCANCODE_INSERT) plat_xchg32(&insert_held, down);
         int k = key_of_sc(e->key.scancode);
         if (k) key_held[k] = (uint8_t)down;
         break;
@@ -207,6 +210,7 @@ void input_sdl_event(const SDL_Event *e) {
         memset((void *)key_held, 0, sizeof key_held);   // the key-ups go elsewhere
         plat_xchg32(&esc_held, 0);
         plat_xchg32(&f8_held, 0);
+        plat_xchg32(&insert_held, 0);
         break;
     }
     cursor_apply();

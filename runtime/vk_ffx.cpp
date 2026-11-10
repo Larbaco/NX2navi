@@ -47,12 +47,20 @@ void message(uint32_t type, const wchar_t *msg) {
     if (told++ < 40) rt_log("ffx: %s %s", type == FFX_API_MESSAGE_TYPE_ERROR ? "error:" : "warning:", s);
 }
 
-// One upscaling context per render and output size (the menu switches the mode live, so a few may exist); never
-// destroyed before shutdown, so none is released while the GPU may still run its work.
+// One upscaling context per render and output size: each render scale the menu sets brings its own, and so do the
+// game's second scenes. When all are taken, the least recently used one is destroyed for the new size once the GPU is
+// idle, as vk_dlaa.c free_size does for DLSS. Without that, a seventh size found no context, and vk_dlaa.c turned
+// FSR 3.1 off for the rest of the run: stepping through the render scales in the menu was enough.
 struct Up {
     ffxContext ctx = nullptr;
     uint32_t w = 0, h = 0, ow = 0, oh = 0;
+    uint64_t used = 0;   // up_tick when context_for last returned it
 } U[6];
+uint64_t up_tick;
+// A context used in the last few calls may sit in a command buffer that is not submitted yet, where waiting for the
+// GPU does not cover it: a frame makes one or two calls (the scene, and a second scene after it), so this is a few
+// frames back.
+const uint64_t UP_RECENT = 8;
 
 FfxApiResource image(const VkFfxImage *i, uint32_t state, uint32_t usage) {
     VkImageCreateInfo ci = {};
@@ -67,13 +75,32 @@ FfxApiResource image(const VkFfxImage *i, uint32_t state, uint32_t usage) {
 }
 
 Up *context_for(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
+    up_tick++;
     for (Up &u : U)
-        if (u.ctx && u.w == w && u.h == h && u.ow == ow && u.oh == oh) return &u;
-    Up *slot = nullptr;
-    for (Up &u : U)
-        if (!u.ctx) { slot = &u; break; }
-    if (!slot) return nullptr;
+        if (u.ctx && u.w == w && u.h == h && u.ow == ow && u.oh == oh) {
+            u.used = up_tick;
+            return &u;
+        }
+    Up *slot = nullptr, *lru = nullptr;
+    for (Up &u : U) {
+        if (!u.ctx) {
+            slot = &u;
+            break;
+        }
+        if (up_tick - u.used >= UP_RECENT && (!lru || u.used < lru->used)) lru = &u;
+    }
     const VkCtx *c = vk_ctx();
+    if (!slot && lru) {
+        static int told;
+        if (told++ < 20)
+            rt_log("ffx: FSR 3.1 context %ux%u -> %ux%u destroyed for %ux%u -> %ux%u (all %d in use)", lru->w, lru->h, lru->ow,
+                   lru->oh, w, h, ow, oh, (int)(sizeof U / sizeof U[0]));
+        vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();   // its work may still be in flight
+        A.destroy(&lru->ctx, nullptr);
+        *lru = Up();
+        slot = lru;
+    }
+    if (!slot) return nullptr;
     ffxCreateBackendVKDesc be = {};
     be.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
     be.vkDevice = c->device;
@@ -92,7 +119,7 @@ Up *context_for(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
         slot->ctx = nullptr;
         return nullptr;
     }
-    slot->w = w, slot->h = h, slot->ow = ow, slot->oh = oh;
+    slot->w = w, slot->h = h, slot->ow = ow, slot->oh = oh, slot->used = up_tick;
     ffxQueryGetProviderVersion v = {};
     v.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
     A.query(&slot->ctx, &v.header);

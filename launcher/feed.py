@@ -13,7 +13,9 @@ The feed (app/<version>/feed.json, or the player's override in settings) is eith
     {"type": "url", "url": "https://.../NX2navi-update.json"}   one manifest; its files sit beside it
 """
 import json
+import re
 import urllib.parse
+from pathlib import Path
 
 from . import net, versions
 
@@ -42,10 +44,19 @@ class Release:
         entry = self.manifest.get(key)
         if not entry:
             raise FeedError(f'the {self.version} manifest has no {key} file')
-        url = self.assets.get(entry['name'])
+        name, size, sha = entry.get('name'), entry.get('size'), entry.get('sha256')
+        # The name becomes a file in downloads/: a bare file name only. Every file is checked against its size and
+        # sha256, so a manifest without them is refused rather than downloaded unchecked.
+        if (not isinstance(name, str) or not name or name in ('.', '..') or name != Path(name).name
+                or '/' in name or '\\' in name or ':' in name):
+            raise FeedError(f'the {self.version} manifest names its {key} file {name!r}, not a plain file name')
+        if (not isinstance(size, int) or isinstance(size, bool) or size <= 0 or not isinstance(sha, str)
+                or not re.fullmatch(r'[0-9a-fA-F]{64}', sha)):
+            raise FeedError(f'the {self.version} manifest gives no size and sha256 for {name}')
+        url = self.assets.get(name)
         if not url:
-            raise FeedError(f'the {self.version} release lacks {entry["name"]}')
-        return url, self.headers, entry.get('size'), entry.get('sha256')
+            raise FeedError(f'the {self.version} release lacks {name}')
+        return url, self.headers, size, sha
 
 
 def load(layout, settings):

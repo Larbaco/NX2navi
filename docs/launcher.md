@@ -17,9 +17,11 @@ it. The code is `launcher/`, the release is made by `tools/make_launcher.py`, an
    unpacks it, translates and compiles the game: 10 to 25 minutes. It keeps the PC awake meanwhile.
 4. Selects **Play**. The launcher hides while the game runs and comes back when it exits.
 
-From then on the launcher looks for a new version each time it opens (Settings can turn that off). When one is out,
-the Updates row turns orange; selecting it downloads the new version, restarts the launcher in it and rebuilds the
-game. Saves and settings are never touched.
+From then on the launcher looks for a new version when it opens and every hour while it runs, also while it is
+hidden during play (Settings can turn that off). A new version downloads in the background, the game playing on, and
+installs when the game is not running: right after the game exits, or the next time the launcher opens. The launcher
+then restarts in the new version and rebuilds the game. With Install Updates Automatically off (Settings) it waits
+until the player selects Updates. Saves and settings are never touched.
 
 ## Look
 
@@ -38,12 +40,14 @@ identity (`NX2navi.Launcher`), so the taskbar groups and pins it under NX2navi r
 
 Screens (`launcher/ui/app.py`): first run (dump, install folder, Desktop Shortcut, Check for Updates at Start,
 Update Channel, Begin Installation); the steps of an install, update or rebuild with their progress, the build log's
-last lines and Cancel, and after a failure Try Again and Copy Report; home (Play, Updates, Game Folder, Import Saves,
-Rebuild the Game, Settings); settings (update check, Hide Launcher While Playing, Keep Build Cache, Update Channel, the folders,
-Open Logs Folder, Uninstall, Back); uninstall (keep or remove the built game).
+last lines and Cancel, and after a failure Try Again and Copy Report; home (Play, Updates, Game Folder, Saves,
+Rebuild the Game, Settings); saves (Export Save, Add Log and Settings, Export To, Import a Save, Import a Save Folder,
+Open Saves Folder, Back); settings (update check, Install Updates Automatically, Hide Launcher While Playing, Keep
+Build Cache, Update Channel, the folders, Open Logs Folder, Uninstall, Back); uninstall (keep or remove the built game).
+A screen with more rows than the window holds draws them closer together (`fit_rows`).
 
 Controls: the mouse (hover moves the cursor, a click selects); the keyboard (arrows, Enter or Space, Esc, F5 checks
-for updates); an XInput gamepad (d-pad or left stick, A, B, Y).
+for updates); an XInput gamepad (d-pad or left stick, A, B, Y) while the window is in front.
 
 `python -m launcher --selftest --shots DIR` draws every screen with made-up states and saves a PNG of each.
 
@@ -51,16 +55,20 @@ for updates); an XInput gamepad (d-pad or left stick, A, B, Y).
 
 ```
 NX2navi.exe              launcher/native/nx2navi.c: swaps in a staged Python, starts app\<current>\launcher\start.pyw
-python/                  python.org's embeddable Python 3.14.9 with tkinter, numpy, lz4, zstandard and truststore
+python/                  python.org's embeddable Python 3.14.9 with tkinter, numpy, lz4, zstandard, fonttools, pillow
+                         and truststore
 app/current.txt          the version the stub starts; app/previous.txt the one before it
 app/<version>/           launcher/, runtime/, recomp/, tools/, bin/nx2navi_xlate.exe, VERSION,
-                         toolchain.lock.json (the pinned build tools), feed.json (where updates come from)
+                         toolchain.lock.json (the pinned build tools), feed.json (where updates come from), and in a
+                         release made with --prompt-art, prompt-art/ (the button art the prompts are drawn from); a
+                         release staged in the background also holds staged.json and the Python it brings,
+                         python.staged/, until it installs
 pydeps/                  zbic, downloaded from PyPI on this PC
 toolchain/msys64/ucrt64  MSYS2's clang and libraries, downloaded from the MSYS2 repository on this PC
 toolchain/pkgs/          the downloaded package files
 data/launcher.json       settings; data/logs/launcher.log (and crash.log); data/cache/fonts
 game/                    the built game, unless another folder was chosen (its layout: README-BuildKit.md), with
-                         saves/ for saves to import (below)
+                         saves/ for saves to import and the backups imports make (below)
 ```
 
 A path the Windows ANSI code page cannot hold breaks the MSYS2 tools, so the toolchain then goes to
@@ -88,9 +96,28 @@ A path the Windows ANSI code page cannot hold breaks the MSYS2 tools, so the too
      (it reads UCRT64's headers; `make_game.py` `fast_clang` checks that both report the same version and target).
    - The lifted code is compiled for the processor's own level, x86-64-v3 (AVX2, FMA) or v2 (`cpu_level`): the game
      runs on the PC that builds it, and a generic build would do every fused multiply-add of the game in software.
-3. **Prepare the Shaders**: make_game.py's last step translates every shader of the game into the game's shader
-   cache and the driver's own cache (`tools/prepare_shaders.py`), so play does not stop to compile them.
-4. The game's Cetra Display is decoded for the window.
+3. **Prepare the Shaders**: make_game.py translates every shader of the game, in its default bind state,
+   into the game's shader cache and builds its stage library or compute pipeline into the driver's own cache
+   (`tools/prepare_shaders.py`), so play stops for them far less often. Variants met in play with another bind state are
+   still translated then, full pipelines are still linked in play (quickly, from the cached parts), and the driver's
+   cache is kept per executable and is lost when the driver clears it. Its bar
+   follows the game's own counts, printed every 2 s: the translation fills the first half, the build into the
+   driver's cache the second. An update every 10 s keeps the step's text current while nothing is printed, and after
+   3 minutes without a count moving it says so, and that the step is still running.
+4. **Draw the Button Prompts**, only when the version holds button art (`app/<version>/prompt-art`, a release made
+   with `--prompt-art`; `build.has_prompt_art`): make_game.py's last step runs `tools/pad_prompts.py` on that art
+   and writes the Xbox, PlayStation and keyboard and mouse prompts into `romfs-patches-*` beside the game (about
+   30 s), which the game's Controls > Button prompts loads. The keyboard and mouse prompts show the keys of
+   `nx2navi.ini`'s `bind_` lines, so Rebuild the Game after rebinding keys draws them again; the step's key names
+   all it reads (the RomFS, the art, the tools, those lines), so it runs again only when one changed or a folder is
+   gone, and runs no other step again. Without art the row is not shown and the game keeps its own prompts.
+5. **Check the Game Files**: make_game.py's last step runs `tools/romfs_check.py`, once for each copy of the game data
+   (about 4 minutes, in worker threads, never while the game runs). It decompresses every file, writes
+   `romfs-check.json` beside the game, and for each damaged texture puts a stand-in, another texture of the same kind
+   under the damaged one's name, in `mods/Damaged file stand-ins`, so the game can load what needs it. A damaged file
+   of any other kind is only reported: only a clean dump restores it. In play the game logs a file it keeps opening
+   and cannot load (runtime/romfs.c `open_note`).
+6. The game's Cetra Display is decoded for the window.
 
 ## Updating
 
@@ -99,9 +126,50 @@ A release carries `NX2navi-update.json` (version, notes, and the size and sha256
 Preview channel) that has the manifest. A private repository answers only with a token (`github_token` in
 `data/launcher.json`); players need a public one. `feed_repo` in `data/launcher.json` points one launcher at another
 repository for testing; `{"type": "url", "url": ".../NX2navi-update.json"}` in feed.json reads one manifest
-directly.
+directly. Every address is https (plain http only to this PC), a redirect to http is refused, and the token is not
+sent on when a redirect leaves the host it was meant for (`launcher/net.py`). A manifest that does not give a file's
+size and sha256 is refused.
 
-`jobs.UpdateDownloadJob`, before the restart (`launcher/updater.py`):
+### In the background
+
+The player never waits for a download and play is never interrupted. A check that finds a newer release (the check
+at start, then one an hour after the last, also while the window is hidden during play: `jobs.RECHECK`) stages it
+at once, without a screen (`jobs.StageJob`, `updater.stage`):
+
+- The app archive is downloaded and checked as in step 1 below and unpacks into `app/<version>` as in step 2. A new
+  Python unpacks into `app/<version>/python.staged`, not `python.next`: the stub swaps `python.next` in at every
+  start, which would put the running version on the new Python. `app/<version>/staged.json`, written last, marks the
+  release complete (`updater.staged_info`); a folder without it, or one that lost its Python, is never installed and
+  is staged again. Nothing is switched and the launcher keeps running. The thread runs in Windows' background mode
+  (lower processor, disk and memory priority), so it shares only the network with the game.
+- A staging that fails is logged in `launcher.log` and tried again after the next check; it never shows an error.
+  Selecting Updates then downloads the release with its steps on screen, as below.
+- The Updates row reads "Downloading <version>", then "Ready · <version>". A staged release survives a restart of the
+  launcher, which finds it without a check (`updater.staged`). A pre-release counts only on the Preview channel; the
+  version the stub last rolled back from (`rolled_back` in `data/launcher.json`) is neither staged nor installed by
+  itself; a staged release newer than the feed's newest is passed over, as the release was withdrawn. Staging a
+  release removes the staged one it supersedes, and `updater.prune` keeps a staged release newer than the current
+  version.
+
+`jobs.BackgroundUpdate` installs a staged release only while no copy of the game runs (`build.game_running`, and the
+process the launcher started), no job holds the window and no staging is under way:
+
+- by itself, with Install Updates Automatically on (Settings; the default): when the launcher starts, right after the
+  game exits (the launcher comes back from hiding), and, checked every minute, once a copy of the game started
+  elsewhere that held the install back has closed;
+- when the player selects Updates, also with the setting off; selected during the download, it installs as soon as
+  the download is done.
+
+Play always starts the game: a release staged meanwhile installs after the game exits. Installing
+(`updater.install_staged`) moves `python.staged` to `python.next`, switches `app/current.txt` as in step 3, deletes
+`staged.json` (so a version the stub rolls back from is not installed again) and restarts the launcher with
+`--continue-update`; the new version finishes in `jobs.ContinueUpdateJob` (steps 4 to 9). A checkout runs from the
+repository: it stages and installs nothing.
+
+### Steps
+
+Without a staged release (its staging failed, it is the version the stub rolled back from, or the launcher runs from a
+checkout), selecting Updates runs `jobs.UpdateDownloadJob`, before the restart (`launcher/updater.py`):
 
 1. **Download** `NX2navi-app-<version>.zip` (about 3 MB plus the shader translator) to `data/downloads`, resuming a cut
    download, and check its size and sha256. When the manifest names a Python other than `python/runtime-id.txt`, also
@@ -124,26 +192,75 @@ The stub swaps `python.next` in while no Python runs, then starts the new versio
      header written per install (`layout.h`, `patches.h`, `romfs_config.h`) are compiled on the player's PC.
    - Every other file compiles only when its source, a header it includes, the flags or the compiler changed
      (`build-cache/obj/objects.json`, from clang's dependency files). The kit's folder is not part of that key, so the
-     objects of the version before are reused although each version lives in its own folder. The lifted code
-     includes only `cpu.h` and `simd.h`: a change there compiles it all again, which is rare.
+     objects of the version before are reused although each version lives in its own folder. The compiler counts by
+     its version and size, not its file time, and the faster CLANG64 compiler, whose objects are the same, not at all.
+     The lifted code includes only `cpu.h` and `simd.h`: a change there compiles it all again, which is rare.
+   - An object an earlier version recorded under its own key form is taken over when its compile and its files are
+     the same (`ObjectCache.adopt`): 0.6.0's keys, and 0.5.0's, which named the kit's folder. An update keeps the
+     x86-64 level the game's code was compiled for (`build-cache/obj/lifted-build.json`; generic for the objects of
+     0.5.0 and earlier); Rebuild the Game compiles it for this processor's (`--retune`).
 6. **Swap In the New Build**: lld links `ocarina.exe.new`, which replaces `ocarina.exe` only once it is complete. A
    failed rebuild leaves the old build playable; Rebuild the Game tries again.
-7. **Prepare the Shaders** again for the new build; shaders the translator already prepared come from the cache.
-8. Every version but the current and the previous one is deleted.
+7. **Prepare the Shaders** is skipped once shaders were prepared before (`shader-prepared.bin`): the game keeps using
+   them and translates them again with the new translator in the background (`NX2NAVI_SHADER_CARRY`). With
+   `shader_carry = 0`, or nothing prepared yet, the step prepares them all as at the install.
+8. **Draw the Button Prompts**, with button art in the new version: only when the art, the prompt tools or the key
+   bindings changed, or a prompt folder is missing (a first version with art draws them all).
+9. Every version but the current and the previous one is deleted, except a staged release newer than the current
+   one.
 
 When the new version fails to start (exit code 86 from `start.pyw`, or any error within six seconds), the stub sets
 `current.txt` back to `previous.txt`'s version and starts it with `--rolled-back`. The game is never rebuilt while it
 runs. Keep Build Cache off deletes the lifted C and the objects (about 5 GB) after each build but keeps
 `build-cache/state.json`, so updates still rebuild without the dump (compiling everything).
 
-## Importing a save
+## Sharing a save
 
-Import Saves (home, under Game Folder; `launcher/saves.py`) makes another save the game's own. The game folder has
-a `saves` folder with a README for it: a save put there (its files, or the folder that holds them) is taken first,
-and the row then reads "From the Saves Folder"; otherwise selecting the row asks for the folder. It recognises a
-Switch save backup (the save's files), an emulator's save folder (nested folders named by user and title ids), and
-another NX2navi game folder or its profile folder (the account folder inside). A folder with more than 4,000 files
-or 1 GB is refused as picked by mistake.
+A bug report from a place in the game the developer has not reached yet is quickest to reproduce with the reporter's
+save. Saves (home, under Game Folder; `launcher/saves.py`) and the Saves rows of the game's settings menu (Game tab;
+`runtime/save_share.c`) write and read the same zip.
+
+**Export.** Export Save writes `NX2navi-save-<date>_<time>.zip` into the Downloads folder (Export To chooses another
+folder) and opens the folder with the zip selected, ready to drag into a bug report. With Add Log and Settings on (the
+default) it is `...-bug-report.zip` and also holds the game's latest log and its `nx2navi.ini`. In the game, Export
+save and Export save for a bug report write the same two zips into Downloads; the second holds the log of the run in
+progress. The zip:
+
+```
+manifest.json   format "nx2navi-save", format_version 1, the game, its title id and version (1.1.1), the NX2navi
+                version, the export time (UTC), exported_by (launcher or game), the number of save files, bug_report
+save/           the save the game would load next (a finished commit still waiting in profile/save-tx, else
+                profile/save/<account>): account.sav, option.sav, slot_00 to slot_05
+bug-report/     nx2navi.log and nx2navi.ini, in a bug report
+```
+
+Key files (any `*.keys`, also one left in a save folder) and game files never go in.
+
+**Import.** Import a Save takes such a zip: put it into the game folder's `saves` folder (the row then reads "From the
+Saves Folder", and the home's Saves row "Import Waiting") or select the row and choose it. Before anything changes it
+checks the manifest (the format, a format version it knows, the game's title id: a newer NX2navi's zip or another
+game's save is refused), every path (inside the save, no links), the size (4,000 files, 256 MB), that the save is
+this game's (`account.sav`, `option.sav` or a `slot_NN/progress.sav`), and each file's CRC as it unpacks. Then the
+zip's save replaces the whole save, every slot, as a save folder does (below): the save the game would load now goes
+to `saves/backup <date time>` first. It refuses while the game runs. A zip taken from the saves folder moves to
+`saves/imported <date time>`.
+
+The game's menu imports at the next start instead of at once: the game keeps its progress in memory and writes it back
+at its next save, over files replaced under it, and the save's working copy is made when the game mounts its save.
+Import a save checks the zip as the launcher does and puts its save in `profile/save-import`; the row then reads "at
+next start", and Cancel the import drops it. The next start (the menu's Restart, or quitting and starting again)
+copies the current save to `saves/backup <date time>` and makes the import the save before the game reads it
+(`runtime/fs_host.c` `import_pending`), and the menu says where the old save went. An import in the launcher replaces
+one still waiting from the menu.
+
+## Importing a save folder
+
+Import a Save Folder (Saves) makes another save the game's own. A save put into the game folder's `saves` folder (its
+files, or the folder that holds them) is taken first by Import a Save; otherwise this row asks for the folder. It
+recognises a Switch save backup (the save's files), an emulator's save folder (nested folders named by user and title
+ids), and another NX2navi game folder or its profile folder (the account folder inside). A folder with `progress.sav`
+at its top is one save slot: it replaces that slot (`slot_00` to `slot_05`, by the folder's name, else `slot_00`) and
+the rest of the current save stays. A folder with more than 4,000 files or 1 GB is refused as picked by mistake.
 
 The game keeps its save in `profile/save/<account>`, named after `profile/account.uid` (made as the game would when
 it never ran). The import copies the save the game would load now (a finished commit still waiting in
@@ -189,6 +306,29 @@ game folder is the default `<launcher>\game`. The dump is never touched.
    ```
 
    `--ffx` puts AMD's signed `amd_fidelityfx_vk.dll` (FidelityFX SDK 1.1.4) in the release for FSR 3.1.
+   NVIDIA's `nvngx_dlss.dll` goes in by itself: the script downloads the version `tools/dlss_pin.py` pins from
+   NVIDIA's DLSS SDK repository (cached in `toolchain/launcher-dl/`), checks its size and sha256, and puts it in
+   `bin/` with `nvngx_dlss-NOTICE.txt`; `make_game.py` copies both beside the game. `--dlss FILE` takes a copy on disk
+   instead (it must be the pinned file), `--no-dlss` leaves DLSS out. NVIDIA's RTX SDKs License lets an application
+   ship the library; it also asks that a commercial release be announced to NVIDIA first
+   (https://developer.nvidia.com/sw-notification) and that the use of DLSS be credited.
+
+   `--dlssg nx2navi_dlssg.dll` (built by `tools/build_dlssg.py`, which needs Visual Studio's C++ compiler) adds DLSS
+   Frame Generation in `bin/dlssg/`: beside it NVIDIA Streamline's runtime (`sl.interposer.dll`, `sl.common.dll`,
+   `sl.dlss_g.dll`, `sl.pcl.dll`, `sl.reflex.dll`) and `nvngx_dlssg.dll`, taken from the Streamline SDK release that
+   `tools/streamline_pin.py` pins. The script downloads that release once (cached in `toolchain/launcher-dl/`), checks
+   the archive's size and sha256 and each file's sha256, and writes `dlssg-NOTICE.txt` with the two licence texts;
+   `make_game.py` copies the whole set beside the game. `--streamline SDK` takes an SDK folder on disk instead (its
+   files must be the pinned ones).
+
+   `--prompt-art FOLDER ...` puts the button art in the release (`app/<version>/prompt-art`): folders that hold
+   `XGamepad`, `P5Gamepad` and `Keyboard_Mouse` (the Source folders of button prompt art packs), or those three
+   folders themselves; a set named itself wins over one found inside a folder named, and the same set twice is
+   refused. Only the pictures `tools/pad_prompts.py` reads are copied (`tools/prompt_art.py`
+   `art_files`: the pad pictures it names and every key of `Keyboard_Mouse/Dark` and `/White`, about 280 PNGs and
+   1 MB), and it stops first naming any that are missing. The art goes into the release only, never into the
+   repository (`.gitignore` has `/prompt-art/`). Without it the release has no art and the build draws no prompts.
+   `tools/make_kit.py` takes the same option for the build kit.
 
    On Linux it cross-compiles the two programs with clang, lld and llvm-windres against the same MSYS2 packages and
    unpacks Tcl/Tk with msiextract (msitools). It writes into `build/launcher-release`: `NX2navi-Setup-<version>.exe`
@@ -206,13 +346,22 @@ repository keeps old package files, so a release keeps building with the compile
 `python tests/launcher_test.py` (Python 3.14): versions, settings, the toolchain resolver and installer against a
 local fake repository, resumed and checked downloads, the certificate checks against a local HTTPS server (its
 certificates made with the `openssl` command), the GitHub and URL feeds, staging, switching, rollback and
-pruning, unsafe archives, the font decoding on a system font wrapped like the game's, `make_game.py` on a synthetic
-`.nup` (events, skipped steps, `--rebuild` without the dump, step keys), the RomFS step beside the lift and compile
-and its failure stopping the build, the compile step's object cache with the system's C compiler and its
+pruning, unsafe archives, the background update (a release staged beside the running version without switching, the
+`staged.json` marker, a staged release installed after a restart, no install while the game runs, the install once
+it exited, nothing by itself with Install Updates Automatically off, a failed staging tried again after the next
+check), the font decoding on a system font wrapped like the game's, `make_game.py` on a synthetic
+`.nup` (events, skipped steps, `--rebuild` without the dump, step keys, the shaders key following the translator the
+build uses), the RomFS step beside the lift and compile
+and its failure stopping the build, the prompts step with a stand-in prompt tool (when it runs again, and that it
+makes no other step run), the button art a release copies and the packages and tools the prompts need in a release,
+the compile step's object cache with the system's C compiler and its
 largest-first order, its windres call under folders with spaces in their names, CLANG64's clang in the lock and the
 install, the save import (the account folder, the save folders it recognises, backup, the commit journal, the saves
-folder, refusals), the install job with a fake
-`make_game.py`, and the window's selftest when a display is there.
+folder, refusals), the shared save's zip (export of the save the game would load, the bug report files, no key
+files, the import of a zip with its backup, a zip in the saves folder, the menu's waiting import dropped, the zips it
+refuses: no manifest, another format or game, a newer format, paths outside the save, links, damage), the install
+job with a fake
+`make_game.py` (with and without the prompts row), and the window's selftest when a display is there.
 
 ## Requirements and limits
 

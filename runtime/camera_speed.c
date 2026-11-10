@@ -73,8 +73,10 @@ static int scale_sensitivity(uint8_t *p, size_t n, float k, float was[8]) {
         if (!u32_at(p, n, root + 4 + 8 * (size_t)i, &e) || (e & 0xffffff) >= nkeys ||
             !u32_at(p, n, keys + 4 + 4 * (size_t)(e & 0xffffff), &at))
             return 0;
-        const char *name = (const char *)p + keys + at;
-        if (keys + at + sizeof "StickSensitivity" > n || strcmp(name, "StickSensitivity")) continue;
+        // in size_t: a mod's key offset near 2^32 would wrap the 32-bit sum below n
+        if ((size_t)keys + at + sizeof "StickSensitivity" > n) continue;
+        const char *name = (const char *)p + (size_t)keys + at;
+        if (strcmp(name, "StickSensitivity")) continue;
         if (e >> 24 != 0xc0 || !u32_at(p, n, root + 8 + 8 * (size_t)i, &arr) || !u32_at(p, n, arr, &ah) ||
             (ah & 0xff) != 0xc0)
             return 0;

@@ -675,7 +675,7 @@ NVN_API(nvnQueueSubmitCommands) {
 static void obs_release_read(Cpu *c) {
     uint64_t lr = c->x[30], obj = c->x[19];
     rt_original(c);
-    if (lr != 0x70008c70c8ull) return;
+    if (rt_game_version != 121 || lr != 0x70008c70c8ull) return;   // the address is 1.2.1's: no other build has this producer there
     static int on = -1;
     if (on < 0) {
         on = cfg_bool("NX2NAVI_LOD_GUARD");

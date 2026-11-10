@@ -21,6 +21,12 @@ def command(layout, args):
             '--events']
 
 
+def has_prompt_art(layout):
+    """True when this version holds button art (app/<version>/prompt-art, tools/prompt_art.py FOLDER): make_game.py
+    then draws the button prompts in a step of its own, and the jobs show a row for it."""
+    return (layout.app / 'prompt-art').is_dir()
+
+
 def install_args(layout, dump, game_dir):
     dump = str(dump)
     if os.path.isdir(dump):
@@ -30,8 +36,10 @@ def install_args(layout, dump, game_dir):
     return [*src, '--out', str(game_dir), '--msys', str(layout.msys)]
 
 
-def rebuild_args(layout, game_dir):
-    return ['--rebuild', '--out', str(game_dir), '--msys', str(layout.msys)]
+def rebuild_args(layout, game_dir, retune=False):
+    """retune: Rebuild the Game, which compiles the game's code for this processor's level; an update keeps the level
+    its objects were compiled for, so that it compiles only what changed (tools/make_game.py lifted_level)."""
+    return ['--rebuild', *(['--retune'] if retune else []), '--out', str(game_dir), '--msys', str(layout.msys)]
 
 
 def check_args(dump):

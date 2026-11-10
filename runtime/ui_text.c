@@ -111,9 +111,33 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_HDR_GAME_DESC] = "Brightness of white in the game, in nits.",
     [UI_MENU_HDR_UI] = "HUD and menu brightness",
     [UI_MENU_HDR_UI_DESC] = "Brightness of the HUD and this menu, in nits.",
-    [UI_MENU_HDR_HUE] = "Highlight hue correction",
-    [UI_MENU_HDR_HUE_DESC] = "Bright colours such as fire and sparks turn towards white as in the game's own SDR picture, "
-                             "matching the light they cast; 0 keeps them fully saturated.",
+    [UI_MENU_HDR_HUE] = "Hue correction",
+    [UI_MENU_HDR_HUE_DESC] = "How much bright colours keep the hue they have before the tone mapper; 0 lets them shift "
+                             "as the curve takes them.",
+    [UI_MENU_HDR_GAMMA] = "Gamma correction",
+    [UI_MENU_HDR_GAMMA_DESC] = "Shows the picture as a 2.2 or BT.1886 (2.4) display would, as the game was made to be "
+                               "seen; Off keeps the sRGB curve, with lighter shadows.",
+    [UI_MENU_HDR_TONEMAP] = "Tone mapper",
+    [UI_MENU_HDR_TONEMAP_DESC] = "Vanilla: the game's own curve at SDR brightness. RenoDRT: the game's look carried up "
+                                 "to your display's peak.",
+    [UI_MENU_HDR_EXPOSURE] = "Exposure",
+    [UI_MENU_HDR_EXPOSURE_DESC] = "Brightness of the whole picture before the tone mapper; 100 % leaves it unchanged.",
+    [UI_MENU_HDR_HIGHLIGHTS] = "Highlights",
+    [UI_MENU_HDR_HIGHLIGHTS_DESC] = "Brightness of the bright parts; 50 leaves them unchanged.",
+    [UI_MENU_HDR_SHADOWS] = "Shadows",
+    [UI_MENU_HDR_SHADOWS_DESC] = "Brightness of the dark parts; 50 leaves them unchanged.",
+    [UI_MENU_HDR_CONTRAST] = "Contrast",
+    [UI_MENU_HDR_CONTRAST_DESC] = "Contrast around mid grey; 50 leaves it unchanged.",
+    [UI_MENU_HDR_SATURATION] = "Saturation",
+    [UI_MENU_HDR_SATURATION_DESC] = "Strength of all colours; 50 leaves it unchanged.",
+    [UI_MENU_HDR_HIGHLIGHT_SAT] = "Highlight saturation",
+    [UI_MENU_HDR_HIGHLIGHT_SAT_DESC] = "Strength of the colours of the brightest parts; 50 leaves it unchanged.",
+    [UI_MENU_HDR_BLOWOUT] = "Blowout",
+    [UI_MENU_HDR_BLOWOUT_DESC] = "Turns the brightest parts towards white; 0 keeps their colour.",
+    [UI_MENU_HDR_FLARE] = "Flare",
+    [UI_MENU_HDR_FLARE_DESC] = "Lifts the darkest parts as a little stray light would; 0 keeps black black.",
+    [UI_MENU_HDR_GRADE] = "Colour grading",
+    [UI_MENU_HDR_GRADE_DESC] = "How much of the game's own colour grading the HDR picture keeps; 0 is the scene without it.",
     [UI_MENU_SHADOW_SCALE] = "Shadow resolution",
     [UI_MENU_SHADOW_SCALE_DESC] = "Sharper shadows. Higher costs more GPU power.",
     [UI_MENU_PCSS] = "Soft shadows",
@@ -219,30 +243,28 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_RUMBLE_TRIGGERS] = "Trigger vibration (Xbox)",
     [UI_MENU_RUMBLE_TRIGGERS_DESC] = "Also vibrates the triggers on Xbox controllers.",
     [UI_MENU_PAD_LAYOUT] = "Button layout",
-    [UI_MENU_PAD_LAYOUT_DESC] = "Sets which button acts as A.",
+    [UI_MENU_PAD_LAYOUT_DESC] = "Sets which button acts as A. Nintendo: by position, A right, B bottom, X top, Y "
+                                "left. Xbox and PlayStation: by label, A bottom, B right, X left, Y top (on a "
+                                "PlayStation pad cross, circle, square and triangle). Automatic: Nintendo for a pad "
+                                "labelled the Nintendo way, by label for the others.",
     [UI_MENU_PAD_LAYOUT_AUTO] = "Automatic", [UI_MENU_PAD_LAYOUT_NINTENDO] = "Nintendo (A right)",
-    [UI_MENU_PAD_LAYOUT_XBOX] = "Xbox (A bottom)",
+    [UI_MENU_PAD_LAYOUT_XBOX] = "Xbox (A bottom)", [UI_MENU_PAD_LAYOUT_PLAYSTATION] = "PlayStation (A bottom)",
     [UI_MENU_PAD_LAYOUT_IN_USE] = "in use: %s",
     [UI_MENU_PROMPTS] = "Button prompts",
-    [UI_MENU_PROMPTS_DESC] = "Which controller's buttons the game's prompts show. Nintendo: the game's own. Xbox: LB, "
-                             "RB, LT, RT, Menu, View and a d-pad cross, and A, B, X and Y as labelled on the button "
-                             "the layout above presses (with Nintendo (A right) the right button is labelled B, so the "
-                             "prompts for A show B). PC: the keys and mouse buttons of the keyboard's default layout "
-                             "(E, Shift, Space, left click...) and the mouse for the camera. The game reads its prompts "
-                             "at start, so they change after a restart. They are part of the game's files, so a button "
-                             "you remap in Controls keeps its old prompt on screen.",
-    [UI_MENU_PROMPTS_NINTENDO] = "Nintendo", [UI_MENU_PROMPTS_XBOX] = "Xbox", [UI_MENU_PROMPTS_PC] = "PC",
-    [UI_MENU_PROMPTS_PLAYSTATION] = "PlayStation", [UI_MENU_PROMPTS_STEAMDECK] = "Steam Deck",
-    [UI_MENU_PROMPTS_PS_DESC] = "Which controller's buttons the game's prompts show. Nintendo: the game's own. "
-                                "PlayStation: Cross, Circle, Square and Triangle, L1, R1, L2, R2, Options, Create and a "
-                                "d-pad cross. Steam Deck: A, B, X and Y as labelled, L1, R1, L2, R2, Menu, View and a "
-                                "d-pad cross. The face buttons follow the layout above: with Nintendo (A right) the "
-                                "prompts for A show Circle or B (the right button), with Automatic or Xbox (A bottom) "
-                                "Cross or A. The "
-                                "game reads its prompts at start, so they change after a restart. They are part of the "
-                                "game's files, so a button you remap in Controls keeps its old prompt on screen.",
-    [UI_MENU_PROMPTS_MISSING] = "prompt files missing: run the setup again",
-    [UI_MENU_PROMPTS_FAILED] = "prompt files damaged: run the setup again",
+    [UI_MENU_PROMPTS_DESC] = "Which buttons the game's prompts show, in text, in the action prompt and on the "
+                             "ocarina's notes. Nintendo: the game's own. Xbox and PlayStation: that pad's buttons (LB, "
+                             "RB, LT, RT, Menu, View; L1, R1, L2, R2, Options, Create), and A, B, X and Y as the "
+                             "button the layout above presses (with Nintendo (A right) the right button does A, so the "
+                             "prompts for A show B, or circle). Keyboard and mouse: the key each button has (E, Ctrl, "
+                             "Space, left click...), WASD for moving and the mouse for the camera. The prompt files "
+                             "are made from button art with tools/pad_prompts.py, the keys as nx2navi.ini binds them "
+                             "when it runs. The game reads its prompts at start, so they change after a restart. They "
+                             "are part of the game's files, so a button you remap in Controls keeps its old prompt on "
+                             "screen until the files are made again.",
+    [UI_MENU_PROMPTS_NINTENDO] = "Nintendo", [UI_MENU_PROMPTS_XBOX] = "Xbox",
+    [UI_MENU_PROMPTS_PLAYSTATION] = "PlayStation", [UI_MENU_PROMPTS_PC] = "Keyboard and mouse",
+    [UI_MENU_PROMPTS_MISSING] = "prompt files missing: tools/pad_prompts.py makes them",
+    [UI_MENU_PROMPTS_FAILED] = "prompt files damaged: make them again with tools/pad_prompts.py",
     [UI_MENU_PROMPTS_RESTART] = "prompts change after restart",
     [UI_MENU_PROMPTS_OFF_SHAPE] = "off at a game resolution not 16:9",
     [UI_MENU_PROMPTS_OFF_MODS] = "off: a RomFS mod replaces their files",
@@ -485,23 +507,62 @@ static const char *const text_en[UI_TEXT_COUNT] = {
                                    "now.",
     [UI_MENU_CHEAT_UNSUPPORTED] = "not supported",
     [UI_MENU_CHEAT_UNSUPPORTED_DESC] = "This cheat cannot be used with this version of the game:",
-    [UI_BOOT_TITLE] = "Preparing shaders", [UI_BOOT_HINT] = "This happens once after an update or a graphics driver change.",
+    [UI_MENU_SAVES] = "Saves",
+    [UI_MENU_SAVE_EXPORT] = "Export save",
+    [UI_MENU_SAVE_EXPORT_DESC] = "Writes your save (every slot) into one zip file in your Downloads folder, to give to "
+                                 "another player or attach to a bug report. It never holds your keys or game files.",
+    [UI_MENU_SAVE_EXPORT_BUG] = "Export save for a bug report",
+    [UI_MENU_SAVE_EXPORT_BUG_DESC] = "The same zip with this run's log and your settings (nx2navi.ini) added, which "
+                                     "show what happened and with which settings. Attach it to your bug report.",
+    [UI_MENU_SAVE_IMPORT] = "Import a save",
+    [UI_MENU_SAVE_IMPORT_DESC] = "Choose a save someone shared (an NX2navi-save zip). It replaces your save, every slot, "
+                                 "at the next start: the game keeps your progress in memory and would write it back "
+                                 "over a save replaced now. Your current save is copied to the saves folder first.",
+    [UI_MENU_SAVE_IMPORT_WAITING] = "at next start",
+    [UI_MENU_SAVE_IMPORT_CANCEL] = "Cancel the import",
+    [UI_MENU_SAVE_IMPORT_CANCEL_DESC] = "Keeps your save as it is: the save waiting for the next start is dropped.",
+    [UI_MENU_SAVE_BUSY] = "working…",
+    [UI_MENU_SAVE_EXPORTED] = "Saved as %s",
+    [UI_MENU_SAVE_IMPORT_READY] = "The save (NX2navi %s) loads at the next start: select Restart below. Your current "
+                                  "save is copied to the saves folder first.",
+    [UI_MENU_SAVE_IMPORT_CANCELLED] = "Import cancelled; your save stays as it is.",
+    [UI_MENU_SAVE_IMPORTED] = "A shared save was imported at this start. Your old save is in %s",
+    [UI_MENU_SAVE_IMPORTED_NEW] = "A shared save was imported at this start.",
+    [UI_MENU_SAVE_E_NO_SAVE] = "There is no save to export yet: play until the game saves.",
+    [UI_MENU_SAVE_E_READ_SAVE] = "A file of your save could not be read; try again in a moment.",
+    [UI_MENU_SAVE_E_WRITE] = "The zip could not be written into %s.",
+    [UI_MENU_SAVE_E_READ] = "%s could not be read.",
+    [UI_MENU_SAVE_E_STAGE] = "The save could not be prepared for the next start; the log says why.",
+    [UI_MENU_SAVE_E_NOT_SAVE] = "%s is not a save NX2navi exported.",
+    [UI_MENU_SAVE_E_OTHER_GAME] = "%s is a save of another game.",
+    [UI_MENU_SAVE_E_NEWER] = "%s was made by a newer NX2navi: update NX2navi first.",
+    [UI_MENU_SAVE_E_DAMAGED] = "%s is damaged: download it again.",
+    [UI_MENU_SAVE_E_UNSAFE] = "%s was refused: it holds files outside a save, links, or far more than a save.",
+    [UI_BOOT_TITLE] = "Preparing shaders",
     [UI_BOOT_STARTING] = "Starting", [UI_BOOT_SHADERS] = "Shaders: %lld of %lld", [UI_BOOT_PIPELINES] = "Pipelines: %lld of %lld",
     [UI_MENU_UPSCALING] = "Upscaling",
     [UI_MENU_UPSCALING_DESC] = "How the picture is smoothed and scaled to your window.",
-    [UI_MENU_UPSCALING_DLSS_NOTE] = "DLSS or FSR 3.1 on or off: after restart",
     [UI_MENU_UPSCALING_DESC_FSR] = "How the picture is smoothed and scaled to your window.",
-    [UI_MENU_UPSCALING_FSR_NOTE] = "FSR 3.1 on or off: after restart",
     [UI_MENU_FRAMEGEN] = "Frame generation",
     [UI_MENU_FRAMEGEN_DESC] = "Adds generated frames for smoother motion. Needs DLSS or FSR 3.1.",
     [UI_MENU_FRAMEGEN_OFF] = "Off",
-    [UI_MENU_HDR_NOTE] = "after restart",
-    [UI_MENU_HDR_ENHANCED] = "Enhanced", [UI_MENU_HDR_NATIVE] = "Native (the game's)",
-    [UI_MENU_FRAMEGEN_NOTE] = "after restart; needs DLSS or FSR 3.1",
+    [UI_MENU_HDR_TONEMAPPED] = "RenoDX", [UI_MENU_HDR_NATIVE] = "Native (the game's)",
+    [UI_MENU_FRAMEGEN_NOTE] = "needs DLSS or FSR 3.1",
     [UI_MENU_FRAMEGEN_NEEDS] = "choose a DLSS or FSR 3.1 mode under Upscaling first",
     [UI_MENU_FRAMEGEN_NEEDS_FSR] = "choose an FSR 3.1 mode under Upscaling first",
-    [UI_MENU_FRAMEGEN_NOTE_FSR] = "after restart; needs FSR 3.1",
+    [UI_MENU_FRAMEGEN_NOTE_FSR] = "needs FSR 3.1",
     [UI_MENU_FRAMEGEN_DESC_FSR] = "Adds generated frames for smoother motion. Needs FSR 3.1.",
+    [UI_MENU_FRAMEGEN_MULT] = "DLSS multiplier",
+    [UI_MENU_FRAMEGEN_MULT_DESC] = "Frames on screen for each frame the game draws: 2x adds one generated frame, 3x "
+                                   "two, 4x three. Higher is smoother but adds a little delay. The frame limit counts "
+                                   "the frames on screen, so the game draws the limit divided by this: set the limit "
+                                   "to your display's rate. 2x needs a GeForce RTX 40 GPU or newer, 3x and 4x an RTX "
+                                   "50.",
+    [UI_MENU_FRAMEGEN_MULT_RTX50] = "3x and 4x need an RTX 50 GPU",
+    [UI_MENU_FRAMEGEN_MULT_UPTO] = "up to %dx on this GPU and driver",
+    [UI_MENU_FRAMEGEN_MULT_OLD_DLL] = "2x only: update the DLSS frame generation files",
+    [UI_MENU_FRAMEGEN_OFF_GPU] = "in use: off, needs an RTX 40 GPU or newer",
+    [UI_MENU_FRAMEGEN_OFF_FILES] = "in use: off, its files are missing",
     [UI_MENU_GAME_RES] = "Resolution",
     [UI_MENU_GAME_RES_DESC] = "Height of the game's picture. Higher is sharper but costs more GPU power.",
     [UI_MENU_GAME_RES_NATIVE] = "Native",
@@ -595,9 +656,33 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_HDR_GAME_DESC] = "Яркость белого в игре, в нитах.",
     [UI_MENU_HDR_UI] = "Яркость интерфейса и меню",
     [UI_MENU_HDR_UI_DESC] = "Яркость интерфейса и этого меню, в нитах.",
-    [UI_MENU_HDR_HUE] = "Коррекция оттенка бликов",
-    [UI_MENU_HDR_HUE_DESC] = "Яркие цвета (огонь, искры) уходят к белому, как в SDR-картинке игры, и совпадают со светом, "
-                             "который они дают; 0 оставляет их полностью насыщенными.",
+    [UI_MENU_HDR_HUE] = "Коррекция оттенка",
+    [UI_MENU_HDR_HUE_DESC] = "Насколько яркие цвета сохраняют оттенок, который был до тональной кривой; при 0 они "
+                             "смещаются вместе с кривой.",
+    [UI_MENU_HDR_GAMMA] = "Коррекция гаммы",
+    [UI_MENU_HDR_GAMMA_DESC] = "Показывает картинку так, как её показал бы экран с гаммой 2.2 или BT.1886 (2.4), для "
+                               "которого игра делалась; «Выкл.» оставляет кривую sRGB с более светлыми тенями.",
+    [UI_MENU_HDR_TONEMAP] = "Тональная кривая",
+    [UI_MENU_HDR_TONEMAP_DESC] = "Vanilla: собственная кривая игры с яркостью SDR. RenoDRT: вид игры, доведённый до "
+                                 "пиковой яркости экрана.",
+    [UI_MENU_HDR_EXPOSURE] = "Экспозиция",
+    [UI_MENU_HDR_EXPOSURE_DESC] = "Яркость всей картинки до тональной кривой; 100 % оставляет её без изменений.",
+    [UI_MENU_HDR_HIGHLIGHTS] = "Света",
+    [UI_MENU_HDR_HIGHLIGHTS_DESC] = "Яркость светлых участков; 50 оставляет их без изменений.",
+    [UI_MENU_HDR_SHADOWS] = "Тени",
+    [UI_MENU_HDR_SHADOWS_DESC] = "Яркость тёмных участков; 50 оставляет их без изменений.",
+    [UI_MENU_HDR_CONTRAST] = "Контраст",
+    [UI_MENU_HDR_CONTRAST_DESC] = "Контраст вокруг среднего серого; 50 оставляет его без изменений.",
+    [UI_MENU_HDR_SATURATION] = "Насыщенность",
+    [UI_MENU_HDR_SATURATION_DESC] = "Сила всех цветов; 50 оставляет её без изменений.",
+    [UI_MENU_HDR_HIGHLIGHT_SAT] = "Насыщенность светов",
+    [UI_MENU_HDR_HIGHLIGHT_SAT_DESC] = "Сила цвета самых ярких участков; 50 оставляет её без изменений.",
+    [UI_MENU_HDR_BLOWOUT] = "Выгорание",
+    [UI_MENU_HDR_BLOWOUT_DESC] = "Уводит самые яркие участки к белому; 0 сохраняет их цвет.",
+    [UI_MENU_HDR_FLARE] = "Засветка",
+    [UI_MENU_HDR_FLARE_DESC] = "Приподнимает самые тёмные участки, как немного рассеянного света; 0 оставляет чёрное чёрным.",
+    [UI_MENU_HDR_GRADE] = "Цветокоррекция игры",
+    [UI_MENU_HDR_GRADE_DESC] = "Сколько собственной цветокоррекции игры сохраняет HDR-картинка; 0 — сцена без неё.",
     [UI_MENU_SHADOW_SCALE] = "Разрешение теней",
     [UI_MENU_SHADOW_SCALE_DESC] = "Более чёткие тени. Выше — больше нагрузка на видеокарту.",
     [UI_MENU_PCSS] = "Мягкие тени",
@@ -699,21 +784,28 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_RUMBLE_TRIGGERS] = "Вибрация триггеров (Xbox)",
     [UI_MENU_RUMBLE_TRIGGERS_DESC] = "Вибрация также на курках контроллера Xbox.",
     [UI_MENU_PAD_LAYOUT] = "Раскладка кнопок",
-    [UI_MENU_PAD_LAYOUT_DESC] = "Какая кнопка работает как A.",
+    [UI_MENU_PAD_LAYOUT_DESC] = "Какая кнопка работает как A. Nintendo: по положению, A справа, B снизу, X сверху, "
+                                "Y слева. Xbox и PlayStation: по подписи, A снизу, B справа, X слева, Y сверху (на "
+                                "контроллере PlayStation крест, круг, квадрат и треугольник). Автоматически: "
+                                "Nintendo для контроллера с подписями Nintendo, по подписи для остальных.",
     [UI_MENU_PAD_LAYOUT_AUTO] = "Автоматически", [UI_MENU_PAD_LAYOUT_NINTENDO] = "Nintendo (A справа)",
-    [UI_MENU_PAD_LAYOUT_XBOX] = "Xbox (A снизу)",
+    [UI_MENU_PAD_LAYOUT_XBOX] = "Xbox (A снизу)", [UI_MENU_PAD_LAYOUT_PLAYSTATION] = "PlayStation (A снизу)",
     [UI_MENU_PAD_LAYOUT_IN_USE] = "сейчас: %s",
     [UI_MENU_PROMPTS] = "Подсказки кнопок",
-    [UI_MENU_PROMPTS_DESC] = "Кнопки какого контроллера показывают подсказки игры. Nintendo: как в самой игре. Xbox: "
-                             "LB, RB, LT, RT, Menu, View и крестовина, а A, B, X и Y подписаны так же, как кнопка, "
-                             "которую нажимает раскладка выше (в Nintendo (A справа) правая кнопка подписана B, и "
-                             "подсказки A показывают B). PC: клавиши и кнопки мыши стандартной раскладки клавиатуры "
-                             "(E, Shift, пробел, левый клик...) и мышь для камеры. Игра читает подсказки при запуске, "
-                             "так что они меняются после перезапуска. Подсказки записаны в файлах игры, поэтому у "
-                             "кнопки, переназначенной на вкладке управления, на экране остаётся прежняя подсказка.",
-    [UI_MENU_PROMPTS_NINTENDO] = "Nintendo", [UI_MENU_PROMPTS_XBOX] = "Xbox", [UI_MENU_PROMPTS_PC] = "PC",
-    [UI_MENU_PROMPTS_MISSING] = "нет файлов подсказок: запустите установку снова",
-    [UI_MENU_PROMPTS_FAILED] = "файлы подсказок повреждены: запустите установку снова",
+    [UI_MENU_PROMPTS_DESC] = "Какие кнопки показывают подсказки игры: в тексте, в подсказке действия и на нотах "
+                             "окарины. Nintendo: как в самой игре. Xbox и PlayStation: кнопки этого контроллера (LB, "
+                             "RB, LT, RT, Menu, View; L1, R1, L2, R2, Options, Create), а A, B, X и Y показаны той "
+                             "кнопкой, которую нажимает раскладка выше (в Nintendo (A справа) A делает правая кнопка, "
+                             "и подсказки A показывают B или круг). Клавиатура и мышь: клавиша каждой кнопки (E, Ctrl, "
+                             "пробел, левый клик...), WASD для движения и мышь для камеры. Файлы подсказок создаются "
+                             "из картинок кнопок программой tools/pad_prompts.py, клавиши берутся из nx2navi.ini на "
+                             "момент её запуска. Игра читает подсказки при запуске, так что они меняются после "
+                             "перезапуска. Подсказки записаны в файлах игры, поэтому у кнопки, переназначенной на "
+                             "вкладке управления, на экране остаётся прежняя подсказка, пока файлы не созданы заново.",
+    [UI_MENU_PROMPTS_NINTENDO] = "Nintendo", [UI_MENU_PROMPTS_XBOX] = "Xbox",
+    [UI_MENU_PROMPTS_PLAYSTATION] = "PlayStation", [UI_MENU_PROMPTS_PC] = "Клавиатура и мышь",
+    [UI_MENU_PROMPTS_MISSING] = "нет файлов подсказок: их создаёт tools/pad_prompts.py",
+    [UI_MENU_PROMPTS_FAILED] = "файлы подсказок повреждены: создайте их снова tools/pad_prompts.py",
     [UI_MENU_PROMPTS_RESTART] = "подсказки сменятся после перезапуска",
     [UI_MENU_PROMPTS_OFF_SHAPE] = "выкл. при разрешении игры не 16:9",
     [UI_MENU_PROMPTS_OFF_MODS] = "выкл.: мод RomFS заменяет их файлы",
@@ -958,7 +1050,41 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
                                    "его при следующем запуске (несколько минут), или нажмите «Пересобрать игру сейчас».",
     [UI_MENU_CHEAT_UNSUPPORTED] = "не поддерживается",
     [UI_MENU_CHEAT_UNSUPPORTED_DESC] = "Этот чит нельзя использовать с этой версией игры:",
-    [UI_BOOT_TITLE] = "Подготовка шейдеров", [UI_BOOT_HINT] = "Это происходит один раз после обновления или смены видеодрайвера.",
+    [UI_MENU_SAVES] = "Сохранения",
+    [UI_MENU_SAVE_EXPORT] = "Экспорт сохранения",
+    [UI_MENU_SAVE_EXPORT_DESC] = "Записывает ваше сохранение (все слоты) в один zip-файл в папке «Загрузки», чтобы "
+                                 "передать его другому игроку или приложить к сообщению об ошибке. Ключи и файлы игры "
+                                 "в него не попадают.",
+    [UI_MENU_SAVE_EXPORT_BUG] = "Экспорт для сообщения об ошибке",
+    [UI_MENU_SAVE_EXPORT_BUG_DESC] = "Тот же zip с журналом этого запуска и вашими настройками (nx2navi.ini): по ним "
+                                     "видно, что произошло и с какими настройками. Приложите его к сообщению об ошибке.",
+    [UI_MENU_SAVE_IMPORT] = "Импорт сохранения",
+    [UI_MENU_SAVE_IMPORT_DESC] = "Выберите сохранение, которым с вами поделились (zip NX2navi-save). Оно заменит ваше "
+                                 "сохранение, все слоты, при следующем запуске: игра держит прогресс в памяти и "
+                                 "записала бы его поверх сохранения, заменённого сейчас. Текущее сохранение сначала "
+                                 "копируется в папку saves.",
+    [UI_MENU_SAVE_IMPORT_WAITING] = "при следующем запуске",
+    [UI_MENU_SAVE_IMPORT_CANCEL] = "Отменить импорт",
+    [UI_MENU_SAVE_IMPORT_CANCEL_DESC] = "Оставляет ваше сохранение как есть: сохранение, ждущее следующего запуска, "
+                                        "удаляется.",
+    [UI_MENU_SAVE_BUSY] = "выполняется…",
+    [UI_MENU_SAVE_EXPORTED] = "Сохранено: %s",
+    [UI_MENU_SAVE_IMPORT_READY] = "Сохранение (NX2navi %s) загрузится при следующем запуске: выберите «Перезапустить» "
+                                  "внизу. Текущее сохранение сначала копируется в папку saves.",
+    [UI_MENU_SAVE_IMPORT_CANCELLED] = "Импорт отменён, ваше сохранение не изменилось.",
+    [UI_MENU_SAVE_IMPORTED] = "При этом запуске импортировано сохранение. Прежнее сохранение лежит в %s",
+    [UI_MENU_SAVE_IMPORTED_NEW] = "При этом запуске импортировано сохранение.",
+    [UI_MENU_SAVE_E_NO_SAVE] = "Экспортировать пока нечего: играйте, пока игра не сохранится.",
+    [UI_MENU_SAVE_E_READ_SAVE] = "Не удалось прочитать файл сохранения; попробуйте ещё раз чуть позже.",
+    [UI_MENU_SAVE_E_WRITE] = "Не удалось записать zip в %s.",
+    [UI_MENU_SAVE_E_READ] = "Не удалось прочитать %s.",
+    [UI_MENU_SAVE_E_STAGE] = "Не удалось подготовить сохранение к следующему запуску; причина указана в журнале.",
+    [UI_MENU_SAVE_E_NOT_SAVE] = "%s — не сохранение, экспортированное NX2navi.",
+    [UI_MENU_SAVE_E_OTHER_GAME] = "%s — сохранение другой игры.",
+    [UI_MENU_SAVE_E_NEWER] = "%s создан более новой версией NX2navi: сначала обновите NX2navi.",
+    [UI_MENU_SAVE_E_DAMAGED] = "%s повреждён: скачайте его заново.",
+    [UI_MENU_SAVE_E_UNSAFE] = "%s отклонён: в нём файлы вне сохранения, ссылки или слишком много данных.",
+    [UI_BOOT_TITLE] = "Подготовка шейдеров",
     [UI_BOOT_STARTING] = "Запуск", [UI_BOOT_SHADERS] = "Шейдеры: %lld из %lld", [UI_BOOT_PIPELINES] = "Конвейеры: %lld из %lld",
     [UI_MENU_CHEATS_REBUILD] = "Пересобрать игру сейчас",
     [UI_MENU_CHEATS_REBUILD_DESC] = "Некоторые читы меняют код игры и ещё не собраны в неё: они новые или изменены, "
@@ -1082,9 +1208,13 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_RUMBLE_TRIGGERS] = "Vibração dos gatilhos (Xbox)",
     [UI_MENU_RUMBLE_TRIGGERS_DESC] = "Também vibra os gatilhos do controle Xbox.",
     [UI_MENU_PAD_LAYOUT] = "Layout dos botões",
-    [UI_MENU_PAD_LAYOUT_DESC] = "Define qual botão funciona como A.",
+    [UI_MENU_PAD_LAYOUT_DESC] = "Define qual botão funciona como A. Nintendo: pela posição, A à direita, B embaixo, "
+                                "X em cima, Y à esquerda. Xbox e PlayStation: pela letra, A embaixo, B à direita, X à "
+                                "esquerda, Y em cima (num controle PlayStation xis, círculo, quadrado e triângulo). "
+                                "Automático: Nintendo para um controle com as letras da Nintendo, pela letra para os "
+                                "outros.",
     [UI_MENU_PAD_LAYOUT_AUTO] = "Automático", [UI_MENU_PAD_LAYOUT_NINTENDO] = "Nintendo (A à direita)",
-    [UI_MENU_PAD_LAYOUT_XBOX] = "Xbox (A embaixo)",
+    [UI_MENU_PAD_LAYOUT_XBOX] = "Xbox (A embaixo)", [UI_MENU_PAD_LAYOUT_PLAYSTATION] = "PlayStation (A embaixo)",
     [UI_MENU_PAD_LAYOUT_IN_USE] = "em uso: %s",
     [UI_MENU_GROUP_STICKS] = "Analógicos",
     [UI_MENU_LSTICK_DEADZONE] = "Zona morta do analógico esquerdo",
@@ -1332,25 +1462,29 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_HDR_UI] = "Brilho do HUD e do menu",
     [UI_MENU_HDR_UI_DESC] = "Brilho da interface e deste menu, em nits.",
     [UI_MENU_PROMPTS] = "Ícones de botões",
-    [UI_MENU_PROMPTS_DESC] = "Os botões de qual controle os ícones do jogo mostram. Nintendo: os do próprio jogo. "
-                             "Xbox: LB, RB, LT, RT, Menu, Exibir e uma cruz direcional, e A, B, X e Y com a letra do "
-                             "botão que o layout acima aperta (com Nintendo (A à direita) o botão da direita tem a "
-                             "letra B, então os ícones de A mostram B). PC: as teclas e os botões do mouse do layout "
-                             "padrão do teclado (E, Shift, Espaço, clique esquerdo...) e o mouse para a câmera. O jogo "
-                             "lê os ícones ao iniciar, então eles mudam depois de reiniciar. Eles fazem parte dos "
-                             "arquivos do jogo, então um botão remapeado em Controles continua com o ícone antigo na "
-                             "tela.",
+    [UI_MENU_PROMPTS_DESC] = "Quais botões os ícones do jogo mostram: no texto, no ícone de ação e nas notas da "
+                             "ocarina. Nintendo: os do próprio jogo. Xbox e PlayStation: os botões desse controle (LB, "
+                             "RB, LT, RT, Menu, Exibir; L1, R1, L2, R2, Options, Create), e A, B, X e Y aparecem como "
+                             "o botão que o layout acima aperta (com Nintendo (A à direita) o botão da direita faz A, "
+                             "então os ícones de A mostram B, ou círculo). Teclado e mouse: a tecla de cada botão (E, "
+                             "Ctrl, Espaço, clique esquerdo...), WASD para andar e o mouse para a câmera. Os arquivos "
+                             "dos ícones são feitos a partir de imagens de botões com tools/pad_prompts.py, com as "
+                             "teclas como o nx2navi.ini as define quando ele roda. O jogo lê os ícones ao iniciar, "
+                             "então eles mudam depois de reiniciar. Eles fazem parte dos arquivos do jogo, então um "
+                             "botão remapeado em Controles continua com o ícone antigo na tela até os arquivos serem "
+                             "feitos de novo.",
     [UI_MENU_PROMPTS_NINTENDO] = "Nintendo",
     [UI_MENU_PROMPTS_XBOX] = "Xbox",
-    [UI_MENU_PROMPTS_PC] = "PC",
+    [UI_MENU_PROMPTS_PLAYSTATION] = "PlayStation",
+    [UI_MENU_PROMPTS_PC] = "Teclado e mouse",
     [UI_MENU_MOUSE_MODE] = "Câmera com o mouse",
     [UI_MENU_MOUSE_MODE_DESC] = "Direta: a câmera gira o quanto o mouse se move, como num jogo de PC, sem zona morta nem curva do analógico (jogo 1.4.3; as outras versões usam a emulação do analógico). Emulação do analógico: o mouse age como o analógico direito.",
     [UI_MENU_MOUSE_STICK] = "Emulação do analógico",
     [UI_MENU_MOUSE_DIRECT] = "Direta",
     [UI_MENU_MENU_CURSOR] = "Mouse nos menus do jogo",
     [UI_MENU_MENU_CURSOR_DESC] = "Nos menus do próprio jogo (título, inventário, lojas, escolhas de diálogo) o ponteiro aparece: o item sob ele fica selecionado, o clique esquerdo confirma e o direito volta. Só depois de usar o mouse ou uma tecla por último, então com um controle os menus ficam como antes (jogo 1.4.3).",
-    [UI_MENU_PROMPTS_MISSING] = "faltam os arquivos dos ícones: execute a instalação de novo",
-    [UI_MENU_PROMPTS_FAILED] = "arquivos dos ícones danificados: execute a instalação de novo",
+    [UI_MENU_PROMPTS_MISSING] = "faltam os arquivos dos ícones: tools/pad_prompts.py os cria",
+    [UI_MENU_PROMPTS_FAILED] = "arquivos dos ícones danificados: crie de novo com tools/pad_prompts.py",
     [UI_MENU_PROMPTS_RESTART] = "os ícones mudam após reiniciar",
     [UI_MENU_PROMPTS_OFF_SHAPE] = "desligados numa resolução de jogo que não é 16:9",
     [UI_MENU_PROMPTS_OFF_MODS] = "desligados: um mod de RomFS substitui os arquivos deles",
@@ -1372,9 +1506,33 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_WALK_SCALE_DESC] = "A inclinação dos analógicos do teclado enquanto a tecla de andar está segura. Metade "
                                 "é andar, a inclinação total é correr.",
     [UI_MENU_OV_SCALE_DOWN] = "bilinear (nitidez FSR 0)",
-    [UI_MENU_HDR_HUE] = "Correção de matiz dos realces",
-    [UI_MENU_HDR_HUE_DESC] = "Cores fortes como fogo e faíscas vão para o branco como na imagem SDR do próprio jogo e "
-                             "combinam com a luz que emitem; 0 as mantém totalmente saturadas.",
+    [UI_MENU_HDR_HUE] = "Correção de matiz",
+    [UI_MENU_HDR_HUE_DESC] = "Quanto as cores brilhantes mantêm o matiz que tinham antes da curva de tons; 0 deixa que "
+                             "mudem com a curva.",
+    [UI_MENU_HDR_GAMMA] = "Correção de gama",
+    [UI_MENU_HDR_GAMMA_DESC] = "Mostra a imagem como uma tela de gama 2.2 ou BT.1886 (2.4) mostraria, como o jogo foi "
+                               "feito para ser visto; Desligado mantém a curva sRGB, com sombras mais claras.",
+    [UI_MENU_HDR_TONEMAP] = "Curva de tons",
+    [UI_MENU_HDR_TONEMAP_DESC] = "Vanilla: a curva do próprio jogo, com brilho SDR. RenoDRT: o visual do jogo levado até "
+                                 "o pico da sua tela.",
+    [UI_MENU_HDR_EXPOSURE] = "Exposição",
+    [UI_MENU_HDR_EXPOSURE_DESC] = "Brilho de toda a imagem antes da curva de tons; 100 % a deixa como está.",
+    [UI_MENU_HDR_HIGHLIGHTS] = "Realces",
+    [UI_MENU_HDR_HIGHLIGHTS_DESC] = "Brilho das partes claras; 50 as deixa como estão.",
+    [UI_MENU_HDR_SHADOWS] = "Sombras",
+    [UI_MENU_HDR_SHADOWS_DESC] = "Brilho das partes escuras; 50 as deixa como estão.",
+    [UI_MENU_HDR_CONTRAST] = "Contraste",
+    [UI_MENU_HDR_CONTRAST_DESC] = "Contraste em torno do cinza médio; 50 o deixa como está.",
+    [UI_MENU_HDR_SATURATION] = "Saturação",
+    [UI_MENU_HDR_SATURATION_DESC] = "Força de todas as cores; 50 a deixa como está.",
+    [UI_MENU_HDR_HIGHLIGHT_SAT] = "Saturação dos realces",
+    [UI_MENU_HDR_HIGHLIGHT_SAT_DESC] = "Força das cores das partes mais claras; 50 a deixa como está.",
+    [UI_MENU_HDR_BLOWOUT] = "Estouro",
+    [UI_MENU_HDR_BLOWOUT_DESC] = "Leva as partes mais claras para o branco; 0 mantém a cor delas.",
+    [UI_MENU_HDR_FLARE] = "Flare",
+    [UI_MENU_HDR_FLARE_DESC] = "Ergue as partes mais escuras como um pouco de luz difusa faria; 0 mantém o preto preto.",
+    [UI_MENU_HDR_GRADE] = "Gradação de cor",
+    [UI_MENU_HDR_GRADE_DESC] = "Quanto da gradação de cor do próprio jogo a imagem HDR mantém; 0 é a cena sem ela.",
     [UI_MENU_SHADOW_SCALE] = "Resolução das sombras",
     [UI_MENU_SHADOW_SCALE_DESC] = "Sombras mais nítidas. Mais alto exige mais da placa de vídeo.",
     [UI_MENU_SHADOW_RANGE] = "Alcance das cascatas de sombra",
@@ -1433,7 +1591,41 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
                                    "Recompilar o jogo agora.",
     [UI_MENU_CHEAT_UNSUPPORTED] = "não suportado",
     [UI_MENU_CHEAT_UNSUPPORTED_DESC] = "Este cheat não pode ser usado com esta versão do jogo:",
-    [UI_BOOT_TITLE] = "Preparando shaders", [UI_BOOT_HINT] = "Isso acontece uma vez após uma atualização ou troca do driver de vídeo.",
+    [UI_MENU_SAVES] = "Saves",
+    [UI_MENU_SAVE_EXPORT] = "Exportar save",
+    [UI_MENU_SAVE_EXPORT_DESC] = "Grava seu save (todos os slots) em um arquivo zip na pasta Downloads, para passar a "
+                                 "outro jogador ou anexar a um relato de bug. Ele nunca contém suas chaves nem arquivos "
+                                 "do jogo.",
+    [UI_MENU_SAVE_EXPORT_BUG] = "Exportar para relato de bug",
+    [UI_MENU_SAVE_EXPORT_BUG_DESC] = "O mesmo zip com o log desta execução e suas configurações (nx2navi.ini), que "
+                                     "mostram o que aconteceu e com quais configurações. Anexe-o ao seu relato de bug.",
+    [UI_MENU_SAVE_IMPORT] = "Importar save",
+    [UI_MENU_SAVE_IMPORT_DESC] = "Escolha um save que alguém compartilhou (um zip NX2navi-save). Ele substitui seu save, "
+                                 "todos os slots, na próxima inicialização: o jogo mantém seu progresso na memória e o "
+                                 "gravaria por cima de um save substituído agora. Seu save atual é copiado antes para a "
+                                 "pasta saves.",
+    [UI_MENU_SAVE_IMPORT_WAITING] = "na próxima inicialização",
+    [UI_MENU_SAVE_IMPORT_CANCEL] = "Cancelar a importação",
+    [UI_MENU_SAVE_IMPORT_CANCEL_DESC] = "Mantém seu save como está: o save que aguardava a próxima inicialização é "
+                                        "descartado.",
+    [UI_MENU_SAVE_BUSY] = "trabalhando…",
+    [UI_MENU_SAVE_EXPORTED] = "Salvo como %s",
+    [UI_MENU_SAVE_IMPORT_READY] = "O save (NX2navi %s) é carregado na próxima inicialização: selecione Reiniciar abaixo. "
+                                  "Seu save atual é copiado antes para a pasta saves.",
+    [UI_MENU_SAVE_IMPORT_CANCELLED] = "Importação cancelada; seu save continua como estava.",
+    [UI_MENU_SAVE_IMPORTED] = "Um save compartilhado foi importado nesta inicialização. Seu save anterior está em %s",
+    [UI_MENU_SAVE_IMPORTED_NEW] = "Um save compartilhado foi importado nesta inicialização.",
+    [UI_MENU_SAVE_E_NO_SAVE] = "Ainda não há save para exportar: jogue até o jogo salvar.",
+    [UI_MENU_SAVE_E_READ_SAVE] = "Um arquivo do seu save não pôde ser lido; tente de novo daqui a pouco.",
+    [UI_MENU_SAVE_E_WRITE] = "Não foi possível gravar o zip em %s.",
+    [UI_MENU_SAVE_E_READ] = "Não foi possível ler %s.",
+    [UI_MENU_SAVE_E_STAGE] = "Não foi possível preparar o save para a próxima inicialização; o log diz o motivo.",
+    [UI_MENU_SAVE_E_NOT_SAVE] = "%s não é um save exportado pelo NX2navi.",
+    [UI_MENU_SAVE_E_OTHER_GAME] = "%s é um save de outro jogo.",
+    [UI_MENU_SAVE_E_NEWER] = "%s foi feito por um NX2navi mais novo: atualize o NX2navi primeiro.",
+    [UI_MENU_SAVE_E_DAMAGED] = "%s está danificado: baixe-o de novo.",
+    [UI_MENU_SAVE_E_UNSAFE] = "%s foi recusado: contém arquivos fora de um save, links ou dados demais.",
+    [UI_BOOT_TITLE] = "Preparando shaders",
     [UI_BOOT_STARTING] = "Iniciando", [UI_BOOT_SHADERS] = "Shaders: %lld de %lld", [UI_BOOT_PIPELINES] = "Pipelines: %lld de %lld",
     [UI_MENU_CHEATS_REBUILD] = "Recompilar o jogo agora",
     [UI_MENU_CHEATS_REBUILD_DESC] = "Alguns cheats alteram o código do jogo e ainda não foram compilados nele: são "
@@ -1597,10 +1789,13 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_RUMBLE_TRIGGERS] = "扳机振动（Xbox）",
     [UI_MENU_RUMBLE_TRIGGERS_DESC] = "同时震动 Xbox 手柄的扳机。",
     [UI_MENU_PAD_LAYOUT] = "按键布局",
-    [UI_MENU_PAD_LAYOUT_DESC] = "设置哪个按键作为 A 键。",
+    [UI_MENU_PAD_LAYOUT_DESC] = "设置哪个按键作为 A 键。Nintendo：按位置，A 在右、B 在下、X 在上、Y 在左。Xbox 和 PlayStation："
+                                "按标注，A 在下、B 在右、X 在左、Y 在上（PlayStation 手柄上为叉、圆圈、方块和三角）。自动："
+                                "Nintendo 标注的手柄用 Nintendo，其他手柄按标注。",
     [UI_MENU_PAD_LAYOUT_AUTO] = "自动",
     [UI_MENU_PAD_LAYOUT_NINTENDO] = "Nintendo（A 在右）",
     [UI_MENU_PAD_LAYOUT_XBOX] = "Xbox（A 在下）",
+    [UI_MENU_PAD_LAYOUT_PLAYSTATION] = "PlayStation（A 在下）",
     [UI_MENU_PAD_LAYOUT_IN_USE] = "使用中：%s",
     [UI_MENU_GROUP_STICKS] = "摇杆",
     [UI_MENU_LSTICK_DEADZONE] = "左摇杆死区", [UI_MENU_RSTICK_DEADZONE] = "右摇杆死区",
@@ -1926,21 +2121,25 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_HDR_UI] = "HUD 和菜单亮度",
     [UI_MENU_HDR_UI_DESC] = "界面和本菜单的亮度（尼特）。",
     [UI_MENU_PROMPTS] = "按键提示",
-    [UI_MENU_PROMPTS_DESC] = "游戏的按键提示显示哪种手柄的按键。Nintendo：游戏原有的提示。Xbox：LB、RB、LT、RT、Menu、View 和十字键，以及上方布局所按下的按键上标注的 "
-                             "A、B、X、Y（使用 Nintendo（A 在右）时右侧按键标为 B，因此 A 的提示显示 "
-                             "B）。PC：键盘默认布局的按键和鼠标按键（E、Shift、空格、左键……），镜头用鼠标。"
-                             "游戏在启动时读取按键提示，因此重启后才会改变。提示属于游戏文件，在“操作”中重新映射的按键在屏幕上仍显示原来的提示。",
+    [UI_MENU_PROMPTS_DESC] = "游戏的按键提示显示哪种按键：包括文字、动作提示和陶笛的音符。Nintendo：游戏原有的提示。"
+                             "Xbox 和 PlayStation：该手柄的按键（LB、RB、LT、RT、Menu、View；L1、R1、L2、R2、Options、Create），"
+                             "A、B、X、Y 显示为上方布局所按下的按键（使用 Nintendo（A 在右）时由右侧按键执行 A，因此 A 的提示显示 B 或圆圈）。"
+                             "键盘和鼠标：每个按键对应的键（E、Ctrl、空格、左键……），WASD 移动，鼠标控制镜头。"
+                             "提示文件由 tools/pad_prompts.py 根据按键图片生成，键位以生成时 nx2navi.ini 中的设置为准。"
+                             "游戏在启动时读取按键提示，因此重启后才会改变。"
+                             "提示属于游戏文件，在“操作”中重新映射的按键在重新生成文件之前仍显示原来的提示。",
     [UI_MENU_PROMPTS_NINTENDO] = "Nintendo",
     [UI_MENU_PROMPTS_XBOX] = "Xbox",
-    [UI_MENU_PROMPTS_PC] = "PC",
+    [UI_MENU_PROMPTS_PLAYSTATION] = "PlayStation",
+    [UI_MENU_PROMPTS_PC] = "键盘和鼠标",
     [UI_MENU_MOUSE_MODE] = "鼠标视角",
     [UI_MENU_MOUSE_MODE_DESC] = "直接：镜头按鼠标移动的距离转动，与电脑游戏相同，没有摇杆死区和响应曲线（游戏 1.4.3；其他版本使用摇杆模拟）。摇杆模拟：鼠标相当于右摇杆。",
     [UI_MENU_MOUSE_STICK] = "摇杆模拟",
     [UI_MENU_MOUSE_DIRECT] = "直接",
     [UI_MENU_MENU_CURSOR] = "在游戏菜单中使用鼠标",
     [UI_MENU_MENU_CURSOR_DESC] = "在游戏自身的菜单中（标题、背包、商店、对话选项）显示指针：指针下的项目被选中，左键确认，右键返回。仅在最后使用的是鼠标或键盘时生效，因此使用手柄时菜单保持不变（游戏 1.4.3）。",
-    [UI_MENU_PROMPTS_MISSING] = "缺少按键提示文件：请重新运行安装程序",
-    [UI_MENU_PROMPTS_FAILED] = "按键提示文件已损坏：请重新运行安装程序",
+    [UI_MENU_PROMPTS_MISSING] = "缺少按键提示文件：请用 tools/pad_prompts.py 生成",
+    [UI_MENU_PROMPTS_FAILED] = "按键提示文件已损坏：请用 tools/pad_prompts.py 重新生成",
     [UI_MENU_PROMPTS_RESTART] = "按键提示重启后生效",
     [UI_MENU_PROMPTS_OFF_SHAPE] = "游戏分辨率不是 16:9 时关闭",
     [UI_MENU_PROMPTS_OFF_MODS] = "已关闭：RomFS 模组替换了它们的文件",
@@ -1960,8 +2159,30 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_WALK_SCALE] = "步行幅度",
     [UI_MENU_WALK_SCALE_DESC] = "按住步行键时键盘摇杆的推动幅度。一半为走路，推满为奔跑。",
     [UI_MENU_OV_SCALE_DOWN] = "双线性（FSR 锐度 0）",
-    [UI_MENU_HDR_HUE] = "高光色调校正",
-    [UI_MENU_HDR_HUE_DESC] = "火焰、火花等明亮色彩像游戏自身的 SDR 画面一样趋向白色，与它们发出的光一致；0 保持完全饱和。",
+    [UI_MENU_HDR_HUE] = "色调校正",
+    [UI_MENU_HDR_HUE_DESC] = "明亮色彩保留色调映射前色调的程度；0 让它们随曲线偏移。",
+    [UI_MENU_HDR_GAMMA] = "伽马校正",
+    [UI_MENU_HDR_GAMMA_DESC] = "按游戏设计时的观看方式，以 2.2 或 BT.1886（2.4）显示器的效果呈现画面；关闭则保留 sRGB 曲线，暗部更亮。",
+    [UI_MENU_HDR_TONEMAP] = "色调映射",
+    [UI_MENU_HDR_TONEMAP_DESC] = "Vanilla：游戏自身的曲线，SDR 亮度。RenoDRT：把游戏的观感延伸到显示器的峰值亮度。",
+    [UI_MENU_HDR_EXPOSURE] = "曝光",
+    [UI_MENU_HDR_EXPOSURE_DESC] = "色调映射前整个画面的亮度；100 % 保持不变。",
+    [UI_MENU_HDR_HIGHLIGHTS] = "高光",
+    [UI_MENU_HDR_HIGHLIGHTS_DESC] = "明亮部分的亮度；50 保持不变。",
+    [UI_MENU_HDR_SHADOWS] = "阴影",
+    [UI_MENU_HDR_SHADOWS_DESC] = "暗部的亮度；50 保持不变。",
+    [UI_MENU_HDR_CONTRAST] = "对比度",
+    [UI_MENU_HDR_CONTRAST_DESC] = "中灰周围的对比度；50 保持不变。",
+    [UI_MENU_HDR_SATURATION] = "饱和度",
+    [UI_MENU_HDR_SATURATION_DESC] = "所有色彩的强度；50 保持不变。",
+    [UI_MENU_HDR_HIGHLIGHT_SAT] = "高光饱和度",
+    [UI_MENU_HDR_HIGHLIGHT_SAT_DESC] = "最亮部分的色彩强度；50 保持不变。",
+    [UI_MENU_HDR_BLOWOUT] = "过曝",
+    [UI_MENU_HDR_BLOWOUT_DESC] = "让最亮的部分趋向白色；0 保留其颜色。",
+    [UI_MENU_HDR_FLARE] = "眩光",
+    [UI_MENU_HDR_FLARE_DESC] = "像少量杂散光一样提亮最暗的部分；0 保持纯黑。",
+    [UI_MENU_HDR_GRADE] = "调色",
+    [UI_MENU_HDR_GRADE_DESC] = "HDR 画面保留游戏自身调色的程度；0 为不含调色的场景。",
     [UI_MENU_SHADOW_SCALE] = "阴影分辨率",
     [UI_MENU_SHADOW_SCALE_DESC] = "让阴影更清晰。越高越吃显卡。",
     [UI_MENU_SHADOW_RANGE] = "阴影级联范围",
@@ -2008,7 +2229,38 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_CHEAT_REBUILD_DESC] = "此金手指修改游戏代码，并且是在游戏构建后新增或修改的。游戏会在下次启动时把它构建进去（几分钟），也可以使用“立即重新构建游戏”。",
     [UI_MENU_CHEAT_UNSUPPORTED] = "不支持",
     [UI_MENU_CHEAT_UNSUPPORTED_DESC] = "此金手指不能用于此游戏版本：",
-    [UI_BOOT_TITLE] = "正在准备着色器", [UI_BOOT_HINT] = "仅在更新或更换显卡驱动后进行一次。",
+    [UI_MENU_SAVES] = "存档",
+    [UI_MENU_SAVE_EXPORT] = "导出存档",
+    [UI_MENU_SAVE_EXPORT_DESC] = "将你的存档（所有存档位）写入“下载”文件夹中的一个 zip 文件，可分享给其他玩家或附在错误报告中。"
+                                 "其中不含你的密钥和游戏文件。",
+    [UI_MENU_SAVE_EXPORT_BUG] = "导出存档用于错误报告",
+    [UI_MENU_SAVE_EXPORT_BUG_DESC] = "同样的 zip，另附本次运行的日志和你的设置（nx2navi.ini），可看出发生了什么以及使用了哪些"
+                                     "设置。请将其附在错误报告中。",
+    [UI_MENU_SAVE_IMPORT] = "导入存档",
+    [UI_MENU_SAVE_IMPORT_DESC] = "选择别人分享的存档（NX2navi-save zip）。它会在下次启动时替换你的存档（所有存档位）：游戏"
+                                 "把进度保存在内存中，若现在替换，游戏会把进度写回并覆盖它。你当前的存档会先复制到 saves "
+                                 "文件夹。",
+    [UI_MENU_SAVE_IMPORT_WAITING] = "下次启动时",
+    [UI_MENU_SAVE_IMPORT_CANCEL] = "取消导入",
+    [UI_MENU_SAVE_IMPORT_CANCEL_DESC] = "保留你的存档不变：丢弃等待下次启动的存档。",
+    [UI_MENU_SAVE_BUSY] = "处理中…",
+    [UI_MENU_SAVE_EXPORTED] = "已保存为 %s",
+    [UI_MENU_SAVE_IMPORT_READY] = "该存档（NX2navi %s）将在下次启动时载入：请选择下方的“重启”。你当前的存档会先复制到 saves "
+                                  "文件夹。",
+    [UI_MENU_SAVE_IMPORT_CANCELLED] = "已取消导入，你的存档保持不变。",
+    [UI_MENU_SAVE_IMPORTED] = "本次启动时已导入分享的存档。你原来的存档在 %s",
+    [UI_MENU_SAVE_IMPORTED_NEW] = "本次启动时已导入分享的存档。",
+    [UI_MENU_SAVE_E_NO_SAVE] = "还没有可导出的存档：请先游玩直到游戏存档。",
+    [UI_MENU_SAVE_E_READ_SAVE] = "无法读取存档文件；请稍后再试。",
+    [UI_MENU_SAVE_E_WRITE] = "无法将 zip 写入 %s。",
+    [UI_MENU_SAVE_E_READ] = "无法读取 %s。",
+    [UI_MENU_SAVE_E_STAGE] = "无法为下次启动准备存档；原因见日志。",
+    [UI_MENU_SAVE_E_NOT_SAVE] = "%s 不是 NX2navi 导出的存档。",
+    [UI_MENU_SAVE_E_OTHER_GAME] = "%s 是其他游戏的存档。",
+    [UI_MENU_SAVE_E_NEWER] = "%s 由更新版本的 NX2navi 制作：请先更新 NX2navi。",
+    [UI_MENU_SAVE_E_DAMAGED] = "%s 已损坏：请重新下载。",
+    [UI_MENU_SAVE_E_UNSAFE] = "%s 被拒绝：其中含有存档以外的文件、链接或过多的数据。",
+    [UI_BOOT_TITLE] = "正在准备着色器",
     [UI_BOOT_STARTING] = "正在启动", [UI_BOOT_SHADERS] = "着色器：%lld / %lld", [UI_BOOT_PIPELINES] = "管线：%lld / %lld",
     [UI_MENU_CHEATS_REBUILD] = "立即重新构建游戏",
     [UI_MENU_CHEATS_REBUILD_DESC] = "有些金手指会修改游戏代码，但尚未构建进游戏：它们是新增或修改的，或上次重新构建失败或被取消。将关闭游戏；安装程序会把它们构建进去（几分钟）并重新启动游戏。上次存档之后的进度会丢失。",

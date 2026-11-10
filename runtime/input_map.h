@@ -82,29 +82,27 @@ int input_map_bind(const char *button, const char *list);
 // Applies the NX2NAVI_BIND_<action> settings (cfg_get) over the defaults: at start, and again when one of them changes.
 void input_map_configure(void);
 
-// The layout for a NX2NAVI_PAD_LAYOUT value: "nintendo" or "xbox" (any case); "xbox_prompts", 0.1.9's name for the Nintendo
-// layout with the Xbox prompts, maps the buttons as "nintendo". Anything else ("auto", NULL) picks Nintendo when the
-// pad's east button is labelled A (a Switch Pro Controller, a GuliKit) and Xbox otherwise.
+// The layout for a NX2NAVI_PAD_LAYOUT value: "nintendo" or "xbox" (any case); "playstation" is the Xbox layout under its
+// PlayStation name (cross A, circle B, square X, triangle Y); "xbox_prompts", 0.1.9's name for the Nintendo layout with
+// the Xbox prompts, maps the buttons as "nintendo". Anything else ("auto", NULL) picks Nintendo when the pad's east
+// button is labelled A (a Switch Pro Controller, a GuliKit) and Xbox otherwise.
 int input_pad_layout_pick(const char *setting, int east_labelled_a);
 
-// Button prompts (NX2NAVI_PROMPTS): the controller whose buttons the game's prompts show. Nintendo: the game's own. Xbox:
-// LB RB LT RT, Menu, View and a d-pad cross for the other buttons, and the face buttons named by the label of the
-// button the pad layout presses (runtime/romfs.c overlay_init, tools/make_romfs_patches.py --prompts). PC: the key or
-// mouse button the keyboard defaults press each button with, the mouse for the right stick. PlayStation: Cross, Circle,
-// Square, Triangle, L1 R1 L2 R2, Options and Create (tools/ocarina_prompts.py), the face buttons named as Xbox's are.
-// Steam Deck: the game's A B X Y named by label as Xbox's are, L1 R1 L2 R2, Menu and View.
-enum { PROMPTS_NINTENDO, PROMPTS_XBOX, PROMPTS_PC, PROMPTS_PLAYSTATION, PROMPTS_STEAMDECK };
-// The prompts for a NX2NAVI_PROMPTS value ("nintendo", "xbox", "pc", "playstation" or "steamdeck", any case). Unset or empty: Xbox
+// Button prompts (NX2NAVI_PROMPTS): the controller whose buttons the game's prompts show. Nintendo: the game's own. Xbox
+// and PlayStation: that pad's buttons (LB RB LT RT, Menu and View; L1 R1 L2 R2, Options and Create), and the face buttons
+// named by the label of the button the pad layout presses (runtime/romfs.c overlay_init, tools/pad_prompts.py). PC:
+// the key or mouse button the keyboard defaults press each button with, the mouse for the right stick.
+enum { PROMPTS_NINTENDO, PROMPTS_XBOX, PROMPTS_PC, PROMPTS_PLAYSTATION };
+// The prompts for a NX2NAVI_PROMPTS value ("nintendo", "xbox", "playstation" or "pc", any case). Unset or empty: Xbox
 // while the pad layout setting is "xbox_prompts", else Nintendo.
 int input_prompts_pick(const char *prompts, const char *pad_layout);
 // The folder next to romfs-index.bin that holds those prompts for a NX2NAVI_PAD_LAYOUT value, NULL for the game's own. The
-// Nintendo layout plays an Xbox pad by position, so its folder names the face buttons the other way round
-// (romfs-patches-xbox: the right button does A and is labelled B); xbox and auto put every Switch button on the button
-// labelled with its letter (auto picks the layout per pad by its labels), so they share romfs-patches-xbox-label. The PC
-// prompts follow no pad: romfs-patches-pc whatever the layout (romfs.c overlay_init serves romfs-patches-pc-<w>x<h>
-// under that name at a game resolution of another shape). The PlayStation prompts pair up as the Xbox ones do:
-// romfs-patches-playstation for the Nintendo layout (A on Circle), romfs-patches-playstation-label for the others;
-// the same for romfs-patches-steamdeck and romfs-patches-steamdeck-label.
+// Nintendo layout plays a pad by position, so its folder names the face buttons the other way round
+// (romfs-patches-xbox: the right button does A and is labelled B; romfs-patches-playstation: it is circle); xbox and
+// auto put every Switch button on the button labelled with its letter, or on cross, circle, square and triangle in
+// that order (auto picks the layout per pad by its labels), so they share romfs-patches-<style>-label. The PC prompts
+// follow no pad: romfs-patches-pc whatever the layout (romfs.c overlay_init serves romfs-patches-pc-<w>x<h> under that
+// name at a game resolution of another shape).
 const char *input_prompts_folder(int prompts, const char *pad_layout);
 // down[pad] != 0 for the gamepad inputs held. Returns the Switch button bits (0..15) the layout's pad table presses.
 uint64_t input_map_pad_buttons(const uint8_t down[PAD_COUNT], int layout);

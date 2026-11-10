@@ -786,8 +786,17 @@ static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx
             static int was_captured;
             static uint8_t mouse_ignore[KEY_COUNT];
             int cap = ikb_captured();
+            // A scan is one key state system call per key (about 95). The game reads several pads in a row: reads
+            // within a millisecond of a scan get its answers again.
+            static uint8_t raw[KEY_COUNT];
+            static uint64_t raw_at;
+            uint64_t now = plat_now_ns();
+            if (!raw_at || now - raw_at >= 1000000) {
+                for (int k = 1; k < KEY_COUNT; k++) raw[k] = (uint8_t)(ikb_down(k) != 0);
+                raw_at = now;
+            }
             for (int k = 1; k < KEY_COUNT; k++) {
-                down[k] = ikb_down(k);
+                down[k] = raw[k];
                 kbm_used |= down[k];
                 if (k < KEY_MOUSE_L || k > KEY_MOUSE_X2) continue;
                 if (cap && !was_captured) mouse_ignore[k] = down[k];

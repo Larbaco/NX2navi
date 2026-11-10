@@ -39,6 +39,9 @@ class Nup:
             magic, _a, _b, toc_off, toc_size, toc_sha, _blob, _size, _count, _z, _uid, _zeros = SUPER.unpack(head)
             if magic != b'NUP\x01':
                 raise NupError(f'not a .nup file (magic {magic!r})')
+            end = f.seek(0, 2)
+            if toc_off > end or toc_size > end - toc_off:   # read no more than the file holds, whatever the header says
+                raise NupError('the table of contents is damaged (it lies past the end of the file)')
             f.seek(toc_off)
             toc = f.read(toc_size)
         if len(toc) != toc_size or hashlib.sha256(toc).digest() != toc_sha:

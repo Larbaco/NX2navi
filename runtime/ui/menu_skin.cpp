@@ -461,12 +461,11 @@ bool skin_tab_item(const char *id, const char *text, int flags, float s, ImFont 
 }
 
 void skin_boot_panel(ImDrawList *dl, ImFont *head, float head_px, ImFont *body, float body_px, const char *title,
-                     const char *step, const char *hint, float frac, float sweep, float w, float h, float s) {
+                     const char *step, float frac, float sweep, float w, float h, float s) {
     const float pad = 38 * s, gap = 16 * s, bar_h = 12 * s, fh = skin_filigree_height(s);
-    ImVec2 ts = head->CalcTextSizeA(head_px, FLT_MAX, 0, title), ss = body->CalcTextSizeA(body_px, FLT_MAX, 0, step),
-           hs = body->CalcTextSizeA(body_px * 0.8f, FLT_MAX, 0, hint);
-    float pw = fminf(fmaxf(fmaxf(fmaxf(ts.x, hs.x), ss.x), 560 * s) + pad * 2, w - 24 * s);
-    float ph = pad + ts.y + fh + gap * 0.4f + ss.y + gap * 0.7f + bar_h + gap * 1.4f + hs.y + pad;
+    ImVec2 ts = head->CalcTextSizeA(head_px, FLT_MAX, 0, title), ss = body->CalcTextSizeA(body_px, FLT_MAX, 0, step);
+    float pw = fminf(fmaxf(fmaxf(ts.x, ss.x), 560 * s) + pad * 2, w - 24 * s);
+    float ph = pad + ts.y + fh + gap * 0.4f + ss.y + gap * 0.7f + bar_h + pad;
     ImVec2 a(floorf((w - pw) / 2), floorf((h - ph) / 2)), b(a.x + pw, a.y + ph);
     skin_panel(dl, a, b, s);
     float y = a.y + pad;
@@ -493,6 +492,4 @@ void skin_boot_panel(ImDrawList *dl, ImFont *head, float head_px, ImFont *body, 
         fill(x0 + run * at, x0 + run * at + span);
     }
     dl->AddRect(ba, bb, rgba(110, 90, 58, 1), 2 * s, 0, 1.3f * s);
-    y += bar_h + gap * 1.4f;
-    dl->AddText(body, body_px * 0.8f, ImVec2(floorf((w - hs.x) / 2), y), rgba(214, 198, 166, 0.85f), hint);
 }

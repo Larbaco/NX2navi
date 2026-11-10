@@ -11,6 +11,7 @@
 #include "audren.h"
 #include "host.h"
 #include "ipc.h"
+#include "ov.h"
 #include "nfp.h"
 #include "platform/platform.h"
 
@@ -117,14 +118,14 @@ static void applet_stub_handler(IpcSession *s, const IpcRequest *rq, IpcResponse
         rs->result = AM_R_NO_MESSAGES;
         return;
     }
-    if (common && rq->cmd == 5) {              // GetOperationMode: docked (matches the oe override)
-        uint8_t mode = 1;
+    if (common && rq->cmd == 5) {              // GetOperationMode (matches the oe override)
+        uint8_t mode = !ov_handheld();
         IPC_OUT(rs, mode);
         rs->result = 0;
         return;
     }
-    if (common && rq->cmd == 6) {              // GetPerformanceMode: boost (docked)
-        uint32_t mode = 1;
+    if (common && rq->cmd == 6) {              // GetPerformanceMode: boost when docked
+        uint32_t mode = !ov_handheld();
         IPC_OUT(rs, mode);
         rs->result = 0;
         return;

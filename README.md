@@ -2,6 +2,8 @@
 
 # NX2navi
 
+**Join the official NX2navi update discord server: https://discord.com/invite/uf6gSrsPpq** 
+
 **NX2navi** is a static recompilation of *The Legend of Zelda: Ocarina of Time* for Nintendo Switch 2 (game
 version 1.1.1) into a native x86-64 application for Windows, with a Vulkan renderer
 ([docs/architecture.md](docs/architecture.md)).
@@ -25,21 +27,33 @@ Report problems as issues, following [CONTRIBUTING.md](CONTRIBUTING.md).
 - Native code, not emulation
 - 60 fps by default, or a limit of 30 to 240 fps, the display's refresh rate or unlimited
 - Native widescreen and ultrawide (the window's shape, 21:9 or 32:9) with the HUD, menus and movies kept 16:9
-- Resolutions above the game's 1440p: 1800p, 4K, 5K or the window's own size, sharp on high-DPI displays
+- Game resolutions from 1080p to above the game's 1440p: 1800p, 4K, 5K or the window's own size, sharp on high-DPI
+  displays
 - Upscaling and anti-aliasing: NVIDIA DLSS (DLAA, Quality, Balanced, Performance, Ultra Performance; RTX GPUs) or
   AMD FSR 3.1 (Native AA and the same modes; any GPU), which render the 3D scene at the mode's share and keep the HUD
   sharp; or AMD FSR 1 or bilinear scaling to the window, with a sharpness setting; black bars or stretch
-- Frame generation with AMD FSR 3.1 (any GPU): a generated frame between every two the game draws, with the HUD kept
-  out of it, for about twice the frame rate on a fast display; in a window of another shape than the picture, frames
-  are generated inside the picture only, so the black bars stay clean
-- HDR on HDR displays: the game's own native HDR, or an enhanced HDR made from its SDR picture
-- Every shader prepared when the game is built, and the pipelines met in play built again in the background at each
-  start, so play does not stop to compile them; a draw that must wait for its pipeline has it built on worker
-  threads, never on the game's drawing thread
+- Frame generation: NVIDIA DLSS Frame Generation (RTX 40 and 50 GPUs, paced with Reflex) at 2x, or 3x and 4x on RTX 50
+  GPUs (one, two or three generated frames for every frame the game draws), or AMD FSR 3.1 (any GPU), a generated
+  frame between every two the game draws, with the HUD kept out of it, for about twice the frame rate on a fast
+  display; in a window of another shape than the picture, frames are generated inside the picture only, so the black
+  bars stay clean. With frame generation on, the frame limit counts the frames on screen, and with no limit chosen
+  it is the display's refresh rate. The frame limit can also be
+  handed to RivaTuner Statistics Server
+- HDR on HDR displays: the game's own native HDR, or its SDR picture tone mapped to the display's peak, with exposure, highlights, shadows, contrast, saturation and gamma in the menu
+- The game's known shaders prepared when the game is built, and the pipelines met in play built again in the
+  background at each start, so play rarely stops to compile them; a shader or pipeline met for the first time can
+  still hold a frame, and a draw that must wait for its pipeline has it built on worker threads, never on the game's
+  drawing thread
 - In-game settings menu (F1, or Minus and Plus together on a gamepad) and performance overlay (F10)
-- Keyboard, mouse and gamepads with remapping, Nintendo or Xbox button layout, rumble and gyro; the game follows
-  whichever connected gamepad you press
-- Stereo or 5.1 surround sound output
+- Keyboard, mouse and gamepads with remapping, Nintendo, Xbox or PlayStation button layout, rumble and gyro; the game
+  follows whichever connected gamepad you press, and DualShock 3 controllers are read directly when enabled
+- Xbox, PlayStation and keyboard and mouse button prompts in the game's own text, drawn on your PC when the game is
+  built; the keyboard prompts follow your key bindings
+- Stereo or 5.1 surround sound output, on the output device of your choice; the default microphone for the game's
+  microphone input
+- The monitor the game opens on, straight in fullscreen when fullscreen is on
+- Your Discord status shows "Playing NX2navi" with the play time (on by default; the Game tab of the menu or the
+  launcher's Settings turns it off)
 - Docked or handheld console mode
 - The game's textures stay compressed (BC3, about half the video memory at the same speed) unless the PC has 20 GiB of
   video memory and 48 GiB of RAM, as Windows counts video memory against the system's commit limit
@@ -62,8 +76,9 @@ and `VK_EXT_mesh_shader`. The setup is not signed, so SmartScreen warns on its f
 
 - The first start after an install or update, and the first visit to an area, can pause briefly while the graphics
   driver builds what it has not seen; later starts are smooth.
+- Machines with 16 GB of RAM can run out of system memory in Hyrule Field.
+- Integrated AMD GPUs can fail at the title screen (their host memory heap is too small for the game's memory).
 - A rare crash in the game's particle code.
-- DLSS Frame Generation is not offered yet: AMD FSR 3.1 frame generation works on every GPU, NVIDIA's included.
 
 ## License
 
@@ -77,5 +92,7 @@ of Zelda*, *Ocarina of Time* and *Nintendo Switch* are trademarks of Nintendo.
 
 ## Building from source
 
-[docs/building.md](docs/building.md) lists the toolchain and the steps. Everything the build writes stays under
+[docs/building.md](docs/building.md) lists the toolchain and the steps. `tools/make_game.py` also builds the game
+natively on Linux ([docs/README-BuildKit.md](docs/README-BuildKit.md), "Linux"); the launcher and the setup are
+Windows only. Everything the build writes stays under
 `build\` and `generated\`, which git ignores; run `tools/check_content.py` before a commit.

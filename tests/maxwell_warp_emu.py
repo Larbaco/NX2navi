@@ -703,6 +703,16 @@ def op_f2f_r(w, i, m):            # InstEmitConversion F2fR / EmitF2F
         w.W(i.rd, pack_half(x, zero), m, halves=(x, zero))
 
 
+def op_mufu(w, i, m):             # InstEmitMultifunction Mufu: FPAbsNeg of Ra, the function in F32, FPSaturate
+    fn = {2: np.exp2, 3: np.log2, 4: lambda v: F32(1) / v, 5: lambda v: F32(1) / np.sqrt(v), 8: np.sqrt}.get(i.bits(20, 4))
+    if fn is None:
+        raise Unsupported(f"MUFU operation {i.bits(20, 4)} {i}")
+    x = abs_neg(as_f32(w.R(i.ra)), i.bit(46), i.bit(48))
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        r = fn(x).astype(F32)
+    w.W(i.rd, from_f32(saturate(r) if i.bit(50) else r), m)
+
+
 def _ffma(w, i, m, a, b, c, neg_b, neg_c, sat):   # EmitFfma (rounding mode and FMZ ignored)
     r = fma_f32(as_f32(a), abs_neg(as_f32(b), False, neg_b), abs_neg(as_f32(c), False, neg_c))
     w.W(i.rd, from_f32(saturate(r) if sat else r), m)
@@ -926,6 +936,7 @@ TABLE = [
     ("1110111101000xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "LDL", op_ldl),
     ("1110111101010xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "STL", op_stl),
     ("0101110010101xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "F2F", op_f2f_r),
+    ("0101000010000xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "MUFU", op_mufu),
     ("010110011xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "FFMA", op_ffma_r),
     ("0011001x1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "FFMA.I", op_ffma_i),
     ("000011xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "FFMA32I", op_ffma32i),

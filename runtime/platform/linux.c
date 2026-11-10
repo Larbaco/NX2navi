@@ -1,8 +1,6 @@
 // Linux implementation of platform.h: pthreads, CLOCK_MONOTONIC, futex locks and condition variables, POSIX files,
 // /proc and sysfs for the load counters, posix_spawn for child processes.
 #define _GNU_SOURCE
-#define UNW_LOCAL_ONLY
-#include <libunwind.h>
 #include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -34,6 +32,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <unwind.h>
 
 #include <SDL3/SDL_clipboard.h>
 
@@ -315,7 +314,7 @@ __asm__(".text\n"
         ".type plat_fiber_entry, @function\n"
         ".p2align 4\n"
         "plat_fiber_entry:\n"
-        "    andq $-16, %rsp\n"   /* reached by ret, not call: align for the call (local fix) */
+        "    andq $-16, %rsp\n"   // fiber_swap's ret leaves rsp 8 off: the SysV ABI wants it aligned at the call
         "    movq %r13, %rdi\n"
         "    callq *%r12\n"
         "    ud2\n"
@@ -392,6 +391,29 @@ int plat_thread_join_ns(PlatThread *t, uint64_t ns) {
 
 // The thread keeps using t->fn and t->arg, so the struct stays allocated (a few bytes per detached thread).
 void plat_thread_detach(PlatThread *t) { pthread_detach(t->t); }
+
+// The calling thread gets the last processor of its affinity mask to itself: every other thread of the process now
+// running loses that processor (threads they start later inherit their masks), and the caller keeps only it. Returns
+// 1, or 0 when the mask has fewer than three processors or the caller's mask cannot be set.
+int plat_cpu_reserve(void) {
+    cpu_set_t all, mine, rest;
+    if (sched_getaffinity(0, sizeof all, &all) || CPU_COUNT(&all) < 3) return 0;
+    int last = -1;
+    for (int i = CPU_SETSIZE - 1; i >= 0 && last < 0; i--)
+        if (CPU_ISSET(i, &all)) last = i;
+    rest = all;
+    CPU_CLR(last, &rest);
+    CPU_ZERO(&mine);
+    CPU_SET(last, &mine);
+    pid_t me = (pid_t)syscall(SYS_gettid);
+    DIR *d = opendir("/proc/self/task");
+    for (struct dirent *e; d && (e = readdir(d));) {
+        pid_t tid = (pid_t)atoi(e->d_name);
+        if (tid > 0 && tid != me) sched_setaffinity(tid, sizeof rest, &rest);
+    }
+    if (d) closedir(d);
+    return sched_setaffinity(0, sizeof mine, &mine) == 0;
+}
 
 uint64_t plat_thread_affinity(PlatThread *t, uint64_t mask) {
     pthread_t th = t ? t->t : pthread_self();
@@ -541,6 +563,10 @@ int plat_mutex_trylock(PlatMutex *m) {
         if (__atomic_compare_exchange_n(w, &s, s | LK_W, 1, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return 1;
     return 0;
 }
+
+// Lock-wait timing is Windows only (platform.h): here the note is kept and never called.
+void plat_lock_timing(PlatLockNote fn) { (void)fn; }
+void plat_mutex_lock_at(PlatMutex *m, void *site) { (void)site; plat_mutex_lock(m); }
 
 void plat_mutex_lock(PlatMutex *m) {
     volatile uint32_t *w = lk(m);
@@ -729,9 +755,9 @@ static void sync_dir_of(const char *path) {
     }
 }
 
-int plat_file_replace(const char *from, const char *to) {
+int plat_file_replace(const char *from, const char *to, int durable) {
     if (rename(from, to)) return 0;
-    sync_dir_of(to);
+    if (durable) sync_dir_of(to);
     return 1;
 }
 
@@ -778,7 +804,8 @@ void plat_unlock_file(const char *path) {
     plat_mutex_unlock(&lock_lock);
 }
 
-int plat_file_write_atomic(const char *path, const void *data, size_t n) {
+// path.<pid>.<tid>.tmp renamed over path; durable: the file and then its folder are synced to the disk.
+static int write_swap(const char *path, const void *data, size_t n, int durable) {
     // A rename replaces a read-only file here (only the folder's permission counts) but not on Windows: a file the
     // player made read-only stays as it is on both.
     if (access(path, W_OK) && errno != ENOENT) return 0;
@@ -787,15 +814,19 @@ int plat_file_write_atomic(const char *path, const void *data, size_t n) {
     if (len < 0 || len >= (int)sizeof tmp) return 0;
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0) return 0;
-    int ok = write_all(fd, data, n) && fsync(fd) == 0;
+    int ok = write_all(fd, data, n) && (!durable || fsync(fd) == 0);
     ok = close(fd) == 0 && ok;
     if (ok && !rename(tmp, path)) {
-        sync_dir_of(path);
+        if (durable) sync_dir_of(path);
         return 1;
     }
     unlink(tmp);
     return 0;
 }
+
+int plat_file_write_atomic(const char *path, const void *data, size_t n) { return write_swap(path, data, n, 1); }
+
+int plat_file_write_cached(const char *path, const void *data, size_t n) { return write_swap(path, data, n, 0); }
 
 int plat_file_flush(const char *path) {
     int fd = open(path, O_WRONLY | O_CLOEXEC);
@@ -975,11 +1006,15 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
 // SDL), then goes to the crash hook (main.c), which reports it and ends the process. Without a crash hook the fault
 // gets the default action. Runs on the thread's signal stack.
 static int (*fault_hook)(uint64_t addr);
+static int (*access_hook)(uint64_t addr, int write, uint64_t ip);   // every read or write fault, before fault_hook
 static void (*crash_fn)(const PlatCrash *c);
 
 static void fault_handler(int sig, siginfo_t *si, void *uc) {
     ucontext_t *u = uc;
     long err = u->uc_mcontext.gregs[REG_ERR];
+    if (sig == SIGSEGV && access_hook && !(err & 16) &&
+        access_hook((uint64_t)(uintptr_t)si->si_addr, (err & 2) != 0, (uint64_t)u->uc_mcontext.gregs[REG_RIP]))
+        return;
     if (sig == SIGSEGV && fault_hook && (err & 2) && fault_hook((uint64_t)(uintptr_t)si->si_addr)) return;
     uintptr_t rip = (uintptr_t)u->uc_mcontext.gregs[REG_RIP];
     Dl_info at, self;
@@ -1019,41 +1054,40 @@ void plat_mem_fault_hook(int (*fn)(uint64_t addr)) {
     fault_install();
 }
 
-void plat_crash_context(const char *s) { (void)s; }   // the Windows crash notes only
-
-// Local Linux port of win32.c's plat_frame_capture, walking the host stack with libunwind (the .eh_frame of the
-// lifted code). The System V ABI keeps rbx, rbp, r12-r15, rsp, MXCSR's control bits and the x87 control word.
-int plat_frame_capture(PlatJmp *out, int (*want)(uintptr_t rip, void *arg), void *arg) {
-    unw_context_t uc;
-    unw_cursor_t cur;
-    if (unw_getcontext(&uc) || unw_init_local(&cur, &uc)) return 0;
-    for (int i = 0; i < 256 && unw_step(&cur) > 0; i++) {
-        unw_word_t ip = 0;
-        if (unw_get_reg(&cur, UNW_REG_IP, &ip) || !ip) return 0;
-        if (!want((uintptr_t)ip, arg)) continue;
-        static const int regs[6] = {UNW_X86_64_RBX, UNW_X86_64_RBP, UNW_X86_64_R12, UNW_X86_64_R13, UNW_X86_64_R14,
-                                    UNW_X86_64_R15};
-        for (int k = 0; k < 6; k++) {
-            unw_word_t v = 0;
-            if (unw_get_reg(&cur, regs[k], &v)) return 0;
-            out->f.gpr[k] = v;
-        }
-        unw_word_t sp = 0;
-        if (unw_get_reg(&cur, UNW_REG_SP, &sp)) return 0;
-        out->f.gpr[6] = sp, out->f.gpr[7] = ip;
-        uint16_t cw;
-        __asm__ volatile("stmxcsr %0\n\tfnstcw %1" : "=m"(out->f.mxcsr), "=m"(cw));
-        out->f.fpcw = cw;
-        return 1;
-    }
-    return 0;
+void plat_mem_access_hook(int (*fn)(uint64_t addr, int write, uint64_t ip)) {
+    access_hook = fn;
+    fault_install();
 }
 
+void plat_crash_context(const char *s) { (void)s; }   // the Windows crash notes only
+int plat_crash_filter_reassert(char *who, size_t n) { (void)who, (void)n; return 0; }   // Windows only
+
+// plat_jmp_save / plat_jmp_go (platform.h): leaf code that does not move rsp before it leaves, as on Windows.
+_Static_assert(sizeof(PlatJmp) == 72 && __builtin_offsetof(PlatJmp, mxcsr) == 64, "plat_jmp_save layout");
 __asm__(".text\n"
-        ".globl plat_frame_go_regs\n"
-        ".type plat_frame_go_regs, @function\n"
+        ".globl plat_jmp_save\n"
+        ".type plat_jmp_save, @function\n"
         ".p2align 4\n"
-        "plat_frame_go_regs:\n"
+        "plat_jmp_save:\n"
+        "    movq %rbx, 0(%rdi)\n"
+        "    movq %rbp, 8(%rdi)\n"
+        "    movq %r12, 16(%rdi)\n"
+        "    movq %r13, 24(%rdi)\n"
+        "    movq %r14, 32(%rdi)\n"
+        "    movq %r15, 40(%rdi)\n"
+        "    leaq 8(%rsp), %rdx\n"   // the caller's rsp after this call returns
+        "    movq %rdx, 48(%rdi)\n"
+        "    movq (%rsp), %rdx\n"
+        "    movq %rdx, 56(%rdi)\n"
+        "    stmxcsr 64(%rdi)\n"
+        "    fnstcw 68(%rdi)\n"
+        "    xorl %eax, %eax\n"
+        "    ret\n"
+        ".size plat_jmp_save, .-plat_jmp_save\n"
+        ".globl plat_jmp_go\n"
+        ".type plat_jmp_go, @function\n"
+        ".p2align 4\n"
+        "plat_jmp_go:\n"
         "    movq 0(%rdi), %rbx\n"
         "    movq 8(%rdi), %rbp\n"
         "    movq 16(%rdi), %r12\n"
@@ -1065,7 +1099,38 @@ __asm__(".text\n"
         "    movq 48(%rdi), %rsp\n"
         "    movl $1, %eax\n"
         "    jmpq *56(%rdi)\n"
-        ".size plat_frame_go_regs, .-plat_frame_go_regs\n");
+        ".size plat_jmp_go, .-plat_jmp_go\n");
+
+// The DWARF unwinder of libgcc (already linked for C++), frame by frame from plat_frame_capture's caller. In each
+// frame's callback the IP is its return address, the callee-saved registers are as that frame sees them, and
+// _Unwind_GetCFA is its rsp once the call returns (libgcc's context holds the CFA of the frame just unwound).
+typedef struct {
+    PlatJmp *out;
+    int (*want)(uintptr_t rip, void *arg);
+    void *arg;
+    int n, found;
+} FrameWalk;
+
+static _Unwind_Reason_Code frame_step(struct _Unwind_Context *ctx, void *p) {
+    FrameWalk *w = p;
+    uintptr_t ip = _Unwind_GetIP(ctx), sp = _Unwind_GetCFA(ctx);
+    if (w->n++ == 0) return _URC_NO_REASON;   // plat_frame_capture itself
+    if (!ip || w->n > 256) return _URC_END_OF_STACK;
+    if (!w->want(ip, w->arg)) return _URC_NO_REASON;
+    PlatJmp *o = w->out;
+    o->gpr[0] = _Unwind_GetGR(ctx, 3), o->gpr[1] = _Unwind_GetGR(ctx, 6);   // DWARF rbx, rbp
+    for (int r = 12; r <= 15; r++) o->gpr[2 + r - 12] = _Unwind_GetGR(ctx, r);
+    o->gpr[6] = sp, o->gpr[7] = ip;
+    __asm__ volatile("stmxcsr %0\n\tfnstcw %1" : "=m"(o->mxcsr), "=m"(o->fpcw));
+    w->found = 1;
+    return _URC_END_OF_STACK;
+}
+
+__attribute__((noinline)) int plat_frame_capture(PlatJmp *out, int (*want)(uintptr_t rip, void *arg), void *arg) {
+    FrameWalk w = {out, want, arg, 0, 0};
+    _Unwind_Backtrace(frame_step, &w);
+    return w.found;
+}
 
 void plat_crash_hook(void (*fn)(const PlatCrash *c)) {
     crash_fn = fn;
@@ -1778,6 +1843,10 @@ void plat_child_stop(PlatChild *c) {
     kill(c->pid, SIGKILL);
     waitpid(c->pid, NULL, 0);
     free(c);
+}
+
+void plat_child_lower(PlatChild *c) {   // a higher nice value needs no privilege
+    if (c) setpriority(PRIO_PROCESS, (id_t)c->pid, 19);
 }
 
 // A child that died makes the write fail with EPIPE; SIGPIPE is ignored for the process (main.c), as Windows has none.

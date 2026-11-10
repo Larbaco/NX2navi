@@ -103,10 +103,12 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
                           uint64_t value) {
     static volatile int32_t n_skipped;
     vk_exec_frame_log(t, frame);
+    dynres_frame();   // before vk_dlaa_frame reads the DLSS mode it may override
     vk_dlaa_frame();
     vk_mvsurvey_frame();
     vk_mvprev_frame();
     vk_mem_census(frame);
+    vk_gpu_passes_frame(frame);
     if (vk_dump_armed) vk_dump_present(frame);
     __atomic_store_n(&gfx_counters.validation_errors, (uint64_t)vk_validation_errors_total(), __ATOMIC_RELAXED);
     const VkTexImage *img = vk_texture_get(t);
@@ -193,11 +195,76 @@ uint64_t gfx_replayed_submits(void) {
     return v;
 }
 
+// ---- a present that waits for held work (event order, vk_exec.c)
+// On the console a present is queued behind its queue's work and goes out once the GPU has run the frame, including
+// work that waited for an event. The replay holds such work (vk_exec.c, "event order across the game's queues") until
+// the wait holds, and the present went out at once: in Kokiri Forest dialogue (Saria), several presents a second came
+// with the frame's whole submission held (4 held submissions, nothing drawn since the last present) and showed the
+// picture from before, a flash of the whole picture; the frame was then drawn after its present, in the present
+// thread's empty submission, next to the following frame. So with work held at a present, what can go on now goes
+// first, in a submission of its own (held_resume); if work is still held, the present waits and goes out right after
+// the submission that replays the last of it, at the next present, or after PH_MAX submissions at the latest. Only with
+// the replay on the submitting thread, as the event order. NX2NAVI_PRESENT_HELD=0: every present goes out at once.
+#define PH_MAX 8
+static struct {
+    int on;                      // a present waits
+    const tex_t *t;
+    int crop[4], has_crop;
+    uint64_t at_ns, queued, frame, since;   // since: vk_exec_submit_seq when it began to wait
+    uint64_t waited, ran, after, capped, next, logged;   // presents that waited; held work run first at a present;
+                                                         // presents out after the held work, at PH_MAX, at the next present
+} PH;
+
+static int present_held_on(void) {
+    static int on = -1;
+    if (on < 0) on = !gfx_replay_async() && rt_knob("PRESENT_HELD", "1");
+    return on;
+}
+
+static uint64_t submit_sync(const uint64_t *handles, int n);
+
+// The held work that can go on now, in a submission of its own (vk_exec_record syncs it like any other: held_sync).
+// The present thread first finishes what it was handed: its empty submission replays held work and frees what it
+// replayed (vk_exec_record), which this walk reads. A present ph_flush handed it a moment ago is such a case.
+static int held_resume(void) {
+    vk_present_drain();
+    if (!vk_exec_held() || !vk_exec_held_ready()) return 0;
+    submit_sync(NULL, 0);
+    PH.ran++;
+    return 1;
+}
+
+static void ph_flush(uint64_t *why) {
+    if (!PH.on) return;
+    PH.on = 0, (*why)++;
+    if (PH.logged < 16)
+        PH.logged++, rt_log("vk: the present of frame %llu went out %llu submission(s) after the game's present call, %d "
+                            "held submissions left (%s)", (unsigned long long)PH.frame,
+                            (unsigned long long)(vk_exec_submit_seq - PH.since), vk_exec_held(),
+                            why == &PH.after ? "the held work was replayed" : why == &PH.capped ? "PH_MAX reached"
+                                                                                         : "the next present came");
+    present_image(PH.t, PH.has_crop ? PH.crop : NULL, PH.at_ns, PH.queued, PH.frame, 0);
+    if (PH.waited % 600 == 0)
+        rt_log("vk: presents that waited for held work: %llu (held work run at the present %llu times; out after it %llu, "
+               "at %d submissions %llu, at the next present %llu)", (unsigned long long)PH.waited,
+               (unsigned long long)PH.ran, (unsigned long long)PH.after, PH_MAX, (unsigned long long)PH.capped,
+               (unsigned long long)PH.next);
+}
+
 static uint64_t submit_sync(const uint64_t *handles, int n) {
     vk_sync_start();
+    if (PH.on && n) {   // a present waits: what can go on goes first, then the present, then this submission
+        held_resume();
+        if (!vk_exec_held()) ph_flush(&PH.after);
+    }
     vk_present_drain();
     vk_texture_new_submit();
-    return vk_sync_submit(handles, n);
+    uint64_t f = vk_sync_submit(handles, n);
+    if (PH.on && n) {
+        if (!vk_exec_held()) ph_flush(&PH.after);
+        else if (vk_exec_submit_seq - PH.since >= PH_MAX) ph_flush(&PH.capped);
+    }
+    return f;
 }
 
 static void replay_main(void *arg) {
@@ -335,7 +402,19 @@ static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
         uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
         vk_dlssg_submitted(frame);
         perf_present(frame);   // before vk_exec_frame_log, which resets the frame's exec counts the flight recorder reads
-        present_image(t, crop, at_ns, kern_now_ns(), frame, 0);
+        uint64_t queued = kern_now_ns();
+        if (present_held_on()) {   // present_held
+            vk_present_drain();    // the present thread's empty submission may run held work: done before it is read
+            if (PH.on) held_resume(), ph_flush(&PH.next);   // the last present still waits: out now
+            if (vk_exec_held()) held_resume();
+            if (vk_exec_held()) {
+                PH.on = 1, PH.t = t, PH.has_crop = crop != NULL, PH.at_ns = at_ns, PH.queued = queued, PH.frame = frame;
+                if (crop) memcpy(PH.crop, crop, sizeof PH.crop);
+                PH.since = vk_exec_submit_seq, PH.waited++;
+                return;
+            }
+        }
+        present_image(t, crop, at_ns, queued, frame, 0);
         return;
     }
     // Frame bound: the replay thread handled the previous present before this one is queued.

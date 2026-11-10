@@ -80,7 +80,7 @@ static int api_load(void) {
 static char found_path[PATH_MAX_LEN];     // written by the scan thread, then found set; read by the poll
 static volatile int32_t found;            // found_path holds a controller
 static volatile int32_t open_now;         // the poll holds a controller open: the scan rests
-static volatile int32_t scan_on;          // NX2NAVI_DS3 is on: the scan runs
+static volatile int32_t scan_on;          // NX2NAVI_DS3 is on (default off): the scan runs
 static volatile int32_t scan_started;
 
 // The path of the first DualShock 3 among the HID devices that are present, copied into out; 0 when there is none.
@@ -266,8 +266,7 @@ int ds3_read(uint8_t pd[PAD_COUNT], int32_t raw[4]) {
     unsigned ver = cfg_version();
     if (ver != seen) {   // live: the setting is read again when one changed
         seen = ver;
-        const char *e = cfg_get("NX2NAVI_DS3");
-        int on = !(e && !strcmp(e, "0"));
+        int on = cfg_bool("NX2NAVI_DS3");   // off by default (cfg.c metas): the reader opens the pad read-write
         if (!on && s.h) drop("closed (ds3 = 0)");
         plat_xchg32(&scan_on, on);
     }

@@ -4,15 +4,29 @@
 
 // ---- recursive mutex: owner is the holder's thread id (0 when free); only the holder writes depth.
 
-void plat_rmutex_lock(PlatRMutex *m) {
+void plat_rmutex_lock_at(PlatRMutex *m, void *site) {
     uint32_t me = plat_thread_id();
     if (__atomic_load_n(&m->owner, __ATOMIC_RELAXED) == me) {
         m->depth++;
         return;
     }
-    plat_mutex_lock(&m->m);
+    plat_mutex_lock_at(&m->m, site);
     __atomic_store_n(&m->owner, me, __ATOMIC_RELAXED);
     m->depth = 1;
+}
+
+void plat_rmutex_lock(PlatRMutex *m) { plat_rmutex_lock_at(m, __builtin_return_address(0)); }
+
+int plat_rmutex_trylock(PlatRMutex *m) {
+    uint32_t me = plat_thread_id();
+    if (__atomic_load_n(&m->owner, __ATOMIC_RELAXED) == me) {
+        m->depth++;
+        return 1;
+    }
+    if (!plat_mutex_trylock(&m->m)) return 0;
+    __atomic_store_n(&m->owner, me, __ATOMIC_RELAXED);
+    m->depth = 1;
+    return 1;
 }
 
 void plat_rmutex_unlock(PlatRMutex *m) {

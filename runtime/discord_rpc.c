@@ -1,10 +1,11 @@
 // Discord Rich Presence: "Playing NX2navi" with the elapsed play time in the player's Discord status, through
 // the local IPC of a running Discord client (platform.h's plat_ipc_*). Nothing leaves the machine but the activity
-// itself, and nothing is sent while NX2NAVI_DISCORD_RPC is off (the default: the status is information about the
-// player's session). NX2NAVI_DISCORD_APP_ID names the application whose name ("Playing <name>") and artwork Discord
-// shows, NX2NAVI_DISCORD_IMAGE the key of its uploaded art asset; both default to discord_app.h, the one place the
-// NX2navi application's id is written, and nx2navi.ini's discord_app_id and discord_image override them. With no
-// application id at all the thread stays idle and logs that once: there is nothing to show the status under.
+// itself, and nothing is sent while NX2NAVI_DISCORD_RPC is off (it is on by default, and does nothing without a
+// Discord client running on the same PC). NX2NAVI_DISCORD_APP_ID names the application whose name ("Playing <name>")
+// and artwork Discord shows, NX2NAVI_DISCORD_IMAGE the key of its uploaded art asset; both default to discord_app.h,
+// the one place the NX2navi application's id is written, and nx2navi.ini's discord_app_id and discord_image override
+// them. With no application id at all the thread stays idle and logs that once: there is nothing to show the status
+// under.
 //
 // One host thread owns the connection and never holds a virtual core (kernel.c: host work runs without one). It
 // re-reads the settings when cfg_version changes (a menu change reaches it within half a second), connects to the

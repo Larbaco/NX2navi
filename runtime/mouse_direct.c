@@ -172,7 +172,7 @@ static void camera_input(Cpu *c) {
         float ratio = 1;
         if (frame_step_realtime()) memcpy(&ratio, rt_patch_page(), sizeof ratio);
         else {
-            double hz = frame_step_limit_hz();
+            double hz = frame_step_game_hz();   // frame generation's frames are not the game's
             if (hz > 0) ratio = (float)(30 / hz);
         }
         if (isfinite(ratio) && ratio > 0 && sensitivity > 0 && (dx || dy)) {

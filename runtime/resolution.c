@@ -208,9 +208,9 @@ static int u32_at(const Byml *b, size_t off, uint32_t *v) {
 static const char *key_name(const Byml *b, uint32_t k) {
     uint32_t head, at;
     if (!u32_at(b, b->keys, &head) || (head & 0xff) != 0xc2 || k >= head >> 8 || !u32_at(b, b->keys + 4 + 4 * k, &at) ||
-        b->keys + at >= b->n || !memchr(b->p + b->keys + at, 0, b->n - b->keys - at))
-        return NULL;
-    return (const char *)b->p + b->keys + at;
+        (size_t)b->keys + at >= b->n || !memchr(b->p + (size_t)b->keys + at, 0, b->n - ((size_t)b->keys + at)))
+        return NULL;   // in size_t: a mod's table offset near 2^32 would wrap the 32-bit sum below n
+    return (const char *)b->p + (size_t)b->keys + at;
 }
 
 // The offset of the value of hash node `node`'s entry `name`, which must have type `type`; 0 when there is none.

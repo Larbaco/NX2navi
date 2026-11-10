@@ -76,15 +76,19 @@ static void outer_size(HWND h, int cw, int ch, int *ow, int *oh) {
     outer_size_at(cw, ch, h ? GetDpiForWindow(h) : GetDpiForSystem(), ow, oh);
 }
 
-// The client size cw x ch scaled down, in its own proportions, so the whole window fits the primary monitor's work
-// area, where CW_USEDEFAULT opens it: the default 1920x1080 on a 1080p laptop put the bottom of the picture (the HUD)
-// under the taskbar and past the screen. The setting itself stays; the menu's size list offers what fits.
-static void fit_work_area(int *cw, int *ch) {
-    RECT work;
+// The client size cw x ch scaled down, in its own proportions, so the whole window fits a work area: the chosen
+// monitor's (work, with the frame measured at dpi) or, with work NULL, the primary monitor's, where CW_USEDEFAULT opens
+// it. The default 1920x1080 on a 1080p laptop put the bottom of the picture (the HUD) under the taskbar and past the
+// screen. The setting itself stays; the menu's size list offers what fits.
+static void fit_work_area(int *cw, int *ch, const RECT *work, UINT dpi) {
+    RECT prim;
     int ow, oh;
-    if (!SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0)) return;
-    outer_size(NULL, *cw, *ch, &ow, &oh);
-    int aw = (work.right - work.left) - (ow - *cw), ah = (work.bottom - work.top) - (oh - *ch);
+    if (!work) {
+        if (!SystemParametersInfoW(SPI_GETWORKAREA, 0, &prim, 0)) return;
+        work = &prim;
+    }
+    outer_size_at(*cw, *ch, dpi, &ow, &oh);
+    int aw = (work->right - work->left) - (ow - *cw), ah = (work->bottom - work->top) - (oh - *ch);
     if (aw <= 0 || ah <= 0 || (*cw <= aw && *ch <= ah)) return;
     double k = (double)aw / *cw < (double)ah / *ch ? (double)aw / *cw : (double)ah / *ch;
     int w = (int)(*cw * k) & ~1, hh = (int)(*ch * k) & ~1;
@@ -248,11 +252,17 @@ static void to_utf8(const wchar_t *w, char *out, size_t n) {
     if (!WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)n, NULL, NULL)) out[0] = 0;
 }
 
-// GetDpiForMonitor lives in shcore.dll, which the build does not link; 0 when it is missing.
+// GetDpiForMonitor lives in shcore.dll, which the build does not link; 0 when it is missing. The library is loaded once
+// and kept: the monitor list asks for every monitor's DPI each time it is built.
 static UINT monitor_dpi(HMONITOR mon) {
     typedef HRESULT(WINAPI * GetDpiForMonitorFn)(HMONITOR, int, UINT *, UINT *);
-    HMODULE lib = LoadLibraryExW(L"shcore.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    GetDpiForMonitorFn fn = lib ? (GetDpiForMonitorFn)(void *)GetProcAddress(lib, "GetDpiForMonitor") : NULL;
+    static GetDpiForMonitorFn fn;
+    static int looked;
+    if (!looked) {
+        HMODULE lib = LoadLibraryExW(L"shcore.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        fn = lib ? (GetDpiForMonitorFn)(void *)GetProcAddress(lib, "GetDpiForMonitor") : NULL;
+        looked = 1;
+    }
     UINT x = 0, y = 0;
     if (!fn || fn(mon, 0 /* MDT_EFFECTIVE_DPI */, &x, &y) != S_OK) x = 0;
     return x;
@@ -494,8 +504,15 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_EXITSIZEMOVE:   // dragged onto another monitor
         refresh_rate_update(h, 0);
         break;
-    case WM_DISPLAYCHANGE:
+    case WM_DISPLAYCHANGE:   // a resolution, layout or HDR change of the desktop
         refresh_rate_update(h, 1);
+        if (is_fullscreen(h) && !IsIconic(h)) {   // keep covering the monitor at its new size (a same size sends no WM_SIZE)
+            MONITORINFO mi = {sizeof mi};
+            if (GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi))
+                SetWindowPos(h, NULL, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
+                             mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        gfx_window_mark_dirty();   // the swapchain is made again: its size, and its colour space after an HDR switch
         break;
     case WM_GETDPISCALEDSIZE:   // a framed window keeps its client size in pixels on a monitor at another scale
         if (!is_fullscreen(h) && !IsZoomed(h)) {
@@ -636,12 +653,13 @@ static void window_main(void *arg) {
     RegisterClassExW(&wc);
     int cw, ch, ow, oh, x = CW_USEDEFAULT, y = CW_USEDEFAULT;
     cfg_window_size(&cw, &ch);
-    fit_work_area(&cw, &ch);
-    outer_size(NULL, cw, ch, &ow, &oh);
     // NX2NAVI_MONITOR: the window is created centred in the chosen monitor's work area, with its frame measured at that
-    // monitor's DPI, so it opens there at the scale it will have. Without a choice the system places it.
+    // monitor's DPI, so it opens there at the scale it will have. Without a choice the system places it. Either way
+    // the size is scaled down first if it does not fit the work area it opens in.
     MonInfo mon;
     int on_mon = chosen_monitor(&mon, 1);
+    fit_work_area(&cw, &ch, on_mon ? &mon.work : NULL, on_mon && mon.dpi ? mon.dpi : GetDpiForSystem());
+    outer_size(NULL, cw, ch, &ow, &oh);
     if (on_mon) {
         outer_size_at(cw, ch, mon.dpi ? mon.dpi : GetDpiForSystem(), &ow, &oh);
         center_in(&mon.work, ow, oh, &x, &y);
@@ -674,17 +692,16 @@ static void window_main(void *arg) {
         outer_size(g_hwnd, cw, ch, &nw, &nh);
         if (on_mon && (nw != ow || nh != oh)) center_in(&mon.work, nw, nh, &nx, &ny);
         else flags |= SWP_NOMOVE;
-        int fs = !background && cfg_fullscreen();
-        if (fs) {   // the hidden window gets its windowed rectangle first: fullscreen_before_show saves it for F11
-            SetWindowPos(g_hwnd, NULL, nx, ny, nw, nh, (flags & SWP_NOMOVE) | SWP_NOZORDER | SWP_NOACTIVATE);
-            fs = fullscreen_before_show(g_hwnd, nw, nh);
-        }
-        SetWindowPos(g_hwnd, HWND_BOTTOM, nx, ny, nw, nh, flags | (fs ? SWP_NOMOVE | SWP_NOSIZE : 0));
+        // the fullscreen setting: the window turns fullscreen on the monitor it is on before it is shown, and keeps
+        // that place and size (fullscreen_before_show); the windowed size stays for F11
+        int fs = !background && cfg_fullscreen() && fullscreen_before_show(g_hwnd, nw, nh);
+        SetWindowPos(g_hwnd, HWND_BOTTOM, nx, ny, nw, nh, flags | (fs ? SWP_NOSIZE | SWP_NOMOVE : 0));
         if (on_mon && MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST) != mon.h)
             rt_log("gfx: the window is not on the chosen monitor; F11 fullscreen covers the monitor it is on");
         if (!background) {
             // Pending before the raise: the activation it gets is the first WM_ACTIVATEAPP, which takes the fullscreen
-            // setting; set after it, fullscreen waited for the next activation and the game started in a window
+            // setting; set after it, fullscreen waited for the next activation and the game started in a window. Only
+            // a window that did not become fullscreen before it was shown still needs that retry.
             g_fs_pending = cfg_fullscreen() && !fs;
             raise_window(g_hwnd);   // a frontend's player may have no way to reach a window left behind
             FLASHWINFO fw = {.cbSize = sizeof fw, .hwnd = g_hwnd, .dwFlags = FLASHW_TRAY | FLASHW_TIMERNOFG};

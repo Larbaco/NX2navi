@@ -149,16 +149,60 @@ def open_path(path):
         subprocess.Popen(['xdg-open', path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def reveal(path):
+    """Show a file in its folder, selected in Explorer (a file to drag into a bug report); elsewhere open the folder."""
+    path = Path(path)
+    if os.name == 'nt':
+        subprocess.Popen(['explorer', f'/select,{path}'])   # noqa: S603, S607
+    else:
+        open_path(path.parent)
+
+
+KNOWN_FOLDERS = {'downloads': '{374DE290-123F-4565-9164-39C4925E467B}',
+                 'desktop': '{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}'}
+
+
+def known_folder(name):
+    """Windows: the folder the shell keeps for name ('downloads', 'desktop'), also when the player moved it to another
+    drive; None elsewhere or when the shell names none."""
+    if os.name != 'nt' or name not in KNOWN_FOLDERS:
+        return None
+    try:
+        from ctypes import wintypes
+
+        class GUID(ctypes.Structure):
+            _fields_ = [('d1', wintypes.DWORD), ('d2', wintypes.WORD), ('d3', wintypes.WORD),
+                        ('d4', ctypes.c_ubyte * 8)]
+        ole32, shell32 = ctypes.WinDLL('ole32'), ctypes.WinDLL('shell32')   # private handles: argtypes stay here
+        ole32.CLSIDFromString.argtypes = (wintypes.LPCWSTR, ctypes.POINTER(GUID))
+        ole32.CoTaskMemFree.argtypes = (ctypes.c_void_p,)
+        shell32.SHGetKnownFolderPath.argtypes = (ctypes.POINTER(GUID), wintypes.DWORD, wintypes.HANDLE,
+                                                 ctypes.POINTER(ctypes.c_void_p))
+        g, out = GUID(), ctypes.c_void_p()
+        if ole32.CLSIDFromString(KNOWN_FOLDERS[name], ctypes.byref(g)) != 0:
+            return None
+        if shell32.SHGetKnownFolderPath(ctypes.byref(g), 0, None, ctypes.byref(out)) != 0:
+            return None
+        try:
+            return Path(ctypes.wstring_at(out.value))
+        finally:
+            ole32.CoTaskMemFree(out)
+    except (AttributeError, OSError):
+        return None
+
+
 def start_game(exe):
-    """Start the game from its own folder; returns the process to watch."""
+    """Start the game from its own folder; returns the process to watch. ocarina.exe is a console program and the
+    launcher has no console, so without CREATE_NO_WINDOW Windows opened an empty console window beside the game,
+    titled with the exe's path. With it the game still has a console (hidden), which its restarts inherit."""
     exe = Path(exe)
-    flags = {'creationflags': CREATE_NEW_PROCESS_GROUP} if os.name == 'nt' else {'start_new_session': True}
+    flags = {'creationflags': CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP} if os.name == 'nt' \
+        else {'start_new_session': True}
     return subprocess.Popen([str(exe)], cwd=str(exe.parent), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL, close_fds=True, **flags)
 
 
 def start_detached(cmd, cwd=None):
-    """Start cmd, an argument list or on Windows a whole command line, and do not wait for it."""
     flags = {'creationflags': DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP} if os.name == 'nt' \
         else {'start_new_session': True}
     subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -199,6 +243,22 @@ def keep_awake(on):
         pass
 
 
+def background_thread():
+    """Windows: put the calling thread in background mode (SetThreadPriority THREAD_MODE_BACKGROUND_BEGIN), which
+    lowers its processor, disk and memory priority, so work done beside the game takes only what the game leaves.
+    False where that is not possible."""
+    if os.name != 'nt':
+        return False
+    try:
+        from ctypes import wintypes
+        k = ctypes.WinDLL('kernel32')   # a private handle: the argument types set here touch no other caller
+        k.GetCurrentThread.restype = wintypes.HANDLE
+        k.SetThreadPriority.argtypes = (wintypes.HANDLE, ctypes.c_int)
+        return bool(k.SetThreadPriority(k.GetCurrentThread(), 0x00010000))
+    except (AttributeError, OSError):
+        return False
+
+
 # What the launcher puts in its folder (launcher/paths.py, the stub's python.next and python.old-<n>). Uninstall deletes
 # only these: the default game folder is <root>\game, and a folder given to the setup with --dest may hold other things.
 OWNED = ('NX2navi.exe', 'app', 'python', 'python.next', 'pydeps', 'data', 'toolchain')
@@ -223,11 +283,13 @@ def uninstall_plan(layout, remove_game=''):
 
 def uninstall_script(gone, empty):
     """The cmd.exe line that deletes them once the launcher has exited: a file with del, a folder with rmdir /s, the
-    folders that must be empty with a plain rmdir (which leaves a folder that still holds something)."""
+    folders that must be empty with a plain rmdir (which leaves a folder that still holds something). A path holding
+    % is left out: cmd.exe expands %NAME% even inside quotes, so a folder named C:\\%HOMEPATH% would delete another."""
     steps = ['ping -n 3 127.0.0.1 >nul']
     for p in gone:
-        steps.append(f'(if exist "{p}\\*" (rmdir /s /q "{p}") else if exist "{p}" (del /f /q "{p}"))')
-    steps += [f'rmdir "{p}" 2>nul' for p in empty]
+        if '%' not in str(p):
+            steps.append(f'(if exist "{p}\\*" (rmdir /s /q "{p}") else if exist "{p}" (del /f /q "{p}"))')
+    steps += [f'rmdir "{p}" 2>nul' for p in empty if '%' not in str(p)]
     return ' & '.join(steps)
 
 
@@ -245,7 +307,10 @@ def uninstall(layout, remove_game='', log=print):
             pass
         # one command line as cmd.exe reads it: a list would have its quotes escaped as \", which cmd.exe does not
         # understand, and no rmdir would find its folder
-        start_detached(f'cmd.exe /d /s /c "{uninstall_script(gone, empty)}"', cwd=os.environ.get('TEMP', 'C:\\'))
+        kept = [str(p) for p in list(gone) + list(empty) if '%' in str(p) and os.path.exists(p)]
+        if kept:
+            log('uninstall: remove these yourself (their names hold %): ' + ', '.join(kept))
+        start_detached(f'cmd.exe /c "{uninstall_script(gone, empty)}"', cwd=os.environ.get('TEMP', 'C:\\'))
     else:
         log('uninstall: remove these yourself: ' + ', '.join(str(p) for p in gone if p.exists()))
 
@@ -266,9 +331,32 @@ BUTTONS = {0x0001: 'up', 0x0002: 'down', 0x0004: 'left', 0x0008: 'right', 0x1000
            0x4000: 'x', 0x0010: 'start'}
 
 
+def in_front(root):
+    """Whether the window the user is typing into belongs to this process. XInput reads the pad whichever window is in
+    front, so without this check the launcher, left open behind the game, took the presses meant for the game: A
+    activated its focused row (it started the game five times in five minutes and tried a rebuild), the stick moved
+    its focus and Y checked for updates. True where it cannot tell."""
+    if os.name != 'nt':
+        return True
+    try:
+        user32 = ctypes.windll.user32
+        user32.GetForegroundWindow.restype = ctypes.c_void_p
+        user32.GetWindowThreadProcessId.restype = ctypes.c_uint
+        user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)]
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return False   # no window in front (the desktop is switching, a lock screen): nothing is meant for us
+        pid = ctypes.c_uint(0)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return pid.value == os.getpid()
+    except (AttributeError, OSError):
+        return True
+
+
 class Gamepad:
     """Polls the first XInput pad; poll() returns the buttons pressed since the last call (edges), the left stick
-    counted as the d-pad."""
+    counted as the d-pad. poll(False) still reads the pad but returns nothing: a button held while another window was
+    in front does not count as pressed when this one comes back."""
 
     def __init__(self):
         self.dll = None
@@ -281,7 +369,7 @@ class Gamepad:
                 except (AttributeError, OSError):
                     continue
 
-    def poll(self):
+    def poll(self, active=True):
         if not self.dll:
             return set()
         st = _XInputState()
@@ -302,7 +390,7 @@ class Gamepad:
                     break
             except OSError:
                 return set()
-        pressed = down - self.held
+        pressed = down - self.held if active else set()
         self.held = down
         return pressed
 

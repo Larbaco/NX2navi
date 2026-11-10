@@ -41,9 +41,9 @@ void skin_panel(ImDrawList *dl, ImVec2 a, ImVec2 b, float s, float alpha = 1);
 
 // The boot screen's box (menu.cpp menu_boot_frame) centred in a w x h frame: the panel, the title in gold over the
 // divider, the step's line, a bar filled to frac (0..1; a negative frac: a short segment sweeping at position sweep
-// 0..1, no count yet) and the hint under it.
+// 0..1, no count yet).
 void skin_boot_panel(ImDrawList *dl, ImFont *head, float head_px, ImFont *body, float body_px, const char *title,
-                     const char *step, const char *hint, float frac, float sweep, float w, float h, float s);
+                     const char *step, float frac, float sweep, float w, float h, float s);
 
 // A button widget drawn as skin_button with its label centred and skin_cursor round it while selected or hovered (the
 // save menu's Load and Cancel). True when pressed (click, A, Enter). size: as for ImGui::Button.

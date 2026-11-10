@@ -26,7 +26,25 @@ layout(push_constant) uniform Params {
     uint bx;         // blocks per row
     uint bslice;     // blocks per slice
     uint srgb;
+    uint bl;         // 1: blk holds the level's block-linear storage from in_base (bl_block), 0: tight rows
+    uint th, td;     // its block height and depth in GOBs, log2
+    uint nvn2;       // Switch 2 order of the 16-byte pieces in a GOB
 } pc;
+
+// The uvec4 index, from in_base, of block (bxi, byi) of slice z in block-linear storage: GOBs of 64 bytes x 8 block rows,
+// in blocks of 2^th GOBs high and 2^td deep, blocks in x, then y, then z order (tex_deswizzle.c nvn_bl_offset, with x
+// the block's byte offset in its row and y its block row).
+uint gob_off(uint x, uint y) {
+    if (pc.nvn2 != 0u) return (x % 64u / 32u) * 256u + (y % 8u / 4u) * 128u + (x % 32u / 16u) * 64u + (y % 4u) * 16u + x % 16u;
+    return (x % 64u / 32u) * 256u + (y % 8u / 2u) * 64u + (x % 32u / 16u) * 32u + (y % 2u) * 16u + x % 16u;
+}
+uint bl_block(uint bxi, uint byi, uint z) {
+    uint gh = 1u << pc.th, gd = 1u << pc.td, x = bxi * 16u, rows = pc.bslice / pc.bx;
+    uint gobs_x = (pc.bx * 16u + 63u) / 64u, blocks_y = (rows + 8u * gh - 1u) / (8u * gh), block = 512u * gh * gd;
+    uint off = (z / gd) * gobs_x * blocks_y * block + (byi / (8u * gh)) * gobs_x * block + (x / 64u) * block +
+               ((z % gd) * gh + (byi % (8u * gh)) / 8u) * 512u + gob_off(x, byi);
+    return off >> 4;
+}
 
 uint tab_byte(uint i) { return (tab[i >> 2] >> ((i & 3u) * 8u)) & 0xFFu; }
 
@@ -353,7 +371,9 @@ void main() {
     int bxi = int(gl_WorkGroupID.x) * bpw + lb, byi = int(gl_WorkGroupID.y);
     live = live && bxi < int(pc.bx);
     lb = min(lb, MAXB - 1);
-    uvec4 b = live ? blk[pc.in_base + gl_WorkGroupID.z * pc.bslice + uint(byi) * pc.bx + uint(bxi)] : uvec4(0u);
+    uint bi = pc.bl != 0u ? bl_block(uint(bxi), uint(byi), gl_WorkGroupID.z)
+                          : gl_WorkGroupID.z * pc.bslice + uint(byi) * pc.bx + uint(bxi);
+    uvec4 b = live ? blk[pc.in_base + bi] : uvec4(0u);
     Hdr H = header(b, bw, bh);
     bool work = live && !H.solid;
 

@@ -46,15 +46,23 @@
 #define INMAX 8      // samples waiting for the decoder thread at most
 #define QREADY 4     // input-ready while fewer than this many samples and pictures wait
 #define NFRAMES 16   // registered VideoFrames
+#define CQMAX 2      // decoded pictures waiting for the convert thread at most
 
 typedef struct { uint8_t *nv12, *rgba; int w, h; int64_t ts; int eos; } Picture;
 typedef struct { uint8_t *data; size_t size; int64_t ts; int eos; } Sample;
+typedef struct { Dav1dPicture pic; uint64_t gen; int64_t ts; int eos; } Decoded;   // for the convert thread
 typedef struct {
     PlatMutex lock;          // queues, frames, flags
     PlatMutex codec;         // dav1d: the decoder thread while it decodes, Flush / Finalize
     PlatCond work;           // a sample arrived, or quit
     PlatThread *thread;
     int run_index;           // which movie of the run this is, counted from 1 as decoders come up (for the log)
+    // The convert thread debands and converts what dav1d decoded while the decoder thread decodes the next picture:
+    // one after the other on the decoder thread the two took longer than the 16.7 ms a 60 fps movie frame has
+    PlatThread *convert;
+    PlatCond conv;           // a decoded picture arrived, a slot freed, or quit
+    Decoded cq[CQMAX];
+    int cqh, cqn;
     Dav1dContext *dav1d;
     uint8_t in_ev[0x40], out_ev[0x40];   // nn::os::SystemEventType each
     int in_bound, out_bound;
@@ -69,6 +77,11 @@ typedef struct {
     uint64_t decoded, shown;
     int live;                // counted in movies_live: from Initialize, or a sample after a Flush, to the end-of-stream
                              // picture, Finalize or the destructor
+    // The first shown picture's time stamp and when it was shown, for the pacing report's distance between the
+    // picture and real time; clock_on: they hold (cleared by Flush and Initialize)
+    int64_t ts0;
+    uint64_t shown0_ns;
+    int clock_on;
 } Video;
 
 static Video *video_of(void *obj) { return obj ? *(Video **)obj : NULL; }
@@ -80,6 +93,9 @@ static void set_live(Video *v, int live) {   // the guest's decode and acquire t
     if (__atomic_exchange_n(&v->live, live, __ATOMIC_RELAXED) != live)
         __atomic_add_fetch(&movies_live, live ? 1 : -1, __ATOMIC_RELAXED);
 }
+// Time summed for the pacing report (one movie plays at a time): on the decoder thread waiting for the game's next
+// sample, dav1d_send_data and dav1d_get_picture; on the convert thread make_picture (deband and conversion)
+static uint64_t t_wait_ns, t_send_ns, t_get_ns, t_make_ns, n_made;   // n_made: pictures converted
 
 // under v->lock
 static void update_events(Video *v) {
@@ -121,38 +137,66 @@ static void clear_queues(Video *v) {
 // the area is flat and the sample becomes their mean with 4 bits of fraction, else it keeps its value. Edges and
 // texture differ by more than that and stay as they are. Output: plane * 16.
 #define DEBAND_THRESH 3
+// The deband taps: radii 4..16 at golden-angle rotations, so every tap of a sample at least DEBAND_REACH away from
+// each edge lies inside the plane.
+#define DEBAND_REACH 16
+static int16_t deband_off[64][2];
+static volatile int32_t deband_ready;
+static void deband_table(void) {
+    if (__atomic_load_n(&deband_ready, __ATOMIC_ACQUIRE)) return;
+    for (int i = 0; i < 64; i++) {
+        double r = 4 + (i * 12) / 63.0, t = i * 2.39996323;
+        deband_off[i][0] = (int16_t)(r * __builtin_cos(t)), deband_off[i][1] = (int16_t)(r * __builtin_sin(t));
+    }
+    __atomic_store_n(&deband_ready, 1, __ATOMIC_RELEASE);
+}
+// One sample near an edge: a tap outside the plane keeps the sample as it is
+static inline uint16_t deband_edge(const uint8_t *src, int w, int h, int stride, int step, int x, int y) {
+    int c = src[(size_t)y * stride + x * step];
+    const int16_t *d = deband_off[(x * 7 + y * 13 + ((x ^ y) >> 2)) & 63];
+    int dx = d[0], dy = d[1];
+    int xa = x + dx, xb = x - dx, ya = y + dy, yb = y - dy;
+    int xc = x - dy, xd = x + dy, yc = y + dx, yd = y - dx;
+    if (xa < 0 || xb < 0 || xc < 0 || xd < 0 || xa >= w || xb >= w || xc >= w || xd >= w || ya < 0 || yb < 0 ||
+        yc < 0 || yd < 0 || ya >= h || yb >= h || yc >= h || yd >= h)
+        return (uint16_t)(c * 16);
+    int s0 = src[(size_t)ya * stride + xa * step], s1 = src[(size_t)yb * stride + xb * step];
+    int s2 = src[(size_t)yc * stride + xc * step], s3 = src[(size_t)yd * stride + xd * step];
+    int m0 = abs(s0 - c), m1 = abs(s1 - c), m2 = abs(s2 - c), m3 = abs(s3 - c);
+    if (m0 > DEBAND_THRESH || m1 > DEBAND_THRESH || m2 > DEBAND_THRESH || m3 > DEBAND_THRESH) return (uint16_t)(c * 16);
+    return (uint16_t)((s0 + s1 + s2 + s3) * 4);   // the mean, * 16
+}
+// Each sample becomes the mean of four taps around it (a rotated pair of mirrored offsets) when all four lie within
+// DEBAND_THRESH of it, else stays as it is; the result is * 16, keeping the mean's fraction. Samples away from the
+// edges, nearly all of them, skip the bounds tests and choose without a branch: 28 ms on one thread for a 1080p frame
+// became 16 ms, and in play the stripes no longer overran the 16.7 ms a 60 fps movie frame has.
 static void deband(const uint8_t *src, uint16_t *dst, int w, int h, int stride, int step, int y0, int y1) {
-    static int16_t off[64][2];
-    static volatile int32_t ready;
-    if (!__atomic_load_n(&ready, __ATOMIC_ACQUIRE)) {
-        for (int i = 0; i < 64; i++) {   // radii 4..16 at golden-angle rotations
-            double r = 4 + (i * 12) / 63.0, t = i * 2.39996323;
-            off[i][0] = (int16_t)(r * __builtin_cos(t)), off[i][1] = (int16_t)(r * __builtin_sin(t));
-        }
-        __atomic_store_n(&ready, 1, __ATOMIC_RELEASE);
+    deband_table();
+    const int R = DEBAND_REACH;
+    ptrdiff_t ta[64], tb[64];   // each offset as a distance in the plane: (+dx, +dy) and (-dy, +dx); their mirrors negate
+    for (int i = 0; i < 64; i++) {
+        ta[i] = (ptrdiff_t)deband_off[i][1] * stride + (ptrdiff_t)deband_off[i][0] * step;
+        tb[i] = (ptrdiff_t)deband_off[i][0] * stride - (ptrdiff_t)deband_off[i][1] * step;
     }
     for (int y = y0; y < y1; y++) {
-        const uint8_t *row = src + (size_t)y * stride;
         uint16_t *o = dst + (size_t)y * w;
-        for (int x = 0; x < w; x++) {
-            int c = row[x * step];
-            const int16_t *d = off[(x * 7 + y * 13 + ((x ^ y) >> 2)) & 63];
-            int dx = d[0], dy = d[1];
-            int xa = x + dx, xb = x - dx, ya = y + dy, yb = y - dy;
-            int xc = x - dy, xd = x + dy, yc = y + dx, yd = y - dx;
-            if (xa < 0 || xb < 0 || xc < 0 || xd < 0 || xa >= w || xb >= w || xc >= w || xd >= w || ya < 0 || yb < 0 ||
-                yc < 0 || yd < 0 || ya >= h || yb >= h || yc >= h || yd >= h) {
-                o[x] = (uint16_t)(c * 16);
-                continue;
-            }
-            int s0 = src[(size_t)ya * stride + xa * step], s1 = src[(size_t)yb * stride + xb * step];
-            int s2 = src[(size_t)yc * stride + xc * step], s3 = src[(size_t)yd * stride + xd * step];
-            int m0 = abs(s0 - c), m1 = abs(s1 - c), m2 = abs(s2 - c), m3 = abs(s3 - c);
-            if (m0 > DEBAND_THRESH || m1 > DEBAND_THRESH || m2 > DEBAND_THRESH || m3 > DEBAND_THRESH)
-                o[x] = (uint16_t)(c * 16);
-            else
-                o[x] = (uint16_t)((s0 + s1 + s2 + s3) * 4);   // the mean, * 16
+        if (y < R || y >= h - R || w <= 2 * R) {
+            for (int x = 0; x < w; x++) o[x] = deband_edge(src, w, h, stride, step, x, y);
+            continue;
         }
+        for (int x = 0; x < R; x++) o[x] = deband_edge(src, w, h, stride, step, x, y);
+        const uint8_t *row = src + (size_t)y * stride;
+        const int y13 = y * 13;
+        for (int x = R; x < w - R; x++) {
+            const uint8_t *p = row + x * step;
+            int c = *p, k = (x * 7 + y13 + ((x ^ y) >> 2)) & 63;
+            const ptrdiff_t a = ta[k], b = tb[k];
+            int s0 = p[a], s1 = p[-a], s2 = p[b], s3 = p[-b];
+            int edge = (abs(s0 - c) > DEBAND_THRESH) | (abs(s1 - c) > DEBAND_THRESH) | (abs(s2 - c) > DEBAND_THRESH) |
+                       (abs(s3 - c) > DEBAND_THRESH);
+            o[x] = (uint16_t)(edge ? c * 16 : (s0 + s1 + s2 + s3) * 4);
+        }
+        for (int x = w - R; x < w; x++) o[x] = deband_edge(src, w, h, stride, step, x, y);
     }
 }
 
@@ -199,6 +243,8 @@ typedef struct {
     uint8_t *nv12;
     uint16_t *Y16, *U16, *V16;
     uint8_t *rgba;
+    const uint8_t *py, *pu, *pv;   // phase 2: the decoder's 8-bit planes and their strides (luma, chroma)
+    ptrdiff_t ys, cs;
 } Stripe;
 // The debanded planes back into the NV12 frame (the game converts it itself), with a 4x4 ordered dither: the
 // 4 fraction bits become texel-sized noise instead of bands.
@@ -227,6 +273,11 @@ static void stripe_run(void *arg) {
         deband(t->nv12, t->Y16, t->w, t->h, t->w, 1, t->y0, t->y1);
         deband(uv, t->U16, t->w / 2, t->h / 2, t->w, 2, t->y0 / 2, t->y1 / 2);
         deband(uv + 1, t->V16, t->w / 2, t->h / 2, t->w, 2, t->y0 / 2, t->y1 / 2);
+    } else if (t->phase == 2) {   // deband straight from the decoder's planes, so the NV12 rows can be written at once
+        deband(t->py, t->Y16, t->w, t->h, t->ys, 1, t->y0, t->y1);
+        deband(t->pu, t->U16, t->w / 2, t->h / 2, t->cs, 1, t->y0 / 2, t->y1 / 2);
+        deband(t->pv, t->V16, t->w / 2, t->h / 2, t->cs, 1, t->y0 / 2, t->y1 / 2);
+        to_nv12(t);
     } else if (t->rgba) {
         to_rgba(t->Y16, t->U16, t->V16, t->rgba, t->w, t->h, t->y0, t->y1);
     } else {
@@ -273,6 +324,24 @@ static int make_picture(const Dav1dPicture *pic, Picture *p) {
     uint8_t *o = malloc((size_t)w * h * 3 / 2), *rgba = overlay ? malloc((size_t)w * h * 4) : NULL;
     if (!o || (overlay && !rgba)) rt_fatal("movie: out of memory for a %dx%d frame", w, h);
     const ptrdiff_t ys = pic->stride[0], cs = pic->stride[1];
+    static int deband_on = -1;   // NX2NAVI_MOVIE_DEBAND=0 keeps the decoded planes
+    if (deband_on < 0) {
+        const char *e = cfg_get("NX2NAVI_MOVIE_DEBAND");
+        deband_on = !(e && !strcmp(e, "0"));
+    }
+    if (deband_on && !hbd && !rgba) {
+        // The usual case (8-bit, debanded, the game converts the frame): one pass per stripe debands the decoder's own
+        // planes and writes the dithered NV12 rows. Reading the decoder's planes instead of an NV12 copy of them gives
+        // the same samples, and nothing reads the frame while it is written, so each stripe finishes its rows alone:
+        // one round of threads per frame instead of two, and no single-threaded copy before it.
+        uint16_t *Y16 = malloc((size_t)w * h * 2), *U16 = malloc((size_t)w * h / 2), *V16 = malloc((size_t)w * h / 2);
+        if (!Y16 || !U16 || !V16) rt_fatal("movie: out of memory for a %dx%d frame", w, h);
+        Stripe base = {2, 0, 0, w, h, o, Y16, U16, V16, NULL, pic->data[0], pic->data[1], pic->data[2], ys, cs};
+        run_stripes(base);
+        free(Y16), free(U16), free(V16);
+        *p = (Picture){o, NULL, w, h, pic->m.timestamp, 0};
+        return 1;
+    }
     for (int y = 0; y < h; y++) {
         const uint8_t *row = (const uint8_t *)pic->data[0] + y * ys;
         if (!hbd) memcpy(o + (size_t)y * w, row, (size_t)w);
@@ -288,11 +357,6 @@ static int make_picture(const Dav1dPicture *pic, Picture *p) {
     }
     // debanded planes (NX2NAVI_MOVIE_DEBAND=0 keeps the decoded ones), then the overlay's RGBA or the dithered NV12
     {
-        static int deband_on = -1;
-        if (deband_on < 0) {
-            const char *e = cfg_get("NX2NAVI_MOVIE_DEBAND");
-            deband_on = !(e && !strcmp(e, "0"));
-        }
         uint16_t *Y16 = malloc((size_t)w * h * 2), *U16 = malloc((size_t)w * h / 2), *V16 = malloc((size_t)w * h / 2);
         if (!Y16 || !U16 || !V16) rt_fatal("movie: out of memory for a %dx%d frame", w, h);
         Stripe base = {0, 0, 0, w, h, o, Y16, U16, V16, rgba};
@@ -334,13 +398,69 @@ static void deliver(Video *v, Picture p, uint64_t gen) {
     plat_mutex_unlock(&v->lock);
 }
 
+// Queues a decoded picture (or the end-of-stream marker) for the convert thread, waiting while it has CQMAX;
+// decoder thread. On quit the picture is released here.
+static void hand_over(Video *v, Decoded d) {
+    plat_mutex_lock(&v->lock);
+    while (v->cqn == CQMAX && !v->quit) plat_cond_wait(&v->conv, &v->lock);
+    if (v->quit) {
+        plat_mutex_unlock(&v->lock);
+        if (!d.eos) dav1d_picture_unref(&d.pic);
+        return;
+    }
+    v->cq[(v->cqh + v->cqn) % CQMAX] = d;
+    v->cqn++;
+    plat_cond_broadcast(&v->conv);
+    plat_mutex_unlock(&v->lock);
+}
+// Releases the pictures still waiting for the convert thread; under v->lock
+static void clear_converts(Video *v) {
+    while (v->cqn) {
+        Decoded *d = &v->cq[v->cqh];
+        if (!d->eos) dav1d_picture_unref(&d->pic);
+        v->cqh = (v->cqh + 1) % CQMAX;
+        v->cqn--;
+    }
+    v->cqh = 0;
+    plat_cond_broadcast(&v->conv);
+}
+static void convert_thread(void *arg) {
+    Video *v = arg;
+    plat_mutex_lock(&v->lock);
+    for (;;) {
+        while (!v->cqn && !v->quit) plat_cond_wait(&v->conv, &v->lock);
+        if (v->quit) break;
+        Decoded d = v->cq[v->cqh];
+        v->cqh = (v->cqh + 1) % CQMAX;
+        v->cqn--;
+        plat_cond_broadcast(&v->conv);
+        plat_mutex_unlock(&v->lock);
+        if (d.eos) {
+            deliver(v, (Picture){NULL, NULL, 0, 0, d.ts, 1}, d.gen);
+        } else {
+            uint64_t t0 = plat_now_ns();
+            Picture p;
+            int ok = make_picture(&d.pic, &p);
+            t_make_ns += plat_now_ns() - t0;
+            n_made++;
+            dav1d_picture_unref(&d.pic);
+            if (ok) deliver(v, p, d.gen);
+        }
+        plat_mutex_lock(&v->lock);
+    }
+    plat_mutex_unlock(&v->lock);
+}
+
 static void drain(Video *v, uint64_t gen) {
     Dav1dPicture pic = {0};
-    while (dav1d_get_picture(v->dav1d, &pic) == 0) {
-        Picture p;
-        int ok = make_picture(&pic, &p);
-        dav1d_picture_unref(&pic);
-        if (ok) deliver(v, p, gen);
+    for (;;) {
+        uint64_t t0 = plat_now_ns();
+        int got = dav1d_get_picture(v->dav1d, &pic) == 0;
+        uint64_t t1 = plat_now_ns();
+        t_get_ns += t1 - t0;
+        if (!got) break;
+        hand_over(v, (Decoded){pic, gen, pic.m.timestamp, 0});
+        pic = (Dav1dPicture){0};
     }
 }
 
@@ -348,7 +468,9 @@ static void decoder_thread(void *arg) {
     Video *v = arg;
     plat_mutex_lock(&v->lock);
     for (;;) {
+        uint64_t tw = plat_now_ns();
         while (!v->in_n && !v->quit) plat_cond_wait(&v->work, &v->lock);
+        t_wait_ns += plat_now_ns() - tw;
         if (v->quit) break;
         Sample s = v->in[v->ih];
         v->ih = (v->ih + 1) % INMAX;
@@ -370,7 +492,9 @@ static void decoder_thread(void *arg) {
                 memcpy(p, s.data, s.size);
                 d.m.timestamp = s.ts;
                 while (d.sz) {
+                    uint64_t ts0 = plat_now_ns();
                     int r = dav1d_send_data(v->dav1d, &d);
+                    t_send_ns += plat_now_ns() - ts0;
                     if (r == DAV1D_ERR(EAGAIN)) drain(v, gen);
                     else if (r < 0) {
                         static volatile int32_t logged;
@@ -384,7 +508,7 @@ static void decoder_thread(void *arg) {
         }
         if (s.eos && v->dav1d) {
             drain(v, gen);
-            deliver(v, (Picture){NULL, NULL, 0, 0, s.ts, 1}, gen);
+            hand_over(v, (Decoded){.gen = gen, .ts = s.ts, .eos = 1});   // after the last picture, through the same queue
         }
         plat_mutex_unlock(&v->codec);
         free(s.data);
@@ -394,14 +518,19 @@ static void decoder_thread(void *arg) {
 }
 
 static void stop_thread(Video *v) {
-    if (!v->thread) return;
+    if (!v->thread && !v->convert) return;
     plat_mutex_lock(&v->lock);
     v->quit = 1;
     plat_cond_broadcast(&v->work);
+    plat_cond_broadcast(&v->conv);
     plat_mutex_unlock(&v->lock);
-    plat_thread_join(v->thread);
-    v->thread = NULL;
+    if (v->thread) plat_thread_join(v->thread);
+    if (v->convert) plat_thread_join(v->convert);
+    v->thread = v->convert = NULL;
+    plat_mutex_lock(&v->lock);
+    clear_converts(v);   // before dav1d_close: the pictures are the decoder's
     v->quit = 0;
+    plat_mutex_unlock(&v->lock);
 }
 
 static void finalize(Video *v) {
@@ -438,10 +567,12 @@ static void ov_initialize(Cpu *c) {
         plat_mutex_init(&(*slot)->lock);
         plat_mutex_init(&(*slot)->codec);
         plat_cond_init(&(*slot)->work);
+        plat_cond_init(&(*slot)->conv);
     }
     Video *v = *slot;
     finalize(v);
     set_live(v, 1);
+    v->clock_on = 0;
     Dav1dSettings s;
     dav1d_default_settings(&s);
     // Frame threading on (dav1d picks the delay): heavy stretches of the title movie took longer than a frame to
@@ -453,6 +584,8 @@ static void ov_initialize(Cpu *c) {
     if (r < 0) rt_fatal("movie: dav1d_open failed (%d)", r);
     v->thread = plat_thread_new(decoder_thread, v, "movie decoder");
     if (!v->thread) rt_fatal("movie: cannot start the decoder thread");
+    v->convert = plat_thread_new(convert_thread, v, "movie convert");
+    if (!v->convert) rt_fatal("movie: cannot start the convert thread");
     v->run_index = __atomic_add_fetch(&movies_started, 1, __ATOMIC_RELAXED);
     rt_log("movie: video decoder %d up (AV1 via dav1d %s on its own thread; mime %u, output format %u, mode %u)",
            v->run_index, dav1d_version(), (unsigned)arg_x(c, 3), (unsigned)arg_x(c, 4), (unsigned)arg_x(c, 5));
@@ -524,8 +657,10 @@ static void ov_flush(Cpu *c) {
     Video *v = video_of(arg_p(c, 0));
     if (v) {
         plat_mutex_lock(&v->lock);
-        v->generation++;   // the decoder thread drops what it is making
+        v->generation++;   // the decoder and convert threads drop what they are making
+        v->clock_on = 0;   // a seek: the report's real-time reference starts again from the next picture
         clear_queues(v);
+        clear_converts(v);
         plat_mutex_unlock(&v->lock);
         plat_mutex_lock(&v->codec);
         if (v->dav1d) dav1d_flush(v->dav1d);
@@ -634,14 +769,22 @@ static void ov_acquire(Cpu *c) {
     v->shown += !p.eos;
     if (p.nv12 && v->shown == 1) rt_log("movie: first frame %dx%d shown", p.w, p.h);
     if (p.nv12) vk_dump_movie_frame(v->run_index, v->shown);
+    if (p.nv12 && !v->clock_on) v->ts0 = p.ts, v->shown0_ns = plat_now_ns(), v->clock_on = 1;
     if (p.nv12) {   // pacing report every 600 frames (10 s): the gaps between acquisitions and their time stamps
         static uint64_t last_ns, sum_gap, max_gap, n;
         uint64_t now = plat_now_ns(), gap = last_ns ? now - last_ns : 0;
+        // how far the picture is behind the time since the first one (positive: the picture is late)
+        int64_t lag = (int64_t)(now - v->shown0_ns) - (p.ts - v->ts0);
         sum_gap += gap, n++;
         if (gap > max_gap) max_gap = gap;
         if (n % 600 == 0) {
-            rt_log("movie: pacing over 600 frames: acquire gap avg %.2f ms, max %.2f ms; %d pictures waiting",
-                   sum_gap / 600 / 1e6, max_gap / 1e6, v->qn);
+            rt_log("movie: pacing over 600 frames: acquire gap avg %.2f ms, max %.2f ms; %d pictures waiting; "
+                   "per frame shown: decoder thread waiting for samples %.2f ms, send %.2f ms, get %.2f ms; convert thread "
+                   "%.2f ms per picture (%llu pictures); "
+                   "picture %.0f ms behind real time since the first picture",
+                   sum_gap / 600 / 1e6, max_gap / 1e6, v->qn, t_wait_ns / 600 / 1e6, t_send_ns / 600 / 1e6,
+                   t_get_ns / 600 / 1e6, n_made ? t_make_ns / n_made / 1e6 : 0.0, (unsigned long long)n_made, lag / 1e6);
+            t_wait_ns = t_send_ns = t_get_ns = t_make_ns = n_made = 0;
             sum_gap = max_gap = 0;
         }
         last_ns = now;

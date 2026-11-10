@@ -331,7 +331,7 @@ def ensure_zbic(layout, progress=None, cancel=None, log=print, version='dev'):
     with zipfile.ZipFile(dest) as z:
         for m in z.infolist():
             target = (layout.pydeps / m.filename).resolve()
-            if not str(target).startswith(str(layout.pydeps.resolve())):
+            if not target.is_relative_to(layout.pydeps.resolve()):   # not a sibling such as pydeps2 either
                 raise ToolchainError(f'{pick["filename"]}: unsafe path {m.filename}')
         z.extractall(layout.pydeps)
     dest.unlink(missing_ok=True)

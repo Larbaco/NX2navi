@@ -16,21 +16,22 @@
              context.GetOp<InstAtomsCas>();
 --- a/src/Ryujinx.Graphics.Shader/Instructions/InstEmitMemory.cs
 +++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmitMemory.cs
-@@ -24,6 +24,23 @@
+@@ -24,6 +24,24 @@
              context.Copy(GetDest(op.Dest), res);
          }
  
-+        // NX2NAVI: ATOM.E.CAS Rd, [Ra], Rb (compare), Rb+1 (swap value), 32-bit: the global compare-and-swap the IR and
-+        // GlobalToStorage already carry (AtomicCompareAndSwap, compare and value its last two sources). The Ampere
-+        // lowering (ATOMG.E.CAS) puts the pair in consecutive registers and takes no offset.
++        // NX2NAVI: ATOM.E.CAS Rd, [Ra], Rb, Rb + 1 (32-bit): the word at the address is replaced by Rb + 1 where it
++        // equals Rb, and Rd gets its old value. tools/xlate/AmpereLowering.cs AtomgCas lowers SM86 ATOMG.CAS to it.
++        // BcRz 1 and 2 read the compare and the new value as zero.
 +        public static void AtomCas(EmitterContext context)
 +        {
 +            InstAtomCas op = context.GetOp<InstAtomCas>();
 +
 +            (Operand addrLow, Operand addrHigh) = Get40BitsAddress(context, new Register(op.SrcA, RegisterType.Gpr), op.E, 0);
 +
-+            Operand compare = GetSrcReg(context, op.SrcB);
-+            Operand value = op.SrcB == RegisterConsts.RegisterZeroIndex ? Const(0) : Register(op.SrcB + 1, RegisterType.Gpr);
++            bool rz = op.SrcB == RegisterConsts.RegisterZeroIndex;
++            Operand compare = rz || op.BcRz == 1 ? Const(0) : GetSrcReg(context, op.SrcB);
++            Operand value = rz || op.BcRz == 2 ? Const(0) : GetSrcReg(context, op.SrcB + 1);
 +
 +            Operand res = context.AtomicCompareAndSwap(StorageKind.GlobalMemory, addrLow, addrHigh, compare, value);
 +

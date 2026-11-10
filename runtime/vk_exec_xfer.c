@@ -34,6 +34,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cfg.h"
+#include "platform/platform.h"
 #include "host.h"
 #include "nvn_api.h"
 #include "nvn_tex.h"
@@ -58,11 +60,12 @@ static uint32_t max1(uint32_t v) { return v ? v : 1; }
 
 // ---- completion callbacks (completion thread)
 
-typedef struct { uint64_t addr, size; } Range;
+typedef struct { uint64_t addr, size; int back; } Range;   // back: written into a VRAM mirror (vk_mem_mirrored)
 
 static void guest_written_cb(void *arg) {
     Range *r = arg;
-    vk_gpu_written(r->addr, r->size);
+    if (r->back) vk_gpu_written_back(r->addr, r->size);
+    else vk_gpu_written(r->addr, r->size);
     free(r);
 }
 
@@ -72,7 +75,7 @@ static void note_gpu_write(VkExec *ex, uint64_t addr, uint64_t size) {
     if (nvn_gpu_only(addr)) return;
     Range *r = malloc(sizeof *r);
     if (!r) rt_fatal("vk: out of memory");
-    *r = (Range){addr, size};
+    *r = (Range){addr, size, vk_mem_mirrored(addr, size)};
     vk_mem_gpu_pending(addr, size);
     vk_completion_add(ex->fence, guest_written_cb, r);
 }
@@ -593,6 +596,7 @@ static int buffer_side(const VkExec *ex, const Sub *s, uint64_t addr, uint64_t *
 static void copy_buffer_image(VkExec *ex, const p_copy_b2t *p, int to_image) {
     Sub s;
     if (!sub_resolve(p->tex, &p->view, p->has_view, &p->r, 1, &s)) return;
+    vk_gpu_gap_note(to_image ? VK_GAP_COPY_B2T : VK_GAP_COPY_T2B, (uint64_t)s.w * s.h);
     if (s.img->scale > 1) {   // the buffer holds the game's texel count, the image more
         warn_once(W_REGION, "buffer copy of a shadow map enlarged by NX2NAVI_SHADOW_SCALE: skipped");
         return;
@@ -616,6 +620,7 @@ static void copy_t2t(VkExec *ex, const p_copy_t2t *p) {
     if (!sub_resolve(p->src, &p->sv, p->has_sv, &p->sr, 1, &s)) return;
     if (!sub_resolve(p->dst, &p->dv, p->has_dv, &p->dr, 1, &d)) return;
     d.nz = s.nz;
+    vk_gpu_gap_note(VK_GAP_COPY_T2T, (uint64_t)s.w * s.h);
     int same_size = s.w == d.w && s.h == d.h;
     int same_format = s.img->format == d.img->format;
     if (s.img->samples != d.img->samples && !(s.img->samples > 1 && d.img->samples == 1 && same_size && same_format)) {
@@ -658,6 +663,7 @@ static void copy_t2t(VkExec *ex, const p_copy_t2t *p) {
 
 static void copy_b2b(VkExec *ex, const p_copy_b2b *p) {
     uint64_t src = p->src, dst = p->dst, left = p->size;
+    vk_gpu_gap_note(VK_GAP_COPY_B2B, p->size);
     int started = 0;
     while (left) {
         VkMemSpan s, d;
@@ -698,6 +704,7 @@ static void clear_buf(VkExec *ex, const p_clear_buf *p) {
         return;
     }
     uint64_t dst = p->addr, left = p->size;
+    vk_gpu_gap_note(VK_GAP_CLEAR_BUF, p->size);
     int started = 0;
     while (left) {
         VkMemSpan d;
@@ -748,6 +755,7 @@ static void clear_tex(VkExec *ex, const p_clear_tex *p) {
     const VkTexImage *img = s.img;
     int is3d = img->type == VK_IMAGE_TYPE_3D;
     uint32_t lw = max1(img->width >> s.level), lh = max1(img->height >> s.level);
+    vk_gpu_gap_note(VK_GAP_CLEAR_TEX, (uint64_t)lw * lh);
     int reformat = p->has_view && p->view.set_format && p->view.format != t->d.format;
     if (s.x || s.y || s.w != lw || s.h != lh || (p->mask & 0xf) != 0xf || reformat ||
         (is3d && (s.z || s.nz != max1(img->depth >> s.level)))) {
@@ -786,7 +794,7 @@ static void clear_tex(VkExec *ex, const p_clear_tex *p) {
     vk_texture_gpu_written(t);
 }
 
-void vk_exec_op_xfer(VkExec *ex, uint32_t op, const void *payload) {
+static void op_xfer_impl(VkExec *ex, uint32_t op, const void *payload) {
     if (op != OP_RENDER_ENABLE && op != OP_SIGNAL_EVENT) vk_contact_flush(ex);
     switch (op) {
     case OP_COPY_B2B: copy_b2b(ex, payload); break;
@@ -806,4 +814,14 @@ void vk_exec_op_xfer(VkExec *ex, uint32_t op, const void *payload) {
         break;
     default: rt_fatal("vk: op %s is not a transfer", nvn_op_name(op));
     }
+}
+
+// NX2NAVI_REPLAY_TIME: see the note over vk_exec_op_draw in vk_exec_draw.c; transfers are the third kind.
+void vk_exec_op_xfer(VkExec *ex, uint32_t op, const void *payload) {
+    static int on = -1;
+    if (on < 0) on = cfg_bool("NX2NAVI_REPLAY_TIME");
+    if (!on) { op_xfer_impl(ex, op, payload); return; }
+    uint64_t t0 = plat_now_ns();
+    op_xfer_impl(ex, op, payload);
+    perf_replay_op_at(PERF_RP_XFER, op, plat_now_ns() - t0);
 }

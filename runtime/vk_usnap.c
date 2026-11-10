@@ -313,7 +313,11 @@ static int first_above(uint64_t a) {
 
 int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out) {
     if (!U.on || !n) return 0;
-    int i = first_above(addr);
+    // Consecutive bindings mostly name the region the last one did: that one is tried before the binary search. The
+    // regions are sorted and disjoint, so the region that holds addr is the one first_above finds.
+    static int hint;
+    int i = hint;
+    if (i >= U.nreg || addr < U.reg[i].lo || addr >= U.reg[i].hi) i = first_above(addr);
     if (i >= U.nreg) return 0;
     const Reg *r = &U.reg[i];
     if (r->dropped || addr < r->lo || addr + n > r->hi) return 0;
@@ -321,6 +325,7 @@ int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferI
     if (off % align) return 0;
     *out = (VkDescriptorBufferInfo){U.arena->buf, off, n};
     U.hits++;
+    hint = i;
     return 1;
 }
 
@@ -334,6 +339,38 @@ void vk_usnap_drop(uint64_t addr, uint64_t n) {
 }
 
 uint64_t vk_usnap_gen(void) { return U.gen; }
+
+// A GPU write of a submission not known to be complete touches [lo, hi). A linear scan: vk_usnap_drop appends after
+// wr_prune sorted the list, so wr_hits's binary search does not hold here; only called on rare paths.
+static int wr_overlaps(uint64_t lo, uint64_t hi) {
+    for (int i = 0; i < U.nwr; i++)
+        if (U.wr[i].lo < hi && lo < U.wr[i].hi) return 1;
+    return 0;
+}
+
+static int cpu_written(uint64_t addr, uint64_t n) {   // the same test vk_usnap_begin keeps regions by
+    VkMemSpan sp;
+    return vk_mem_resolve(addr, n, &sp) && !sp.alloc && sp.pool && sp.avail >= n &&
+           (sp.cls == VK_MCLS_HOST_CACHED || sp.cls == VK_MCLS_HOST_UNC);
+}
+
+int vk_usnap_read(uint64_t addr, uint64_t n, void *dst) {
+    const uint8_t *s = vk_usnap_bytes(addr, n);
+    if (s) return memcpy(dst, s, n), 1;
+    if (!n || !cpu_written(addr, n) || wr_overlaps(addr, addr + n)) return 0;
+    memcpy(dst, (const void *)(uintptr_t)addr, n);
+    return 2;
+}
+
+int vk_usnap_why(uint64_t addr, uint64_t n) {
+    if (!U.on) return VK_USNAP_NO_SNAPSHOT;
+    int i = first_above(addr);
+    if (i < U.nreg && addr >= U.reg[i].lo && addr + n <= U.reg[i].hi)
+        return U.reg[i].dropped ? VK_USNAP_DROPPED : VK_USNAP_FOUND;
+    if (wr_overlaps(addr, addr + n)) return VK_USNAP_IN_FLIGHT;
+    if (!cpu_written(addr, n)) return VK_USNAP_NOT_CPU;
+    return VK_USNAP_NOT_BOUND;
+}
 
 // the host copy where there is one (DLSS), else the device copy
 static uint8_t *host_copy(void) { return U.arena->cpu ? U.arena->cpu : U.arena->map; }

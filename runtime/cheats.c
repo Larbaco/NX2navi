@@ -152,7 +152,8 @@ static uint64_t region(int m) {
     }
 }
 
-static int in_main(uint64_t a, unsigned n) { return a >= g_main && a + n <= g_main + g_main_size; }
+// Without a + n: an address near 2^64 (a pointer chain that read -1) would wrap the sum and pass.
+static int in_main(uint64_t a, unsigned n) { return a >= g_main && n <= g_main_size && a - g_main <= g_main_size - n; }
 
 static int guest_ok(uint64_t a, unsigned n, uint32_t perm) {
     if (in_main(a, n)) return 1;

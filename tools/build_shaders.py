@@ -59,9 +59,12 @@ def stale(runtime):
 
 
 def compile_one(src):
+    # "// build_shaders: keep functions" in a source: no optimisation, so its functions stay functions (the HDR tonemap,
+    # which runtime/vk_hdr.c splices into the game's shader by function)
+    opt = [] if '// build_shaders: keep functions' in src.read_text(encoding='utf-8') else ['-O']
     with tempfile.TemporaryDirectory() as tmp:
         spv = Path(tmp) / 'out.spv'
-        subprocess.run([str(BIN / 'glslc.exe') if WIN else 'glslc', '-O', f'--target-env={TARGET}', f'-fshader-stage={STAGES[src.suffix]}',
+        subprocess.run([str(BIN / 'glslc.exe') if WIN else 'glslc', *opt, f'--target-env={TARGET}', f'-fshader-stage={STAGES[src.suffix]}',
                         '-o', str(spv), str(src)], check=True)
         subprocess.run([str(BIN / 'spirv-val.exe') if WIN else 'spirv-val', f'--target-env', TARGET, str(spv)], check=True)
         data = spv.read_bytes()

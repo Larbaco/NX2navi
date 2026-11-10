@@ -1,16 +1,17 @@
 ﻿// nx2navi.exe entry: reserves the guest address space, parses the command line and runs one mode.
 //
-//   nx2navi.exe [--exefs DIR] [--romfs DIR] [--profile DIR] [--monitor VALUE] [--audio-device VALUE] <mode>
-//     --monitor VALUE   open the game window on one monitor: sets NX2NAVI_MONITOR before the settings are read, so it wins
-//                       over nx2navi.ini's `monitor =`. VALUE is auto (default), primary, a 1-based index as --list-monitors
-//                       prints it, or part of a GDI device name (DISPLAY3) or of a monitor's name, case-insensitive
-//     --list-monitors   print each monitor's index, GDI device name, name, desktop rectangle, primary flag and DPI;
-//                       needs no game files
+//   nx2navi.exe [--exefs DIR] [--romfs DIR] [--profile DIR] [--audio-device VALUE] [--monitor VALUE] <mode>
 //     --audio-device VALUE   play the sound on one output device: sets NX2NAVI_AUDIO_DEVICE before the settings are read, so
 //                       it wins over nx2navi.ini's `audio_device =`. VALUE is default (the system default device),
 //                       a 1-based index as --list-audio-devices prints it (devices sorted by name), or part of a device name, case-insensitive
 //     --list-audio-devices   print each playback device's index, name, channels and frequency, mark the system default and
 //                       show which device NX2NAVI_AUDIO_DEVICE picks; needs no game files
+//     --monitor VALUE   open the game window on one monitor: sets NX2NAVI_MONITOR before the settings are read, so it wins
+//                       over nx2navi.ini's `monitor =`. VALUE is auto (default), primary, a 1-based index as --list-monitors
+//                       prints it, or part of a monitor's name (on Windows also of its GDI device name, DISPLAY3),
+//                       case-insensitive. Wayland places a windowed window itself: only fullscreen opens on the monitor
+//     --list-monitors   print each monitor's index, name (on Windows also its GDI device name), desktop rectangle,
+//                       primary flag and DPI; needs no game files
 //     --selftest        layout, dispatch table and host-function registry; needs no game files
 //     --probe-mods      the mods folder scan, order and switches (mods.c); needs no game files
 //     --probe-loader    load and relocate the modules, check them against the measured 1.2.1 values
@@ -20,6 +21,7 @@
 //     --probe-gfx-abi   NVN object layouts against nvn.h's reserved sizes; needs no game files
 //     --probe-nvn, --probe-nvn-tex, --probe-window, --probe-shader, --probe-vkmem, --probe-vkexec    graphics probes
 //     --probe-astc      the compute ASTC decoder against astc_decode_ldr; needs no game files
+//     --probe-zstd      host zstd streams (ov_zstd.c) on frames made here; needs no game files
 //     --probe-movie     host VP9 movie::Decoder on one RomFS movie; skips without game data
 //     --boot            run the game to the first NVN call
 //     --seconds S       run the game (implies --boot's start-up) until the world clock (game time since the loaded
@@ -37,6 +39,7 @@
 
 #include "cfg.h"
 #include "host.h"
+#include "prof.h"
 #include "platform/platform.h"
 #include "sha256.h"
 
@@ -123,7 +126,7 @@ static void log_open(int game) {
             if (i > 1) snprintf(from, sizeof from, "%s/nx2navi.%d.log", dir, i - 1);
             else snprintf(from, sizeof from, "%s/nx2navi.log", dir);
             snprintf(to, sizeof to, "%s/nx2navi.%d.log", dir, i);
-            if (plat_file_exists(from)) plat_file_replace(from, to);
+            if (plat_file_exists(from)) plat_file_replace(from, to, 1);
         }
         snprintf(g_log_path, sizeof g_log_path, "%s/nx2navi.log", dir);
         g_log_file = plat_append_open(g_log_path);
@@ -276,6 +279,7 @@ static void crash_handler(const PlatCrash *x) {
     kern_free_cores_note();
     rtss_limit_restore();   // after the report: RivaTuner Statistics Server's profile as it was
     fflush(stderr);
+    prof_sampler_write();   // NX2NAVI_PROFILE: what was sampled until the crash (it gives up after 2 s if the sampler hangs)
     plat_exit(71);
 }
 
@@ -416,7 +420,10 @@ static void check_memory(void) {
     CHECK(q.state == 0 && q.base == g->alias.base && q.size == g->alias.size, "QueryMemory on the free alias region");
     CHECK(mem_map_physical(a, 0x1000) == 0 && LD64(a + 0x10) == 0 && mem_unmap_physical(a, 0x1000) == 0,
           "remapped physical memory is not zeroed");
-    CHECK(mem_map_physical(a, 0x100000000ull) == 0x10801, "MapPhysicalMemory beyond the pool is not LimitReached");
+    // One page more than the whole pool (GetInfo 6), so the request is over the limit whatever the title's pool is.
+    mem_info(6, &v);
+    CHECK(mem_map_physical(a, ((v + 0xFFFull) & ~0xFFFull) + 0x1000) == 0x10801,
+          "MapPhysicalMemory beyond the pool is not LimitReached");
     mem_query(RT_HOSTFN_BASE + 0x40, &q);
     CHECK(q.state == 0x10 && q.base == RT_HOSTFN_BASE, "QueryMemory on the host-function window");
     mem_query(g->alias.base + g->alias.size + 0x1000, &q);
@@ -458,6 +465,7 @@ static int selftest(void) {
     mem_kernel_free(k1, 0x200);
     CHECK(mem_kernel_alloc(0x200, 16) == k1, "a freed kernel-region block is not reused");
     check_memory();
+    failures += vk_pipeline_spirv_selftest();
 
     float used, total, proc;
     plat_mem_info(&used, &total, &proc);
@@ -482,10 +490,10 @@ static int probe_crash(int null) {
 }
 
 static int usage(const char *argv0) {
-    fprintf(stderr, "usage: %s [--exefs DIR] [--romfs DIR] [--profile DIR] [--monitor VALUE] [--audio-device VALUE] [--list-monitors | --list-audio-devices | --selftest | --probe-loader | "
+    fprintf(stderr, "usage: %s [--exefs DIR] [--romfs DIR] [--profile DIR] [--audio-device VALUE] [--monitor VALUE] [--list-audio-devices | --list-monitors | --selftest | --probe-loader | "
                     "--probe-cfg | --probe-dpi | --probe-mods | --probe-kernel | --probe-ipc | --probe-services | --probe-fs | --probe-gfx-abi | "
                     "--probe-nvn | --probe-nvn-tex | --probe-window | --probe-shader | --probe-vkmem | "
-                    "--probe-vkexec | --probe-astc | --probe-movie | --probe-crash-call | --probe-crash-null | --probe-discord | "
+                    "--probe-vkexec | --probe-astc | --probe-zstd | --probe-movie | --probe-crash-call | --probe-crash-null | --probe-discord | "
                     "--prepare-shaders | --warm-shaders | --boot |--seconds S [--shot PNG]]\n", argv0);
     return 2;
 }
@@ -561,18 +569,18 @@ int main(int argc, char **argv) {
         if (path) {
             if (++i == argc) return usage(argv[0]);
             *path = argv[i];
-        } else if (!strcmp(argv[i], "--monitor")) {
-            // The settings read NX2NAVI_MONITOR from the environment first (cfg.c raw_get), and nothing has read it yet:
-            // the window opens in rt_boot. An empty value would remove the variable (plat_setenv) and hand the choice back
-            // to nx2navi.ini, so "auto" is the spelling for "no monitor choice" on the command line.
-            if (++i == argc || !*argv[i]) return usage(argv[0]);
-            plat_setenv("NX2NAVI_MONITOR", argv[i]);
         } else if (!strcmp(argv[i], "--audio-device")) {
             // Same approach as every setting: NX2NAVI_AUDIO_DEVICE is read from the environment first (cfg.c raw_get), and
             // nothing has read it yet because the audio renderer opens in rt_boot. An empty value would remove the variable
             // (plat_setenv) and hand the choice back to nx2navi.ini, so "default" is the spelling for the system default.
             if (++i == argc || !*argv[i]) return usage(argv[0]);
             plat_setenv("NX2NAVI_AUDIO_DEVICE", argv[i]);
+        } else if (!strcmp(argv[i], "--monitor")) {
+            // The settings read NX2NAVI_MONITOR from the environment first (cfg.c raw_get), and nothing has read it yet:
+            // the window opens in rt_boot. An empty value would remove the variable (plat_setenv) and hand the choice back
+            // to nx2navi.ini, so "auto" is the spelling for "no monitor choice" on the command line.
+            if (++i == argc || !*argv[i]) return usage(argv[0]);
+            plat_setenv("NX2NAVI_MONITOR", argv[i]);
         } else if (!strcmp(argv[i], "--seconds")) {
             char *end;
             if (++i == argc) return usage(argv[0]);
@@ -598,8 +606,8 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!strcmp(mode, "--selftest")) return selftest();
-    if (!strcmp(mode, "--list-monitors")) return list_monitors();
     if (!strcmp(mode, "--list-audio-devices")) return list_audio_devices();
+    if (!strcmp(mode, "--list-monitors")) return list_monitors();
     if (!strcmp(mode, "--probe-loader")) return probe_loader();
     if (!strcmp(mode, "--probe-crash-call")) return probe_crash(0);
     if (!strcmp(mode, "--probe-crash-null")) return probe_crash(1);
@@ -621,6 +629,7 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "--probe-vkmem")) return probe_vkmem();
     if (!strcmp(mode, "--probe-vkexec")) return probe_vkexec();
     if (!strcmp(mode, "--probe-astc")) return probe_astc();
+    if (!strcmp(mode, "--probe-zstd")) return probe_zstd();
     if (!strcmp(mode, "--probe-vkdevice")) return probe_vkdevice();
     if (!strcmp(mode, "--probe-movie")) return probe_movie();
     if (!strcmp(mode, "--prepare-shaders")) return vk_pipeline_prepare_shaders();

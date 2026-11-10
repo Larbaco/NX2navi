@@ -54,6 +54,8 @@ const GfxShader *gfx_shader_await(int stage, const uint8_t *control, const uint8
                                   const GfxShaderAnswers *a);
 uint64_t gfx_shader_async_done(void);                      // translations finished by the background worker
 void gfx_shader_counts(uint64_t *keys, uint64_t *translated);   // distinct keys in memory, translations done (NX2NAVI_TRACE=perf)
+void gfx_shader_disk_counts(uint64_t *sync, uint64_t *sync_ns, uint64_t *bg);   // disk cache reads on the render
+                                                     // thread (count, ns) and by the loaders (gfx_shader.c load_budget)
 // Translator answers for this device (vk_caps.c): shaderFloat64, storage offset rounding, subgroup size per vs/fs/cs.
 void gfx_shader_set_host(int float64, uint32_t sbuf_align, const uint32_t subgroup[3], uint32_t gather_bits, int zero_locals,
                          int bda);
@@ -62,8 +64,13 @@ const uint8_t *gfx_shader_input_id(const GfxShader *s);     // the 32-byte input
 // By input id from memory or disk; xlate 1 also translates it from its stored inputs. NULL if absent.
 const GfxShader *gfx_shader_load_input(const uint8_t iid[32], int xlate);
 // Boot prewarm: out[i] = gfx_shader_load_input(iids[i], 1) on `threads` threads with up to `procs` translators, then
-// every other stored input not cached under this translator is translated. Logs progress and the total.
+// every other stored input not cached under this translator is translated (one a previous translator's translation
+// serves is left to gfx_shader_carry_start's pass). Logs progress and the total.
 void gfx_shader_prewarm(const uint8_t (*iids)[32], size_t n, const GfxShader **out, int threads, int procs);
+// After the boot prewarm of a game run (boot.c): when the shader cache holds translations of a previous translator
+// (NX2NAVI_SHADER_CARRY), starts the background pass that translates them again under the current one for the next
+// start and then drops the old ones (gfx_shader.c, "Carry").
+void gfx_shader_carry_start(void);
 // How far the running (or last) gfx_shader_prewarm is: shaders done of total, and how many of them it translated (the
 // rest were cached). Any thread; the numbers lag the workers by at most 100 ms.
 void gfx_shader_prewarm_progress(int64_t *done, int64_t *total, int64_t *translated);
@@ -93,8 +100,8 @@ int gfx_shader_write_code(const GfxShader *s, const char *path);   // the guest 
 // A shader of the runtime's own (SPIR-V and a .res.json text as the translator writes them), outside the cache and
 // never freed; its key is the sha256 of both. NULL when the SPIR-V is malformed.
 const GfxShader *gfx_shader_own(const uint32_t *spirv, uint64_t words, const char *res_json);
-// vk_hdr.c: with NX2NAVI_HDR=1, replaces a fragment shader's SPIR-V (malloc'd, *words long) by the HDR tonemap when it is
-// the game's tonemap; gfx_shader.c calls it for every fragment shader entering the cache.
+// vk_hdr.c: with NX2NAVI_HDR=1, splices the HDR tonemap into a fragment shader's SPIR-V (malloc'd, *words long) when it
+// is the game's tonemap, and unclamps the game's FSR pass; gfx_shader.c calls it for every fragment shader entering the cache.
 void vk_hdr_shader_swap(uint32_t **spirv, uint64_t *words);
 uint64_t gfx_shader_failures(void);                         // failed translations; feeds GfxStats.shader_failures
 // Reflection: parsed once per shader from the translator's .res.json and the SPIR-V before it enters the cache.

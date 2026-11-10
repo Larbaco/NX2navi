@@ -5,12 +5,15 @@
 // modes among them). Each case decodes two regions into two mip levels of an RGBA8 image with cropped edges, and
 // compares both the decoder's texels (readback) and what the image holds afterwards. The same regions also go through
 // the BC3 encoder (NX2NAVI_ASTC_BC) into a BC3 image, whose blocks are decoded here and held to error bounds (bc_check).
+// Then cut-out foliage at every footprint (cutout_case): full mip chains of transparent and opaque patches with sharp
+// alpha edges, through the encoder, where alpha 0 and 255 must stay exact and alpha tests keep their outline (cut_check).
 // Also times one 2048x2048 texture on the CPU (astc_decode_ldr_mt) and on the GPU (wall time of the upload batch).
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "cfg.h"
 #include "platform/platform.h"
 #include "host.h"
 #include "tex.h"
@@ -114,24 +117,23 @@ static void to_general(VkCommandBuffer cb, VkImage img) {
 
 static double now_ms(void) { return (double)plat_now_ns() / 1e6; }
 
-// Decodes regions (w0 x h0 at level 0, w1 x h1 at level 1) of blk on the GPU; out_rb: the decoder's texels, out_img:
-// the image's two levels read back. 0 on a Vulkan failure.
-static int gpu_decode(VkCtx *c, const uint8_t *blk, size_t n0, size_t n1, uint32_t w0, uint32_t h0, uint32_t w1,
-                      uint32_t h1, uint32_t bw, uint32_t bh, int srgb, uint8_t *out_rb, uint8_t *out_img, double *ms) {
+// Decodes the two regions ar (w0 x h0 at level 0, w1 x h1 at level 1) of the src_bytes at src on the GPU; out_rb: the
+// decoder's texels, out_img: the image's two levels read back. 0 on a Vulkan failure.
+static int gpu_decode_ar(VkCtx *c, const uint8_t *src, size_t src_bytes, const VkAstcRegion ar[2], uint32_t bw,
+                         uint32_t bh, int srgb, uint8_t *out_rb, uint8_t *out_img, double *ms) {
+    uint32_t w0 = ar[0].w, h0 = ar[0].h, w1 = ar[1].w, h1 = ar[1].h;
     Img im;
     if (!make_image(c, w0, h0, 2, srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM, &im)) return 0;
     size_t t0 = (size_t)w0 * h0 * 4, t1 = (size_t)w1 * h1 * 4;
     VkCommandBuffer cb = vk_upload_begin();
     VkBuffer sb, rb, ib;
     VmaAllocation ra, ia;
-    uint8_t *stg = vk_staging((n0 + n1) * 16, &sb, NULL);
+    uint8_t *stg = vk_staging(src_bytes, &sb, NULL);
     uint8_t *rmap = vk_staging(t0 + t1, &rb, &ra), *imap = vk_staging(t0 + t1, &ib, &ia);
-    memcpy(stg, blk, (n0 + n1) * 16);
+    memcpy(stg, src, src_bytes);
     to_general(cb, im.img);
-    VkAstcRegion ar[2] = {{.src = 0, .w = w0, .h = h0, .slices = 1, .level = 0},
-                          {.src = n0 * 16, .w = w1, .h = h1, .slices = 1, .level = 1}};
     barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-    int ok = vk_astc_record(cb, sb, (n0 + n1) * 16, ar, 2, bw, bh, srgb, 0, im.img, VK_IMAGE_ASPECT_COLOR_BIT, rb);
+    int ok = vk_astc_record(cb, sb, src_bytes, ar, 2, bw, bh, srgb, 0, im.img, VK_IMAGE_ASPECT_COLOR_BIT, rb);
     barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
     VkBufferImageCopy cp[2] = {{.bufferOffset = 0, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w0, h0, 1}},
                                {.bufferOffset = t0, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 1, 0, 1}, .imageExtent = {w1, h1, 1}}};
@@ -151,32 +153,90 @@ static int gpu_decode(VkCtx *c, const uint8_t *blk, size_t n0, size_t n1, uint32
     return ok;
 }
 
-// The same two regions decoded and encoded to BC3 (NX2NAVI_ASTC_BC) into a BC3 image; out: its blocks read back, level 0
-// then level 1, rows of 4x4 blocks. 0 on a Vulkan failure or when nothing was recorded.
-static int gpu_bc(VkCtx *c, const uint8_t *blk, size_t n0, size_t n1, uint32_t w0, uint32_t h0, uint32_t w1, uint32_t h1,
+// The two regions as tight blocks: n0 blocks of level 0, then n1 of level 1.
+static int gpu_decode(VkCtx *c, const uint8_t *blk, size_t n0, size_t n1, uint32_t w0, uint32_t h0, uint32_t w1,
+                      uint32_t h1, uint32_t bw, uint32_t bh, int srgb, uint8_t *out_rb, uint8_t *out_img, double *ms) {
+    VkAstcRegion ar[2] = {{.src = 0, .w = w0, .h = h0, .slices = 1, .level = 0},
+                          {.src = n0 * 16, .w = w1, .h = h1, .slices = 1, .level = 1}};
+    return gpu_decode_ar(c, blk, (n0 + n1) * 16, ar, bw, bh, srgb, out_rb, out_img, ms);
+}
+
+static int first_diff(const uint8_t *a, const uint8_t *b, size_t texels, size_t *at);
+
+// The same blocks tiled as the game stores them (tex_bl_copy, the CPU deswizzle's own copy), level 0 in blocks of 4 GOBs
+// and level 1 in blocks of 2, decoded in place (VkAstcRegion.bl, astc_decode.comp bl_block): the decoder's texels must be
+// want's. Checks the GPU's block-linear addressing against the CPU's.
+static int test_bl(VkCtx *c, const uint8_t *blk, size_t n0, uint32_t w0, uint32_t h0, uint32_t w1, uint32_t h1,
+                   uint32_t bw, uint32_t bh, int srgb, const uint8_t *want) {
+    const unsigned th[2] = {2, 1};
+    uint32_t bx[2] = {(w0 + bw - 1) / bw, (w1 + bw - 1) / bw}, by[2] = {(h0 + bh - 1) / bh, (h1 + bh - 1) / bh};
+    uint64_t sz[2];
+    for (int lv = 0; lv < 2; lv++) {
+        uint64_t gh = 8ull << th[lv];
+        sz[lv] = ((uint64_t)bx[lv] * 16 + 63) / 64 * ((by[lv] + gh - 1) / gh) * (512ull << th[lv]);
+    }
+    uint8_t *bl = calloc(1, sz[0] + sz[1]);
+    tex_bl_copy(bl, (uint8_t *)blk, (size_t)bx[0] * 16, bx[0] * 16, by[0], 1, th[0], 0, 0);
+    tex_bl_copy(bl + sz[0], (uint8_t *)blk + n0 * 16, (size_t)bx[1] * 16, bx[1] * 16, by[1], 1, th[1], 0, 0);
+    VkAstcRegion ar[2] = {{.src = 0, .w = w0, .h = h0, .slices = 1, .level = 0, .bl = 1, .th = (uint8_t)th[0]},
+                          {.src = sz[0], .w = w1, .h = h1, .slices = 1, .level = 1, .bl = 1, .th = (uint8_t)th[1]}};
+    size_t t0 = (size_t)w0 * h0, t1 = (size_t)w1 * h1, at;
+    uint8_t *rb = malloc((t0 + t1) * 4);
+    memset(rb, 0x5A, (t0 + t1) * 4);
+    int bad = 0;
+    if (!gpu_decode_ar(c, bl, sz[0] + sz[1], ar, bw, bh, srgb, rb, NULL, NULL)) {
+        printf("probe-astc: FAIL %ux%u %s block-linear: the GPU decode was not recorded\n", bw, bh, srgb ? "sRGB" : "linear");
+        bad = 1;
+    }
+    for (int lv = 0; lv < 2 && !bad; lv++) {
+        size_t off = lv ? t0 * 4 : 0;
+        uint32_t w = lv ? w1 : w0;
+        if (first_diff(want + off, rb + off, lv ? t1 : t0, &at)) {
+            printf("probe-astc: FAIL %ux%u %s block-linear level %d: texel (%zu,%zu) differs from the tight decode\n", bw, bh,
+                   srgb ? "sRGB" : "linear", lv, at % w, at / w);
+            bad = 1;
+        }
+    }
+    free(bl), free(rb);
+    return bad;
+}
+
+enum { MAX_LEVELS = 13 };   // a mip chain of up to 4096 texels a side
+static size_t bc_bytes(uint32_t w, uint32_t h) { return (size_t)((w + 3) / 4) * ((h + 3) / 4) * 16; }
+
+// Mip levels 0 .. levels-1 (w[i] x h[i] texels from the n[i] blocks that follow the previous level's in blk) decoded and
+// encoded to BC3 (NX2NAVI_ASTC_BC) by one vk_astc_record call into a BC3 image; out: its blocks read back level after
+// level, rows of 4x4 blocks. 0 on a Vulkan failure or when nothing was recorded.
+static int gpu_bc(VkCtx *c, const uint8_t *blk, const size_t *n, const uint32_t *w, const uint32_t *h, int levels,
                   uint32_t bw, uint32_t bh, int srgb, uint8_t *out) {
     Img im;
-    if (!make_image(c, w0, h0, 2, srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK, &im)) return 0;
-    size_t b0 = (size_t)((w0 + 3) / 4) * ((h0 + 3) / 4) * 16, b1 = (size_t)((w1 + 3) / 4) * ((h1 + 3) / 4) * 16;
+    if (levels > MAX_LEVELS ||
+        !make_image(c, w[0], h[0], (uint32_t)levels, srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK, &im))
+        return 0;
+    VkAstcRegion ar[MAX_LEVELS];
+    VkBufferImageCopy cp[MAX_LEVELS];
+    size_t nb = 0, ob = 0;
+    for (int i = 0; i < levels; i++) {
+        ar[i] = (VkAstcRegion){.src = nb * 16, .w = w[i], .h = h[i], .slices = 1, .level = (uint32_t)i};
+        cp[i] = (VkBufferImageCopy){.bufferOffset = ob, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)i, 0, 1},
+                                    .imageExtent = {w[i], h[i], 1}};
+        nb += n[i], ob += bc_bytes(w[i], h[i]);
+    }
     VkCommandBuffer cb = vk_upload_begin();
     VkBuffer sb, ib;
     VmaAllocation ia;
-    uint8_t *stg = vk_staging((n0 + n1) * 16, &sb, NULL), *imap = vk_staging(b0 + b1, &ib, &ia);
-    memcpy(stg, blk, (n0 + n1) * 16);
+    uint8_t *stg = vk_staging(nb * 16, &sb, NULL), *imap = vk_staging(ob, &ib, &ia);
+    memcpy(stg, blk, nb * 16);
     to_general(cb, im.img);
-    VkAstcRegion ar[2] = {{.src = 0, .w = w0, .h = h0, .slices = 1, .level = 0},
-                          {.src = n0 * 16, .w = w1, .h = h1, .slices = 1, .level = 1}};
     barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-    int ok = vk_astc_record(cb, sb, (n0 + n1) * 16, ar, 2, bw, bh, srgb, 1, im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_NULL_HANDLE);
+    int ok = vk_astc_record(cb, sb, nb * 16, ar, levels, bw, bh, srgb, 1, im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_NULL_HANDLE);
     barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
-    VkBufferImageCopy cp[2] = {{.bufferOffset = 0, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w0, h0, 1}},
-                               {.bufferOffset = b0, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 1, 0, 1}, .imageExtent = {w1, h1, 1}}};
-    vkCmdCopyImageToBuffer(cb, im.img, VK_IMAGE_LAYOUT_GENERAL, ib, 2, cp);
+    vkCmdCopyImageToBuffer(cb, im.img, VK_IMAGE_LAYOUT_GENERAL, ib, (uint32_t)levels, cp);
     barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
     vk_upload_end();
     vk_upload_flush(1);
     vmaInvalidateAllocation(c->vma, ia, 0, VK_WHOLE_SIZE);
-    memcpy(out, imap, b0 + b1);
+    memcpy(out, imap, ob);
     vmaDestroyBuffer(c->vma, ib, ia);
     vk_defer_image(im.img, im.alloc);
     vk_upload_flush(1);
@@ -305,13 +365,16 @@ static int test_case(VkCtx *c, uint32_t bw, uint32_t bh, int srgb) {
             }
         }
     }
+    if (!bad) bad = test_bl(c, blk, n0, w0, h0, w1, h1, bw, bh, srgb, want);
     if (!bad && vk_astc_bc()) {
-        size_t b0 = (size_t)((w0 + 3) / 4) * ((h0 + 3) / 4) * 16, b1 = (size_t)((w1 + 3) / 4) * ((h1 + 3) / 4) * 16;
+        size_t b0 = bc_bytes(w0, h0), b1 = bc_bytes(w1, h1);
         uint8_t *bc = malloc(b0 + b1);
         char what[2][48];
         double db[2] = {0, 0};
         for (int lv = 0; lv < 2; lv++) snprintf(what[lv], sizeof what[lv], "%ux%u %s level %d", bw, bh, srgb ? "sRGB" : "linear", lv);
-        if (!gpu_bc(c, blk, n0, n1, w0, h0, w1, h1, bw, bh, srgb, bc)) {
+        size_t nn[2] = {n0, n1};
+        uint32_t ww[2] = {w0, w1}, hh[2] = {h0, h1};
+        if (!gpu_bc(c, blk, nn, ww, hh, 2, bw, bh, srgb, bc)) {
             printf("probe-astc: FAIL BC3 %s: the encode was not recorded\n", what[0]);
             bad = 1;
         }
@@ -323,6 +386,149 @@ static int test_case(VkCtx *c, uint32_t bw, uint32_t bh, int srgb) {
     }
     g_blocks += n0 + n1, g_texels += t0 + t1;
     free(blk), free(want), free(rb), free(im);
+    return bad;
+}
+
+// ---- cut-outs: alpha-tested foliage through the BC3 encoder
+// Mip chains whose ASTC blocks are, by a hash of their place, fully transparent (alpha 0 over whatever colour, as an
+// encoder leaves the colour under a cut-out), fully opaque leaf green, or a block whose alpha jumps from transparent to
+// opaque between two neighbouring texels. The edges between blocks lie on the footprint's grid, so along a side of 5, 6
+// or 10 texels they cut through BC3's 4x4 blocks at every offset; the levels shrink to odd sizes down to 1x1.
+enum { SHARP_POOL = 96 };
+static uint64_t g_cut_cases, g_cut_texels, g_cut_edges, g_cut_sharp;
+static double g_cut_db = 99;   // the lowest BC3 PSNR of the cut-out levels
+
+// Valid blocks (not void extents) whose alpha runs from at most 16 to at least 240 with a step of 192 or more between
+// two neighbouring texels; the number found, up to SHARP_POOL.
+static size_t sharp_blocks(uint8_t *pool, uint32_t bw, uint32_t bh) {
+    uint8_t t[12 * 12 * 4];
+    size_t k = 0;
+    for (int tries = 0; tries < 400000 && k < SHARP_POOL; tries++) {
+        uint64_t v[2] = {rnd64(), rnd64()};
+        if ((v[0] & 0x1FF) == 0x1FC || !astc_decode_block((uint8_t *)v, bw, bh, false, t)) continue;
+        int lo = 255, hi = 0, step = 0;
+        for (uint32_t y = 0; y < bh; y++)
+            for (uint32_t x = 0; x < bw; x++) {
+                int a = t[4 * (y * bw + x) + 3];
+                lo = a < lo ? a : lo, hi = a > hi ? a : hi;
+                if ((x && abs(a - t[4 * (y * bw + x - 1) + 3]) >= 192) || (y && abs(a - t[4 * ((y - 1) * bw + x) + 3]) >= 192))
+                    step = 1;
+            }
+        if (lo <= 16 && hi >= 240 && step) memcpy(pool + 16 * k++, v, 16);
+    }
+    return k;
+}
+
+// A void-extent block of one colour (UNORM16 channels, the 8-bit value in both bytes).
+static void void_rgba(uint8_t b[16], const uint8_t c[4]) {
+    uint64_t lo = 0x1FC | 3ull << 10 | 0x1FFFull << 12 | 0x1FFFull << 25 | 0x1FFFull << 38 | 0x1FFFull << 51, hi = 0;
+    for (int ch = 0; ch < 4; ch++) hi |= (uint64_t)(c[ch] * 257u) << 16 * ch;
+    memcpy(b, &lo, 8), memcpy(b + 8, &hi, 8);
+}
+
+// The n blocks of one level, bx to a row: opaque and transparent in patches of 2x2 blocks, one block in five from the
+// sharp-edged pool.
+static void cut_blocks(uint8_t *blk, size_t n, uint32_t bx, int level, const uint8_t *pool, size_t npool) {
+    for (size_t k = 0; k < n; k++) {
+        uint32_t x = (uint32_t)(k % bx), y = (uint32_t)(k / bx);
+        uint64_t patch = ((x >> 1) * 0x9E3779B1ull ^ (y >> 1) * 0x85EBCA77ull ^ (uint64_t)level * 0xC2B2AE3Dull) * 0x27D4EB2F165667C5ull;
+        uint64_t own = (x * 0xC2B2AE3Dull ^ y * 0x9E3779B1ull ^ (uint64_t)level) * 0x165667B19E3779F9ull;
+        patch ^= patch >> 29, own ^= own >> 31;
+        if (own % 5 == 0) {
+            memcpy(blk + 16 * k, pool + 16 * (own / 5 % npool), 16);
+            continue;
+        }
+        uint64_t r = rnd64();
+        uint8_t col[4] = {(uint8_t)r, (uint8_t)(r >> 8), (uint8_t)(r >> 16), 0};   // transparent: any colour
+        if (patch % 2)
+            col[0] = (uint8_t)(40 + r % 60), col[1] = (uint8_t)(120 + (r >> 8) % 80), col[2] = (uint8_t)(20 + (r >> 16) % 40),
+            col[3] = 255;
+        void_rgba(blk + 16 * k, col);
+    }
+}
+
+// What an alpha test sees of the cut-outs. A texel the ASTC image holds fully transparent or fully opaque stays
+// exactly 0 or 255 (a BC3 alpha block's endpoints are its 4x4 block's least and greatest alpha), and every texel keeps
+// its side of an alpha test at a quarter, a half and three quarters unless it lies within the block's alpha step of
+// the threshold. *edges: the 4x4 blocks whose alpha runs from at most 16 to at least 240.
+static int cut_check(const uint8_t *want, const uint8_t *blocks, uint32_t w, uint32_t h, const char *what, uint64_t *edges) {
+    static const int thr[3] = {64, 128, 192};
+    uint32_t bx = (w + 3) / 4, by = (h + 3) / 4;
+    for (uint32_t y4 = 0; y4 < by; y4++)
+        for (uint32_t x4 = 0; x4 < bx; x4++) {
+            uint8_t t[16][4], ep[2][3];
+            int pos[16], lo = 255, hi = 0;
+            bc3_decode(blocks + 16 * ((size_t)y4 * bx + x4), t, ep, pos);
+            for (int pass = 0; pass < 2; pass++)
+                for (int i = 0; i < 16; i++) {
+                    uint32_t x = x4 * 4 + (i & 3), y = y4 * 4 + (i >> 2);
+                    if (x >= w || y >= h) continue;
+                    int a = want[4 * ((size_t)y * w + x) + 3], b = t[i][3];
+                    if (!pass) {
+                        lo = a < lo ? a : lo, hi = a > hi ? a : hi;
+                        continue;
+                    }
+                    int margin = (hi - lo) / 14 + 1;   // bc_check's alpha bound
+                    if ((a == 0 || a == 255) && b != a) {
+                        printf("probe-astc: FAIL BC3 cut-out %s: texel (%u,%u) alpha %d came out %d\n", what, x, y, a, b);
+                        return 1;
+                    }
+                    for (int k = 0; k < 3; k++)
+                        if (abs(a - thr[k]) > margin && (a >= thr[k]) != (b >= thr[k])) {
+                            printf("probe-astc: FAIL BC3 cut-out %s: texel (%u,%u) alpha %d came out %d, across an alpha "
+                                   "test at %d (block alpha %d..%d)\n", what, x, y, a, b, thr[k], lo, hi);
+                            return 1;
+                        }
+                }
+            *edges += lo <= 16 && hi >= 240;
+        }
+    return 0;
+}
+
+// One cut-out mip chain of w0 x h0 texels at footprint bw x bh: every level held to bc_check's bounds and cut_check.
+static int cutout_case(VkCtx *c, uint32_t bw, uint32_t bh, int srgb, uint32_t w0, uint32_t h0) {
+    uint8_t pool[SHARP_POOL * 16];
+    size_t npool = sharp_blocks(pool, bw, bh);
+    char what[64];
+    snprintf(what, sizeof what, "%ux%u %s %ux%u", bw, bh, srgb ? "sRGB" : "linear", w0, h0);
+    if (npool < 8) {
+        printf("probe-astc: FAIL BC3 cut-out %s: only %zu blocks with a sharp alpha edge were generated\n", what, npool);
+        return 1;
+    }
+    int levels = 1;
+    for (uint32_t s = w0 > h0 ? w0 : h0; s > 1; s >>= 1) levels++;
+    if (levels > MAX_LEVELS) levels = MAX_LEVELS;
+    size_t n[MAX_LEVELS], nb = 0, nt = 0, nbc = 0;
+    uint32_t w[MAX_LEVELS], h[MAX_LEVELS];
+    for (int i = 0; i < levels; i++) {
+        w[i] = w0 >> i ? w0 >> i : 1, h[i] = h0 >> i ? h0 >> i : 1;
+        n[i] = (size_t)((w[i] + bw - 1) / bw) * ((h[i] + bh - 1) / bh);
+        nb += n[i], nt += (size_t)w[i] * h[i], nbc += bc_bytes(w[i], h[i]);
+    }
+    uint8_t *blk = malloc(nb * 16), *want = malloc(nt * 4), *bc = malloc(nbc);
+    if (!blk || !want || !bc) { printf("probe-astc: FAIL out of memory\n"); return 1; }
+    size_t ob = 0, ot = 0;
+    for (int i = 0; i < levels; ob += n[i], ot += (size_t)w[i] * h[i], i++) {
+        cut_blocks(blk + ob * 16, n[i], (w[i] + bw - 1) / bw, i, pool, npool);
+        astc_decode_ldr(blk + ob * 16, w[i], h[i], bw, bh, srgb, want + ot * 4);
+    }
+    int bad = !gpu_bc(c, blk, n, w, h, levels, bw, bh, srgb, bc);
+    if (bad) printf("probe-astc: FAIL BC3 cut-out %s: the encode was not recorded\n", what);
+    uint64_t edges = 0;
+    ot = ob = 0;
+    for (int i = 0; i < levels && !bad; ot += (size_t)w[i] * h[i], ob += bc_bytes(w[i], h[i]), i++) {
+        char lv[80];
+        double db = 99;
+        snprintf(lv, sizeof lv, "%s level %d (%ux%u)", what, i, w[i], h[i]);
+        bad = bc_check(want + ot * 4, bc + ob, w[i], h[i], lv, &db) || cut_check(want + ot * 4, bc + ob, w[i], h[i], lv, &edges);
+        if (!bad && db < g_cut_db) g_cut_db = db;
+    }
+    if (!bad && !edges) {
+        printf("probe-astc: FAIL BC3 cut-out %s: no 4x4 block ran from transparent to opaque\n", what);
+        bad = 1;
+    }
+    if (!bad) g_cut_cases++, g_cut_texels += nt, g_cut_edges += edges, g_cut_sharp += npool;
+    free(blk), free(want), free(bc);
     return bad;
 }
 
@@ -355,7 +561,7 @@ static void timing(VkCtx *c, uint32_t bw, uint32_t bh) {
 }
 
 int probe_astc(void) {
-    plat_setenv("NX2NAVI_ASTC_BC", "1");   // also builds the BC3 encoder; the RGBA8 cases pass bc 0 and do not use it
+    cfg_setenv("NX2NAVI_ASTC_BC", "1");   // also builds the BC3 encoder; the RGBA8 cases pass bc 0 and do not use it
     if (!vk_init()) { printf("probe-astc: FAIL vk_init\n"); return 1; }
     VkCtx *c = vk_ctx();
     printf("probe-astc: GPU %s, textureCompressionASTC_LDR %d, mode %d\n", c->props.deviceName, c->has_astc_ldr,
@@ -370,8 +576,21 @@ int probe_astc(void) {
     for (int b = 0; b < NB && !bad; b++)
         if (!g_bucket[b]) { printf("probe-astc: FAIL no valid %s block was generated\n", bucket_name[b]); bad = 1; }
     if (!bad && !vk_astc_bc()) printf("probe-astc: BC3 encoder not available on this device: not checked\n");
-    else if (!bad) printf("probe-astc: BC3 encode: %llu cases within the bounds, lowest PSNR %.1f dB (floor %d)\n",
-                          (unsigned long long)g_bc_cases, g_bc_db, BC_MIN_DB);
+    else if (!bad) {
+        printf("probe-astc: BC3 encode: %llu cases within the bounds, lowest PSNR %.1f dB (floor %d)\n",
+               (unsigned long long)g_bc_cases, g_bc_db, BC_MIN_DB);
+        // cut-outs: every footprint, then two chains large enough that level 0 is a scratch chunk of its own
+        for (int i = 0; i < 14 && !bad; i++)
+            for (int s = 0; s < 2 && !bad; s++)
+                bad = cutout_case(c, dims[i][0], dims[i][1], s, 53u * dims[i][0] - 3, 41u * dims[i][1] - 1);
+        if (!bad) bad = cutout_case(c, 4, 4, 1, 3001, 2999) || cutout_case(c, 6, 5, 0, 3003, 2997);
+        if (!bad)
+            printf("probe-astc: BC3 cut-outs: %llu mip chains, %.2f M texels, %llu 4x4 blocks from transparent to opaque "
+                   "(%llu sharp-edged ASTC blocks among the void extents): alpha 0 and 255 exact, every alpha test at 1/4, "
+                   "1/2 and 3/4 kept outside the block's alpha step; lowest PSNR %.1f dB\n",
+                   (unsigned long long)g_cut_cases, (double)g_cut_texels / 1e6, (unsigned long long)g_cut_edges,
+                   (unsigned long long)g_cut_sharp, g_cut_db);
+    }
     if (!bad) {
         timing(c, 4, 4);
         timing(c, 6, 6);
@@ -385,7 +604,8 @@ int probe_astc(void) {
         printf("probe-astc: FAILED (%s, %ld validation errors)\n", bad ? "a check failed" : "checks passed", errors);
         return 1;
     }
-    printf("probe-astc: passed (14 footprints x linear/sRGB, %llu blocks, %llu texels bit-exact with astc_decode_ldr; "
+    printf("probe-astc: passed (14 footprints x linear/sRGB, tight and block-linear, %llu blocks, %llu texels bit-exact "
+           "with astc_decode_ldr; "
            "valid blocks by kind: 1p %llu, 2p %llu, 3p %llu, 4p %llu, dual 1p %llu, dual 2p %llu, dual 3p %llu; "
            "%llu void extents, %llu random error blocks; 0 validation errors)\n",
            (unsigned long long)g_blocks, (unsigned long long)g_texels, (unsigned long long)g_bucket[0],

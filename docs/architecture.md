@@ -86,12 +86,30 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   pinned shader translator (`tools/vendor/ryujinx`, 1.3.2) with our patches (`tools/xlate/patches/`), built with .NET 10 NativeAOT as
   `nx2navi_xlate.exe` and run as separate processes. Translations are cached on disk; shaders and pipelines seen in
   play are prepared at the next boot. The game waits for it (`runtime/boot.c` `boot_wait`): about half a second
-  when warm; after a translator, GPU or driver change a "Preparing shaders" screen shows the progress (`ui/menu.cpp`
+  when warm; after a GPU or driver change, or a translator change with nothing to carry (below), a "Preparing
+  shaders" screen shows the progress (`ui/menu.cpp`
   `menu_boot_frame`). With the graphics pipeline library the boot builds recorded pipelines in record order for at
   most 20 s after the shaders are ready and leaves the rest to the pipeline workers below normal priority; a draw
   that meets one before it is built gets a fast-linked pipeline (`vk_pipeline.c` `PREWARM_PIPE_MS`).
   `NX2NAVI_PREWARM_FULL=1`, and drivers without the library, wait for every pipeline. `NX2NAVI_PREWARM_WAIT_MS` caps
   the whole wait, after which the rest finishes in the background.
+- Translator updates: every cache key names the translator, so a new one has no translations. The cache carries the
+  previous translator's (`NX2NAVI_SHADER_CARRY`, `runtime/gfx_shader.c` "Carry"): `shader-cache/identities.txt`
+  lists the translators it holds translations of, and a shader the new translator has not translated yet uses the
+  previous one's for the whole session, so neither the start nor play waits for a translation the update caused.
+  After the boot prewarm a background pass on its own translator process at idle priority, which waits while the game
+  translates, translates every stored program again for the next start, then deletes the old translations (a pruned
+  copy of `shader-cache.pack` replaces the pack at the next start). A program the new translator refuses keeps its
+  old translation. `--prepare-shaders` still translates everything with the current translator.
+- Shader disk reads in play: a draw's shader that is in the disk cache but not in memory is read on the render thread
+  within a budget of 1/8 of the wall time (2 ms at once), and past it by three loader threads while its draws are
+  skipped as for a translation (`runtime/gfx_shader.c` `load_budget`). Opening a loose file is what costs (5.6 ms a
+  pair the first time on Windows), so an update that carries the shaders over packs the cache once it holds 1,000
+  loose translations (`tools/make_game.py` `PACK_LOOSE_MIN`).
+- Texture pool streaming: the bindless pool's refresh before each draw creates at most `pool_create_budget` entries,
+  and once a frame's refreshes have taken `pool_create_ms` (6 ms) none more until the next frame; the slots left keep
+  their stand-in, and the frame's later refreshes skip them (`runtime/vk_exec_draw.c` `pool_refill`). An area load
+  spreads over several frames instead of holding one for 200-400 ms.
 - Mesh and task shaders run as `VK_EXT_mesh_shader`; indirect mesh draws read NVN's `{count, first}` record through a
   ring of Vulkan `{x, y, z}` records filled on the GPU.
 - Pipelines: `VK_EXT_graphics_pipeline_library` where the driver has it: stage libraries compiled ahead, a fast link
@@ -100,6 +118,12 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   are compiled outside the pipeline lock, and one compile serves every thread that needs it.
 - The game's tensor-core upscaler is replaced by a decode-and-scale pass (`vk_tonemap.c`); `vk_fsr.c` runs AMD FSR 1
   (EASU, RCAS) on the present when the window is larger than the picture.
+- HDR (`vk_hdr.c`): the game tonemaps its scene into a float target, upscales it, draws the HUD into a second float
+  target and copies that into the 8-bit sRGB window texture it presents. With `NX2NAVI_HDR=1` the tonemap shader gets
+  the function of `shaders/hdr_tonemap.frag` spliced in where its SDR curve clamps each channel, so the float picture
+  holds the HDR picture relative to the HUD's white; the game's FSR 1 pass loses its output clamp; the present reads
+  the float picture in place of the window texture and `shaders/hdr_encode.comp` writes PQ for an HDR10 swapchain.
+  `NX2NAVI_HDR=native` reports an HDR10 display to the game, which then renders and presents its own PQ picture.
 - ASTC textures are uploaded as they are where the device samples ASTC, and decoded by a compute shader everywhere
   else (`vk_astc.c`); under 20 GiB of video memory the decoder encodes them to BC3.
 - Occlusion queries never block the CPU; a result that is not ready counts as visible.

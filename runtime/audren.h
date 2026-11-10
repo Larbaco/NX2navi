@@ -145,6 +145,8 @@ typedef struct {
     uint32_t consumed, drops;
     struct { int16_t history[2]; int32_t buffer; uint64_t at; } adpcm;   // DSP-ADPCM decode cursor (buffer slot, next sample) and history
     float biquad_state[2][6][2];   // filter, channel: transposed direct-form II delays
+    uint64_t dry_pass;             // NX2NAVI_AUDIO_STATS: 1 + the render pass in which the voice ran out of queued
+                                   // buffers before its end of stream (audren.c advance_voice), 0 otherwise
 } ServerVoice;
 enum { SV_STOPPED, SV_STARTED, SV_PAUSED, SV_STOPPING };
 
@@ -157,6 +159,7 @@ typedef struct AudioRenderer {
     int logged;
     uint64_t behavior_flags, elapsed_frames;
     uint64_t stop_released, empty_played, flushed, logged_released;
+    struct AudrenStats *stats;   // NX2NAVI_AUDIO_STATS (audren.c), NULL when off
     ServerVoice *voices;
     AudrenPoolIn *pools;
     AudrenMixIn *mixes;
@@ -184,6 +187,10 @@ void audio_mixer_render(AudioRenderer *r, double seconds);   // after audio_voic
 // many ns (the ring is at its target), -1 leaves the pace to the render thread's timer (no device, renderer stopped,
 // device stalled).
 int64_t audio_mixer_pace_ns(AudioRenderer *r, uint64_t now);
+// NX2NAVI_AUDIO_STATS: the output's counters since it opened, and the longest gap between two device requests since
+// the last call (which starts that measure again). False without a device.
+typedef struct { uint64_t underruns, missing_frames, skipped_frames, overruns, queued_frames, pull_gap_max_ns; } AudioOutStats;
+int audio_mixer_out_stats(AudioRenderer *r, AudioOutStats *o);
 uint64_t audio_voice_consumed(const AudioRenderer *r, ServerVoice *v, int frames);   // source samples over one frame; advances v->fraction
 int audio_buffer_empty(const AudrenWaveBuffer *b);   // no samples to decode: played as soon as it is reached
 void audio_device_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs);   // IAudioDevice

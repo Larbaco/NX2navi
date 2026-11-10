@@ -64,6 +64,7 @@ typedef struct Mixer {
     int target, period;                            // output target and device period, frames (output_open)
     uint64_t stall_ns;
     _Atomic uint64_t pulled_ns;                    // kern_now_ns of the device's last request, 0 before the first
+    _Atomic uint64_t pull_gap_max;                 // NX2NAVI_AUDIO_STATS: longest gap between two requests (ns)
     _Atomic uint64_t flush_until; _Atomic unsigned stop_epoch; unsigned callback_epoch;
     EffectState *effect; int *effect_order; unsigned effect_reported;
     uint64_t *sink_address; uint32_t *sink_size, *sink_offset, *sink_old, *sink_written;
@@ -319,7 +320,9 @@ static void SDLCALL sdl_pull(void *user, SDL_AudioStream *stream, int additional
     Mixer *m = user;
     float tmp[OUT_MAX * 1024];
     const uint32_t frame_bytes = (uint32_t)m->channels * sizeof(float);
-    atomic_store_explicit(&m->pulled_ns, kern_now_ns(), memory_order_release);
+    uint64_t now = kern_now_ns(), prev = atomic_exchange_explicit(&m->pulled_ns, now, memory_order_acq_rel);
+    if (prev && now > prev && now - prev > atomic_load_explicit(&m->pull_gap_max, memory_order_relaxed))
+        atomic_store_explicit(&m->pull_gap_max, now - prev, memory_order_relaxed);   // a lost race only loses a sample
     while (additional > 0) {
         uint32_t frames = (uint32_t)additional / frame_bytes;
         if (!frames) break;
@@ -437,6 +440,18 @@ int64_t audio_mixer_pace_ns(AudioRenderer *r, uint64_t now) {
     if (have < (uint64_t)m->target) return 0;
     int64_t ns = (int64_t)((have - (uint64_t)m->target + 1) * 1000000000ull / (uint64_t)m->rate);
     return ns < 500000 ? 500000 : ns;   // until the device has taken it below the target
+}
+
+int audio_mixer_out_stats(AudioRenderer *r, AudioOutStats *o) {
+    Mixer *m = r->mixer;
+    if (!m || !m->device_ok) return 0;
+    o->underruns = atomic_load(&m->underruns);
+    o->missing_frames = atomic_load(&m->missing_frames);
+    o->skipped_frames = atomic_load(&m->skipped_frames);
+    o->overruns = atomic_load(&m->overruns);
+    o->queued_frames = atomic_load(&m->wr) - atomic_load_explicit(&m->rd, memory_order_acquire);
+    o->pull_gap_max_ns = atomic_exchange(&m->pull_gap_max, 0);
+    return 1;
 }
 
 // Render thread only.

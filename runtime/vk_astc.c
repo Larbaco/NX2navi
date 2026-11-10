@@ -10,7 +10,7 @@
 // device cannot. cpu: astc_decode_ldr_mt on the uploading thread, as before. check: gpu, and every upload is also
 // decoded on the CPU and compared (waits for the GPU; for testing only).
 //
-// The decode is recorded into the upload batch (vk_memory.c) in chunks of at most 32 MiB of texels: a chunk's raw
+// The decode is recorded into the upload batch (vk_memory.c) in chunks of at most 16 MiB of texels: a chunk's raw
 // blocks go from staging to a device-local scratch buffer, its dispatches write RGBA8 texels behind them, and a
 // buffer-to-image copy puts them into the image; the next chunk reuses the scratch after a barrier. The next texture
 // reuses it too, behind the same barrier, while it records into the same command buffer (scratch_get): a buffer per
@@ -97,6 +97,7 @@ enum { TAB_BYTES = 28 * 4, TAB_WUNQ = TAB_BYTES, TAB_CUNQ = TAB_BYTES + 144, TAB
 
 typedef struct {
     uint32_t in_base, out_base, width, height, bw, bh, bx, bslice, srgb;
+    uint32_t bl, th, td, nvn2;   // block-linear source (VkAstcRegion.bl) and its GOB order (Switch 2 when nvn2)
 } Push;
 
 static PlatMutex g_lock = PLAT_MUTEX_INIT;
@@ -267,7 +268,7 @@ static void reset_for(VkCtx *c) {
 }
 
 static int create_pipeline(VkCtx *c) {
-    G.push = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(c->device, "vkCmdPushDescriptorSetKHR");
+    G.push = (PFN_vkCmdPushDescriptorSetKHR)vk_dpa(c->device, "vkCmdPushDescriptorSetKHR");
     VkDescriptorSetLayoutBinding b[3];
     for (int i = 0; i < 3; i++)
         b[i] = (VkDescriptorSetLayoutBinding){.binding = (uint32_t)i, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -429,21 +430,53 @@ static void mem_barrier(VkCommandBuffer cb, VkPipelineStageFlags2 src, VkAccessF
 
 // Scratch per vk_astc_record: texels of at most this many bytes at a time (or one region, when larger), so a large
 // texture array (169 M texels, 677 MB as RGBA8, on monsters2) does not need its whole RGBA8 copy as scratch.
-#define CHUNK_OUT (32ull << 20)
-#define SCRATCH_MIN (64ull << 20)   // the shared scratch's least size: one chunk's texels plus its blocks and BC3
+// The scratch is made per upload batch and kept until that batch completes (scratch_keep), and an area load records
+// many batches in one frame: 12 scratches in the frame that uploaded 2617 textures entering an area, all alive at once.
+// So each is kept to half a VMA block (vk_vma_block_size's default 64 MiB), where VMA still places it in a block, not in
+// memory of its own: 16 MiB of texels, their blocks and BC3 fit in 32 MiB.
+#define CHUNK_OUT (16ull << 20)
+#define SCRATCH_MIN (32ull << 20)   // the shared scratch's least size: one chunk's texels plus its blocks and BC3
 
 // The shared scratch and the command buffer it was last recorded into. An upload batch's command buffer is used again
 // only after that batch completed (vk_memory.c: completed batches go to the spare list), so the same handle means the
 // open batch, ordered by a barrier, or a finished one. g_lock held.
-static struct { VkBuffer buf; VmaAllocation alloc; VkDeviceSize size; VkCommandBuffer cb; VkDevice dev; } S;
+static struct { VkBuffer buf; VmaAllocation alloc; VkDeviceSize size; VkCommandBuffer cb; VkDevice dev; uint64_t big_ns; } S;
 static uint64_t n_scratch_new, n_scratch_reuse;
 
-// A scratch of at least need bytes for recording into cb; *reused: earlier work in cb may still use it. 0 on failure.
+// NX2NAVI_ASTC_SCRATCH_KEEP=1 (default 0 until a play test measured it): the scratch outlives its upload batch. Every
+// batch goes to gfx_queue, so the reuse barrier at the start of the next batch's first chunk (vk_astc_record) orders it
+// after the earlier batches' copies and dispatches, as it does between two textures of one batch; it then also waits
+// for their writes (WAW). With
+// a scratch per batch, each submission that uploaded an ASTC texture made a new 64 MiB device buffer and deferred the
+// old one (324 in one Kokiri Forest to Hyrule Field run), and one that found no room in a VMA block allocated a new
+// block on the replay thread during an area load (8-19 ms per block on NVIDIA, vk_headroom.c). A scratch grown past
+// SCRATCH_MIN for a large texture goes back to SCRATCH_MIN once no texture needed more for SCRATCH_SHRINK_NS.
+// 0: a scratch per batch.
+#define SCRATCH_SHRINK_NS 5000000000ull
+static int scratch_keep(void) {
+    static int keep = -1;
+    if (keep < 0) {
+        keep = cfg_bool("NX2NAVI_ASTC_SCRATCH_KEEP");
+        rt_log("vk: ASTC scratch %s (NX2NAVI_ASTC_SCRATCH_KEEP=%d)", keep ? "kept across upload batches" : "made per upload batch",
+               keep);
+    }
+    return keep;
+}
+
+// A scratch of at least need bytes for recording into cb; *reused: earlier work (in cb, or with the keep rule in an
+// earlier batch) may still use it. 0 on failure.
 static VkBuffer scratch_get(VkCtx *c, VkCommandBuffer cb, VkDeviceSize need, int *reused) {
+    int keep = scratch_keep();
     plat_mutex_lock(&g_lock);
-    *reused = S.buf && S.dev == c->device && S.cb == cb && S.size >= need;
+    uint64_t now = kern_now_ns();
+    if (need > SCRATCH_MIN) S.big_ns = now;
+    // with the keep rule, a grown scratch is replaced by a small one after a while without large textures
+    int shrink = keep && S.size > SCRATCH_MIN && now - S.big_ns > SCRATCH_SHRINK_NS;
+    *reused = S.buf && S.dev == c->device && (S.cb == cb || keep) && S.size >= need && !shrink;
     if (!*reused) {
+        uint64_t t0 = now;
         VkDeviceSize size = need < SCRATCH_MIN ? SCRATCH_MIN : need;
+        if (keep && size > SCRATCH_MIN) size = (size + (32ull << 20) - 1) & ~((32ull << 20) - 1);
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
                                  .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                                           VK_BUFFER_USAGE_TRANSFER_DST_BIT};
@@ -458,6 +491,7 @@ static VkBuffer scratch_get(VkCtx *c, VkCommandBuffer cb, VkDeviceSize need, int
         if (S.buf && S.dev == c->device) vk_defer_buffer(S.buf, S.alloc);
         S.buf = b, S.alloc = a, S.size = size, S.dev = c->device;
         n_scratch_new++;
+        vk_texstat_time(VK_TS_SCRATCH, t0);
     } else {
         n_scratch_reuse++;
     }
@@ -467,11 +501,28 @@ static VkBuffer scratch_get(VkCtx *c, VkCommandBuffer cb, VkDeviceSize need, int
     return out;
 }
 
+// The shared scratch's size, for the log's VRAM breakdown (scratches still owned by an upload batch not counted).
+uint64_t vk_astc_scratch_bytes(void) {
+    plat_mutex_lock(&g_lock);
+    uint64_t n = S.buf ? S.size : 0;
+    plat_mutex_unlock(&g_lock);
+    return n;
+}
+
 static VkDeviceSize region_out(const VkAstcRegion *r) { return (VkDeviceSize)r->w * r->h * r->slices * 4; }
-static VkDeviceSize region_in(const VkAstcRegion *r, uint32_t bw, uint32_t bh) {
+static VkDeviceSize tight_in(const VkAstcRegion *r, uint32_t bw, uint32_t bh) {
     return (VkDeviceSize)((r->w + bw - 1) / bw) * ((r->h + bh - 1) / bh) * r->slices * 16;
 }
-static VkDeviceSize region_bc(const VkAstcRegion *r) { return region_in(r, 4, 4); }   // BC3: 16 bytes per 4x4 block
+// The source bytes a region reads: its tight blocks, or for a block-linear one the whole of its level as laid out in
+// GOB blocks (columns of 64 bytes, rows of 8 * 2^th block rows, layers of 2^td slices), padding included.
+static VkDeviceSize region_in(const VkAstcRegion *r, uint32_t bw, uint32_t bh) {
+    if (!r->bl) return tight_in(r, bw, bh);
+    uint64_t row_bytes = (uint64_t)(r->w + bw - 1) / bw * 16, rows = (r->h + bh - 1) / bh;
+    uint64_t gh = 8ull << r->th, gd = 1ull << r->td;
+    return (VkDeviceSize)((row_bytes + 63) / 64 * ((rows + gh - 1) / gh) * ((r->slices + gd - 1) / gd) * (512ull << r->th << r->td));
+}
+static VkDeviceSize region_bc(const VkAstcRegion *r) { return tight_in(r, 4, 4); }   // BC3: 16 bytes per 4x4 block
+VkDeviceSize vk_astc_region_bytes(const VkAstcRegion *r, uint32_t bw, uint32_t bh) { return region_in(r, bw, bh); }
 
 typedef struct { uint32_t in_base, out_base, width, height, bx, bslice; } BcPush;   // bc3_encode.comp Params
 
@@ -568,7 +619,8 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
         vk_crumb(cb, VK_CRUMB_ASTC, ++n_chunks);
         if (chunks || reused)   // the previous chunk's (or texture's) dispatches and copies are done with the scratch
             mem_barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                        VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+                        VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                            (scratch_keep() ? VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT : 0),
                         VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                         VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
         vkCmdCopyBuffer(cb, src, sb, (uint32_t)(i1 - i0), bcp);
@@ -589,7 +641,8 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
             const VkAstcRegion *r = &rg[i];
             uint32_t bx = (r->w + bw - 1) / bw, by = (r->h + bh - 1) / bh;
             Push pc = {.in_base = (uint32_t)(ib / 16), .out_base = (uint32_t)(ob / 4), .width = r->w, .height = r->h,
-                       .bw = bw, .bh = bh, .bx = bx, .bslice = bx * by, .srgb = (uint32_t)(srgb != 0)};
+                       .bw = bw, .bh = bh, .bx = bx, .bslice = bx * by, .srgb = (uint32_t)(srgb != 0),
+                       .bl = r->bl, .th = r->th, .td = r->td, .nvn2 = rt_nvn_api_version[0] >= 200};
             vkCmdPushConstants(cb, G.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
             uint32_t bpw = bw * bh <= 64 ? 64 / (bw * bh) : 1;   // blocks per workgroup, as astc_decode.comp main
             vkCmdDispatch(cb, (bx + bpw - 1) / bpw, by, r->slices);

@@ -36,20 +36,24 @@ static char dir[2048];
 static char start_order[MAX_MODS][256];   // names in the scan's order, for mods_changed
 
 // 1 when a file lies anywhere under path.
+// Folders nest at most MOD_DEPTH deep below it: each level costs a stack frame, and the RomFS has no deeper paths.
+#define MOD_DEPTH 32
+typedef struct { const char *path; int found, depth; } HasFile;
 static int has_file_cb(const char *name, int kind, uint64_t size, void *ctx);
-static int has_file(const char *path) {
-    struct { const char *path; int found; } c = {path, 0};
+static int has_file_at(const char *path, int depth) {
+    HasFile c = {path, 0, depth};
     plat_fs_list(path, has_file_cb, &c);
     return c.found;
 }
+static int has_file(const char *path) { return has_file_at(path, 0); }
 static int has_file_cb(const char *name, int kind, uint64_t size, void *ctx) {
     (void)size;
-    struct { const char *path; int found; } *c = ctx;
+    HasFile *c = ctx;
     if (kind == PLAT_FS_FILE) {
         c->found = 1;
-    } else if (kind == PLAT_FS_DIR) {
+    } else if (kind == PLAT_FS_DIR && c->depth < MOD_DEPTH) {
         char sub[2100];
-        if (snprintf(sub, sizeof sub, "%s/%s", c->path, name) < (int)sizeof sub) c->found = has_file(sub);
+        if (snprintf(sub, sizeof sub, "%s/%s", c->path, name) < (int)sizeof sub) c->found = has_file_at(sub, c->depth + 1);
     }
     return !c->found;
 }
@@ -221,7 +225,8 @@ static int status_line(const char *key, const char *content, char *kind, char *o
         size_t len = end ? (size_t)(end - line) : strlen(line);
         if (len > 18 && !memcmp(line, want, 18)) {
             char copy[600];
-            snprintf(copy, sizeof copy, "%.*s", (int)(len < sizeof copy ? len : sizeof copy - 1), line + 18);
+            size_t rest = len - 18;   // the line after the 18 bytes compared, not into the next line
+            snprintf(copy, sizeof copy, "%.*s", (int)(rest < sizeof copy ? rest : sizeof copy - 1), line + 18);
             char *t1 = strchr(copy, '\t'), *t2 = t1 ? strchr(t1 + 1, '\t') : NULL;
             if (!t1 || !t2) return 0;
             *t1 = *t2 = 0;

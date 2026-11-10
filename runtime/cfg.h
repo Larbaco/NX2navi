@@ -19,6 +19,8 @@ void cfg_set(const char *name, const char *value);
 // Bumped by every cfg_set. A consumer that keeps a parsed value compares this with the number it last saw (one atomic
 // load) and parses again when it changed.
 unsigned cfg_version(void);
+// plat_setenv for an NX2NAVI_ variable the process reads back: also bumps cfg_version, so lookups see the new value.
+int cfg_setenv(const char *name, const char *value);
 // 1 when the environment sets name: cfg_set cannot change what cfg_get returns (the menu greys the setting out).
 int cfg_from_env(const char *name);
 // 1 when the player set name (the environment or nx2navi.ini), 0 when cfg_get gives a device profile's default or NULL.

@@ -88,13 +88,42 @@ def _checks():
     return _CHECKS
 
 
+LOOPBACK = ('127.0.0.1', 'localhost', '::1')
+
+
+def _plain_ok(url):
+    """Plain HTTP only to this PC (the tests' local servers): anything fetched from elsewhere comes over TLS."""
+    return urllib.parse.urlsplit(url).hostname in LOOPBACK
+
+
+class _Redirect(urllib.request.HTTPRedirectHandler):
+    """Follows a redirect only to https (or to this PC), and drops the Authorization header when the redirect leaves
+    the host it was meant for: urllib copies every header given to the Request onto the redirected one, and GitHub
+    sends asset downloads on to its file servers."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urllib.parse.urlsplit(newurl).scheme.lower() != 'https' and not _plain_ok(newurl):
+            raise urllib.error.HTTPError(newurl, code, f'redirect to {newurl} refused: not https', headers, fp)
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and urllib.parse.urlsplit(newurl).hostname != urllib.parse.urlsplit(req.full_url).hostname:
+            new.remove_header('Authorization')
+        return new
+
+
+def _open(url, h, timeout, ctx=None):
+    handlers = [_Redirect()] + ([urllib.request.HTTPSHandler(context=ctx)] if ctx is not None else [])
+    return urllib.request.build_opener(*handlers).open(urllib.request.Request(url, headers=h), timeout=timeout)
+
+
 def request(url, headers=None, timeout=30, version='dev'):
     """The open response to a GET of url. An https URL is tried with each certificate check in turn, first the one
-    that accepted the host last, until one accepts the server; CertificateError when none does."""
+    that accepted the host last, until one accepts the server; CertificateError when none does. Plain http is
+    refused but for this PC's own address."""
     h = {'User-Agent': user_agent(version)}
     h.update(headers or {})
-    if not url.startswith('https:'):
-        return urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=timeout)
+    if urllib.parse.urlsplit(url).scheme.lower() != 'https':
+        if not _plain_ok(url):
+            raise DownloadError(f'{url}: not an https address')
+        return _open(url, h, timeout)
     host = urllib.parse.urlsplit(url).hostname or ''
     checks = _checks()
     first = min(_ACCEPTED.get(host, 0), len(checks) - 1)
@@ -102,7 +131,7 @@ def request(url, headers=None, timeout=30, version='dev'):
     for i in [first] + [i for i in range(len(checks)) if i != first]:
         name, ctx = checks[i]
         try:
-            r = urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=timeout, context=ctx)
+            r = _open(url, h, timeout, ctx)
         except urllib.error.URLError as e:
             if not isinstance(e.reason, ssl.SSLCertVerificationError):
                 raise
@@ -165,9 +194,26 @@ def certificate_problem(url, refused, version='dev'):
             'may be replacing the certificate: let NX2navi through it or turn that scanning off, then try again.')
 
 
-def get_bytes(url, headers=None, timeout=30, version='dev', limit=64 << 20):
-    with request(url, headers, timeout, version) as r:
-        data = r.read(limit + 1)
+def get_bytes(url, headers=None, timeout=30, version='dev', limit=64 << 20, retries=3):
+    """The body of a GET of url, at most limit bytes. A cut connection, a timeout or a server error (5xx, 429) is tried
+    again after 1, then 2 seconds, as download's are: one connection reset during Gather Build Tools (the package
+    index read by toolchain.ensure_zbic) ended the install. A refused certificate or another HTTP error is not."""
+    last_error = None
+    for attempt in range(retries):
+        try:
+            with request(url, headers, timeout, version) as r:
+                data = r.read(limit + 1)
+            break
+        except urllib.error.HTTPError as e:
+            if e.code != 429 and e.code < 500:
+                raise
+            last_error = e
+        except (urllib.error.URLError, OSError, TimeoutError) as e:   # not DownloadError or CertificateError
+            last_error = e
+        if attempt + 1 < retries:
+            time.sleep(min(2 ** attempt, 8))
+    else:
+        raise last_error
     if len(data) > limit:
         raise DownloadError(f'{url}: more than {limit >> 20} MB')
     return data
@@ -218,17 +264,22 @@ def download(url, dest, sha256=None, size=None, progress=None, cancel=None, head
                             break
                         f.write(b)
                         done += len(b)
+                        if size and done > size:   # stop a server that sends more than the file: it would fill the disk
+                            raise DownloadError(f'{url}: more than the expected {size} bytes')
                         if progress:
                             progress(done, total or done)
             break
         except (Cancelled, CertificateError):
+            raise
+        except DownloadError:
+            part.unlink(missing_ok=True)
             raise
         except urllib.error.HTTPError as e:
             if e.code == 416 and have:   # the part file is complete or longer than the file: start over
                 part.unlink(missing_ok=True)
                 last_error = e
                 continue
-            if e.code in (401, 403, 404, 410):
+            if e.code in (401, 403, 404, 410) or 300 <= e.code < 400:   # 3xx: a redirect _Redirect refused
                 raise DownloadError(f'{url}: HTTP {e.code}') from e
             last_error = e
         except (urllib.error.URLError, OSError, TimeoutError) as e:

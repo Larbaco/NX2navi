@@ -38,6 +38,9 @@ SHFL is guarded.
 Derived cases, beyond the hardware vectors, for forms the game uses: reference models of HFMA2(.RELU) and LDSM, each
 first checked against every hardware case of its instruction, give the expected values of HFMA2.RELU with an
 immediate B (opcode 0x831, as in the game's HFMA2.RELU Rd, Ra, 1, 1, Rc) and LDSM .M88.4 / .MT88.4 with an offset.
+MUFU.F16 (LG2 and EX2 of either half, with abs and neg, on the HFMA2 case's inputs) is checked against a model of
+the lowering (F32 function of the widened half, rounded back to a half): no hardware vectors, as PTX has no lg2.f16;
+the instruction forms were confirmed with nvdisasm.
 """
 
 from __future__ import annotations
@@ -90,6 +93,8 @@ def operands(sm86) -> tuple[list[int], list[int]]:
         return regs(rd, 1), regs(ra, 1)
     if op in (0x231, 0x831):                            # HFMA2: B a register (0x231) or an immediate (0x831)
         return regs(rd, 1), regs(ra, 1) + (regs(rb, 1) if op == 0x231 else []) + regs(rc, 1)
+    if op == 0x308:                                     # MUFU (register form): the operand is B
+        return regs(rd, 1), regs(rb, 1)
     raise ValueError(f"no operand table for SM86 opcode 0x{op:03x}")
 
 
@@ -381,7 +386,29 @@ def derived_cases(cases: list[dict]) -> list[dict]:
             regs_out = [{f"R{rd + m}": f"{model[t][m]:08x}" for m in range(4)} for t in range(LANES)]
             out.append(dict(src, name=f"derived_ldsm_{'mt88' if transpose else 'm88'}_x4_off40",
                             sm86=[f"{x:08x}" for x in sm86], regs_out=regs_out))
+    if relu is not None:   # MUFU.F16 on the halves of the HFMA2 case's A register, as the upscaler's colour decode
+        w0 = words_of(relu["sm86"])[0]
+        rd, rs = (w0 >> 16) & 0xFF, (w0 >> 24) & 0xFF
+        regs = emu.load_regs(relu["regs_in"])
+        for name, operation, high, absolute, negate in (("lg2_abs_h1", 3, True, True, False), ("lg2_abs_h0", 3, False, True, False),
+                                                        ("ex2_h1", 2, True, False, False), ("ex2_neg_h0", 2, False, False, True)):
+            sm86 = [(rd << 16) | (7 << 12) | 0x308, rs | (high << 28) | (absolute << 30) | (negate << 31),
+                    (operation << 10) | (1 << 9), 0x000FE200]
+            regs_out = [{f"R{rd}": f"{mufu_f16_model(regs[t][('R', rs)], operation, high, absolute, negate):08x}"}
+                        for t in range(LANES)]
+            out.append({"name": f"derived_mufu_f16_{name}", "sm86": [f"{x:08x}" for x in sm86],
+                        "regs_in": relu["regs_in"], "regs_out": regs_out})
     return out
+
+
+def mufu_f16_model(reg: int, operation: int, high: bool, absolute: bool, negate: bool) -> int:
+    """MUFU.F16 as AmpereLowering.cs Mufu lowers it: the half widened to F32 with abs and neg, the function in F32
+    (EX2 2, LG2 3), rounded to a half in the low 16 bits, the high 16 bits clear."""
+    x = np.array([(reg >> 16) & 0xFFFF if high else reg & 0xFFFF], dtype=np.uint16).view(np.float16).astype(np.float32)
+    x = np.negative(np.abs(x) if absolute else x) if negate else (np.abs(x) if absolute else x)
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        y = (np.exp2 if operation == 2 else np.log2)(x).astype(np.float32)
+    return int(y.astype(np.float16).view(np.uint16)[0])
 
 
 # ---- driver -------------------------------------------------------------------------------------------------------

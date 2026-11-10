@@ -3,8 +3,8 @@
 #include <stdint.h>
 #include <vulkan/vulkan.h>
 
-int vk_fg_wanted(void);                      // NX2NAVI_FRAMEGEN = fsr3 with DLSS or FSR 3.1 upscaling on (read once)
-uint32_t vk_fg_queue_count(void);            // graphics-family queues the device creates: 3 with frame generation, else 1
+int vk_fg_wanted(void);                      // NX2NAVI_FRAMEGEN = fsr3 with DLSS or FSR 3.1 upscaling on (live)
+uint32_t vk_fg_queue_count(void);            // graphics-family queues the device creates
 void vk_fg_queues(VkQueue present, VkQueue acquire);   // vk_device.c, after the device exists
 int vk_fg_active(void);                      // the frame generation swapchain exists
 int vk_fg_generating(void);                  // ... and the last frame had generation on (not paused for the menu)
