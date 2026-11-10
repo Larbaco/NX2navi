@@ -1042,8 +1042,8 @@ static int bind_range(VkExec *ex, uint64_t addr, uint64_t size, uint64_t align, 
     return 1;
 }
 
-static void c0_table(uint8_t *at, const p_bind_buf b[16]) {
-    for (int r = 0; r < 16; r++) {
+static void c0_table(uint8_t *at, const p_bind_buf b[16], int rows) {
+    for (int r = 0; r < rows; r++) {
         uint64_t a = b[r].addr;
         uint32_t n = (uint32_t)b[r].size;
         memcpy(at + 16 * r, &a, 8);
@@ -1056,8 +1056,9 @@ static void c0_table(uint8_t *at, const p_bind_buf b[16]) {
 // candidate base from here and compares the global pointer against it. Compute: dispatch size at 0x200, the uniform
 // buffer table at 0x210 + 16 r. Graphics: the largest point size (Maxwell's limit, GLSLC clamps gl_PointSize to it) at
 // 0x610, the base instance at 0x644. NVN2 task and mesh stages: storage tables at 0x670 and 0x770 (the game binds
-// slots 0-2 there, and their programs read 0x670.. and 0x770..). Other stages: zeros. Unbound slots read zero, since the
-// replay keeps them zero.
+// slots 0-2 there, and their programs read 0x670.. and 0x770..). The mesh table starts 0x90 bytes before the bank's
+// end: it holds the 9 slots that fit, and sixteen would write 0x6C bytes past the bank. Other stages: zeros. Unbound
+// slots read zero, since the replay keeps them zero.
 // Byte offset of a stage's storage buffer table in c0, -1 for none.
 static int c0_ssbo_base(int stage) {
     return stage == NVN_STAGE_VS ? 0x110 : stage == NVN_STAGE_FS ? 0x510 : stage == NVN_STAGE_CS ? 0x310
@@ -1069,11 +1070,12 @@ void vk_c0_fill(uint8_t bank[VK_C0_BYTES], int stage, const p_bind_buf ssbo[16],
     memset(bank, 0, VK_C0_BYTES);
     int base = c0_ssbo_base(stage);
     if (base < 0) return;
-    c0_table(bank + base, ssbo);
+    int rows = (int)(VK_C0_BYTES - (uint32_t)base) / 16;
+    c0_table(bank + base, ssbo, rows < 16 ? rows : 16);
     if (stage == NVN_STAGE_TASK || stage == NVN_STAGE_MESH) return;
     if (stage == NVN_STAGE_CS) {
         memcpy(bank + 0x200, dispatch, 12);
-        c0_table(bank + 0x210, ubo);
+        c0_table(bank + 0x210, ubo, 16);
         return;
     }
     const float max_point = 2047.0f;
@@ -2530,7 +2532,7 @@ static void support_fill(uint8_t *b, float w, float h, float point_size) {
     memcpy(b + 1408, pcss_params(), 16);   // pcss (translator patch 0010): soft sun shadows in the cascade compares
     memcpy(b + 1424, shadow_spread_params(), 16);    // shadow_spread (translator patch 0011): sun shadow filter width
     for (int i = 0; i < 73; i++) memcpy(b + 192 + 16 * i, &one, 4);   // render scale 1: the host renders at guest size
-    if (vk_hdr_wanted()) {   // read by the game's tonemap only, once vk_hdr.c tonemap_splice has grown its block past the translator's
+    if (vk_hdr_armed()) {   // read by the game's tonemap only, once vk_hdr.c tonemap_splice has grown its block past the translator's
         float hdr[16];
         vk_hdr_support(hdr);
         memcpy(b + 1440, hdr, sizeof hdr);
@@ -3249,21 +3251,56 @@ static void foliage_shadow_cull(const VkExec *ex, VkPipeState *s) {
 //   buffer or g-buffer with a colour target the frame before did not use: half-resolution effect buffers in fights).
 //   Passes with none (volumes, LUTs, shadow layers seen for the first time) still wait, and so do passes whose only
 //   recent target is the depth buffer while a colour target is rendered for the first time (item icon captures).
-// fullscreen (2, default): as any, and full-screen draws into such passes are skipped instead of waiting from their
+//   Full-screen draws into such passes wait from their budget of 50 ms a presented frame. The default: a skipped
+//   full-screen draw is a lighting, fog or tone mapping pass that leaves its target as it was, which shows as a black
+//   or unlit frame with the interface intact, and with the stage libraries in the driver's cache the wait is a
+//   millisecond (vk_pipeline.c lw_start keeps them there). One that is skipped once its budget is spent leaves a frame
+//   that is not shown (vk_backend.c frame_hold); where that cannot hold the picture any longer, the draw waits on
+//   (FULLSCREEN_LAST_MS).
+// fullscreen (2): as any, and full-screen draws into such passes are skipped instead of waiting from their
 //   budget. A full-screen pass whose stage libraries are cold in the driver cache took 86 ms on average (up to 194 ms)
 //   in a fight on an RX 9070: three frames in a row each spent the 50 ms budget, and some of the draws were skipped
-//   after all. Skipping costs the pass for the frames until the pipeline is ready.
+//   after all. Skipping costs the pass for the frames until the pipeline is ready. It was the default until the
+//   libraries were kept warm.
+// Any other draw whose pipeline is missing waits for its fast link from a small budget per presented frame
+// (link_budget) before it is skipped.
 static int pipe_skip_mode(void) {
     static int mode = -1;
     if (mode < 0) {
         const char *e = cfg_value("NX2NAVI_PIPE_SKIP");
         mode = !strcmp(e, "strict") || !strcmp(e, "0") ? 0 : !strcmp(e, "fullscreen") || !strcmp(e, "2") ? 2 : 1;
         static const char *const what[3] = {"only draws into per-frame passes (NX2NAVI_PIPE_SKIP=strict)",
-                                            "draws into passes with a target the previous frame rendered",
+                                            "draws into passes with a target the previous frame rendered; full-screen "
+                                            "draws wait (NX2NAVI_PIPE_SKIP=any)",
                                             "those and full-screen draws (NX2NAVI_PIPE_SKIP=fullscreen)"};
         rt_log("vk_exec: draws skipped while their pipeline builds: %s", what[mode]);
     }
     return mode;
+}
+
+// NX2NAVI_PIPE_LINK_MS (default 6; 0 = off): how long the draws of one presented frame may wait, in all, for the fast
+// link of a pipeline that is missing, LINK_DRAW_MS at most each. A draw into a per-frame pass used to be skipped at
+// once and for as long as its pipeline built, also when its stage libraries were in the driver's cache and the link
+// took under a millisecond: geometry seen for the first time (ground, a wall, a character) was missing for a frame or
+// more and then appeared. With the libraries warm the wait ends within the budget and nothing is skipped; with them
+// cold it runs out after a few draws and the rest are skipped as before, so a burst of cold pipelines costs a frame
+// this much and no more. Measured on an RX 7900 XT, first walk through a village with no pipeline recorded: 2,349
+// draws skipped without the budget, with the libraries warm in both runs.
+#define LINK_DRAW_MS 3u
+// How long a full-screen draw waits on for its pipeline once its frame budget is spent and the previous picture
+// cannot be held any longer (prepare_draw_ex): the longest optimised build of such a pipeline measured was 194 ms.
+#define FULLSCREEN_LAST_MS 500u
+static uint64_t *link_budget(void) {
+    static uint64_t frame = ~0ull, left, per_frame = ~0ull;
+    if (per_frame == ~0ull) {
+        long long ms = cfg_int("NX2NAVI_PIPE_LINK_MS");
+        per_frame = (uint64_t)(ms < 0 ? 0 : ms > 100 ? 100 : ms) * 1000000ull;
+        rt_log("vk_exec: draws wait up to %llu ms a frame in all for the fast link of a missing pipeline "
+               "(NX2NAVI_PIPE_LINK_MS)", (unsigned long long)(per_frame / 1000000));
+    }
+    uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    if (f != frame) frame = f, left = per_frame;
+    return &left;
 }
 
 // The previous draw's shaders, kept while its program, bound pipeline state, the vertex and fragment stages' first 32
@@ -3352,8 +3389,19 @@ static void draw_stats_tick(void) {
     DRS.frame = f;
 }
 
+// The draws skipped since the last present because their shader or pipeline was still building: the picture of that
+// frame lacks them (a light, a wall, a whole lighting pass). vk_backend.c frame_hold reads it at the present and keeps
+// the previous picture on screen instead. Written and read on the replay thread.
+static uint32_t pending_draws;
+uint32_t vk_exec_pending_draws_take(void) {
+    uint32_t n = pending_draws;
+    pending_draws = 0;
+    return n;
+}
+
 static int draw_skipped(const VkExec *ex, int mesh, int why) {
     DRS.skipped[mesh][why]++;
+    if (why == SK_SHADER_PENDING || why == SK_PIPE_PENDING) pending_draws++;
     if (!(DRS.first[mesh] >> why & 1)) {
         DRS.first[mesh] |= 1u << why;
         rt_log("vk: first %s draw skipped because: %s (program %llu)", mesh ? "mesh" : "vertex", sk_names[why],
@@ -3461,6 +3509,7 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
     uint32_t wait_ms = 0;
     uint64_t t0 = 0;
     uint64_t *budget = NULL;   // the per-frame budget a timed wait is charged to
+    int linking = 0;           // the wait is the short one for a fast link (link_budget)
     int large = (uint64_t)ex->pass_w * ex->pass_h >= ONESHOT_LARGE_PX;
     if (oneshot > 0 && oneshot_budget_on()) {
         budget = oneshot_budget(large);
@@ -3474,6 +3523,12 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
         wait_ms = (uint32_t)(wait_left_ns / 1000000);
         if (wait_ms) t0 = kern_now_ns();
         budget = &wait_left_ns;
+    } else {
+        budget = link_budget();
+        wait_ms = (uint32_t)(*budget / 1000000);
+        if (wait_ms > LINK_DRAW_MS) wait_ms = LINK_DRAW_MS;
+        linking = wait_ms != 0;
+        if (!wait_ms) budget = NULL;
     }
     // The previous draw's pipeline while its state repeats (PM, NX2NAVI_PIPE_MEMO=0 turns it off): the cache key is made
     // from the state alone, and a pipeline once found only changes from its fast link to its optimised build, read
@@ -3485,13 +3540,21 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
         info = PM.info, pending = 0;
         p = __atomic_load_n(&info->pipeline, __ATOMIC_ACQUIRE);
     } else {
-        w0 = t0 ? t0 : wait_ms ? kern_now_ns() : 0;   // the clock is read only for draws that may wait
-        p = vk_pipeline_graphics_async(&s, &info, &pending, wait_ms);
+        if (linking) {   // nearly every draw finds its pipeline: the clock is read only for one that did not
+            p = vk_pipeline_graphics_async(&s, &info, &pending, 0);
+            if (pending) {
+                t0 = kern_now_ns();
+                p = vk_pipeline_graphics_async(&s, &info, &pending, wait_ms);
+            }
+        } else {
+            w0 = t0 ? t0 : wait_ms ? kern_now_ns() : 0;   // the clock is read only for draws that may wait
+            p = vk_pipeline_graphics_async(&s, &info, &pending, wait_ms);
+        }
         if (t0 && budget) {
             uint64_t spent = kern_now_ns() - t0;
             *budget = spent < *budget ? *budget - spent : 0;
         }
-        why = oneshot > 0 ? "one-shot, shader" : wait_ms ? "full-screen" : NULL;
+        why = oneshot > 0 ? "one-shot, shader" : linking ? NULL : wait_ms ? "full-screen" : NULL;
         if (pending && oneshot < 0 && !vk_exec_targets_recent(ex, skip >= 1)) {
             perf_count(PERF_CNT_ONESHOT_WAIT);
             why = "one-shot";
@@ -3505,6 +3568,14 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
             } else {
                 p = vk_pipeline_graphics_async(&s, &info, &pending, ONESHOT_WAIT_MS);
             }
+        }
+        // A full-screen draw still pending after its budget: skipped, it leaves the frame black or unlit. While the
+        // previous picture can stay on screen in its place (vk_frame_hold_left) that is what happens; once that time
+        // is used up the draw waits on, FULLSCREEN_LAST_MS at most, so that no such frame is shown.
+        if (pending && budget == &wait_left_ns && !vk_frame_hold_left()) {
+            why = "full-screen, nothing left to hold the picture";
+            if (!w0) w0 = kern_now_ns();
+            p = vk_pipeline_graphics_async(&s, &info, &pending, FULLSCREEN_LAST_MS);
         }
         PM.valid = !pending && p && info;
         if (PM.valid) PM.s = s, PM.info = info;
@@ -3572,14 +3643,14 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
 // an object's own uniform blocks (bones c5, place c7, c6; mvobj_draw_ says which are left out and why) is therefore
 // drawn a second time (listed during the replay, MQ, and recorded by mv_pass) with its vertex shader's last-frame
 // variant (translator patch 0015: the position again from last frame's blocks, bound at slot bank + 15, and last
-// frame's camera, written to a spare output) and the fragment shader of vk_mvobj_fs.h, which writes last frame's window
+// frame's camera, written to a spare output) and the fragment shader of mvobj_fs_spv.h, which writes last frame's window
 // position minus this frame's. The draw keeps everything else of the original: vertex and index buffers, the other
 // uniform blocks, the jittered viewport and the scene depth, tested with the game's own test and its equal case
 // (LEQUAL, GEQUAL) without writes, so only the visible surface writes its vector. Last frame's blocks:
 // vk_mvprev_find and mo_prev_block; the camera: vk_dlaa_prev_camera. A draw whose variant or pipeline is still
 // building, or whose last-frame blocks are not in the snapshot, keeps the camera's motion. NX2NAVI_DLAA_OBJMV=0 turns it
 // off (vk_mvprev.c).
-#include "vk_mvobj_fs.h"
+#include "mvobj_fs_spv.h"
 static const char MO_FS_RES[] = "{\"key\":\"mvobj\",\"stage\":\"ps\",\"notes\":[],\"cbufs\":[{\"binding\":1,\"slot\":3}],"
                                 "\"sbufs\":[],\"textures\":[],\"images\":[]}";
 static struct {

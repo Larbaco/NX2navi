@@ -159,11 +159,12 @@ def reveal(path):
 
 
 KNOWN_FOLDERS = {'downloads': '{374DE290-123F-4565-9164-39C4925E467B}',
-                 'desktop': '{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}'}
+                 'desktop': '{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}',
+                 'pictures': '{33E28130-4E1E-4676-835A-98395C3BC3BB}'}
 
 
 def known_folder(name):
-    """Windows: the folder the shell keeps for name ('downloads', 'desktop'), also when the player moved it to another
+    """Windows: the folder the shell keeps for name ('downloads', 'desktop', 'pictures'), also when the player moved it to another
     drive; None elsewhere or when the shell names none."""
     if os.name != 'nt' or name not in KNOWN_FOLDERS:
         return None

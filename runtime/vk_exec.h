@@ -185,6 +185,10 @@ extern VkExecFrame vk_exec_frame;
 void vk_exec_frame_written(const tex_t *t);                    // vk_texture_gpu_written: t rendered or copied into
 uint64_t vk_exec_recording_fence(void);                        // fence of the submission this thread records, else 0
 void vk_exec_frame_log(const tex_t *presented, uint64_t frame);
+// The draws skipped since the last call because a shader or pipeline was still building (vk_exec_draw.c), and whether
+// a frame lacking them would be held back at its present (vk_backend.c frame_hold).
+uint32_t vk_exec_pending_draws_take(void);
+int vk_frame_hold_left(void);
 
 // NX2NAVI_DUMP=<frame> (vk_dump.c): between presents frame-1 and frame, every pass's targets and every dispatch's storage
 // images are copied out and written as PNGs to NX2NAVI_DUMP_DIR (default "dump"), with passes.txt (targets, pipelines,

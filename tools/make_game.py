@@ -365,11 +365,28 @@ def exefs_digest(out):
 
 # ---------------------------------------------------------------- romfs
 
+ROMFS_READ_AHEAD = 64 << 20   # total file bytes requested from workers in one group
+
+
+def romfs_read_groups(files):
+    group, buffered = [], 0
+    for entry in files:
+        size = entry[2]
+        ahead = size if size <= ROMFS_READ_AHEAD else 0   # the writer streams larger files
+        if buffered + ahead > ROMFS_READ_AHEAD or len(group) == 256:
+            yield group
+            group, buffered = [], 0
+        group.append(entry)
+        buffered += ahead
+    if group:
+        yield group
+
+
 def step_romfs(src, out, jobs):
     dst = out / 'romfs'
     dst.mkdir(parents=True, exist_ok=True)
-    files = sorted(src.romfs, key=lambda e: e[0].encode())
-    total = sum(src.romfs_size(ref) for _, ref in files)
+    files = sorted(((rel, ref, src.romfs_size(ref)) for rel, ref in src.romfs), key=lambda e: e[0].encode())
+    total = sum(size for _, _, size in files)
     free = shutil.disk_usage(dst).free
     if free < total + (1 << 30):
         fail(f'{dst} needs {total / 1e9:.1f} GB free for the RomFS image, it has {free / 1e9:.1f} GB')
@@ -379,28 +396,28 @@ def step_romfs(src, out, jobs):
     emit('progress', step='romfs', done=0, total=total, unit='bytes')
 
     def load(e):   # small files are read whole on a worker; big ones are streamed by the writer
-        rel, ref = e
-        return None if src.romfs_size(ref) > (64 << 20) else b''.join(src.romfs_chunks(ref))
+        _, ref, size = e
+        return None if size > ROMFS_READ_AHEAD else b''.join(src.romfs_chunks(ref))
 
     with open(part, 'wb', buffering=16 << 20) as img, concurrent.futures.ThreadPoolExecutor(jobs) as ex:
-        batch = 256
-        for start in range(0, len(files), batch):
-            group = files[start:start + batch]
-            for (rel, ref), data in zip(group, ex.map(load, group)):
+        for batch, group in enumerate(romfs_read_groups(files)):
+            for (rel, ref, size), data in zip(group, ex.map(load, group)):
                 pad = -pos % ALIGN
                 if pad:
                     img.write(b'\0' * pad)
                     h.update(b'\0' * pad)
                     pos += pad
-                size = src.romfs_size(ref)
-                entries.append({'path': rel, 'offset': pos, 'size': size})
+                offset = pos
                 for chunk in ((data,) if data is not None else src.romfs_chunks(ref)):
                     img.write(chunk)
                     h.update(chunk)
-                pos += size
+                    pos += len(chunk)
+                if pos - offset != size:
+                    fail(f'{rel} changed size while packing the RomFS: expected {size} bytes, read {pos - offset}')
+                entries.append({'path': rel, 'offset': offset, 'size': size})
                 done += size
             emit('progress', step='romfs', done=done, total=total, unit='bytes')
-            if start // batch % 40 == 0:
+            if batch % 40 == 0:
                 say(f'  RomFS {done / 1e9:5.1f} of {total / 1e9:.1f} GB, {time.time() - t0:.0f} s')
     part.replace(dst / 'romfs.bin')
     index = {'status': 'pass', 'romfs_size': pos, 'romfs_sha256': h.hexdigest(), 'files': entries}
@@ -703,6 +720,14 @@ class ObjectCache:
     def forget(self, obj):
         self.entries.pop(obj.name, None)
 
+    def keep_only(self, names):
+        """Drops the entries of objects this build does not make (the runtime objects an earlier version compiled
+        here and a later one links prebuilt): they would stay as that version wrote them for good. The number dropped."""
+        gone = [n for n in self.entries if n not in names]
+        for n in gone:
+            del self.entries[n]
+        return len(gone)
+
     def adopt(self, obj, key, old_keys, old_kits=()):
         """Records obj under key when its entry has one of old_keys, the keys an earlier version gave the same compile,
         its object is there and every file it was compiled from reads as it did. A file in an earlier kit's folder
@@ -740,7 +765,7 @@ def compiler_ids(clang, env):
     size. The keys up to 0.6.0 held the file's modification time too, so a tool update that put the same compiler back
     made every object stale, a full compile of the game for nothing; that form is still made, to take those objects
     over (object_alts)."""
-    p = subprocess.run([str(clang), '--version'], capture_output=True, text=True, env=env)
+    p = subprocess.run([str(clang), '--version'], capture_output=True, text=True, env=env, errors='replace')
     st = os.stat(clang)
     return (sha256_bytes(f'{p.stdout}\n{st.st_size}'.encode()),
             sha256_bytes(f'{p.stdout}\n{st.st_size}\n{int(st.st_mtime)}'.encode()))
@@ -879,7 +904,7 @@ def per_install(src, tainted):
 
 
 def clang_version(clang, env):
-    p = subprocess.run([str(clang), '--version'], capture_output=True, text=True, env=env)
+    p = subprocess.run([str(clang), '--version'], capture_output=True, text=True, env=env, errors='replace')
     return (p.stdout.splitlines() or [''])[0].strip()
 
 
@@ -1130,14 +1155,16 @@ def xlate_source():
 
 # The x86-64 level the lifted code was compiled for, beside the objects (lifted_level).
 LIFTED_BUILD = 'lifted-build.json'
+LIFTED_OBJECTS = ('main_', 'sdk_', 'subsdk0_')   # the objects of the lifted code, by the module their names start with
 
 
 def lifted_level(obj, now, update):
     """The x86-64 level to compile the lifted code for. A build from the game files takes this processor's (now). An
     update keeps the level the objects were compiled for, so that it compiles only what changed: the one recorded
-    (LIFTED_BUILD), else 0 (generic x86-64) when the cache is one of 0.5.0 or earlier, which compiled for no level and
-    whose entries name their files by sha256 alone. Never above this processor's: a game folder moved to an older PC is
-    compiled again for it."""
+    (LIFTED_BUILD), else 0 (generic x86-64) when the lifted objects are those of 0.5.0 or earlier, which compiled for no
+    level and whose entries name their files by sha256 alone. Only the lifted objects' entries say that: 0.5.0 also
+    compiled the runtime here, and those entries outlive it in a cache whose lifted code a later version compiled for
+    this processor. Never above this processor's: a game folder moved to an older PC is compiled again for it."""
     if not update:
         return now
     try:
@@ -1147,10 +1174,21 @@ def lifted_level(obj, now, update):
         pass
     try:
         entries = json.loads((obj / 'objects.json').read_text(encoding='utf-8'))
-        old = any(isinstance(rec, str) for e in entries.values() for rec in e.get('deps', {}).values())
+        old = any(isinstance(rec, str) for name, e in entries.items() if name.startswith(LIFTED_OBJECTS)
+                  for rec in e.get('deps', {}).values())
     except (OSError, ValueError, AttributeError):
         old = False
     return 0 if old else now
+
+
+def retune_due(obj, msys):
+    """Rebuild the Game (--rebuild --retune): whether the lifted code is recorded as compiled for another level than
+    this processor's, or for none (LIFTED_BUILD). The compile step then runs although its inputs are unchanged."""
+    clang, _, env, _ = toolchain(msys)
+    try:
+        return int(json.loads((obj / LIFTED_BUILD).read_text(encoding='utf-8'))['level']) != cpu_level(clang, env)
+    except (OSError, ValueError, KeyError, TypeError):
+        return True
 
 
 def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
@@ -1236,6 +1274,8 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
         for src, err in bad[:3]:
             print(f'--- {src}\n{err}', file=sys.stderr)
         fail(f'{len(bad)} files did not compile')
+    if cache.keep_only({o.name for _, o in srcs}):
+        cache.save()
     (obj / LIFTED_BUILD).write_text(json.dumps({'level': level}), encoding='utf-8')   # lifted_level reads it next update
 
     objs = [o for _, o in srcs] + ([compile_resources(msys, rt, obj, env, lld=(msys / 'bin' / 'ld.lld.exe').is_file())]
@@ -1372,30 +1412,12 @@ def shader_carry(out):
     return (out / 'shader-prepared.bin').is_file() and bool(cache_identities(out))
 
 
-def step_shaders(out, update=False):
-    """Every shader of the game files into the game's shader cache and the driver's own cache, before the first start.
-    Its output is read as it comes: the counts nx2navi.exe prints become progress events, the other lines go on to
-    the log, and while nothing moves an event every few seconds keeps saying the step is running and for how long.
-    update: after a kit update the shaders prepared before stay in use and the game translates them again in the
-    background (shader_carry), so the update does not wait the minutes a full preparation takes."""
-    # The game translates with the copy beside it. The compile step refreshes that copy, but a kit that changes only
-    # the translator runs this step again alone (step_key), which would then prepare with the old one. Only a kit that
-    # has one: the compile step, which always runs first, stops a build without it.
-    for d in (KIT / 'bin', KIT / 'build' / 'xlate'):
-        if (d / XLATE_NAME).is_file():
-            note_cache_translator(out)
-            for name in (XLATE_NAME, 'nx2navi_xlate.id'):
-                copy_if_changed(d / name, out / name)
-            break
-    if update and shader_carry(out):
-        say('  the shaders prepared before this update stay in use; the game translates them again in the background')
-        if loose_shaders(out) >= PACK_LOOSE_MIN:
-            pack_shader_cache(out)
-        return
-    cmd = [sys.executable, '-u', str(KIT / 'tools' / 'prepare_shaders.py'), str(out), '--romfs', str(out / 'romfs'),
-           '--exefs', str(out / 'exefs'), '--no-list', '--exe', EXE_NAME]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8',
-                            errors='replace', bufsize=1)
+def shader_run(cmd, cwd=None):
+    """Runs a shader preparation command and returns its exit code. Its output is read as it comes: the counts
+    nx2navi.exe prints become progress events, the other lines go on to the log, and while nothing moves an event
+    every few seconds keeps saying the step is running and for how long."""
+    proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                            encoding='utf-8', errors='replace', bufsize=1)
     t0 = time.monotonic()
     state = {'phase': None, 'done': 0, 'total': 0, 'moved': t0}
     lock = threading.Lock()
@@ -1435,6 +1457,56 @@ def step_shaders(out, update=False):
         proc.stdout.close()
         stop.set()
         beat.join()
+    return rc
+
+
+def warm_driver_cache(out):
+    """After an update that carries the shaders over: every prepared stage library is built into the graphics driver's
+    cache again (`nx2navi.exe --warm-shaders`). It takes seconds while the driver still has them. It takes minutes when
+    the update changed what a library is built with, which gives each one another entry in the driver's cache: without
+    this run every pipeline a draw first needed then compiled in play, which skipped that draw for some frames or made
+    it wait (on an RX 7900 XT 100 to 340 ms a library against 3 ms from the cache, after dynamic vertex input was
+    turned off for that driver). A run that fails is not an error of the build: the game checks the cache at every
+    start and warms it in the background itself (runtime/vk_pipeline.c lw_start)."""
+    exe = out / EXE_NAME
+    if not exe.is_file() or not (out / 'shader-prepared.bin').is_file():
+        return
+    say("  the prepared shaders are built into the graphics driver's cache again")
+    t0 = time.monotonic()
+    try:
+        rc = shader_run([str(exe), '--warm-shaders'], cwd=str(out))
+    except OSError as e:
+        rc = str(e)
+    if rc:
+        say(f'  that did not finish ({rc}); the game does it in the background while it runs')
+    else:
+        say(f"  driver's cache warm in {time.monotonic() - t0:.0f} s")
+
+
+def step_shaders(out, update=False):
+    """Every shader of the game files into the game's shader cache and the driver's own cache, before the first start
+    (shader_run reports its progress).
+    update: after a kit update the shaders prepared before stay in use and the game translates them again in the
+    background (shader_carry), so the update does not wait the minutes a full preparation takes; the driver's cache
+    gets their stage libraries again (warm_driver_cache)."""
+    # The game translates with the copy beside it. The compile step refreshes that copy, but a kit that changes only
+    # the translator runs this step again alone (step_key), which would then prepare with the old one. Only a kit that
+    # has one: the compile step, which always runs first, stops a build without it.
+    for d in (KIT / 'bin', KIT / 'build' / 'xlate'):
+        if (d / XLATE_NAME).is_file():
+            note_cache_translator(out)
+            for name in (XLATE_NAME, 'nx2navi_xlate.id'):
+                copy_if_changed(d / name, out / name)
+            break
+    if update and shader_carry(out):
+        say('  the shaders prepared before this update stay in use; the game translates them again in the background')
+        if loose_shaders(out) >= PACK_LOOSE_MIN:
+            pack_shader_cache(out)
+        warm_driver_cache(out)
+        return
+    cmd = [sys.executable, '-u', str(KIT / 'tools' / 'prepare_shaders.py'), str(out), '--romfs', str(out / 'romfs'),
+           '--exefs', str(out / 'exefs'), '--no-list', '--exe', EXE_NAME]
+    rc = shader_run(cmd)
     if rc:
         fail('preparing the shaders failed (the lines above say why); the game still runs, compiling shaders as it '
              'meets them. Run the build again to retry this step')
@@ -1722,6 +1794,9 @@ def main():
     if reset:
         state = {'version': STATE_VERSION, 'input': src.identity, 'steps': {}}
     state['kit'] = kit_version()
+    if a.rebuild and a.retune and retune_due(cache / 'obj', msys):
+        # the compile step's key does not name the level: without this a finished compile reads as done before
+        state['steps'].pop('compile', None)
     keep_awake()
     t0 = time.time()
     romfs_job = None
@@ -1754,12 +1829,18 @@ def main():
         say(f'{name}: {time.time() - t:.0f} s')
         emit('step', step=name, state='done', seconds=round(time.time() - t, 1))
 
+    def lift_gone(name):
+        # Keep Build Cache off (the launcher) deletes the lift and the objects after a build and keeps this state:
+        # the lift's key still matches then, and a compile step that runs would find no lifted code to compile
+        return (name == 'lift' and not (cache / 'lift' / 'layout.json').is_file()
+                and state['steps'].get('compile') != step_key('compile', src.identity, out))
+
     try:
         for name in STEPS:
             if name == 'prompts' and not prompt_art_dir():
                 say('prompts: none to draw, the kit has no button art')
                 emit('step', step=name, state='skip')
-            elif state['steps'].get(name) == step_key(name, src.identity, out):
+            elif state['steps'].get(name) == step_key(name, src.identity, out) and not lift_gone(name):
                 say(f'{name}: done before')
                 emit('step', step=name, state='skip')
             else:

@@ -1325,6 +1325,13 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     vk_exec_pass_end(ex);
     x_here = 0;
     if (ex->recorded) vk_exec_barrier(ex), vk_exec_pool_marks(ex);   // later submissions see this one's writes
+    // The write-backs in a part of their own, after one that signals the executed timeline (vk_sync.c exec_tl): the
+    // wait after a frame's first submission then ends when the submission's passes are through, not its write-backs.
+    if (synced && ex->recorded && vk_sync_wb_split() && vk_mem_mirror_wb_pending() && vk_exec_pool_split(ex->fence)) {
+        ex->cb = vk_sync_split_exec();
+        ex->dirty = VK_EXEC_DIRTY_ALL;
+        vk_exec_draw_new_cb();
+    }
     if (synced) ex->recorded += vk_mem_mirror_end(ex->cb, fence), vk_usnap_end(fence);   // VRAM mirror bytes the GPU wrote go back to guest memory
     if (ex->nviews) {
         ViewList *l = malloc(sizeof *l + sizeof(VkImageView) * (size_t)ex->nviews);

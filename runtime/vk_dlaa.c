@@ -147,6 +147,35 @@ int vk_dlaa_needs_restart(void) {
     return strcmp(cfg_value("NX2NAVI_TAA"), "fsr3") ? !N.ngx_up && !N.tried : N.ngx_up;
 }
 
+#ifdef _WIN32
+// The NGX core's folder when the driver has not written NGXCore\FullPath (seen with driver 617.42, whose key held
+// only DLSS override values): the core sits in the driver's own DriverStore folder, the one its Vulkan driver is in.
+// That is the display adapter's VulkanDriverName, where the Vulkan loader itself finds the driver.
+static int ngx_dir_from_adapter(char *dir, DWORD size) {
+    HKEY cls;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}",
+                      0, KEY_READ, &cls) != ERROR_SUCCESS)
+        return 0;
+    int found = 0;
+    for (DWORD i = 0; !found; i++) {
+        char sub[64], val[MAX_PATH + 1] = {0}, probe[MAX_PATH + 32];
+        DWORD sn = sizeof sub, vn = MAX_PATH;
+        if (RegEnumKeyExA(cls, i, sub, &sn, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) break;
+        if (RegGetValueA(cls, sub, "VulkanDriverName", RRF_RT_REG_SZ | RRF_RT_REG_MULTI_SZ, NULL, val, &vn) != ERROR_SUCCESS)
+            continue;
+        char *slash = strrchr(val, '\\');
+        if (!slash) continue;
+        *slash = 0;
+        snprintf(probe, sizeof probe, "%s\\_nvngx.dll", val);
+        if (GetFileAttributesA(probe) == INVALID_FILE_ATTRIBUTES) continue;
+        snprintf(dir, size, "%s", val);
+        found = 1;
+    }
+    RegCloseKey(cls);
+    return found;
+}
+#endif
+
 static int core_load(void) {
     if (N.tried) return N.loaded;
     N.tried = 1;
@@ -154,8 +183,8 @@ static int core_load(void) {
     char dir[MAX_PATH] = {0}, path[MAX_PATH + 32];
     DWORD n = sizeof dir;
     if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore", "FullPath", RRF_RT_REG_SZ,
-                     NULL, dir, &n) != ERROR_SUCCESS) {
-        rt_log("dlaa: the driver has no NGX core (registry NGXCore missing): DLAA off");
+                     NULL, dir, &n) != ERROR_SUCCESS && !ngx_dir_from_adapter(dir, sizeof dir)) {
+        rt_log("dlaa: the driver has no NGX core (registry NGXCore missing, none beside its Vulkan driver): DLAA off");
         return 0;
     }
     snprintf(path, sizeof path, "%s\\_nvngx.dll", dir);
@@ -511,6 +540,33 @@ static int image2d(uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlags usage, 
     return vkCreateImageView(c->device, &vi, NULL, view) == VK_SUCCESS;
 }
 
+// Which features may stay alive when another is made (NX2NAVI_DLSS_IDLE_FREE). A feature made while one with a larger
+// input size is alive leaves that larger one drawing alternating bands of rows black or noise from then on, for as long
+// as it is used; seen for the pause screen's feature (the picture's size in and out), in two ways:
+// - a pause of 3,600 frames frees the gameplay feature (stale_sizes) and the unpause makes it again: every later pause
+//   was striped, in each of 8 scripted runs of pause, unpause, pause in which it had been freed and in none of 12 in
+//   which it had not, whatever the texture, write-back, HDR and frame generation settings;
+// - a DLSS mode picked in the menu makes a feature of a third size at the unpause, with nothing freed: the next pause
+//   was striped (performance to ultra performance in play).
+// Giving the kept feature its own sizes again at each evaluation changed nothing. A feature made while a smaller one
+// is alive leaves the smaller one as it was (the pause screen's after the gameplay one, at every first pause). So when
+// a feature is made, the alive ones with a larger input are released first, and after a release since the last
+// creation all of them (release_kept); their images stay and each is made again when its size is next evaluated.
+// Scripted on one build, each way with the rule and with 2: the long pause and the mode change were striped without it
+// and clean with it. The input size may not be what matters: in every striped case the feature made was of another
+// model (performance's or ultra performance's) than the pause screen's, and the one run in which balanced's feature,
+// of the pause screen's model, was made again beside it without the rule was clean. The rule covers both readings.
+//   1 (default)  idle features are freed
+//   0            idle features are never freed (about 0.5 GB more video memory after the first pause)
+//   2            idle features are freed and nothing is released when a feature is made (as before; shows the fault)
+static int feat_released;
+
+static int idle_free(void) {
+    static int m = -1;
+    if (m < 0) m = cfg_int("NX2NAVI_DLSS_IDLE_FREE");
+    return m;
+}
+
 // The images and views of a size, then its feature. The device must be idle: free_size waits for it, vk_dlaa_release
 // has. Whatever was not made is skipped, so a half-made size goes the same way.
 static void destroy_size(struct Size *e) {
@@ -527,7 +583,7 @@ static void destroy_size(struct Size *e) {
         if (e->dist_view[i]) vkDestroyImageView(c->device, e->dist_view[i], NULL);
         if (e->dist[i]) vmaDestroyImage(c->vma, e->dist[i], e->dist_mem[i]);
     }
-    if (e->feat && N.release) N.release(e->feat);
+    if (e->feat && N.release) N.release(e->feat), feat_released = 1;
     memset(e, 0, sizeof *e);
 }
 
@@ -1412,6 +1468,7 @@ static void query_vram(void) {
 // Frees the sizes other than cur that no evaluation used for SIZE_STALE evaluations: the GPU finished with them long
 // ago (the CPU is never that many presents ahead), so their images and feature go at once.
 static void stale_sizes(const struct Size *cur) {
+    if (!idle_free()) return;
     for (int i = 0; i < DLSS_SIZES; i++) {
         struct Size *s = &D.sizes[i];
         if (s == cur || !s->out || D.evals < s->used + SIZE_STALE) continue;
@@ -1420,6 +1477,23 @@ static void stale_sizes(const struct Size *cur) {
         if (D.last == s) D.last = NULL;
         free_size(s);
     }
+}
+
+// Before a feature is made: the features of the other sizes with a larger input go, or all of them (all: a feature was
+// released since the last creation, feat_released); their images stay. The GPU may still be running an evaluation of
+// theirs, so it finishes first, as in free_size.
+static void release_kept(const struct Size *making, int all) {
+    int n = 0;
+    for (int i = 0; i < DLSS_SIZES; i++) {
+        struct Size *s = &D.sizes[i];
+        if (s == making || !s->feat) continue;
+        if (!all && (uint64_t)s->w * s->h <= (uint64_t)making->w * making->h) continue;
+        if (!n++) vk_queue_lock(), vkDeviceWaitIdle(vk_ctx()->device), vk_queue_unlock();
+        N.release(s->feat), s->feat = NULL;
+        if (D.last == s) D.last = NULL;
+    }
+    if (n) rt_log("dlaa: %d DLSS feature(s) released before the one for %ux%u is made (%s); made again when used", n,
+                  making->w, making->h, all ? "after a release" : "larger inputs");
 }
 
 static void evaluate(VkExec *ex, const VkExecTarget *dst) {
@@ -1481,6 +1555,8 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
         goto evaluated;
     }
     if (!e->feat) {
+        if (idle_free() != 2) release_kept(e, feat_released);
+        feat_released = 0;
         p_setu(p, "CreationNodeMask", 1);
         p_setu(p, "VisibilityNodeMask", 1);
         p_setu(p, "Width", w);

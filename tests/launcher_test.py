@@ -18,6 +18,8 @@ Run: python tests/launcher_test.py   (Python 3.14 for the zstd tests; the window
   a source checkout's build/xlate/), the prompts step with a stand-in prompt tool, the object cache of the compile
   step with the system's C compiler, and its windres call under folders with spaces (a script in windres's place)
 - jobs: an install driven by a fake make_game.py, with and without the prompts row
+- the look: the colour schemes, the background picture's fitting and kept copy, the sound effects (low by default,
+  only the game's own select and back sounds, decoded from a made-up .bwav)
 - the window: --selftest draws every screen (skipped without a display)
 """
 import contextlib
@@ -85,7 +87,8 @@ class Server:
                     self.send_response(status)
                     for k, v in headers.items():
                         self.send_header(k, v)
-                    self.send_header('Content-Length', str(len(body)))
+                    if 'Content-Length' not in headers:
+                        self.send_header('Content-Length', str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
                     return
@@ -520,6 +523,22 @@ class NetTest(Tmp):
         with mock.patch.object(net, 'request', down), mock.patch.object(net.time, 'sleep'):
             with self.assertRaises(ConnectionResetError):   # every try failed: the last error goes up
                 net.get_bytes('https://example.invalid/down')
+
+    def test_early_eof_retries_metadata_and_resumes_file(self):
+        data = b'{"build":123}'
+        (self.tmp / 'asset').write_bytes(data)
+        cut = (200, {'Content-Length': str(len(data))}, data[:7])
+        routes = {'/asset': cut}
+        srv = Server(self.tmp, routes)
+        self.addCleanup(srv.close)
+        url = srv.url + 'asset'
+        with mock.patch.object(net.time, 'sleep', side_effect=lambda _: routes.clear()):
+            self.assertEqual(net.get_json(url), {'build': 123})
+            routes['/asset'] = cut
+            dest = self.tmp / 'download'
+            net.download(url, dest, sha256=sha(data), size=len(data))
+        self.assertEqual(dest.read_bytes(), data)
+        self.assertEqual([h.get('Range') for _, h in srv.hits], [None, None, None, 'bytes=7-'])
 
     def test_download_resume_and_checks(self):
         data = os.urandom(3 * net.CHUNK + 123)
@@ -1423,6 +1442,36 @@ class MakeGameTest(Tmp):
         self.assertIn('stay in use', buf.getvalue())
         self.assertIn('shader cache packed', buf.getvalue())
 
+    def test_carried_update_warms_the_drivers_cache(self):
+        """An update that carries the shaders over runs the game's --warm-shaders, in the game folder; a run that
+        fails is said and does not stop the build, and without a built game or a preparation nothing runs."""
+        calls = []
+        for name, value in (('shader_carry', lambda out: True),
+                            ('shader_run', lambda cmd, cwd=None: calls.append((cmd, cwd)) or self.rc)):
+            self.addCleanup(setattr, self.mg, name, getattr(self.mg, name))
+            setattr(self.mg, name, value)
+        self.rc = 0
+        self.out.mkdir(parents=True, exist_ok=True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.mg.step_shaders(self.out, update=True)
+        self.assertEqual(calls, [])                           # no exe, no prepared list
+        (self.out / self.mg.EXE_NAME).write_bytes(b'MZ')
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.mg.step_shaders(self.out, update=True)
+        self.assertEqual(calls, [])                           # never prepared: nothing to build again
+        (self.out / 'shader-prepared.bin').write_bytes(bytes(16))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.mg.step_shaders(self.out, update=True)
+        self.assertEqual(calls, [([str(self.out / self.mg.EXE_NAME), '--warm-shaders'], str(self.out))])
+        self.assertIn("driver's cache warm", buf.getvalue())
+        self.rc = 3
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.mg.step_shaders(self.out, update=True)       # no exception: the game warms it itself
+        self.assertIn('did not finish (3)', buf.getvalue())
+        self.assertEqual(len(calls), 2)
+
     def test_romfs_failure_stops_the_build(self):
         ran, lifting, failed = [], threading.Event(), threading.Event()
 
@@ -1716,10 +1765,28 @@ class MakeGameTest(Tmp):
         self.assertEqual(self.mg.lifted_level(obj, 3, update=True), 3)    # nothing recorded, no old cache
         (obj / 'objects.json').write_text(json.dumps({'main_main_0000.o': {'key': 'k', 'deps': {'a.c': 'ab'}}}))
         self.assertEqual(self.mg.lifted_level(obj, 3, update=True), 0)    # 0.5.0's cache: compiled for no level
+        # 0.5.0's runtime objects left in a cache whose lifted code a later version compiled: not an old cache
+        (obj / 'objects.json').write_text(json.dumps({
+            'main_main_0000.o': {'key': 'k', 'deps': {'a.c': ['ab', 1, 2]}}, 'rt_amiibo.o': {'key': 'k', 'deps': {'b.c': 'cd'}}}))
+        self.assertEqual(self.mg.lifted_level(obj, 3, update=True), 3)
+        cache = self.mg.ObjectCache(obj / 'objects.json')
+        self.assertEqual(cache.keep_only({'main_main_0000.o'}), 1)        # what this build no longer makes
+        self.assertEqual(list(cache.entries), ['main_main_0000.o'])
+        (obj / 'objects.json').write_text(json.dumps({'main_main_0000.o': {'key': 'k', 'deps': {'a.c': 'ab'}}}))
         (obj / self.mg.LIFTED_BUILD).write_text(json.dumps({'level': 2}))
         self.assertEqual(self.mg.lifted_level(obj, 3, update=True), 2)    # as recorded
         self.assertEqual(self.mg.lifted_level(obj, 1, update=True), 1)    # never above this processor's
         self.assertEqual(self.mg.lifted_level(obj, 3, update=False), 3)
+
+    def test_retune_due_when_the_level_differs(self):
+        obj = self.tmp / 'obj'
+        obj.mkdir()
+        with mock.patch.object(self.mg, 'cpu_level', lambda clang, env: 3),                 mock.patch.object(self.mg, 'toolchain', lambda msys: (None, None, {}, None)):
+            self.assertTrue(self.mg.retune_due(obj, None))                     # nothing recorded
+            (obj / self.mg.LIFTED_BUILD).write_text(json.dumps({'level': 0}))
+            self.assertTrue(self.mg.retune_due(obj, None))                     # generic objects on a v3 processor
+            (obj / self.mg.LIFTED_BUILD).write_text(json.dumps({'level': 3}))
+            self.assertFalse(self.mg.retune_due(obj, None))
 
     def test_updates_skip_shader_preparation(self):
         """An update leaves the shaders to the game (shader_carry) only when they were prepared and the cache names the
@@ -2402,6 +2469,221 @@ class IconTest(unittest.TestCase):
         self.assertEqual(data[big:big + 4], b'\x89PNG')
 
 
+class LookTest(Tmp):
+    """Customize Launcher: the colour schemes, the background picture and the sounds."""
+
+    def setUp(self):
+        super().setUp()
+        try:
+            from launcher.ui import art, picture, sound
+        except ImportError:
+            self.skipTest('needs numpy')
+        self.art, self.picture, self.sound = art, picture, sound
+
+    def test_every_colour_scheme_has_every_colour(self):
+        art = self.art
+        self.assertEqual(art.theme_palette('forest'), art.BASE)   # the first scheme is the colours as written
+        for name, t in art.THEMES.items():
+            pal = art.theme_palette(name)
+            self.assertEqual(set(pal), set(art.BASE), name)
+            for key, value in pal.items():
+                self.assertRegex(value, r'^#[0-9a-f]{6}$', f'{name} {key}')
+            self.assertTrue(t['label'])
+        grouped = [k for keys in art.GROUPS.values() for k in keys]
+        self.assertEqual(len(grouped), len(set(grouped)), 'a colour in two groups')
+        self.assertLessEqual(set(grouped), set(art.BASE))
+
+    def test_set_theme_changes_the_palette_in_place(self):
+        art = self.art
+        held = art.PALETTE
+        try:
+            self.assertEqual(art.set_theme('lake'), 'lake')
+            self.assertIs(art.PALETTE, held)
+            self.assertNotEqual(held['panel'], art.BASE['panel'])
+            self.assertEqual(held['salmon'], art.BASE['salmon'])        # a warning stays a warning in every scheme
+            self.assertEqual(art.set_theme('no such scheme'), 'forest')
+            self.assertEqual(dict(held), art.BASE)
+            self.assertEqual(art.set_theme(None), 'forest')             # launcher.json without the key
+        finally:
+            art.set_theme('forest')
+
+    def test_recolor_keeps_light_and_dark(self):
+        import colorsys
+        art = self.art
+
+        def hls(c):
+            return colorsys.rgb_to_hls(*(int(c[i:i + 2], 16) / 255 for i in (1, 3, 5)))
+        for c in ('#7a5c32', '#2a2019', '#d69127'):
+            h, l, _s = hls(art.recolor(c, 200))
+            self.assertAlmostEqual(h * 360, 200, delta=4)
+            self.assertAlmostEqual(l, hls(c)[1], delta=0.01)
+        self.assertEqual(art.recolor('#7a5c32', None), '#7a5c32')
+
+    def test_a_picture_is_cut_to_the_windows_shape(self):
+        import numpy as np
+        pic = self.picture
+        wide = np.zeros((100, 400, 3), dtype=np.uint8)
+        wide[:, 150:250] = 255                                # the middle of a wide picture
+        out = pic.cover(wide, 160, 100)
+        self.assertEqual(out.shape, (100, 160, 3))
+        self.assertGreater(out[:, 40:120].mean(), 200)        # its middle fills most of the result
+        tall = np.zeros((400, 100, 3), dtype=np.uint8)
+        tall[150:250] = 255
+        self.assertEqual(pic.cover(tall, 160, 100).shape, (100, 160, 3))
+        self.assertGreater(pic.cover(tall, 160, 100).mean(), 120)
+        big = np.full((2048, 3200, 3), 77, dtype=np.uint8)   # shrunk to half: averaged, the grey stays
+        self.assertTrue((pic.cover(big, 1600, 1024) == 77).all())
+
+    def test_the_kept_background(self):
+        import numpy as np
+        art, pic = self.art, self.picture
+        src = self.tmp / 'mine.png'
+        img = np.zeros((90, 300, 4), dtype=np.float32)
+        img[..., 0], img[..., 3] = 1.0, 1.0                  # red
+        src.write_bytes(art.png_bytes(img))
+        store = self.tmp / 'background.npy'
+        if pic.Image is None and os.name != 'nt':
+            self.skipTest('needs Pillow, or Tk with a display')
+        fitted = pic.keep(src, store)
+        self.assertEqual(fitted.shape, (pic.KEEP_H, pic.KEEP_W, 3))
+        back = pic.kept(store, 1000, 640)
+        self.assertEqual(back.shape, (640, 1000, 3))
+        self.assertEqual(str(back.dtype), 'float32')
+        self.assertAlmostEqual(float(back[..., 0].min()), 1.0, places=3)
+        self.assertAlmostEqual(float(back[..., 1:].max()), 0.0, places=3)
+        # the backdrop with it: the picture darkened by the dimming, solid everywhere
+        plain = art.backdrop(200, 128, 1.0, pic.kept(store, 200, 128), 0.0)
+        dimmed = art.backdrop(200, 128, 1.0, pic.kept(store, 200, 128), 0.8)
+        self.assertEqual(plain.shape, (128, 200, 4))
+        self.assertGreater(plain[64, 100, 0], 0.8)                   # the corners' shade reaches in a little
+        self.assertLess(dimmed[64, 100, 0], 0.35)
+        self.assertEqual(float(dimmed[..., 3].min()), 1.0)
+        # what is not a kept background, and what is no picture
+        self.assertIsNone(pic.kept(self.tmp / 'none.npy', 100, 64))
+        store.write_bytes(b'not numpy')
+        self.assertIsNone(pic.kept(store, 100, 64))
+        text = self.tmp / 'notes.txt'
+        text.write_text('no picture')
+        with self.assertRaises(pic.PictureError):
+            pic.keep(text, store)
+        with self.assertRaises(pic.PictureError):
+            pic.load(self.tmp / 'gone.png')
+
+    def test_ppm(self):
+        import numpy as np
+        px = bytes(range(18))
+        a = self.picture.read_ppm(b'P6\n# a comment\n3 2\n255\n' + px)
+        self.assertEqual(a.shape, (2, 3, 3))
+        self.assertEqual(a.tobytes(), px)
+        self.assertEqual(a.dtype, np.uint8)
+        with self.assertRaises(self.picture.PictureError):
+            self.picture.read_ppm(b'P5\n1 1\n255\n\0')
+
+    @staticmethod
+    def bwav(channels, rate=48000):
+        """A .bwav of channels given as (codec, pan, samples, data): the header, 0x4c bytes a channel, the data."""
+        out = bytearray(b'BWAV' + struct.pack('<HHIHH', 0xfeff, 1, 0, 0, len(channels)))
+        at = 0x10 + 0x4c * len(channels)
+        for codec, pan, count, data in channels:
+            info = bytearray(0x4c)
+            struct.pack_into('<HHIII', info, 0, codec, pan, rate, count, count)
+            struct.pack_into('<I', info, 0x30, at)
+            out += info
+            at += len(data)
+        for _codec, _pan, _count, data in channels:
+            out += data
+        return bytes(out)
+
+    def game_sounds(self, names=('Do', 'Cancel')):
+        """A dump folder whose RomFS holds the given interface sounds; decoded into this layout's cache."""
+        dump = self.tmp / 'dump'
+        (dump / 'exefs').mkdir(parents=True, exist_ok=True)
+        (dump / 'exefs' / 'main').write_bytes(b'')
+        stream = dump / 'romfs' / 'Sound' / 'Resource' / 'Stream'
+        stream.mkdir(parents=True, exist_ok=True)
+        loud = struct.pack('<4h', 0, 16000, -16000, 8000)
+        for name in names:
+            (stream / f'SE_Sys_{name}00.bwav').write_bytes(self.bwav([(0, 0, 4, loud), (0, 1, 4, loud)]))
+        return gamefiles.extract_sounds(self.layout, '', str(dump))
+
+    def test_the_games_interface_sounds(self):
+        sound = self.sound
+        # one PCM16 channel in the middle: both sides, at 0.707
+        mono = self.bwav([(0, 2, 3, struct.pack('<3h', 1000, -2000, 3000))])
+        self.assertEqual(gamefiles.bwav_to_pcm(mono), (48000, [(707, 707), (-1414, -1414), (2121, 2121)]))
+        # two DSP-ADPCM channels, left and right: a frame's header byte (coefficient pair 0, all zero here, shift 8)
+        # and its four-bit samples 1, -1, 7 make 256, -256, 1792
+        frame = bytes([0x08, 0x1f, 0x70]) + bytes(5)
+        both = self.bwav([(1, 0, 3, frame), (1, 1, 2, frame)])
+        self.assertEqual(gamefiles.bwav_to_pcm(both), (48000, [(256, 256), (-256, -256), (1792, 0)]))
+        for bad in (b'', b'RIFF' + bytes(60), mono[:0x30], self.bwav([(7, 2, 3, bytes(6))]), mono[:-2]):
+            self.assertIsNone(gamefiles.bwav_to_pcm(bad))
+        # from a dump folder into data/cache/sounds, and from there into the effects: the decide sound only here
+        got = self.game_sounds(('Do',))
+        (self.tmp / 'dump' / 'romfs' / 'Sound' / 'Resource' / 'Stream' / 'SE_Sys_Cancel00.bwav').write_bytes(b'no sound')
+        self.assertEqual(set(got), {'select'})
+        self.assertEqual(gamefiles.cached_sounds(self.layout), got)
+        with mock.patch.object(sound.os, 'name', 'posix'), mock.patch.object(sound.shutil, 'which', return_value=None):
+            s = sound.Sounds(self.layout.cache, 'high')
+        self.assertEqual(set(s.game), {'select'})
+        wav = s.wav('select')                                  # the game's sound: stereo at its rate, at the level
+        self.assertEqual(wav[:4] + wav[8:16], b'RIFFWAVEfmt ')
+        self.assertEqual(struct.unpack_from('<I', wav, 4)[0], len(wav) - 8)
+        self.assertEqual(struct.unpack_from('<HHI', wav, 20), (1, 2, 48000))
+        peak = max(abs(v) for v in struct.unpack_from('<8h', wav, 44))
+        self.assertAlmostEqual(peak / 32767, sound.LEVELS['high'], delta=0.01)
+        self.assertFalse(sound.Sounds(self.tmp / 'empty', 'high').game)
+
+    def test_only_the_games_sounds_play_at_low_unless_set(self):
+        sound = self.sound
+        self.assertEqual(settings.DEFAULTS['sounds'], 'low')
+        self.assertEqual(sound.DEFAULT_LEVEL, 'low')
+        self.assertEqual(set(gamefiles.SOUNDS), set(sound.EFFECTS))
+        empty = self.tmp / 'empty'
+        self.game_sounds()
+        with mock.patch.object(sound.os, 'name', 'posix'), mock.patch.object(sound.shutil, 'which',
+                                                                             return_value='/usr/bin/aplay'), \
+                mock.patch.object(sound.subprocess, 'Popen') as popen:
+            quiet = sound.Sounds(empty, 'high')                # before the game has been read: nothing to play
+            quiet.play('select')
+            quiet.play('back')
+            popen.assert_not_called()
+            quiet.cache = self.layout.cache
+            self.assertTrue(quiet.load_game())                 # the game's sounds, once decoded
+            quiet.play('select')
+            self.assertEqual(popen.call_count, 1)
+            s = sound.Sounds(self.layout.cache)                # no level given, as a new launcher.json has it: low
+            self.assertEqual(s.level, 'low')
+            s.play('select')
+            self.assertEqual(popen.call_count, 2)
+            s.set_level('off')                                 # the player turned them off
+            s.play('select')
+            self.assertEqual(popen.call_count, 2)
+            s.set_level('nonsense')                            # a level launcher.json cannot hold: the default
+            self.assertEqual(s.level, 'low')
+            s.play('back')
+            s.play('move')                                     # the cursor has no sound
+            s.play('no such effect')
+            self.assertEqual(popen.call_count, 3)
+            with open(popen.call_args[0][0][1], 'rb') as f:
+                self.assertEqual(f.read(4), b'RIFF')
+            peak = max(abs(v) for v in struct.unpack_from('<8h', s.wav('back'), 44))
+            self.assertAlmostEqual(peak / 32767, sound.LEVELS['low'], delta=0.01)
+
+    def test_the_look_settings_survive_and_fall_back(self):
+        path = self.tmp / 'launcher.json'
+        s = settings.Settings(path)
+        self.assertEqual((s['theme'], s['background'], s['background_dim'], s['animations'], s['sounds']),
+                         ('forest', '', 40, True, 'low'))
+        s['theme'], s['sounds'], s['background_dim'] = 'shadow', 'high', 60
+        s.save()
+        t = settings.Settings(path)
+        self.assertEqual((t['theme'], t['sounds'], t['background_dim']), ('shadow', 'high', 60))
+        path.write_text(json.dumps({'theme': 5, 'animations': 'yes', 'background_dim': '40'}))
+        u = settings.Settings(path)                        # values of the wrong kind: the defaults
+        self.assertEqual((u['theme'], u['animations'], u['background_dim']), ('forest', True, 40))
+
+
 # ---------------------------------------------------------------- the window
 
 def have_display():
@@ -2442,7 +2724,7 @@ class WindowTest(Tmp):
         r = subprocess.run([sys.executable, '-m', 'launcher', '--root', str(self.tmp / 'w'), '--selftest'],
                            cwd=ROOT, capture_output=True, text=True, timeout=180)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn('12 screens drawn', r.stdout)
+        self.assertIn('15 screens drawn', r.stdout)
 
 
 if __name__ == '__main__':
