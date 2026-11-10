@@ -18,6 +18,7 @@ Run: python tests/launcher_test.py   (Python 3.14 for the zstd tests; the window
   a source checkout's build/xlate/), the prompts step with a stand-in prompt tool, the object cache of the compile
   step with the system's C compiler, and its windres call under folders with spaces (a script in windres's place)
 - jobs: an install driven by a fake make_game.py, with and without the prompts row
+- Add to Steam: the binary shortcuts file read and written back unchanged, a shortcut added and updated in place
 - the look: the colour schemes, the background picture's fitting and kept copy, the sound effects (low by default,
   only the game's own select and back sounds, decoded from a made-up .bwav)
 - the window: --selftest draws every screen (skipped without a display)
@@ -2839,6 +2840,60 @@ def have_display():
 
 
 @unittest.skipUnless(have_display(), 'needs tkinter, numpy and a display')
+class SteamTest(Tmp):
+    """launcher/steam.py on made-up Steam files: the binary shortcuts file read and written back unchanged, our
+    shortcut added beside another and updated in place, its id as Steam computes it, the accounts that signed in."""
+
+    def other(self):
+        from launcher import steam
+        exe = '"C:\\Games\\Other\\other.exe"'
+        entry = [[steam.T_INT, 'appid', struct.pack('<I', steam.appid(exe, 'Other'))], [steam.T_STR, 'AppName', 'Other'],
+                 [steam.T_STR, 'Exe', exe], [steam.T_STR, 'StartDir', '"C:\\Games\\Other\\"'],
+                 [steam.T_STR, 'icon', ''], [steam.T_INT, 'LastPlayTime', struct.pack('<I', 1234)],
+                 [steam.T_STR, 'sortas', ''], [steam.T_MAP, 'tags', [[steam.T_STR, '0', 'Favorite']]]]
+        return steam.vdf_dump([[steam.T_MAP, 'shortcuts', [[steam.T_MAP, '0', entry]]]])
+
+    def test_round_trip_add_and_update(self):
+        from launcher import steam
+        b = self.other()
+        self.assertEqual(b[-4:], b'\x08\x08\x08\x08')   # tags, the shortcut, shortcuts, the file
+        self.assertEqual(steam.vdf_dump(steam.vdf_load(b)), b)
+        self.assertFalse(steam.has_shortcut(b))
+        new, sid = steam.add_shortcut(b, '"C:\\NX2navi\\python\\pythonw.exe"', '"C:\\NX2navi"',
+                                      '"C:\\NX2navi\\data\\steam_play.pyw"', 'C:\\grid\\x_icon.png')
+        self.assertEqual(sid, steam.appid('"C:\\NX2navi\\python\\pythonw.exe"', steam.NAME))
+        self.assertTrue(sid & 0x80000000)
+        self.assertTrue(new.startswith(b[:-2]))   # the other shortcut stays byte for byte
+        self.assertTrue(steam.has_shortcut(new))
+        items = steam.vdf_load(new)[0][2]
+        self.assertEqual([k for _, k, _ in items], ['0', '1'])
+        ours = {k: v for _, k, v in items[1][2]}
+        self.assertEqual(ours['AppName'], 'The Legend of Zelda Ocarina of Time')
+        self.assertEqual(struct.unpack('<I', ours['appid'])[0], sid)
+        self.assertEqual(ours['LaunchOptions'], '"C:\\NX2navi\\data\\steam_play.pyw"')
+        self.assertEqual(ours['AllowOverlay'], struct.pack('<I', 1))
+        again, _ = steam.add_shortcut(new, '"D:\\NX2navi\\python\\pythonw.exe"', '"D:\\NX2navi"', '', 'x')
+        items = steam.vdf_load(again)[0][2]
+        self.assertEqual(len(items), 2)   # moved launcher: the same shortcut, updated
+        self.assertEqual({k: v for _, k, v in items[1][2]}['StartDir'], '"D:\\NX2navi"')
+        with self.assertRaises(steam.SteamError):
+            steam.vdf_load(b[:-5])
+
+    def test_new_file_and_accounts(self):
+        from launcher import steam
+        new, _ = steam.add_shortcut(b'', '"x.exe"', '"."', '', '')
+        self.assertTrue(steam.has_shortcut(new))
+        root = self.tmp / 'Steam'
+        for a in ('0', '1046310423', '22'):
+            (root / 'userdata' / a / 'config').mkdir(parents=True)
+        (root / 'config').mkdir()
+        (root / 'config' / 'loginusers.vdf').write_text('"users"\n{\n\t"76561199006576151"\n\t{\n\t}\n}\n')
+        self.assertEqual(steam.accounts(root), [root / 'userdata' / '1046310423' / 'config'])
+        (root / 'config' / 'loginusers.vdf').unlink()
+        self.assertEqual(steam.accounts(root), sorted([root / 'userdata' / '1046310423' / 'config',
+                                                       root / 'userdata' / '22' / 'config']))
+
+
 class WhilePlayingTest(Tmp):
     def test_the_games_restart_does_not_bring_the_launcher_back(self):
         try:

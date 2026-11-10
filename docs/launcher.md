@@ -55,6 +55,18 @@ Customize Launcher (on the home screen) makes the look the player's own:
   it is silent until the player's game has been read. Moving the cursor makes no sound. They are played from memory
   (PlaySound on Windows; `pw-play`, `paplay` or `aplay` elsewhere).
 
+- Add to Steam (Windows): the game in the player's Steam library as *The Legend of Zelda Ocarina of Time*, started
+  from there without the launcher's window (`launcher/steam.py`). Its pictures are made from the player's game when
+  the row is selected (`launcher/gameart.py`): Navi as the game's HUD draws her for the icon, the title screen's logo,
+  and a frame of the first title movie (the moonlit field) as the background, the cover and the wide tile, the movie
+  decoded with the toolchain's `dav1d.exe` and the logo with the runtime's own ASTC decoder built with its clang. They
+  go into each signed-in account's `config/grid`, the shortcut into its `shortcuts.vdf` (other shortcuts kept as they
+  are, ours updated when it is there; the file before the first change kept as `shortcuts.vdf.nx2navi-backup`).
+  Steam reads that file only when it starts and writes it back when it closes, so a running Steam is asked to close
+  first and started again after. The shortcut runs the launcher's `pythonw.exe` on `data/steam_play.pyw`, which
+  starts the launcher of `app/current.txt` with `--play`: the game starts as Play starts it, and the process waits
+  for it, so Steam counts the game as running while it is.
+
 The choices are `theme`, `background`, `background_dim`, `animations` and `sounds` in `data/launcher.json`.
 
 Navi (`art.NAVI`, 22 x 21 pixels, drawn in whole pixels at every size) is also the icon of `NX2navi.exe`,
@@ -66,7 +78,7 @@ Screens (`launcher/ui/app.py`): first run (dump, install folder, Desktop Shortcu
 Update Channel, Begin Installation); the steps of an install, update or rebuild with their progress, the build log's
 last lines and Cancel, and after a failure Try Again and Copy Report; home (Play, Updates, Game Folder, Saves,
 Rebuild the Game, Customize Launcher, Settings); customize (Color Scheme, Background, with a picture set Background
-Dimming and Remove Background, Animations, Sounds, Back); saves (Export Save, Add Log and Settings, Export To, Import a Save, Import a Save Folder,
+Dimming and Remove Background, Animations, Sounds, Add to Steam on Windows, Back); saves (Export Save, Add Log and Settings, Export To, Import a Save, Import a Save Folder,
 Open Saves Folder, Back); settings (update check, Install Updates Automatically, Hide Launcher While Playing, Keep
 Build Cache, Update Channel, the folders, Open Logs Folder, Uninstall, Back); uninstall (keep or remove the built game).
 A screen with more rows than the window holds draws them closer together (`fit_rows`).

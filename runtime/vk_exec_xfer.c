@@ -265,38 +265,103 @@ void vk_exec_oq_draw(VkExec *ex) {
 
 void vk_exec_oq_pass_end(VkExec *ex) { oq_close(ex); }
 
+static void oq_batch_drop(void);   // the results kept by the completion thread (oq_take)
+
 void vk_exec_xfer_shutdown(void) {
     if (oq_state > 0) vkDestroyQueryPool(vk_ctx()->device, oq_pool, NULL);
     oq_pool = VK_NULL_HANDLE, oq_state = 0, oq_next = 0, oq_counting = oq_reported = oq_keep = 0, oq_open = -1;
     oq_nseg = 0, oq_lost = 0, oq_count = 0;
     memset((void *)oq_busy, 0, sizeof oq_busy);
+    oq_batch_drop();
+}
+
+// The completion thread reads the results in batches (NX2NAVI_OQ_BATCH, default 1; 0: every segment by itself, as
+// before). The game tests one proxy per report, so a segment holds one query, and a frame of Hyrule Field has about a
+// hundred of them: one vkGetQueryPoolResults and one vkResetQueryPool each. On an RX 7900 XT (26.10.1) each of those
+// calls goes into the kernel, and the two hundred took 3.9 ms of every frame on the completion thread, which runs a
+// submission's callbacks before it lets the submission's waiters go: the game's main thread waits for the previous
+// frame's fence before it lets the next frame's GPU work start, so the frame after one replayed inside its submit
+// call began 4 to 6 ms late with every thread idle. Slots come from the ring in order, so the slots of the segments
+// that follow lie behind the one asked for: one call reads OQ_BATCH slots from there on with their availability, the
+// available ones are kept (the results stay in the pool until the reset), and the segments after it take theirs from
+// what is kept. A slot not available in the batch (its part had not run yet) is read again when its segment comes.
+// The slots taken are reset in runs, one vkResetQueryPool for each: a run ends when a slot that does not continue it
+// is taken or a new batch is read. Until then its slots stay busy for the replay, at most OQ_BATCH of the ring's
+// OQ_N, also while the game reports nothing.
+#define OQ_BATCH 256
+static struct {
+    uint32_t first, n;               // the slots kept: [first, first + n)
+    uint64_t v[OQ_BATCH * 2];        // per slot: samples, available
+    uint8_t taken[OQ_BATCH];
+    uint32_t r0, rn;                 // the run of taken slots still to be reset
+    uint64_t calls, slots, segs;     // since the last perf line: result calls, slots they read, segments served
+} OQB;
+static int oq_batch_mode = -1;
+
+static void oq_batch_drop(void) { OQB.n = OQB.rn = 0; }
+
+static void oq_reset_flush(VkDevice dev) {
+    if (!OQB.rn) return;
+    vkResetQueryPool(dev, oq_pool, OQB.r0, OQB.rn);
+    for (uint32_t k = 0; k < OQB.rn; k++) __atomic_store_n(&oq_busy[OQB.r0 + k], 0, __ATOMIC_RELEASE);
+    OQB.rn = 0;
+}
+
+static void oq_read(VkDevice dev, uint32_t first, uint32_t n) {
+    VkResult r = vkGetQueryPoolResults(dev, oq_pool, first, n, sizeof OQB.v[0] * 2 * n, OQB.v, 2 * sizeof OQB.v[0],
+                                       VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    if (r != VK_SUCCESS && r != VK_NOT_READY) {
+        vk_device_fault_report(r);
+        rt_fatal("vk: occlusion query results failed (%d)", (int)r);
+    }
+    OQB.first = first, OQB.n = n;
+    memset(OQB.taken, 0, n);
+    OQB.calls++, OQB.slots += n;
+}
+
+// The samples of slot q, whose submission has completed; *avail 0 when the query has no result.
+static uint64_t oq_take(VkDevice dev, uint32_t q, int *avail) {
+    uint32_t k = q - OQB.first;
+    if (!(q >= OQB.first && k < OQB.n && !OQB.taken[k] && OQB.v[2 * k + 1])) {
+        // not kept, or kept as unavailable (read before its part ran): from this slot on, up to the replay's next slot
+        oq_reset_flush(dev);   // before the kept results go: the run's slots are among them
+        uint32_t next = __atomic_load_n(&oq_next, __ATOMIC_RELAXED) % OQ_N, n = OQ_N - q;
+        if (next > q && next - q < n) n = next - q;
+        if (n > OQ_BATCH) n = OQ_BATCH;
+        if (oq_batch_mode == 0) n = 1;
+        oq_read(dev, q, n);
+        k = 0;
+    }
+    OQB.taken[k] = 1;
+    if (OQB.rn && q != OQB.r0 + OQB.rn) oq_reset_flush(dev);
+    if (!OQB.rn) OQB.r0 = q;
+    OQB.rn++;
+    *avail = OQB.v[2 * k + 1] != 0;
+    return OQB.v[2 * k];
 }
 
 static void oq_cb(void *arg) {
     OqSegment *s = arg;
     VkDevice dev = vk_ctx()->device;
-    uint64_t sum = 0, v[64 * 2];
-    for (uint32_t i = 0; i < s->n;) {
-        uint32_t j = i + 1;
-        while (j < s->n && j - i < 64 && s->q[j] == s->q[j - 1] + 1) j++;
+    if (oq_batch_mode < 0) oq_batch_mode = cfg_bool("NX2NAVI_OQ_BATCH");
+    uint64_t sum = 0;
+    for (uint32_t i = 0; i < s->n; i++) {
         // The fence has passed, so a query that is still unavailable will not become available: waiting would block the
         // completion thread, and with it every later callback, for good. It counts as visible (one sample).
-        VkResult r = vkGetQueryPoolResults(dev, oq_pool, s->q[i], j - i, sizeof v, v, 2 * sizeof v[0],
-                                           VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
-        if (r != VK_SUCCESS && r != VK_NOT_READY) {
-            vk_device_fault_report(r);
-            rt_fatal("vk: occlusion query results failed (%d)", (int)r);
+        int avail;
+        uint64_t v = oq_take(dev, s->q[i], &avail);
+        if (avail) sum += v;
+        else {
+            sum += 1;
+            LOG_ONCE("vk: occlusion query slot %u not available after its fence, counted as visible", s->q[i]);
         }
-        vkResetQueryPool(dev, oq_pool, s->q[i], j - i);
-        for (uint32_t k = i; k < j; k++) {
-            if (v[2 * (k - i) + 1]) sum += v[2 * (k - i)];
-            else {
-                sum += 1;
-                LOG_ONCE("vk: occlusion query slot %u not available after its fence, counted as visible", s->q[k]);
-            }
-            __atomic_store_n(&oq_busy[s->q[k]], 0, __ATOMIC_RELEASE);
-        }
-        i = j;
+    }
+    if (s->n && ++OQB.segs >= 12000) {
+        if (rt_trace & RT_TRACE_PERF)
+            rt_log("perf: occlusion queries: %llu segments read with %llu result calls of %.1f slots on average",
+                   (unsigned long long)OQB.segs, (unsigned long long)OQB.calls,
+                   OQB.calls ? (double)OQB.slots / (double)OQB.calls : 0.0);
+        OQB.calls = OQB.slots = OQB.segs = 0;
     }
     if (s->reset) oq_count = 0;
     else {
@@ -366,11 +431,115 @@ static int ev_holds(uint32_t have, uint32_t mode, uint32_t want) {
     return mode == NVN_EVENT_WAIT_MODE_GEQUAL_WRAP ? (int32_t)(have - want) >= 0 : have == want;
 }
 
-int vk_exec_event_met(const void *payload) {
+// ---- events the CPU signals
+// Ocarina gates its main queue on the CPU: each frame the game sets one of two events to 0 (they take turns frame by
+// frame), submits the worker queues' command buffers and the main queue's, whose first command waits for the event
+// to be 1, and signals 1 from the CPU (nvnEventSignal) once it has finished writing what the frame's commands read.
+// The signal comes before the main queue's submit call, after it, or while that call is replaying. On the console
+// the GPU starts the queue at the signal and reads memory from then on.
+// Here a submission's recording begins with the copies of what it reads: the VRAM mirrors' sync and the uniform
+// snapshot (vk_exec_record), and the wait is tested when the walk reaches it, some hundred microseconds later. A
+// signal that came in between passed the wait, and the frame was drawn from copies taken before the game had
+// finished writing: single frames with the scene's shadowing missing or the whole scene black, the interface as it
+// was, most of them when other work keeps the CPU busy, since the game's threads then finish later and the signal
+// falls into the replay more often.
+// So a wait is tested against the value the event had when the submission took its copies: every nvnEventSignal is
+// numbered and keeps the value it replaced (vk_exec_event_cpu, before the write), vk_exec_record notes the number at
+// its start (vk_exec_event_sync), and a signal with a later number does not count for that submission. The wait then
+// stops the submission like any wait reached before its signal, and vk_backend.c submit_sync lets it go on at once
+// in a submission of its own, whose copies are taken after the signal.
+// NX2NAVI_EVENT_AT_SYNC=0: the value in memory when the walk reaches the wait, as before.
+#define CPU_EV 16
+#define CPU_EV_HIST 8
+static struct { const void *val; uint64_t seq[CPU_EV_HIST]; uint32_t before[CPU_EV_HIST]; unsigned n; } cpu_ev[CPU_EV];
+static int cpu_ev_n;                             // cpu_ev_lock
+static uint64_t cpu_ev_seq;                      // cpu_ev_lock: nvnEventSignal calls so far
+static uint64_t ev_sync_seq = UINT64_MAX;        // cpu_ev_lock: cpu_ev_seq at the recording's start; UINT64_MAX outside one
+static PlatMutex cpu_ev_lock = PLAT_MUTEX_INIT;
+static uint64_t ev_after_sync;                   // replay: waits only a signal after the copies would have passed
+
+int vk_exec_event_at_sync(void) {
+    static int on = -1;
+    if (on < 0) on = rt_knob("EVENT_AT_SYNC", "1");
+    return on;
+}
+
+void vk_exec_event_cpu(const void *event) {
+    plat_mutex_lock(&cpu_ev_lock);
+    int i = 0;
+    while (i < cpu_ev_n && cpu_ev[i].val != event) i++;
+    if (i == cpu_ev_n && cpu_ev_n < CPU_EV) cpu_ev[cpu_ev_n++].val = event, cpu_ev[i].n = 0;
+    cpu_ev_seq++;
+    if (i < cpu_ev_n) {
+        unsigned k = cpu_ev[i].n++ % CPU_EV_HIST;
+        cpu_ev[i].seq[k] = cpu_ev_seq, cpu_ev[i].before[k] = __atomic_load_n((const volatile uint32_t *)event, __ATOMIC_ACQUIRE);
+    }
+    plat_mutex_unlock(&cpu_ev_lock);
+}
+
+// 1 when the CPU has signalled this event before (nvnEventSignal): its waits are gates the game opens from the CPU.
+int vk_exec_event_cpu_known(const void *event) {
+    plat_mutex_lock(&cpu_ev_lock);
+    int i = 0;
+    while (i < cpu_ev_n && cpu_ev[i].val != event) i++;
+    int known = i < cpu_ev_n;
+    plat_mutex_unlock(&cpu_ev_lock);
+    return known;
+}
+
+// The wait's condition on the value in memory now, whatever the replay has seen. Any thread.
+int vk_exec_event_holds_now(const void *payload) {
     const p_wait_event *p = payload;
-    const uint32_t *seen = ev_slot(p->val, 0);
-    return ev_holds(__atomic_load_n(p->val, __ATOMIC_ACQUIRE), p->mode, p->value) ||
-           (seen && ev_holds(*seen, p->mode, p->value));
+    return ev_holds(__atomic_load_n(p->val, __ATOMIC_ACQUIRE), p->mode, p->value);
+}
+
+void vk_exec_event_sync(int begin) {
+    plat_mutex_lock(&cpu_ev_lock);
+    ev_sync_seq = begin ? cpu_ev_seq : UINT64_MAX;
+    plat_mutex_unlock(&cpu_ev_lock);
+}
+
+uint64_t vk_exec_event_late_take(void) {
+    uint64_t n = ev_after_sync;
+    ev_after_sync = 0;
+    return n;
+}
+
+// The event's value in memory, and in *at_sync the value it had when the submission being recorded took its copies
+// (the same outside a recording, and for an event the CPU has not signalled since).
+static uint32_t ev_mem(volatile uint32_t *val, uint32_t *at_sync) {
+    uint32_t mem = __atomic_load_n(val, __ATOMIC_ACQUIRE);
+    *at_sync = mem;
+    plat_mutex_lock(&cpu_ev_lock);
+    if (ev_sync_seq != UINT64_MAX)
+        for (int i = 0; i < cpu_ev_n; i++) {
+            if (cpu_ev[i].val != (const void *)val) continue;
+            uint64_t first = UINT64_MAX;
+            unsigned n = cpu_ev[i].n < CPU_EV_HIST ? cpu_ev[i].n : CPU_EV_HIST;
+            for (unsigned k = 0; k < n; k++)   // the earliest signal after the copies replaced the value they saw
+                if (cpu_ev[i].seq[k] > ev_sync_seq && cpu_ev[i].seq[k] < first) first = cpu_ev[i].seq[k], *at_sync = cpu_ev[i].before[k];
+            break;
+        }
+    plat_mutex_unlock(&cpu_ev_lock);
+    return mem;
+}
+
+// Whether the wait holds. *late: it holds only by a CPU signal that came after the submission's copies.
+static int ev_met(const p_wait_event *p, uint32_t *mem, const uint32_t **seen, int *late) {
+    uint32_t at_sync;
+    *mem = ev_mem(p->val, &at_sync);
+    *seen = ev_slot(p->val, 0);
+    int by_seen = *seen && ev_holds(**seen, p->mode, p->value);
+    int now = ev_holds(*mem, p->mode, p->value) || by_seen, then = ev_holds(at_sync, p->mode, p->value) || by_seen;
+    *late = now && !then;
+    return vk_exec_event_at_sync() ? then : now;
+}
+
+int vk_exec_event_met(const void *payload) {
+    uint32_t mem;
+    const uint32_t *seen;
+    int late;
+    return ev_met(payload, &mem, &seen, &late);
 }
 
 int vk_exec_signalled;
@@ -378,9 +547,15 @@ int vk_exec_signalled;
 int vk_exec_wait_event(const void *payload) {
     const p_wait_event *p = payload;
     ev_waits++;
-    uint32_t mem = __atomic_load_n(p->val, __ATOMIC_ACQUIRE);
-    const uint32_t *seen = ev_slot(p->val, 0);
-    if (ev_holds(mem, p->mode, p->value) || (seen && ev_holds(*seen, p->mode, p->value))) return 1;
+    uint32_t mem;
+    const uint32_t *seen;
+    int late;
+    int met = ev_met(p, &mem, &seen, &late);
+    if (late) {
+        ev_after_sync++;
+        vk_exec_evt('L', (const void *)p->val, 0);
+    }
+    if (met) return 1;
     ev_unmet++;
     if (ev_open_n == EV_OPEN) memmove(ev_open, ev_open + 1, sizeof ev_open - sizeof *ev_open), ev_open_n--;
     ev_open[ev_open_n].val = p->val, ev_open[ev_open_n].mode = p->mode, ev_open[ev_open_n].value = p->value;
@@ -400,6 +575,7 @@ void vk_exec_event_stats(uint64_t *waits, uint64_t *unmet, uint64_t *late, uint6
 static void signal_event(VkExec *ex, const p_signal_event *p) {
     uint32_t *seen = ev_slot(p->val, 1);
     *seen = p->mode == NVN_EVENT_SIGNAL_MODE_ADD ? *seen + p->value : p->value;
+    vk_exec_evt('s', (const void *)p->val, *seen);
     vk_exec_signalled = 1;
     for (int i = 0; i < ev_open_n;)
         if (ev_open[i].val == p->val && ev_holds(*seen, ev_open[i].mode, ev_open[i].value)) {

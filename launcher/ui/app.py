@@ -9,7 +9,7 @@ flat cells and the orange choices are canvas items. Screens:
 
     first_run   the dump, the install folder, three choices and Begin Installation
     home        Play, Updates, the game folder, Saves, Rebuild the Game, Customize Launcher, Settings
-    customize   the colour scheme, the player's own background picture, animations and sounds
+    customize   the colour scheme, the player's own background picture, animations and sounds; Add to Steam
     saves       Export Save (a zip for a bug report or another player), Import a Save (such a zip), a save folder
     job         the steps of an install, update or rebuild, with their progress, and Cancel; after a failure Try Again
                 and Copy Report
@@ -35,7 +35,7 @@ import tkinter.font as tkfont
 from pathlib import Path
 from tkinter import filedialog
 
-from .. import NAME, build, feed, gameini, gamefiles, jobs, saves, versions, winsys
+from .. import NAME, build, feed, gameini, gamefiles, jobs, saves, steam, versions, winsys
 from ..context import Context
 from . import art, picture, sound
 
@@ -170,6 +170,8 @@ class App:
         self.look_message = ''   # why the last background picture was not taken, in Customize Launcher's descriptions
         self.save_message = ''   # the last import's result, shown in the import rows' descriptions
         self.export_message = ''   # the last Export Save result, shown in its description
+        self.steam_message = ''   # the last Add to Steam result, shown in its description
+        self.steam_busy = False   # Add to Steam is making the pictures or writing Steam's files
         self.dumps = None
         self.dump_search = None
         self.uninstall_game = False
@@ -951,10 +953,74 @@ class App:
                 left=lambda: sounds(-1), right=lambda: sounds(1),
                 desc=('The game\'s select and back sounds. Low by default.',)),
             Row('divider'),
+        ]
+        if os.name == 'nt':
+            rows += [self.steam_row(), Row('divider')]
+        rows += [
             Row('action', 'Back', on=lambda: self.show('home', self.home_row('Customize Launcher')), height=40,
                 desc=('Back to the main menu.',)),
         ]
         return rows
+
+    def steam_row(self):
+        """Add to Steam: the game in the Steam library, started from there without the launcher (launcher/steam.py)."""
+        found = steam.find_steam()
+        desc = ('Add Ocarina of Time to your Steam library as The Legend of Zelda Ocarina of Time, with Navi as its '
+                'icon and the title screen\'s moonlit field and logo as its pictures, all taken from your game. '
+                'Playing it from Steam starts the game straight away.',
+                'Steam closes while the shortcut is written and starts again with it. Select the row again after an '
+                'update of the game to refresh it.')
+        if self.steam_message:
+            desc = (self.steam_message,) + desc
+        if self.steam_busy:
+            value, style = 'Adding…', 'dim'
+        elif not found:
+            value, style = 'Steam not found', 'dim'
+        else:
+            value, style = ('Added' if steam.added(found[0]) else ''), 'arrow'
+        return Row('value', 'Add to Steam', value, style, on=self.add_to_steam, desc=desc)
+
+    def add_to_steam(self):
+        import threading
+        if self.steam_busy:
+            return
+        gd = self.settings.get('game_dir')
+        if not steam.find_steam():
+            self.steam_message = 'Steam is not installed on this PC.'
+            self.sounds.play('back')
+            self.show('customize', self.focus)
+            return
+        if not gd or not (Path(gd) / 'ocarina.exe').is_file():
+            self.steam_message = 'The game is not built yet.'
+            self.sounds.play('back')
+            self.show('customize', self.focus)
+            return
+        self.steam_busy = True
+        self.steam_message = 'Making the pictures from your game and adding it to Steam…'
+        self.sounds.play('select')
+        self.show('customize', self.focus)
+        dump = self.settings.get('dump')
+
+        def work():
+            try:
+                text, ok = steam.add(self.layout, gd, dump, self.ctx.log), True
+            except steam.SteamError as e:
+                text, ok = str(e), False
+            except Exception as e:   # a Steam folder in a state nobody expected: say so instead of dying
+                import traceback
+                self.ctx.log('steam: ' + traceback.format_exc())
+                text, ok = f'Adding to Steam failed: {e}', False
+            self.ctx.log(f'steam: {text}')
+            self.root.after(0, lambda: self.steam_done(text, ok))
+        threading.Thread(target=work, daemon=True).start()
+
+    def steam_done(self, text, ok):
+        self.steam_busy = False
+        self.steam_message = text
+        if not ok:
+            self.sounds.play('back')
+        if self.screen == 'customize':
+            self.show('customize', self.focus)
 
     def choose_background(self):
         start = self.settings.get('background')
@@ -1982,6 +2048,8 @@ def parse_args(argv):
     ap.add_argument('--root', help='the launcher folder (tests)')
     ap.add_argument('--selftest', action='store_true', help='draw every screen and close')
     ap.add_argument('--shots', help='with --selftest: save a PNG of each screen into this folder')
+    ap.add_argument('--play', action='store_true',
+                    help='start the game without the window and wait for it (the Steam shortcut, launcher/steam.py)')
     a, _unknown = ap.parse_known_args(argv)
     return a
 
@@ -2011,12 +2079,40 @@ def single_instance(layout, wait):
             time.sleep(0.25)
 
 
+def play_only(ctx):
+    """--play, from the Steam shortcut (launcher/steam.py): the game starts from its folder with its console hidden, as
+    Play starts it, and this process waits until it and the copies its own Restart starts have ended, so Steam shows
+    the game as running all that time. None when there is no built game: the launcher's window opens instead."""
+    gd = ctx.settings.get('game_dir')
+    exe = Path(gd) / 'ocarina.exe' if gd else None
+    if not exe or not exe.is_file():
+        return None
+    if saves.game_running(gd):
+        ctx.log('play from Steam: the game is already running')
+        return 0
+    try:
+        proc = winsys.start_game(exe)
+    except OSError as e:
+        ctx.log(f'play from Steam: {exe}: {e}')
+        return None
+    ctx.log(f'play from Steam: {exe}')
+    time.sleep(2)
+    while proc.poll() is None or saves.game_running(gd):
+        time.sleep(1)
+    ctx.log(f'play from Steam: the game ended (code {proc.returncode})')
+    return 0
+
+
 def main(argv=None):
     a = parse_args(sys.argv[1:] if argv is None else argv)
     winsys.dpi_aware()
     winsys.app_id()
     from ..paths import Layout
     ctx = Context(Layout(root=a.root) if a.root else None)
+    if a.play and not a.selftest:
+        code = play_only(ctx)
+        if code is not None:
+            return code
     lock = None
     if not a.selftest:
         lock = single_instance(ctx.layout, 20 if (a.continue_update or a.rolled_back) else 2)

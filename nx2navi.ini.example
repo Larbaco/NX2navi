@@ -74,6 +74,13 @@
 # recorder_core = auto
 # Submissions handed to the GPU queue together in one call, 1 to 16 (1 = each one at once).
 # submit_batch = 4
+# Occlusion query results are read back from the video card in batches, 0 or 1. Default: on. 0 reads each query with a
+# call of its own, as before, which on AMD's Windows driver held every frame's "GPU done" back by about 4 ms.
+# oq_batch = 1
+# How many milliseconds a submit call waits for the game's own signal that the frame's data is written, when the
+# frame's commands begin with a wait for that signal (0 to 100; 0: the frame is set aside at once and drawn at its
+# present, as before).
+# gate_wait_ms = 10
 # Dynamic resolution, 0 or 1, applied at once: with a DLSS upscaling mode, the scene resolution follows the GPU time
 # per frame toward dyn_res_target milliseconds (1 to 100), one DLSS step at a time, each held for dyn_res_step frames
 # (8 to 600), from the DLSS mode set down to performance. Default: off.
@@ -96,8 +103,21 @@
 # How many milliseconds the draws of one frame may wait, in all, for a missing pipeline to be linked from the shader
 # libraries in the graphics driver's cache before they are dropped (0 to 100; 0: dropped at once, as before).
 # pipe_link_ms = 6
+# When a draw finds its pipeline missing, the rest of the commands the game submitted with it are read ahead and the
+# shader libraries of every other pipeline they will need are built at once on background threads, so the later draws
+# find theirs ready instead of waiting one after another or being left out of a frame. 0: off, as before.
+# pipe_ahead = 1
+# A pipeline whose fragment shader reads the picture it draws into (soft particles, water, some full-screen passes) is
+# linked from the shader libraries like any other. 0: as before, such a draw waits for the whole compile.
+# gpl_feedback = 1
+# The threads that build shader libraries also link the pipelines of draws that were left out of a frame, several at
+# once, instead of one thread linking them one after another while the others build optimised pipelines. 0: as before.
+# pipe_fast_workers = 1
 # The graphics driver's cache of shader libraries is checked at every start and, when it lost them (a driver update,
 # a cache the driver emptied), filled again in the background while the game runs. 0: no check; force: at every start.
+# After two cold starts in a row warming stops being tried on that driver; once its cache can hold the libraries (on
+# NVIDIA under Windows, Shader Cache Size Unlimited in the NVIDIA app), start once with force, or delete
+# shader-warm.txt, to warm again.
 # lib_warm = 1
 # How long (ms) a draw into a target no recent frame rendered waits for a pipeline built for the first time,
 # then is skipped. The default waits, as such a target (a lookup table, a new area's target) can stay empty if
@@ -263,6 +283,11 @@
 # sparkles), black and white blocks on her and on Link, shadows blown up. Default: on, except on NVIDIA's driver,
 # which keeps them anyway; 1 also asks NVIDIA's driver. The first start after a change compiles the pipelines again.
 # vk_nan_preserve = 1
+# Test for NaN in the game's shaders on the bits of the number instead of as a float, 0 or 1, so that no shader
+# compiler can leave a test out. Default: on with AMD's driver for RX 5000 and RX 6000 cards (the one whose shader
+# compiler reads "AMD proprietary shader compiler" in the log), where the black and white blocks were reported; off
+# elsewhere. The first start after a change compiles the pipelines again.
+# vk_nan_bits = 1
 
 [display]
 # Device profile: auto (the Steam Deck when this is one), desktop or deck. On a Steam Deck the keys this file does not
@@ -328,6 +353,14 @@
 # are raised; shadow maps, data maps and screen-sized buffers keep the game's setting. Changes while the game runs take
 # effect at once.
 # aniso = game
+# Texture detail: auto, full, reduced or low. The textures of a loaded area are what fills a card with little video
+# memory, and three quarters of a texture is its largest mip level. reduced makes the large surface textures (256x256 and
+# more, with smaller levels) without that level, low without the two largest when they are 1024x1024 or more. Surfaces
+# seen up close look softer; interface art, small textures, shadow maps and everything the game draws itself keep their
+# size. auto picks by the video memory Windows grants the game: full from 8192 MiB (cards of 10 GB and more), low under
+# 6144 MiB (cards of 6 GB and less), reduced between (8 GB cards). The log says what was picked ("texture detail:").
+# Read at start.
+# texture_detail = auto
 # Sun shadow map size: game (the game's own, which changes with the view and drops to about 400 near the ground, so
 # leaf shadows look blocky and jump) or a fixed 256, 512, 768, 1024, 1536 or 2048. Above 960 the texture heap grows with
 # it. 256 is coarser than the game's own and is for integrated GPUs short of memory bandwidth. Read at start.
@@ -673,12 +706,11 @@
 # first submission ends when that submission's passes are through, without waiting for the copy back (3 to 4 ms of
 # every frame). 0: the copy back is part of the submission, and the wait covers it.
 # wb_split = 1
-# 0: what the game's shaders write into its memory is copied back from the video card at the end of every GPU
-# submission. 1 (experimental): copied back once, and after that only when the game's CPU code touches it (most of it
-# never is: 66 MiB a frame in Hyrule Field), for about a third more frames a second in open areas. With 1, single
-# frames of the scene can flicker; tell us what you see if you try it. In the settings menu: Experimental FPS boost
-# (Screen tab). With shadow storage (Linux, Wine) it stays off.
-# wb_lazy = 0
+# 1 (the default on Windows): what the game's shaders write into its memory is copied back from the video card once,
+# and after that only when the game's CPU code touches it (most of it never is: 66 MiB a frame in Hyrule Field), for
+# about a third more frames a second in open areas. 0: copied back at the end of every GPU submission, as in 0.7.0.
+# With shadow storage (Linux, Wine) it stays off.
+# wb_lazy = 1
 # Linux, shadow storage: 1 clears the write watch's protection of a range in one call before the GPU's bytes are copied
 # back into the game's memory, instead of taking a fault at the first store into each page.
 # shadow_bulk_write = 0

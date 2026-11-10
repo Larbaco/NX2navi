@@ -49,6 +49,7 @@
 #include "platform/platform.h"
 #include "tex.h"
 #include "vk_gpa.h"
+#include "vk_warm_hint.h"
 
 #define LOG_ONCE(...) do { static volatile int32_t once_; if (!plat_xchg32(&once_, 1)) rt_log(__VA_ARGS__); } while (0)
 
@@ -75,7 +76,7 @@ static struct {
     int indep;                         // stage-independent layouts (vk_caps.gpl): vertex set 0, fragment set 1
     int push_stage;                    // GFX_STAGE_* whose set is pushed with independent layouts
     int gpl;                           // draws whose pipeline is building get a fast-linked one (vk_caps.gpl)
-    struct { uint64_t links, wlinks, dlinks, requeued, link_fail, defer, lib_n[4], lib_fail, swaps, slow, pre_used[4]; double link_ms, link_max, lib_ms[4], lib_max[4], dlink_ms, dlink_max; } g;
+    struct { uint64_t links, fb_links, wlinks, flinks, dlinks, pr_added, lib_slow[4], ready_n[6], ready_nofast, hints, hint_libs, requeued, link_fail, defer, lib_n[4], lib_fail, swaps, slow, pre_used[4]; double pr_added_ms, lib_slow_ms[4], ready_ms, ready_max, link_ms, link_max, lib_ms[4], lib_max[4], dlink_ms, dlink_max; } g;
     int vs_outs_all;                   // NX2NAVI_VS_OUTS: 0 union of paired fragment inputs, 1 (all) all 32 output locations
     int dyn_vi, dyn_clamp, dyn_poly, dyn_blend_en, dyn_blend_eq, dyn_wmask, dyn_a2c;
     int f_logic_op, f_depth_clamp, f_fill_non_solid, f_dual_src, f_full_subgroups;
@@ -86,6 +87,8 @@ static struct {
     VkShaderStageFlags sg32_stages;    // stages that accept requiredSubgroupSize = 32 (0: not available)
     int reconverge;                    // modules with subgroup ops get MaximallyReconvergesKHR (spirv_reconverge)
     uint32_t nan_preserve;             // float widths that get SignedZeroInfNanPreserve (spirv_nan_preserve): NP_16|NP_32|NP_64
+    int nan_bits;                      // NaN tests as integer bit tests (spirv_nan_bits)
+    volatile uint32_t nan_bits_tests, nan_bits_selects, nan_bits_modules;   // rewritten so far (the first log line)
     VkDynamicState dyn[32];
     uint32_t n_dyn;
     PFN_vkCmdPushDescriptorSetKHR push;
@@ -133,6 +136,7 @@ typedef struct Pipe {
     uint8_t link_queued;               // a waiting draw queued its fast link to the workers (LibJob p), not yet run
     uint8_t used;                      // compute: a dispatch of this run asked for it (vk_pipeline_compute)
     uint8_t pre;                       // compute: built and kept by the boot prebuild (lb_compute) or bg_main
+    uint64_t t_miss;                   // graphics: when a draw first missed it (ns), 0 once it is usable (ready_note)
     size_t key_size;
     uint8_t key[];
 } Pipe;
@@ -656,6 +660,12 @@ static void nan_preserve_init(VkCtx *c) {
                    (fc.shaderSignedZeroInfNanPreserveFloat32 ? NP_32 : 0) |
                    (fc.shaderSignedZeroInfNanPreserveFloat64 ? NP_64 : 0);
     P.nan_preserve = want && (can & NP_32) ? can : 0;
+    // NX2NAVI_VK_NAN_BITS: 1 every driver, 0 none; unset: AMD's driver for RDNA 1 and 2 (spirv_nan_bits)
+    const char *nb = cfg_get("NX2NAVI_VK_NAN_BITS");
+    P.nan_bits = nb && *nb ? strcmp(nb, "0") != 0 : vk_caps.amd_sc;
+    if (P.nan_bits)
+        rt_log("vk_pipeline: game shaders test for NaN on the bits of the number, not as a float (%s)",
+               nb && *nb ? "NX2NAVI_VK_NAN_BITS=1" : "AMD's driver for RDNA 1 and 2");
     if (P.nan_preserve)
         rt_log("vk_pipeline: game shaders keep NaN, infinity and signed zero (SignedZeroInfNanPreserve for %s32%s-bit "
                "floats%s)", can & NP_16 ? "16, " : "", can & NP_64 ? ", 64" : "", set ? ", NX2NAVI_VK_NAN_PRESERVE=1" : "");
@@ -1476,6 +1486,125 @@ static uint32_t *spirv_nan_preserve(const uint32_t *w, uint64_t n, uint32_t widt
     return o;
 }
 
+// NaN tests that no compiler can drop (P.nan_bits). The game's shaders and the translator's own guards test for NaN with
+// OpIsNan: 48,717 of an install's 54,959 translated modules, 26 tests each on average (the game's unordered
+// comparisons, and the guard that keeps NaN out of every float colour output, patch 0027, so that one NaN texel does not
+// spread through bloom and blur into blocks of black and white). SignedZeroInfNanPreserve asks the driver to keep NaN,
+// but whether a compiler that reasons about floats keeps an isnan through every optimisation is up to it. The reports
+// of black and white blocks, on Navi, on Link next to her and on bright surfaces seen from inside a house, come from
+// RX 5000 and 6000 cards (#41, #110, #117), whose Windows driver compiles with "AMD proprietary shader compiler"
+// (vk_caps.amd_sc); RDNA 3 and 4 (LLPC) draw the same scenes clean. It is not known whether that compiler keeps the
+// mode: on it each float32 test becomes integer arithmetic on the bits, which means the same under any float
+// assumption:
+//   isnan(x)  ->  (bitcast<uint>(x) & 0x7fffffff) > 0x7f800000
+// for scalars and vectors of 32-bit floats; tests of 16- and 64-bit floats stay. A float32 select with a constant
+// operand whose bits are a NaN (an integer mask such as 0xffffffff that the translator types as float) becomes a
+// select of the bits (issue #156: on an RX 9070 XT without the mode such a select between 1 and -1 gave 2^32).
+// NULL: nothing to change (or no memory); *tests and *selects count what changed.
+static uint32_t *spirv_nan_bits(const uint32_t *w, uint64_t n, uint64_t *out_n, uint32_t *tests, uint32_t *selects) {
+    enum { OP_UNDEF = 1, OP_TYPE_BOOL = 20, OP_SPEC_CONSTANT = 50, OP_SPEC_CONSTANT_COMPOSITE = 51, OP_STORE = 62,
+           OP_BITCAST = 124, OP_IS_NAN = 156, OP_SELECT = 169, OP_UGREATER = 172, OP_BITWISE_AND = 199 };
+    *tests = *selects = 0;
+    if (n < 5 || w[3] >= (1u << 22)) return NULL;
+    uint32_t bound = w[3];
+    uint32_t *rtype = calloc(bound, sizeof *rtype), *vec_comp = calloc(bound, sizeof *vec_comp);
+    uint8_t *f32 = calloc(bound, 1), *vec_n = calloc(bound, 1), *nan_const = calloc(bound, 1);
+    uint32_t *o = NULL;
+    if (!rtype || !vec_comp || !f32 || !vec_n || !nan_const) goto out;
+    uint32_t tu = 0, uvec[5] = {0};   // uint32 and its vectors by component count
+    uint64_t fn_at = 0;
+    int vec_used[5] = {0};
+    // Ids that are not results of the instruction's second word, inside functions: first assignment wins anyway, as
+    // a definition comes before its uses (OpPhi operands aside, which this never reads).
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, l = w[i] >> 16;
+        if (!l || i + l > n) goto out;
+        const uint32_t *a = w + i + 1;
+        if (!fn_at) {
+            if (op == SPV_OP_FUNCTION) fn_at = i;
+            else if (op == SPV_OP_TYPE_FLOAT && l >= 3 && a[0] < bound && a[1] == 32) f32[a[0]] = 1;
+            else if (op == SPV_OP_TYPE_INT && l >= 4 && a[1] == 32 && a[2] == 0 && !tu) tu = a[0];
+            else if (op == SPV_OP_TYPE_VECTOR && l >= 4 && a[0] < bound && a[2] >= 2 && a[2] <= 4) {
+                vec_comp[a[0]] = a[1], vec_n[a[0]] = (uint8_t)a[2];
+                if (tu && a[1] == tu && !uvec[a[2]]) uvec[a[2]] = a[0];
+            } else if ((op == SPV_OP_CONSTANT || op == SPV_OP_CONSTANT_COMPOSITE || op == SPV_OP_CONSTANT_NULL ||
+                        op == OP_UNDEF || op == SPV_OP_VARIABLE || op == OP_SPEC_CONSTANT ||
+                        op == OP_SPEC_CONSTANT_COMPOSITE) && l >= 3 && a[1] < bound) {
+                rtype[a[1]] = a[0];
+                if (op == SPV_OP_CONSTANT && l == 4 && a[0] < bound && f32[a[0]] && (a[2] & 0x7fffffffu) > 0x7f800000u)
+                    nan_const[a[1]] = 1;
+            }
+        }
+        if (fn_at) {
+            int no_result = op == OP_STORE || op == 63 || op == 64 || op == 8 || op == 317 || (op >= 246 && op <= 255) ||
+                            op == 99 || op == 224 || op == 225 || op == 228 || op == 56 || op == 218 || op == 219 ||
+                            op == 5294 || op == 5295 || op == 4416 || op == 5380 || op == 5364 || op == 5365;
+            if (!no_result && op != SPV_OP_FUNCTION && l >= 3 && a[1] < bound && !rtype[a[1]]) rtype[a[1]] = a[0];
+            if (op == OP_IS_NAN && l == 4 && a[2] < bound) {
+                uint32_t t = rtype[a[2]];
+                if (t < bound && f32[t]) ++*tests;
+                else if (t < bound && vec_n[t] && vec_comp[t] < bound && f32[vec_comp[t]]) ++*tests, vec_used[vec_n[t]] = 1;
+            } else if (op == OP_SELECT && l == 6 && a[0] < bound && f32[a[0]] && a[3] < bound && a[4] < bound &&
+                       (nan_const[a[3]] || nan_const[a[4]])) {
+                ++*selects;
+            }
+        }
+        i += l;
+    }
+    if (!fn_at || (!*tests && !*selects)) goto out;
+    // the declarations go right before the first function: uint32 and its vectors where missing, then the constants
+    uint32_t next = bound, decl[64], nd = 0;
+    if (!tu) tu = next++, decl[nd++] = 4u << 16 | SPV_OP_TYPE_INT, decl[nd++] = tu, decl[nd++] = 32, decl[nd++] = 0;
+    uint32_t c_mag = next++, c_inf = next++, cv_mag[5] = {0}, cv_inf[5] = {0};
+    for (int k = 2; k <= 4; k++)
+        if (vec_used[k] && !uvec[k])
+            uvec[k] = next++, decl[nd++] = 4u << 16 | SPV_OP_TYPE_VECTOR, decl[nd++] = uvec[k], decl[nd++] = tu, decl[nd++] = (uint32_t)k;
+    decl[nd++] = 4u << 16 | SPV_OP_CONSTANT, decl[nd++] = tu, decl[nd++] = c_mag, decl[nd++] = 0x7fffffffu;
+    decl[nd++] = 4u << 16 | SPV_OP_CONSTANT, decl[nd++] = tu, decl[nd++] = c_inf, decl[nd++] = 0x7f800000u;
+    for (int k = 2; k <= 4; k++) {
+        if (!vec_used[k]) continue;
+        cv_mag[k] = next++, cv_inf[k] = next++;
+        decl[nd++] = (uint32_t)(3 + k) << 16 | SPV_OP_CONSTANT_COMPOSITE, decl[nd++] = uvec[k], decl[nd++] = cv_mag[k];
+        for (int j = 0; j < k; j++) decl[nd++] = c_mag;
+        decl[nd++] = (uint32_t)(3 + k) << 16 | SPV_OP_CONSTANT_COMPOSITE, decl[nd++] = uvec[k], decl[nd++] = cv_inf[k];
+        for (int j = 0; j < k; j++) decl[nd++] = c_inf;
+    }
+    uint64_t cap = n + nd + 10ull * *tests + 12ull * *selects;
+    o = malloc(cap * 4);
+    if (!o) goto out;
+    memcpy(o, w, fn_at * 4);
+    uint64_t p = fn_at;
+    memcpy(o + p, decl, nd * 4), p += nd;
+    for (uint64_t i = fn_at; i < n;) {
+        uint32_t op = w[i] & 0xffff, l = w[i] >> 16;
+        const uint32_t *a = w + i + 1;
+        uint32_t t = op == OP_IS_NAN && l == 4 && a[2] < bound ? rtype[a[2]] : 0;
+        int k = t && t < bound ? (f32[t] ? 1 : vec_n[t] && vec_comp[t] < bound && f32[vec_comp[t]] ? vec_n[t] : 0) : 0;
+        if (k) {
+            uint32_t ut = k == 1 ? tu : uvec[k], mag = k == 1 ? c_mag : cv_mag[k], inf = k == 1 ? c_inf : cv_inf[k];
+            uint32_t bits = next++, low = next++;
+            o[p++] = 4u << 16 | OP_BITCAST, o[p++] = ut, o[p++] = bits, o[p++] = a[2];
+            o[p++] = 5u << 16 | OP_BITWISE_AND, o[p++] = ut, o[p++] = low, o[p++] = bits, o[p++] = mag;
+            o[p++] = 5u << 16 | OP_UGREATER, o[p++] = a[0], o[p++] = a[1], o[p++] = low, o[p++] = inf;
+        } else if (op == OP_SELECT && l == 6 && a[0] < bound && f32[a[0]] && a[3] < bound && a[4] < bound &&
+                   (nan_const[a[3]] || nan_const[a[4]])) {
+            uint32_t x = next++, y = next++, s = next++;
+            o[p++] = 4u << 16 | OP_BITCAST, o[p++] = tu, o[p++] = x, o[p++] = a[3];
+            o[p++] = 4u << 16 | OP_BITCAST, o[p++] = tu, o[p++] = y, o[p++] = a[4];
+            o[p++] = 6u << 16 | OP_SELECT, o[p++] = tu, o[p++] = s, o[p++] = a[2], o[p++] = x, o[p++] = y;
+            o[p++] = 4u << 16 | OP_BITCAST, o[p++] = a[0], o[p++] = a[1], o[p++] = s;
+        } else {
+            memcpy(o + p, w + i, l * 4), p += l;
+        }
+        i += l;
+    }
+    o[3] = next;
+    *out_n = p;
+out:
+    free(rtype), free(vec_comp), free(f32), free(vec_n), free(nan_const);
+    return o;
+}
+
 static int spirv_mark_list_test(const char *list);   // texture pool marks, below
 
 // --selftest (main.c): spirv_nan_preserve on a small fragment module, without a device. Returns the number of failures.
@@ -1521,6 +1650,42 @@ int vk_pipeline_spirv_selftest(void) {
         failures++;
     }
     printf("spirv: SignedZeroInfNanPreserve rewrite: %s\n", failures ? "FAIL" : "ok");
+    {   // spirv_nan_bits: a scalar and a vec2 isnan, a select on a NaN constant; no uint32 type in the module
+        static const uint32_t m[] = {
+            0x07230203, 0x00010300, 0, 20, 0,
+            2u << 16 | 17, 1,                         // OpCapability Shader
+            3u << 16 | 14, 0, 1,                      // OpMemoryModel Logical GLSL450
+            5u << 16 | 15, 5, 1, 0x6e69616d, 0,       // OpEntryPoint GLCompute %1 "main"
+            2u << 16 | 19, 2,                         // %2 void
+            3u << 16 | 33, 3, 2,                      // %3 fn
+            3u << 16 | 22, 4, 32,                     // %4 float
+            2u << 16 | 20, 5,                         // %5 bool
+            4u << 16 | 23, 6, 4, 2,                   // %6 vec2
+            4u << 16 | 23, 7, 5, 2,                   // %7 bvec2
+            4u << 16 | 43, 4, 8, 0xffffffffu,         // %8 = NaN bits
+            4u << 16 | 43, 4, 9, 0x3f800000u,         // %9 = 1.0
+            5u << 16 | 44, 6, 10, 8, 9,               // %10 = vec2(%8, %9)
+            3u << 16 | 41, 5, 11,                     // %11 = OpConstantTrue
+            5u << 16 | 54, 2, 1, 0, 3,                // %1 = OpFunction
+            2u << 16 | 248, 12,                       // OpLabel
+            4u << 16 | 156, 5, 13, 9,                 // %13 = OpIsNan bool %9
+            4u << 16 | 156, 7, 14, 10,                // %14 = OpIsNan bvec2 %10
+            6u << 16 | 169, 4, 15, 11, 9, 8,          // %15 = OpSelect float %11 %9 %8
+            1u << 16 | 253, 1u << 16 | 56};           // OpReturn, OpFunctionEnd
+        uint64_t on = 0;
+        uint32_t tests = 0, sels = 0, isnan_left = 0, ugt = 0, int32 = 0, bitcasts = 0;
+        uint32_t *o = spirv_nan_bits(m, sizeof m / 4, &on, &tests, &sels);
+        for (uint64_t i = 5; o && i < on;) {
+            uint32_t op = o[i] & 0xffff, l = o[i] >> 16;
+            if (!l) break;
+            isnan_left += op == 156, ugt += op == 172, int32 += op == 21 && o[i + 2] == 32, bitcasts += op == 124;
+            i += l;
+        }
+        int bad = !o || tests != 2 || sels != 1 || isnan_left || ugt != 2 || int32 != 1 || bitcasts != 5 || o[3] <= 20;
+        printf("spirv: integer NaN tests rewrite: %s\n", bad ? "FAIL" : "ok");
+        failures += bad;
+        free(o);
+    }
     const char *list = cfg_get("NX2NAVI_SPV_MARK_TEST");
     if (list && *list) failures += spirv_mark_list_test(list);
     return failures;
@@ -1864,6 +2029,18 @@ static VkShaderModule make_module(const uint32_t *w, uint64_t words, int early_o
     if (np) {
         free(fixed);
         w = fixed = np, words = np_n;
+    }
+    uint64_t nb_n = 0;
+    uint32_t nb_tests = 0, nb_sels = 0;
+    uint32_t *nb = P.nan_bits ? spirv_nan_bits(w, words, &nb_n, &nb_tests, &nb_sels) : NULL;
+    if (nb) {
+        free(fixed);
+        w = fixed = nb, words = nb_n;
+        __atomic_fetch_add(&P.nan_bits_tests, nb_tests, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&P.nan_bits_selects, nb_sels, __ATOMIC_RELAXED);
+        if (__atomic_add_fetch(&P.nan_bits_modules, 1, __ATOMIC_RELAXED) == 1)
+            rt_log("vk_pipeline: first module with NaN tests made integer: %u tests, %u selects of NaN bits", nb_tests,
+                   nb_sels);
     }
     if (P.feedback >= 2) mm_hash = fnv(FNV0, w, (size_t)words * 4);
     VkShaderModuleCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = (size_t)words * 4, .pCode = w};
@@ -2618,8 +2795,8 @@ static Lib *libs[LIB_BUCKETS];
 typedef struct { uint32_t kind, topo_class, attr_fmt[32], attr_off[32]; uint8_t attr_bind[32], rate[17], pad[3]; } ViKey;
 typedef struct { uint32_t kind, missing; const GfxShader *vs; uint8_t clamp, poly_mode, minus_w, pad; GfxShaderIo fin[32]; } PrKey;
 typedef struct { uint32_t kind; uint8_t dsb, samples, a2c, pad; const GfxShader *fs; } FsKey;
-typedef struct { uint32_t kind; uint8_t n_color, samples, a2c, logic_op, blend_en, pad[3]; uint32_t color[8], depth, stencil, wmask;
-                 uint8_t blend[8][6]; } FoKey;
+typedef struct { uint32_t kind; uint8_t n_color, samples, a2c, logic_op, blend_en, fbl, pad[2]; uint32_t color[8], depth, stencil, wmask;
+                 uint8_t blend[8][6]; } FoKey;   // fbl: GKey.fbl, the feedback loop flags of the library (gpl_feedback)
 
 static uint64_t qpc(void) { return plat_now_ns(); }
 static double ms_since(uint64_t t0) { return (double)(qpc() - t0) / 1e6; }
@@ -2731,6 +2908,11 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
         ri.colorAttachmentCount = k->n_color, ri.pColorAttachmentFormats = (const VkFormat *)k->color;
         ri.depthAttachmentFormat = (VkFormat)k->depth, ri.stencilAttachmentFormat = (VkFormat)k->stencil;
         pi.pColorBlendState = &cb, pi.pMultisampleState = &ms;
+        // Whether the pipeline may sample an attachment it renders to is part of the fragment output state: the flags
+        // go on this library alone, and a pipeline linked from it has them (gpl_feedback).
+        const FoKey *ok = key;
+        if (ok->fbl & 1) pi.flags |= VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+        if (ok->fbl & 2) pi.flags |= VK_PIPELINE_CREATE_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
     }
     VkPipelineCreationFeedbackCreateInfo fci;
     VkPipelineCreationFeedback fb;
@@ -2813,6 +2995,8 @@ static VkPipeline lib_build(Lib *b, int kind, const VkPipeState *s, const GKey *
         plat_mutex_lock(&P.lock);
         P.g.lib_n[kind]++, P.g.lib_ms[kind] += ms;
         if (ms > P.g.lib_max[kind]) P.g.lib_max[kind] = ms;
+        if (kind == LIB_PR && ((const PrKey *)(const void *)b->key)->missing) P.g.pr_added++, P.g.pr_added_ms += ms;
+        if (ms >= 25) P.g.lib_slow[kind]++, P.g.lib_slow_ms[kind] += ms;
     }
     if (!pipe && ++P.g.lib_fail <= 8) rt_log("vk_pipeline: gpl: stage library %d not built", kind);
     b->pipe = pipe, b->building = 0;
@@ -2896,19 +3080,48 @@ static void lib_keys(const VkPipeState *s, const GKey *k, ViKey *v, PrKey *pk, F
     fk->kind = LIB_FS, fk->fs = s->fs, fk->dsb = k->dsb, fk->samples = k->samples, fk->a2c = k->a2c;
     memset(ok, 0, sizeof *ok);
     ok->kind = LIB_FO, ok->n_color = k->n_color, ok->samples = k->samples, ok->a2c = k->a2c, ok->logic_op = k->logic_op;
-    ok->blend_en = k->blend_en, ok->depth = k->depth, ok->stencil = k->stencil, ok->wmask = k->wmask;
+    ok->blend_en = k->blend_en, ok->fbl = k->fbl, ok->depth = k->depth, ok->stencil = k->stencil, ok->wmask = k->wmask;
     memcpy(ok->color, k->color, sizeof ok->color), memcpy(ok->blend, k->blend, sizeof ok->blend);
+}
+
+// p, which a draw missed, has its first usable pipeline: how long that took is how long its draws were skipped or
+// waited. fast 0: it had no fast link and this is the optimised build. Caller holds P.lock.
+static void ready_note(Pipe *p, int fast) {
+    if (!p->t_miss) return;
+    double ms = (double)(plat_now_ns() - p->t_miss) / 1e6;
+    p->t_miss = 0;
+    P.g.ready_n[ms < 4 ? 0 : ms < 8 ? 1 : ms < 17 ? 2 : ms < 50 ? 3 : ms < 150 ? 4 : 5]++;
+    P.g.ready_ms += ms;
+    if (ms > P.g.ready_max) P.g.ready_max = ms;
+    P.g.ready_nofast += !fast;
+}
+
+// NX2NAVI_GPL_FEEDBACK (default 1; 0 = as before): a pipeline whose fragment shader samples an attachment of its own pass
+// (VkPipeState.feedback: soft particles and water reading the depth buffer, decals, full-screen passes that read the
+// target they write) gets a fast link like any other. The feedback loop flags belong to the fragment output state, so
+// they are part of that library's key (FoKey.fbl) and of nothing else; the shader libraries are the ones the same
+// shaders use without a loop. Before, such a pipeline had no fast link at all and its draws waited for, or were
+// skipped during, the whole optimised build. On a first visit to Kokiri Forest (RTX 5090, every stage library in the
+// driver's cache, DLSS Frame Generation on, so no frame is held back) full-screen draws of such pipelines waited
+// 267 ms at the area's first frame and 410 ms in the middle of a walk; linked, 3 ms.
+static int gpl_feedback(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = cfg_bool("NX2NAVI_GPL_FEEDBACK");
+        if (!on) rt_log("vk_pipeline: gpl: pipelines with a feedback loop get no fast link (NX2NAVI_GPL_FEEDBACK=0)");
+    }
+    return on;
 }
 
 // A fast-linked pipeline for s from its stage libraries. Caller holds P.lock.
 // build 0 (drawing thread): links only when the shader libraries exist (vertex input and fragment output libraries,
 // which hold no shader, are built here); *final 0 = not yet, a worker builds them. build 1 (worker): builds the
 // missing libraries and links with P.lock released. VK_NULL_HANDLE with *final 1 when GPL cannot express the pipeline
-// (shared layout, feedback loop) or a build failed.
+// (shared layout; a feedback loop with NX2NAVI_GPL_FEEDBACK=0) or a build failed.
 static VkPipeline gpl_link(const VkPipeState *s, const GKey *k, const Layout *lc, int build, int *final) {
     Layout *l = (Layout *)lc;
     *final = 1;
-    if (!l->set1 || k->fbl) return VK_NULL_HANDLE;
+    if (!l->set1 || (k->fbl && !gpl_feedback())) return VK_NULL_HANDLE;
     uint64_t t0 = qpc();
     ViKey vk_;
     PrKey pk;
@@ -2941,7 +3154,7 @@ static VkPipeline gpl_link(const VkPipeState *s, const GKey *k, const Layout *lc
         P.g.link_ms += ms;
         if (ms > P.g.link_max) P.g.link_max = ms;
     }
-    if (pipe) P.g.links++;
+    if (pipe) P.g.links++, P.g.fb_links += k->fbl != 0;
     else if (!P.g.link_fail++) rt_log("vk_pipeline: gpl: fast link failed; such draws wait or skip as without GPL");
     double total = ms_since(t0);
     if (!build && total > 5.0 && P.g.slow++ < 16)
@@ -3185,6 +3398,7 @@ static void u_run(LibJob *lj) {
             VkPipeline f = gpl_link(&lj->s, &lj->k, lj->l, 1, &final);   // releases P.lock while linking
             if (f && !p->info.pipeline) {
                 p->fast = p->info.pipeline = f;
+                ready_note(p, 1);
                 job_lower(p->job);   // its job now only does the optimised build
             } else if (f) {
                 vkDestroyPipeline(P.device, f, NULL);   // the job published one meanwhile
@@ -3200,17 +3414,74 @@ static void u_run(LibJob *lj) {
     free(lj);
 }
 
-// A worker for waiting draws' jobs only (U): a draw that waits finds one free even while the pool builds pipelines,
-// so the drawing thread never builds a library itself.
+// NX2NAVI_PIPE_FAST_WORKERS (default 1; 0 = as before): the library workers also take the fast link of a draw-queue job
+// (fast_take). A draw that is skipped rather than waiting leaves its pipeline to the pool, where a job is first
+// fast-linked and then goes back in the queue for its optimised build. The pool keeps one worker out of optimised
+// builds, so with the others inside one (about 100 ms each with the driver's cache warm, 350 ms cold) that single
+// worker linked every new pipeline of a burst, one after another at 5 to 10 ms each. On a first visit to Kokiri
+// Forest (RTX 5090, libraries in the driver's cache) 180 of the 444 pipelines draws missed took over 50 ms to become
+// usable, the longest 1.3 s, and their draws were missing from every frame until then; with the library workers
+// linking, 23 did, 19 of them mesh pipelines, which have no fast link.
+static int fast_workers(void) {
+    static int on = -1;
+    if (on < 0) on = cfg_bool("NX2NAVI_PIPE_FAST_WORKERS");
+    return on;
+}
+
+// The first draw-queue job whose pipeline still lacks its fast link, taken out of the queue; NULL when there is none.
+// Caller holds P.lock.
+static Job *fast_take(void) {
+    if (!P.gpl || !fast_workers()) return NULL;
+    for (Job *j = A.head, *prev = NULL; j; prev = j, j = j->next) {
+        Pipe *p = j->p;
+        if (p->info.pipeline || p->fast_tried || p->link_queued || !p->lay || is_mesh(&j->s)) continue;
+        if (prev) prev->next = j->next;
+        else A.head = j->next;
+        if (A.tail == j) A.tail = prev;
+        j->next = j->prev = NULL;
+        return j;
+    }
+    return NULL;
+}
+
+// A worker for stage libraries and fast links only: a waiting draw's jobs (U) first, so a draw that waits finds one
+// free even while the pool builds pipelines and the drawing thread never builds a library itself; then the fast link
+// of a draw-queue job (fast_take), whose optimised build goes on to the pool.
 static void lib_worker(void *arg) {
     (void)arg;
     plat_mutex_lock(&P.lock);
     for (;;) {
-        while (!U.head) plat_cond_wait(&lib_cv, &P.lock);
-        LibJob *lj = U.head;
-        if (!(U.head = lj->next)) U.tail = NULL;
-        if (lj->b) lj->b->job = NULL;
-        u_run(lj);
+        Job *j = NULL;
+        while (!U.head && !(j = fast_take())) plat_cond_wait(&lib_cv, &P.lock);
+        if (!j) {
+            LibJob *lj = U.head;
+            if (!(U.head = lj->next)) U.tail = NULL;
+            if (lj->b) lj->b->job = NULL;
+            u_run(lj);
+            continue;
+        }
+        Pipe *p = j->p;
+        int final;
+        p->fast_tried = 1;   // no other thread links it meanwhile; a draw that waits for it waits for this link
+        VkPipeline f = gpl_link(&j->s, &j->k, p->lay, 1, &final);   // releases P.lock while building
+        if (f && !p->info.pipeline) {
+            p->fast = p->info.pipeline = f, P.g.wlinks++, P.g.flinks++;
+            ready_note(p, 1);
+            plat_cond_broadcast(&done_cv);
+        } else if (f) {
+            vkDestroyPipeline(P.device, f, NULL);
+        }
+        if (p->info.pipeline) {   // the optimised build: ahead of the prebuild, behind other draws' misses
+            j->low = 1, P.g.requeued++;
+            j->next = A.low;
+            if (A.low) A.low->prev = j;
+            else A.low_tail = j;
+            A.low = j;
+        } else {   // no fast link for this one: its whole build, next in the draw queue
+            if (!(j->next = A.head)) A.tail = j;
+            A.head = j;
+        }
+        plat_cond_signal(&work_cv);
     }
 }
 
@@ -3258,6 +3529,7 @@ static void pipe_worker(void *arg) {
             j->p->fast_tried = 1;
             if (f && !j->p->info.pipeline) {
                 j->p->fast = j->p->info.pipeline = f, P.g.wlinks++;
+                ready_note(j->p, 1);
                 plat_cond_broadcast(&done_cv);
                 j->low = 1, j->worker = -1, P.g.requeued++;
                 j->prev = NULL, j->next = A.low;
@@ -3274,6 +3546,7 @@ static void pipe_worker(void *arg) {
         VkPipeline pipe = create_graphics(&j->s, &j->k, j->l, j->fs_off);
         plat_mutex_lock(&P.lock);
         if (pipe || !j->p->fast) j->p->info.pipeline = pipe;   // a failed optimised build keeps the fast-linked one
+        ready_note(j->p, 0);
         if (pipe && j->p->fast) P.g.swaps++;
         j->p->building = 0;
         j->p->job = NULL;
@@ -3299,6 +3572,8 @@ static void pipe_worker(void *arg) {
     return;
 }
 
+static int hint_on(void);
+
 // Starts the pool on first use: a quarter of the logical processors, 2 to 4. Caller holds P.lock.
 static int workers_start(void) {
     if (A.threads) return 1;
@@ -3309,8 +3584,12 @@ static int workers_start(void) {
         if (!t) break;
         A.thread[A.threads++] = t;   // kept: promote() raises a worker running a prebuild job
     }
-    // two for waiting draws' libraries and links (the vertex and fragment libraries of one draw in parallel)
-    for (int i = 0; A.threads && U.on && P.gpl && i < 2; i++)
+    // Workers for stage libraries and fast links alone: two (the vertex and fragment libraries of one waiting draw in
+    // parallel), and as many as the pool has with the look-ahead, which queues the libraries of a whole submission's
+    // new pipelines at once (vk_pipeline_hint), or with the fast links of skipped draws (lib_worker). They sleep
+    // unless a library or a fast link is queued.
+    int nlib = hint_on() || fast_workers() ? n : 2;
+    for (int i = 0; A.threads && U.on && P.gpl && i < nlib; i++)
         if (plat_thread_new(lib_worker, NULL, "pipe lib worker")) U.lib_workers++;
     if (A.threads)
         rt_log("vk_pipeline: %d background graphics pipeline workers, %d for waiting draws' libraries", A.threads,
@@ -3354,6 +3633,7 @@ int vk_pipeline_async_on(void) { return A.on; }
 static void promote(Pipe *p) {
     Job *j = p->job;
     if (!j || !j->low) return;
+    if (j->prebuild && !j->demanded && !p->info.pipeline) p->t_miss = plat_now_ns();
     j->low = 0, j->demanded = 1;
     if (j->worker < 0) {
         if (j->prev) j->prev->next = j->next;
@@ -3365,6 +3645,7 @@ static void promote(Pipe *p) {
         else A.head = j;
         A.tail = j;
         plat_cond_signal(&work_cv);
+        if (U.lib_workers) plat_cond_signal(&lib_cv);   // its fast link (lib_worker)
     } else if (A.prio_low[j->worker]) {
         A.prio_low[j->worker] = 0;
         plat_thread_set_priority(A.thread[j->worker], PLAT_PRIO_NORMAL);
@@ -3424,6 +3705,7 @@ static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode
     }
     j->p = p;
     p->building = 1, p->job = j;
+    if (mode != 2) p->t_miss = plat_now_ns();
     if (mode == 2) {
         j->prev = A.low_tail;
         if (A.low_tail) A.low_tail->next = j;
@@ -3434,6 +3716,7 @@ static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode
         if (A.tail) A.tail->next = j;
         else A.head = j;
         A.tail = j;
+        if (U.lib_workers && fast_workers()) plat_cond_signal(&lib_cv);   // its fast link (lib_worker)
     }
     A.inflight++;
     plat_cond_signal(&work_cv);
@@ -3535,6 +3818,42 @@ static void lib_wait(const VkPipeState *s, const GKey *k, Layout *l, double end)
     }
 }
 
+// ---- stage libraries ahead of their draws (NX2NAVI_PIPE_AHEAD, default 1; 0 off; vk_exec.c "looking ahead")
+// The replay names the state of a draw it has not reached yet. When no pipeline is known for it, its pre-rasterization
+// and fragment shader libraries are queued to the library workers now, so they build while the draws before it are
+// recorded, in parallel with each other and with those of the other draws named: the draw's own lookup then finds both
+// and links on its thread in microseconds instead of waiting for them or being skipped while they build. Nothing else
+// is entered, no pipeline, no optimised build and no key record: a state the scan guessed wrong costs two libraries
+// at most. The feedback loop bits, the topology and the targets do not matter here, as no shader library depends on
+// them. Returns the libraries queued.
+static int hint_on(void) {
+    static int on = -1;
+    if (on < 0) on = cfg_bool("NX2NAVI_PIPE_AHEAD");
+    return on;
+}
+
+int vk_pipeline_hint(const VkPipeState *s) {
+    if (!A.on || !U.on || !hint_on() || !s->vs || !ensure_init() || !P.gpl || !P.indep || is_mesh(s)) return 0;
+    if (gfx_shader_stage(s->vs) != GFX_STAGE_VS || (s->fs && gfx_shader_stage(s->fs) != GFX_STAGE_FS)) return 0;
+    GKey k;
+    gkey_fill(s, &k);
+    if (k.topo_class == 3) return 0;
+    uint64_t h = key_hash(&k, sizeof k);
+    int queued = 0;
+    plat_mutex_lock(&P.lock);
+    if (!pipe_find(&k, sizeof k, h)) {
+        Bindings B = {0}, F = {0};
+        Layout *l = add_stage(&B, s->vs, 0) && (!s->fs || add_stage(&F, s->fs, 0)) ? layout_pair(&B, &F) : NULL;
+        Lib *b[2];
+        uint64_t q0 = U.queued, w0 = U.waits;
+        if (l && l->set1 && workers_start() && lib_queue(s, &k, l, b)) queued = (int)(U.queued - q0);
+        U.waits = w0, U.queued = q0;   // those count waiting draws' jobs
+        P.g.hints++, P.g.hint_libs += (uint64_t)queued;
+    }
+    plat_mutex_unlock(&P.lock);
+    return queued;
+}
+
 static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int async, int *pending, uint32_t wait_ms) {
     if (info) *info = NULL;
     if (pending) *pending = 0;
@@ -3593,6 +3912,7 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
         if (final) p->fast_tried = 1;
         if (f && !p->info.pipeline) {
             p->fast = p->info.pipeline = f;
+            ready_note(p, 1);
             job_lower(p->job);
             plat_cond_broadcast(&done_cv);
         } else if (f) {
@@ -3613,7 +3933,6 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
     VkPipeline pipe = p ? p->info.pipeline : VK_NULL_HANDLE;
     plat_mutex_unlock(&P.lock);
     if (wait) {
-        perf_count(PERF_CNT_PIPE_SKIP);
         if (pending) *pending = 1;
         return VK_NULL_HANDLE;
     }
@@ -3649,6 +3968,7 @@ static void warm_builder(void *arg) {
         VkPipeline pipe = create_graphics(&j->s, &j->k, j->l, j->fs_off);
         plat_mutex_lock(&P.lock);
         if (pipe || !j->p->fast) j->p->info.pipeline = pipe;   // a failed optimised build keeps the fast-linked one
+        ready_note(j->p, 0);
         if (pipe && j->p->fast) P.g.swaps++;
         j->p->building = 0;
         j->p->job = NULL;
@@ -5115,6 +5435,7 @@ static struct {
     volatile int32_t running, stop, started;
     PlatThread *th[LW_MAX_THREADS + 1];
     int threads, strikes;
+    uint32_t vendor;   // the GPU's vendor id, for what a cold cache's log line adds (vk_warm_hint.h)
     double t0;
     char stamp[PLAT_PATH_MAX * 2 + 32], id[64];
 } LW;
@@ -5208,7 +5529,8 @@ static void lw_main(void *arg) {
     if (!resume && same && strikes >= 2 && strcmp(mode, "force")) {
         rt_log("vk_pipeline: library warm: the prepared libraries are cold again (a sample's median %.0f ms) after two "
                "finished warms on this driver: it does not keep them, so pipelines compile when a draw first needs "
-               "them (NX2NAVI_LIB_WARM=force warms anyway)", median);
+               "them (NX2NAVI_LIB_WARM=force warms anyway).%s", median,
+               lw_cold_hint(LW.vendor, LW_COLD_GAVE_UP, LW_ON_WINDOWS));
         return;
     }
     LW.strikes = resume ? strikes : same && !strcmp(was, "done") ? strikes + 1 : 0;
@@ -5218,11 +5540,15 @@ static void lw_main(void *arg) {
     if (resume)
         rt_log("vk_pipeline: library warm: going on with the warm an earlier run began: %zu prepared variants on %d "
                "idle threads", LW.n, t);
-    else
+    else   // cold right after a finished warm on this driver says more than a first cold (vk_warm_hint.h)
         rt_log("vk_pipeline: library warm: the driver's cache does not have the prepared libraries (a sample's median "
                "%.0f ms; a driver update or a change of what they are built with): building %zu prepared variants "
                "into it on %d idle threads while the game runs. Until it is done, a pipeline a draw first needs may "
-               "compile, which skips that draw for some frames or makes it wait", median, LW.n, t);
+               "compile, which skips that draw for some frames or makes it wait.%s", median, LW.n, t,
+               lw_cold_hint(LW.vendor,
+                            median <= LW_COLD_MS ? LW_WARM_FORCED   // warm, but lib_warm = force
+                            : same && !strcmp(was, "done") ? LW_COLD_AFTER_WARM : LW_COLD_FIRST,
+                            LW_ON_WINDOWS));
     LW.t0 = now_ms();
     LW.running = t;
     int started = 0;
@@ -5252,6 +5578,7 @@ static void lw_start(void) {
     VkPhysicalDeviceProperties pp;
     vkGetPhysicalDeviceProperties(vk_ctx()->phys, &pp);
     snprintf(LW.id, sizeof LW.id, "%04x:%04x:%08x", pp.vendorID, pp.deviceID, pp.driverVersion);
+    LW.vendor = pp.vendorID;
     LW.th[0] = plat_thread_new(lw_main, NULL, "lib warm check");
 }
 
@@ -5741,14 +6068,27 @@ static int cache_save(uint32_t wait_ms) {
 static void save_with(uint32_t wait_ms) {
     if (P.ready) keys_flush(), pb_flush(), cu_flush(), cf_log();
     if (P.ready && P.gpl) {
-        rt_log("vk_pipeline: gpl: %llu fast links (%llu by workers; avg %.2f ms, max %.2f ms, %llu failed), %llu draws "
+        rt_log("vk_pipeline: gpl: %llu fast links (%llu by workers, %llu of those by the library workers for skipped draws; "
+               "%llu of pipelines with a feedback loop; avg %.2f ms, "
+               "max %.2f ms, %llu failed), %llu draws "
                "lookups found shader libraries missing (left to a worker), %llu optimised pipelines swapped in (%llu queued "
                "low after their fast link), %llu drawing-thread links over 5 ms; %llu waiting draws built their libraries "
                "(avg %.2f ms, max %.2f ms)",
-               (unsigned long long)P.g.links, (unsigned long long)P.g.wlinks, P.g.links ? P.g.link_ms / P.g.links : 0.0,
+               (unsigned long long)P.g.links, (unsigned long long)P.g.wlinks, (unsigned long long)P.g.flinks,
+               (unsigned long long)P.g.fb_links,
+               P.g.links ? P.g.link_ms / P.g.links : 0.0,
                P.g.link_max, (unsigned long long)P.g.link_fail, (unsigned long long)P.g.defer,
                (unsigned long long)P.g.swaps, (unsigned long long)P.g.requeued, (unsigned long long)P.g.slow,
                (unsigned long long)P.g.dlinks, P.g.dlinks ? P.g.dlink_ms / P.g.dlinks : 0.0, P.g.dlink_max);
+        uint64_t rn = P.g.ready_n[0] + P.g.ready_n[1] + P.g.ready_n[2] + P.g.ready_n[3] + P.g.ready_n[4] + P.g.ready_n[5];
+        rt_log("vk_pipeline: gpl: pipelines a draw missed were usable after under 4 ms %llu, 4-8 ms %llu, 8-17 ms %llu, "
+               "17-50 ms %llu, 50-150 ms %llu, longer %llu (avg %.1f ms, longest %.0f ms); %llu of them had no fast link",
+               (unsigned long long)P.g.ready_n[0], (unsigned long long)P.g.ready_n[1], (unsigned long long)P.g.ready_n[2],
+               (unsigned long long)P.g.ready_n[3], (unsigned long long)P.g.ready_n[4], (unsigned long long)P.g.ready_n[5],
+               rn ? P.g.ready_ms / (double)rn : 0.0, P.g.ready_max, (unsigned long long)P.g.ready_nofast);
+        if (P.g.hints)
+            rt_log("vk_pipeline: gpl: looking ahead named %llu pipeline states not known yet and queued %llu stage libraries "
+                   "for them", (unsigned long long)P.g.hints, (unsigned long long)P.g.hint_libs);
         if (U.waits || U.queued)
             rt_log("vk_pipeline: gpl: library jobs for waiting draws: %llu queued, %llu built by a worker, %llu by the "
                    "thread that needed them (no worker free), %llu waits ended at their limit; %llu fast links on the %d "
@@ -5757,8 +6097,13 @@ static void save_with(uint32_t wait_ms) {
                    (unsigned long long)U.timeouts, (unsigned long long)U.links, U.lib_workers);
         static const char *const kn[4] = {"vertex input", "pre-rasterization", "fragment shader", "fragment output"};
         for (int i = 0; i < 4; i++)
-            rt_log("vk_pipeline: gpl: %s libraries %llu (avg %.2f ms, max %.2f ms)", kn[i], (unsigned long long)P.g.lib_n[i],
-                   P.g.lib_n[i] ? P.g.lib_ms[i] / P.g.lib_n[i] : 0.0, P.g.lib_max[i]);
+            rt_log("vk_pipeline: gpl: %s libraries %llu (avg %.2f ms, max %.2f ms; %llu of 25 ms or more, %.0f ms in all)",
+                   kn[i], (unsigned long long)P.g.lib_n[i], P.g.lib_n[i] ? P.g.lib_ms[i] / P.g.lib_n[i] : 0.0, P.g.lib_max[i],
+                   (unsigned long long)P.g.lib_slow[i], P.g.lib_slow_ms[i]);
+        if (P.g.pr_added)
+            rt_log("vk_pipeline: gpl: %llu of the pre-rasterization libraries had outputs added for their fragment shaders "
+                   "(avg %.1f ms): another module than the one the preparation built, so the driver's cache has none of them",
+                   (unsigned long long)P.g.pr_added, P.g.pr_added_ms / (double)P.g.pr_added);
         if (LB.n)
             rt_log("vk_pipeline: gpl: prebuilt libraries a draw used: pre-rasterization %llu, fragment shader %llu; "
                    "compute pipelines built on the replay thread %llu", (unsigned long long)P.g.pre_used[LIB_PR],
