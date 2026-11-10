@@ -113,6 +113,7 @@ Changes made in the settings menu are a draft until they are applied; nothing is
 - *Restart* applies and saves the draft first, since the restart is what brings the restart-only changes in; its box says so. *Quit game* drops the draft (its box says so), and so does closing the window.
 - A change set back to the value it began with leaves the draft. A key something else changes meanwhile (F11 on *Fullscreen*) leaves it too, with the outside value kept. Settings an environment variable fixes are greyed out and never enter it.
 - A save made by anything else while the draft is open (F10 with the menu closed, F11, a cheat) does not write a previewed value: the entry is held out of every save until Apply (`cfg_hold`, `cfg_revert` in `runtime/cfg.c`).
+- Every step is in `logs/nx2navi.log`, so a run can be checked afterwards: `menu: draft +` and `menu: draft -` when a key enters or leaves the draft (preview or staged), `menu: box` for each box opened and the answer given (button, Esc or B, the countdown running out, F11), `menu: draft applied` / `discarded` with each value, `menu: display kept` / `reverted`, `cfg: wrote <path>: <keys>` for every save and `cfg: save leaves out <key>` for a held preview, and `cfg: reload: not run` when Ctrl+F5 waits for the menu.
 
 ## Reloading `nx2navi.ini`
 

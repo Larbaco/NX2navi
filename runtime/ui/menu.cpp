@@ -1585,10 +1585,14 @@ static void restart_confirm(float scale) {
     ImGui::BeginDisabled(saving);
     if (skin_widget_button(yes, ImVec2(bw, 0), scale)) {
         if (g_confirm_quit) {
+            if (opt_draft_any()) rt_log("menu: Quit game with a draft: the %d change(s) are dropped", opt_draft_any());
             gfx_window_request_close();
-        } else if (opt_draft_apply()) {
-            if (restart_rebuild) cheats_rebuild_allow();
-            gfx_window_request_restart();
+        } else {
+            if (opt_draft_any()) rt_log("menu: Restart with a draft: applying it first");
+            if (opt_draft_apply()) {
+                if (restart_rebuild) cheats_rebuild_allow();
+                gfx_window_request_restart();
+            }
         }
     }
     ImGui::EndDisabled();
@@ -1654,6 +1658,13 @@ static void apply_confirm(float scale) {
     if (g_apply_ask) {
         g_apply_ask = false;
         ImGui::OpenPopup("##apply");
+        const int shown = opt_draft_count();
+        rt_log("menu: box \"Apply your changes?\" opened: %d line(s)", shown);
+        for (int i = 0; i < shown; i++) {
+            OptDraftItem it;
+            if (opt_draft_item(i, &it))
+                rt_log("menu: box   %s: %s -> %s%s", it.label, it.from, it.to, it.restart ? " (after restart)" : "");
+        }
     }
     ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, 0);
@@ -1709,6 +1720,10 @@ static void apply_confirm(float scale) {
         if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false))
             keep = true, menu_sound_play(MENU_SOUND_CANCEL);
     }
+    if (apply || discard || keep)
+        rt_log("menu: box \"Apply your changes?\": %s", apply ? "Apply" : keep ? "Continue editing (the draft stays)"
+                                                       : n == 0 ? "closed: nothing left in the draft (changed outside)"
+                                                                : "Discard");
     if (apply || discard || keep) ImGui::CloseCurrentPopup();
     if (apply) {
         g_restart_lines.clear();   // read before Apply empties the draft
@@ -1738,6 +1753,9 @@ static void post_confirm(float scale) {
         if (GImGui->FrameCount < g_post_frame) return;
         ImGui::OpenPopup(id);
         g_post_open = true;
+        if (keep_box) rt_log("menu: box \"Keep these display settings?\" opened: %llu s to answer, then Revert",
+                             (unsigned long long)(KEEP_NS / 1000000000ull));
+        else rt_log("menu: box \"Some changes take effect after a restart\" opened: %d setting(s)", (int)g_restart_lines.size());
     }
     ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, 0);
@@ -1745,6 +1763,8 @@ static void post_confirm(float scale) {
     ImGui::PopStyleVar();
     if (!open) {   // the popup is gone (closed from outside): the safe answer
         g_post_open = false;
+        rt_log("menu: box %s: closed from outside: %s", keep_box ? "\"Keep these display settings?\"" : "restart",
+               keep_box ? "Revert" : "Later");
         if (keep_box) {
             opt_display_revert();
             gfx_window_apply_settings();
@@ -1765,6 +1785,7 @@ static void post_confirm(float scale) {
         const uint64_t now = plat_now_ns();
         const int left = now >= g_keep_deadline_ns ? 0 : (int)((g_keep_deadline_ns - now + 999999999ull) / 1000000000ull);
         if (opt_display_external()) {   // F11: keep what it set, without asking
+            rt_log("menu: box \"Keep these display settings?\": F11 took control: Keep, with F11's state");
             opt_display_keep();
             ImGui::CloseCurrentPopup();
             ImGui::EndPopup();
@@ -1780,11 +1801,14 @@ static void post_confirm(float scale) {
         ImGui::SameLine(0, gap);
         no = skin_widget_button(kn, ImVec2(bw, 0), scale);
         if (ImGui::IsWindowAppearing()) ImGui::SetItemDefaultFocus();   // Revert has the cursor first
+        const char *why = "button";
         if (left == 0 || ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)) {
             if (left) menu_sound_play(MENU_SOUND_CANCEL);
+            why = left ? "Esc or B" : "the countdown ran out";
             no = true;
         }
         if (yes || no) {
+            rt_log("menu: box \"Keep these display settings?\": %s (%s, %d s left)", yes ? "Keep" : "Revert", yes ? "button" : why, left);
             if (yes) {
                 opt_display_keep();
             } else {
@@ -1814,6 +1838,7 @@ static void post_confirm(float scale) {
         if (ImGui::IsWindowAppearing()) ImGui::SetItemDefaultFocus();   // Later has the cursor first
         if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false))
             no = true, menu_sound_play(MENU_SOUND_CANCEL);
+        if (yes || no) rt_log("menu: box restart: %s", yes ? "Restart now" : "Later (saved for the next start)");
         if (yes) {
             gfx_window_request_restart();   // the box stays until the window closes
         } else if (no) {
@@ -2191,6 +2216,8 @@ static void notice(const char *text) {
 static void cfg_reload_tick(void) {
     if (!g_cfg_reload.exchange(0)) return;
     if (opt_draft_any() || opt_display_pending() || g_post != POST_NONE || (g_open.load() && (g_apply_ask || g_modal))) {
+        rt_log("cfg: reload: not run: the settings menu holds changes not applied yet (draft %d, display %d, box %s)",
+               opt_draft_any(), opt_display_pending(), g_post != POST_NONE || g_apply_ask || g_modal ? "open" : "none");
         notice(menu_text(UI_MENU_RELOAD_BUSY));
         return;
     }
@@ -2455,6 +2482,7 @@ static int overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot)
     }
     if (reset) g_close_req.store(0);   // a request of the menu that just closed
     if (open && g_close_req.exchange(0)) {   // F1 or the pad combo with a draft: ask, or close if the box is not needed
+        rt_log("menu: leave requested by F1 or Minus+Plus with a draft open");
         leave_menu();
         open = g_open.load(std::memory_order_acquire);
     }

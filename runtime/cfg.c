@@ -1036,6 +1036,8 @@ static void park_held(unsigned char *parked, int n) {
     for (int i = 0; i < n; i++) {
         parked[i] = 0;
         if (!entries[i].held) continue;
+        if (entries[i].dirty || entries[i].removed)
+            rt_log("cfg: save leaves out %s: the settings menu previews it and it is not applied yet", entries[i].key);
         parked[i] = (unsigned char)(1 | (entries[i].dirty ? 2 : 0) | (entries[i].removed ? 4 : 0));
         entries[i].dirty = entries[i].removed = 0;
     }
@@ -1164,9 +1166,20 @@ int cfg_save_to(const char *path) {
             }
     }
     int ok = plat_file_write_atomic(path, o.buf ? o.buf : "", o.n);
-    if (ok)
+    if (ok) {
+        char names[256];   // which keys this save wrote, so a log shows what reached the file and when
+        int nn = 0, len = 0;
+        names[0] = 0;
+        for (int e = 0; e < n; e++)
+            if (entries[e].dirty || entries[e].removed) {
+                if (len < (int)sizeof names - 40)
+                    len += snprintf(names + len, sizeof names - (size_t)len, "%s%s%s", nn ? ", " : "", entries[e].key,
+                                    entries[e].removed ? " (removed)" : "");
+                nn++;
+            }
+        rt_log("cfg: wrote %s: %d key(s): %s%s", path, nn, names, len >= (int)sizeof names - 40 ? ", ..." : "");
         for (int e = 0; e < n; e++) entries[e].dirty = entries[e].removed = 0;
-    else
+    } else
         rt_log("cfg: cannot write %s", path);
     unpark_held(parked, n);
     __atomic_store_n(&save_ok, ok ? 1 : 0, __ATOMIC_RELEASE);

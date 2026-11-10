@@ -486,7 +486,12 @@ void erase_change(size_t i) {
     g_draft_n.store((int)g_changes.size());
 }
 
-// Puts key at value in the draft. A change back to the value the key had when the draft began leaves the draft.
+// A value as the log shows it: quoted, or (default) for an unset key.
+std::string shown(const std::string &v) { return v.empty() ? "(default)" : "'" + v + "'"; }
+
+// Puts key at value in the draft. A change back to the value the key had when the draft began leaves the draft. The log
+// names a key when it enters the draft and when it leaves it (a slider dragged through many values is not every step);
+// Apply and Discard list the values they settle on.
 void record(const std::string &key, const char *value, const std::string &gid, bool has_id, UiTextId label,
             const char *label_str, const char *from, const char *to) {
     Change *c = find_change(key);
@@ -500,6 +505,8 @@ void record(const std::string &key, const char *value, const std::string &gid, b
         if (!n.staged) cfg_hold(key.c_str(), 1);
         g_changes.push_back(n);
         c = &g_changes.back();
+        rt_log("menu: draft + %s: %s -> %s (%s)", key.c_str() + 8, shown(n.orig_eff).c_str(), shown(eff_of(key, value)).c_str(),
+               n.staged ? "staged: waits for Apply" : "preview: in effect now");
     }
     if (Group *g = find_group(gid)) {
         g->to = to;
@@ -509,6 +516,7 @@ void record(const std::string &key, const char *value, const std::string &gid, b
     c->new_val = value;
     if (!c->staged) write_key(key, c->new_val);
     if (eff_of(key, c->new_val) == c->orig_eff) {   // back where it began
+        rt_log("menu: draft - %s: back to %s", key.c_str() + 8, shown(c->orig_eff).c_str());
         if (!c->staged) cfg_revert(key.c_str(), c->orig_val, c->orig_state);
         erase_change((size_t)(c - g_changes.data()));
     }
@@ -612,14 +620,20 @@ void opt_draft_sync(void) {
     for (size_t i = g_changes.size(); i-- > 0;) {
         const Change &c = g_changes[i];
         if (eff_now(c.key) == (c.staged ? c.orig_eff : eff_of(c.key, c.new_val))) continue;
+        rt_log("menu: draft - %s: changed outside the menu (F10, F11, a cheat) to %s, which stays", c.key.c_str() + 8,
+               shown(eff_now(c.key)).c_str());
         if (!c.staged) cfg_hold(c.key.c_str(), 0);
         erase_change(i);
     }
 }
 
 void opt_draft_discard(void) {
-    for (const Change &c : g_changes)
+    if (!g_changes.empty()) rt_log("menu: draft discarded: %d change(s), nothing saved", (int)g_changes.size());
+    for (const Change &c : g_changes) {
+        rt_log("menu: draft   %s back to %s%s", c.key.c_str() + 8, shown(c.orig_eff).c_str(),
+               c.staged ? " (it never left the draft)" : " (the preview is undone)");
         if (!c.staged) cfg_revert(c.key.c_str(), c.orig_val, c.orig_state);
+    }
     g_changes.clear();
     g_groups.clear();
     g_ctx.valid = false;
@@ -659,8 +673,13 @@ bool is_timed(const std::string &key) {
 
 bool opt_draft_apply(bool timed) {
     g_display.clear();
+    rt_log("menu: draft applied: %d change(s)%s", (int)g_changes.size(), timed ? "" : " (for a restart)");
     for (const Change &c : g_changes) {
-        if (c.staged && timed && is_timed(c.key) && !live_needs_restart(c)) {   // HDR to or from native: no timer
+        const bool held = c.staged && timed && is_timed(c.key) && !live_needs_restart(c);
+        rt_log("menu: draft   %s: %s -> %s%s%s", c.key.c_str() + 8, shown(c.orig_eff).c_str(),
+               shown(eff_of(c.key, c.new_val)).c_str(), held ? ", in effect now, saved only after Keep" : ", saved",
+               live_needs_restart(c) || (c.staged && !cfg_meta(c.key.c_str())->live) ? ", takes effect after a restart" : "");
+        if (held) {   // HDR to or from native: no timer
             cfg_hold(c.key.c_str(), 1);   // before the write: no save in between can take the new value
             write_key(c.key, c.new_val);
             g_display.push_back({c.key, eff_of(c.key, c.new_val), c.orig_val, c.orig_state});
@@ -675,6 +694,8 @@ bool opt_draft_apply(bool timed) {
     g_ctx.valid = false;
     g_draft_n.store(0);
     opt_save_now();   // the held display keys stay out of it
+    rt_log("menu: draft: nx2navi.ini %s%s", cfg_last_save_ok() ? "saved" : "NOT saved (write failed)",
+           g_display.empty() ? "" : "; display settings wait for Keep or Revert");
     return cfg_last_save_ok() != 0;
 }
 
@@ -688,18 +709,26 @@ int opt_display_external(void) {
 }
 
 bool opt_display_keep(void) {
-    for (const Pending &p : g_display) cfg_hold(p.key.c_str(), 0);
+    for (const Pending &p : g_display) {
+        rt_log("menu: display kept: %s = %s", p.key.c_str() + 8, shown(eff_now(p.key)).c_str());
+        cfg_hold(p.key.c_str(), 0);
+    }
     g_display.clear();
     opt_save_now();
+    rt_log("menu: display: nx2navi.ini %s", cfg_last_save_ok() ? "saved" : "NOT saved (write failed)");
     return cfg_last_save_ok() != 0;
 }
 
 void opt_display_revert(void) {
     if (opt_display_external()) {   // the player took control with F11: what is on screen now stays
+        rt_log("menu: display: changed outside the menu (F11) during the countdown: kept instead of reverted");
         opt_display_keep();
         return;
     }
-    for (const Pending &p : g_display) cfg_revert(p.key.c_str(), p.orig_val, p.orig_state);
+    for (const Pending &p : g_display) {
+        cfg_revert(p.key.c_str(), p.orig_val, p.orig_state);
+        rt_log("menu: display reverted: %s back to %s, not saved", p.key.c_str() + 8, shown(eff_now(p.key)).c_str());
+    }
     g_display.clear();
 }
 
