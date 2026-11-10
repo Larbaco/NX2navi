@@ -40,6 +40,10 @@ from other projects, with its license, is listed in [THIRD_PARTY_NOTICES.md](../
 - Settings and menu: every key with its default is in one table (`cfg.c`), read from `nx2navi.ini` and `NX2NAVI_*`
   variables and written back when the in-game menu changes it. The menu and the performance overlay are Dear ImGui,
   drawn into the swapchain image (`runtime/ui/`); their text is in `ui_text.c`.
+- Log: in a game run the lines go through a queue to a thread that writes them (`runtime/logq.c`), so a stalled
+  write to the log file or the console does not hold the thread that logged; a fatal error, the crash report and the
+  end of the process write the queue out first (`rt_log_sync`). `NX2NAVI_LOG_ASYNC=0` writes each line where it is
+  logged.
 - OS calls the host makes go through `runtime/platform/` (`platform.h`, `win32.c`).
 
 #### Threads and cores
@@ -57,6 +61,9 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   and, if its host rip is in lifted code at host depth 0, moves it to `kern_ap_stub`, which saves the volatile
   registers and gives the core up there. A holder of a guest mutex counts at the priority of its best waiter, and one
   inside an SDK spin lock is not preempted.
+- Wakes. A signalled event or a thread that ends wakes only the `WaitSynchronization` waits that hold a handle of it
+  (`wake_sync_waiters`): a woken thread takes a core before it looks, so waking the others cost running threads
+  their cores for nothing (`NX2NAVI_SYNC_WAKE_ALL=1` wakes them all).
 - Host work gives the core back. Queue submits, presents, GPU waits, shader translation, `nn::fs` calls and NVN memory
   pool setup run without a core (`NVN_BLOCKING`, `kern_core_away`).
 - Spin waits. Loops that only another thread can end send their back-edges through `rt_spin_gate`, which pauses the
@@ -118,9 +125,10 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   are compiled outside the pipeline lock, and one compile serves every thread that needs it. The boot builds the
   pipeline of every compute shader play recorded or the shader preparation listed, but keeps only those of the shaders
   dispatched most recently (`compute-used.bin`, `compute_keep`): the others go into the pipeline cache and are
-  destroyed, and their first dispatch creates them from it. A kept pipeline holds driver memory whether it is used or
-  not, and the list has thousands of compute shaders a session never dispatches (`runtime/vk_pipeline.c`, "compute
-  pipelines the boot keeps").
+  destroyed, and their first dispatch creates them from it. A compute shader of more than half a million SPIR-V words
+  is built ahead only when a run has dispatched it: a pipeline of one holds about 100 MiB of device memory whether it
+  is used or not, also after it is destroyed, and the list has about twenty of them that the game never dispatches
+  (`runtime/vk_pipeline.c`, "compute pipelines the boot keeps").
 - The game's tensor-core upscaler is replaced by a decode-and-scale pass (`vk_tonemap.c`); `vk_fsr.c` runs AMD FSR 1
   (EASU, RCAS) on the present when the window is larger than the picture.
 - HDR (`vk_hdr.c`): the game tonemaps its scene into a float target, upscales it, draws the HUD into a second float

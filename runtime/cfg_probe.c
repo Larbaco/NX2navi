@@ -381,6 +381,13 @@ int probe_cfg(void) {
               input_prompts_pick("playstation", "xbox_prompts") == PROMPTS_PLAYSTATION &&
               input_prompts_pick("ps", "nintendo") == PROMPTS_NINTENDO,
           "prompts: playstation in any case; an unknown value is the game's own");
+    CHECK(input_prompts_pick("SteamDeck", "nintendo") == PROMPTS_STEAMDECK &&
+              input_prompts_pick("steamdeck", "xbox_prompts") == PROMPTS_STEAMDECK &&
+              EQ(input_prompts_folder(PROMPTS_STEAMDECK, "nintendo"), "romfs-patches-steamdeck") &&
+              EQ(input_prompts_folder(PROMPTS_STEAMDECK, "xbox"), "romfs-patches-steamdeck-label") &&
+              EQ(input_prompts_folder(PROMPTS_STEAMDECK, "auto"), "romfs-patches-steamdeck-label") &&
+              EQ(input_prompts_folder(PROMPTS_STEAMDECK, NULL), "romfs-patches-steamdeck-label"),
+          "prompts: steamdeck in any case, its face buttons by position for the Nintendo layout, by label otherwise");
     CHECK(EQ(input_prompts_folder(PROMPTS_PLAYSTATION, "nintendo"), "romfs-patches-playstation") &&
               EQ(input_prompts_folder(PROMPTS_PLAYSTATION, "xbox_prompts"), "romfs-patches-playstation") &&
               EQ(input_prompts_folder(PROMPTS_PLAYSTATION, "xbox"), "romfs-patches-playstation-label") &&

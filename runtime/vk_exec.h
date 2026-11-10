@@ -189,6 +189,9 @@ void vk_exec_frame_log(const tex_t *presented, uint64_t frame);
 // a frame lacking them would be held back at its present (vk_backend.c frame_hold).
 uint32_t vk_exec_pending_draws_take(void);
 int vk_frame_hold_left(void);
+// 1 while the texture pool makes the textures of an area load (vk_exec_draw.c pool_load_backlog): the frames drawn
+// meanwhile show black stand-ins, and frame_hold leaves their presents out.
+int vk_exec_pool_loading(void);
 
 // NX2NAVI_DUMP=<frame> (vk_dump.c): between presents frame-1 and frame, every pass's targets and every dispatch's storage
 // images are copied out and written as PNGs to NX2NAVI_DUMP_DIR (default "dump"), with passes.txt (targets, pipelines,

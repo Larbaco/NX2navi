@@ -326,10 +326,18 @@ void vk_mem_mirror_begin(void);
 int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence);
 int vk_mem_mirror_pending(void);
 void vk_mem_mirror_prologue(VkCommandBuffer cb);
+void vk_mem_lazy_part_end(void);   // lazy write-back: a part ends (before its prologue), and it is handed over
+void vk_mem_lazy_handed(void);
 // Shadow storage (vk_memory.c): vk_sync.c calls vk_mem_shadow_sync right before each submit; the replay notes every GPU
 // write into CPU-visible memory at record time (vk_mem_gpu_pending) and reports it at the fence with vk_gpu_written,
 // which copies the bytes back into guest memory before telling the texture cache (vk_guest_written).
 void vk_mem_shadow_sync(void);
+// A shader of the part being recorded reads through the device address table (vk_gpa.c), also when its descriptors
+// are reused: with shadow storage the part's prologue (vk_mem_gpa_sync) then brings every pool the table names up to
+// date with the CPU's writes, since the pools such a shader reaches are never resolved.
+void vk_mem_gpa_use(void);
+void vk_mem_gpa_sync(void);
+int vk_mem_shadow_storage(void);   // CPU-visible pools are shadow copies of guest memory, not imports (NX2NAVI_SHADOW)
 void vk_mem_gpu_pending(uint64_t addr, uint64_t size);
 void vk_gpu_written(uint64_t addr, uint64_t size);
 // The same for a GPU write into a VRAM mirror, which went back to guest memory with the submission: the texture checks
@@ -359,6 +367,9 @@ void vk_headroom_stop(void);   // before vmaDestroyAllocator
 uint64_t vk_headroom_held(void);        // bytes the spare blocks' anchors hold
 VkDeviceSize vk_vma_block_size(void);   // VMA's block size on heaps over 1 GiB (NX2NAVI_VMA_BLOCK_MB)
 int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out);   // 1 when all of [addr, addr+size) is backed
+// vk_mem_resolve for a caller that reads guest memory itself or only asks what backs it: with shadow storage the pool
+// is not copied in for it (vk_memory.c, mem_resolve).
+int vk_mem_lookup(uint64_t addr, uint64_t size, VkMemSpan *out);
 // Changes whenever vk_mem_resolve plus VK_MEM_USE may give another span for an address: a pool added, finalized or
 // mapped, a mirror created, refused or forgotten, a submission started.
 uint64_t vk_mem_gen(void);
@@ -577,6 +588,9 @@ void rt_write_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h)
 // once the GPU reached it and the completion thread ran its side effects. Guest or host threads.
 void vk_sync_start(void);                  // vk_init (fatal without a device) and the completion thread; idempotent
 uint64_t vk_sync_submit(const uint64_t *handles, int n);   // records with vk_exec_record, submits; returns the value
+// --probe-vkmem: record gives the submission's commands in place of the replay, under the same submission lock,
+// recorder, memory prologue and fence.
+uint64_t vk_sync_probe_submit(void (*record)(VkCommandBuffer, void *), void *arg);
 uint64_t vk_sync_reserve(void);            // asynchronous replay: the value the next queued submission signals
 int vk_sync_fence_wait(uint64_t value, uint64_t timeout_ns);   // 1 when done; 0 on timeout or a value never submitted
 // The executed timeline (vk_sync.c): a submission's own commands are through the GPU, its write-backs maybe not yet.
@@ -674,6 +688,7 @@ typedef struct {
     // from the start of the set's descriptors. VK_NULL_HANDLE: the set is written with VkWriteDescriptorSet structs.
     VkDescriptorUpdateTemplate tpl[2];
     int pool;                              // a stage indexes the texture or sampler pool: bind set 2 (the pools)
+    int gpa;                               // a stage accesses guest pointers through the device address table
 } VkPipeInfo;
 // One descriptor of the packed array a descriptor update template reads (VkPipeInfo.tpl), 24 bytes for every type; the
 // bytes a type leaves unused are zero, so equal descriptors compare equal byte for byte.

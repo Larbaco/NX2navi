@@ -48,6 +48,7 @@
 #include "nvn_hmap.h"
 #include "platform/platform.h"
 #include "tex.h"
+#include "vk_gpa.h"
 
 #define LOG_ONCE(...) do { static volatile int32_t once_; if (!plat_xchg32(&once_, 1)) rt_log(__VA_ARGS__); } while (0)
 
@@ -223,8 +224,9 @@ static struct {
     double from_ms, compile_ms;
 } PB = {.lock = PLAT_MUTEX_INIT};
 static __thread int pb_last;           // 1: the last pipe_create on this thread made its pipeline from binaries
-static __thread int cc_hit;            // compute_create's last pipeline on this thread: 1 from pipeline-cache.bin or
-                                       // the pipeline binaries, 0 not, -1 the driver did not say
+static __thread int cc_hit;            // compute_create's last pipeline on this thread: 1 the pipeline cache held it
+                                       // (P.cache: read from pipeline-cache.bin, or built into it earlier in this
+                                       // run) or it was made from pipeline binaries, 0 not, -1 the driver did not say
 
 static uint64_t pb_hash(uint32_t type, const uint8_t *key, uint32_t n) {
     uint64_t h = fnv(fnv(FNV0, &type, 4), key, n);
@@ -2204,6 +2206,8 @@ static Pipe *pipe_add(const void *key, size_t size, uint64_t h, VkPipeline pipel
     p->info.push1 = l ? l->push1 : 0;
     p->info.n_sets = l && l->set1 ? 2 : 1;
     p->info.pool = B ? B->pool : 0;
+    for (uint32_t i = 0; i < p->info.n_bindings; i++)
+        if (p->bindings[i].kind == GFX_RES_SSBO && p->bindings[i].res->cbuf_slot == VK_GPA_CB_SLOT) p->info.gpa = 1;
     if (l) p->info.tpl[0] = l->tpl[0], p->info.tpl[1] = l->tpl[1];
     p->lay = l;
     Pipe **head = &pipes[h % PIPE_BUCKETS];
@@ -4109,10 +4113,12 @@ static struct {
     PlatThread *th[LB_MAX_THREADS];
     uint8_t clamp, poly, minus_w, samples;             // library state (GKey fields)
     double t0, ms[3];                                  // ms: build time per kind (vertex, fragment, compute)
-    // warmed: driver cache only; nolib: vertex and fragment variants skipped with the graphics pipeline library off
+    // warmed: built for the caches only and destroyed; nolib: vertex and fragment variants skipped with the graphics
+    // pipeline library off
     // skipped: variants of the skip list (SK below)
     uint64_t built[3], have[3], fail[3], warmed[3], noshader, nolib, skipped, done, cs_draw;
     uint64_t big_words, deferred;                      // LB_BIG_WORDS; compute shaders over it left to their dispatch
+    uint64_t big_unused;                               // compute shaders over it that no run dispatched: not built at all
     double warm_ms[3];
     volatile int32_t kept;                                // libraries entered in libs[] so far
     int32_t keep_n;
@@ -4296,25 +4302,35 @@ static int cs_flight_remove(const GfxShader *cs) {   // 1 when a dispatch waited
 
 // ---- compute pipelines the boot keeps (compute-used.bin next to pipeline-keys.bin; NX2NAVI_COMPUTE_KEEP)
 // The boot prebuild (lb_compute) used to build the pipeline of every compute shader of the warm list (the ones play
-// recorded and the prepared ones, shader-prepared.bin) and keep all of them for the process. A pipeline that exists
-// holds driver memory whether or not anything dispatches it: on an RTX 5090 (NVIDIA 621.01) the 4,066 compute shaders
-// of an installed copy's list (42,344 variants, 42,142 of them prepared) held 2.3 GiB of device memory and a matching
-// share of the process's commit from the title screen on, while a boot into the first village dispatched 95 of them.
-// That is memory an 8 to 12 GB card needs for textures, and a copy with prepared shaders pays it from its first boot.
-// So the boot keeps only the pipelines of the NX2NAVI_COMPUTE_KEEP (default 512) compute shaders dispatched most
-// recently, and builds every other one into the pipeline cache and destroys it at once (lb_compute keep 0): the cache
-// then holds it, so its first dispatch creates it without compiling, and no pipeline of an unused shader stays. On
-// that machine a compute pipeline came from pipeline-cache.bin in 0.25 ms on average at boot, and 256 first dispatches
-// of pipelines the boot had not kept (--probe-prewarm, with a game running beside it) took 0.19 ms on average and 3 ms
-// at most. Built and destroyed one after the other, they leave nothing behind in the driver either: 372 of them left
-// its device memory where it was. NVIDIA's driver does not hand back the device memory of destroyed pipelines, it
-// keeps it for the next ones (400 test pipelines, destroyed together: no change), so building all of them first and
-// destroying them afterwards would end at the same 2.3 GiB.
+// recorded and the prepared ones, shader-prepared.bin) and keep all of them for the process: 4,066 on an installed
+// copy (42,344 variants in its list, 42,142 of them prepared), of which a boot into the first village dispatched 95.
+// What that cost was twenty of them. A copy's list has about twenty compute shaders of 0.9 to 2.0 million SPIR-V
+// words: the game's tensor-core upscaler programs, which the game never dispatches natively (vk_exec_draw.c
+// native_tensor) and which no run of the usage record below ever dispatched. A pipeline of one holds about 100 MiB
+// of device memory from the moment it exists, used or not, and the driver keeps that memory when the pipeline is
+// destroyed. On an RTX 5090 (NVIDIA 621.01) a boot pass that read all 4,066 pipelines from pipeline-cache.bin took the
+// device memory from 386 to 2,398 MiB although it destroyed 3,949 of them at once; the same pass before the twenty
+// were in the cache left it at 386, and building only the twenty took it to 1,370 (--probe-prewarm, 2026-11-10; the
+// game showed 608 to 2,743 MiB over the same stage). The 4,046 others are cheap: all of them kept cost 2 MiB of device
+// memory and 0.7 GB of the process's commit. So a copy with prepared shaders and a filled pipeline cache held 2 GiB
+// for nothing from the title screen on, on cards that need that memory for textures.
+// What the boot does now:
+// - A compute shader over LB.big_words is built ahead only when a run has dispatched it (lb_compute, its keep
+//   argument). One that no run dispatched is not created at all: not from the pipeline caches and not by the
+//   background builder (bg_main). If the game does dispatch one for the first time, that dispatch builds it, which
+//   holds the frame for the compile once (0.65 to 1.9 s measured for such a shader), and the record has it built ahead
+//   from the next boot on.
+// - Of the others the boot keeps the pipelines of the NX2NAVI_COMPUTE_KEEP (default 512) dispatched most recently, and
+//   builds every other one into the pipeline cache and destroys it at once (lb_compute keep 0), from a copy of its
+//   shader that is released again (lb_worker): the cache then holds it, so its first dispatch creates it without
+//   compiling. On that machine 94 first dispatches in play took 0.24 ms on average and 1.6 ms at most, 14 of them in
+//   the busiest 33 ms; reading the shader from the disk at that moment adds 0.05 to 0.15 ms (--probe-prewarm).
 // The record: one entry per compute shader a run dispatched (its input id) with the number of the last run that did;
 // each run that dispatches anything takes the next number. Kept at boot are the keep_n entries with the highest
 // numbers, so a short run does not push out what a long one used, and nothing is forgotten until newer shaders take
 // its place. Without a record (the first run that has one) nothing is kept and the run pays the first dispatches once.
-// NX2NAVI_COMPUTE_KEEP=all keeps every compute shader of the warm list as before; 0 keeps none.
+// NX2NAVI_COMPUTE_KEEP=all builds and keeps every compute shader of the warm list, the large ones too, as before; 0
+// keeps none.
 #define CU_VERSION 1
 typedef struct { char magic[8]; uint32_t version, rec_size, run, pad; } CuHeader;
 typedef struct { uint8_t iid[32]; uint32_t run, pad; } CuRec;
@@ -4338,7 +4354,7 @@ static struct {
 // player would feel as one long frame when a new area starts.
 #define CF_WINDOW_MS 33.0
 static struct {
-    uint64_t n, hit, pre_used;         // hit: read from pipeline-cache.bin; pre_used: kept from the boot and dispatched
+    uint64_t n, hit, pre_used;         // hit: the pipeline cache held it (cc_hit 1); pre_used: kept from the boot and dispatched
     double ms, max_ms, hit_ms;
     double win_t0, win_ms, worst_ms;
     uint32_t win_n, worst_n;
@@ -4388,7 +4404,8 @@ static void cu_open(void) {
     if (!A.on || !K.path[0]) return;
     const char *e = cfg_value("NX2NAVI_COMPUTE_KEEP");
     plat_mutex_lock(&CU.lock);
-    CU.keep_n = !strcmp(e, "all") ? -1 : atoi(e) < 0 ? 0 : atoi(e);
+    int count = cfg_int("NX2NAVI_COMPUTE_KEEP");   // a value that is neither "all" nor a number reads as the default
+    CU.keep_n = !strcmp(e, "all") ? -1 : count < 0 ? 0 : count;
     snprintf(CU.path, sizeof CU.path, "%s", K.path);
     char *cut = plat_last_sep(CU.path);
     snprintf(cut ? cut + 1 : CU.path, sizeof CU.path - (size_t)(cut ? cut + 1 - CU.path : 0), "compute-used.bin");
@@ -4457,23 +4474,42 @@ static void cu_note(const GfxShader *cs) {
 }
 
 // Writes the record to path. 1 when written.
+// One writer at a time, from the copy of the record to the end of the file write: the autosave thread and a save at
+// exit can both be here, and the older copy must not land on the newer file.
+static PlatMutex cu_io = PLAT_MUTEX_INIT;
+
 static int cu_write(const char *path) {
+    plat_mutex_lock(&cu_io);
+    plat_mutex_lock(&CU.lock);
+    uint32_t n = CU.n;
+    plat_mutex_unlock(&CU.lock);
+    // allocated outside CU.lock, which a dispatch takes (cu_note); room for the entries that come meanwhile
+    size_t cap = sizeof(CuHeader) + ((size_t)n + 256) * sizeof(CuRec), size = 0;
+    uint8_t *out = malloc(cap);
     plat_mutex_lock(&CU.lock);
     CuHeader h = {{'N', 'X', '2', 'N', 'C', 'U', 'S', 'E'}, CU_VERSION, sizeof(CuRec), CU.run, 0};
-    size_t size = sizeof h + CU.n * sizeof(CuRec);
-    uint8_t *out = malloc(size);
-    if (out) memcpy(out, &h, sizeof h), memcpy(out + sizeof h, CU.rec, CU.n * sizeof(CuRec));
-    CU.dirty = 0;
+    if (out && sizeof h + CU.n * sizeof(CuRec) <= cap) {
+        size = sizeof h + CU.n * sizeof(CuRec);
+        memcpy(out, &h, sizeof h);
+        if (CU.n) memcpy(out + sizeof h, CU.rec, CU.n * sizeof(CuRec));
+        CU.dirty = 0;
+    }
     plat_mutex_unlock(&CU.lock);
-    int ok = out && plat_file_write_atomic(path, out, size);
+    int ok = size && plat_file_write_atomic(path, out, size);
+    if (!ok) {   // still to be written: the next flush tries again
+        plat_mutex_lock(&CU.lock);
+        CU.dirty = 1;
+        plat_mutex_unlock(&CU.lock);
+    }
     free(out);
+    plat_mutex_unlock(&cu_io);
     return ok;
 }
 
 // Writes the record when a dispatch changed it (the autosave thread and the save at exit).
 static void cu_flush(void) {
     if (!CU.opened || CU.quiet || !*(volatile int *)&CU.dirty) return;
-    if (!cu_write(CU.path)) rt_log("vk_pipeline: cannot write %s", CU.path);
+    if (!cu_write(CU.path)) LOG_ONCE("vk_pipeline: cannot write %s; the next saves try again", CU.path);
 }
 
 // A compute pipeline created at a dispatch took ms. Caller holds P.lock.
@@ -4489,13 +4525,14 @@ static void cf_note(double ms, int hit) {
 
 static void cf_log(void) {
     plat_mutex_lock_shared(&P.lock);
-    if (CF.n || CF.pre_used)
-        rt_log("vk_pipeline: compute pipelines created at their first dispatch: %llu (avg %.2f ms, longest %.2f ms; %llu "
-               "of them read from the pipeline cache file, avg %.2f ms); the %.0f ms that held the most of it: %u "
-               "pipelines, %.1f ms; of the compute pipelines kept from the boot, %llu were dispatched",
-               (unsigned long long)CF.n, CF.n ? CF.ms / CF.n : 0.0, CF.max_ms, (unsigned long long)CF.hit,
-               CF.hit ? CF.hit_ms / CF.hit : 0.0, CF_WINDOW_MS, CF.worst_n, CF.worst_ms, (unsigned long long)CF.pre_used);
-    plat_mutex_unlock_shared(&P.lock);
+    typeof(CF) c = CF;                 // the line is written after the unlock: every dispatch needs P.lock, and this
+    plat_mutex_unlock_shared(&P.lock); // runs on the autosave thread below normal priority
+    if (c.n || c.pre_used)
+        rt_log("vk_pipeline: compute pipelines created at their first dispatch: %llu (avg %.2f ms, longest %.2f ms; the "
+               "pipeline cache held %llu of them, avg %.2f ms); the %.0f ms that held the most of it: %u pipelines, "
+               "%.1f ms; of the compute pipelines kept from the boot, %llu were dispatched",
+               (unsigned long long)c.n, c.n ? c.ms / c.n : 0.0, c.max_ms, (unsigned long long)c.hit,
+               c.hit ? c.hit_ms / c.hit : 0.0, CF_WINDOW_MS, c.worst_n, c.worst_ms, (unsigned long long)c.pre_used);
 }
 
 // The background builder of large compute shaders (comment at bg_main).
@@ -4793,18 +4830,18 @@ static void bg_main(void *arg) {
         VkPipeline pipe = compute_create(cs, l, 0);
         own_cache = VK_NULL_HANDLE;
         double ms = now_ms() - t0;
-        int keep = cu_keep(iid);
+        // The pipeline stays: only a shader a run dispatched is queued here (lb_compute), and it is entered before
+        // the merge below, so a dispatch that comes meanwhile finds it.
         plat_mutex_lock(&P.lock);
-        if (flight && cs_flight_remove(cs)) keep = 1;   // a dispatch waits for it
+        if (flight) cs_flight_remove(cs);
         BG.building = NULL;
         Pipe *e = NULL;
-        if (pipe && keep && !pipe_find(&k, sizeof k, h) &&
+        if (pipe && !pipe_find(&k, sizeof k, h) &&
             (e = pipe_add(&k, sizeof k, h, pipe, l, &B, VK_PIPELINE_BIND_POINT_COMPUTE, 0))) {
             e->pre = 1;
             P.stats.compute++;
-        } else if (pipe) {   // only for the pipeline cache (comment at compute-used.bin), or a dispatch built its own
+        } else if (pipe) {   // a dispatch built its own meanwhile (no flight slot was free), or out of memory
             vkDestroyPipeline(P.device, pipe, NULL);
-            if (!own) __atomic_fetch_add(&cache_merges, 1, __ATOMIC_RELAXED);   // new content in P.cache to save
         }
         plat_mutex_unlock(&P.lock);
         if (own) bg_merge(own, pipe != VK_NULL_HANDLE);   // after the entry: a dispatch waiting for it does not wait for this
@@ -4831,7 +4868,8 @@ static void bg_start(void) {
 }
 
 // keep 0: the pipeline is built for the pipeline cache only and destroyed at once, unless a dispatch came to wait for
-// it meanwhile (comment at compute-used.bin).
+// it meanwhile; a shader over LB.big_words is then not built at all (comment at compute-used.bin). cs may be a copy
+// the caller releases afterwards when keep is 0: nothing here holds on to it then.
 static void lb_compute(const GfxShader *cs, const uint8_t iid[32], int keep) {
     struct { const GfxShader *cs; uint64_t compute; } k = {cs, 1};   // no padding: the key is hashed and compared as bytes
     uint64_t h = key_hash(&k, sizeof k);
@@ -4840,6 +4878,12 @@ static void lb_compute(const GfxShader *cs, const uint8_t iid[32], int keep) {
     uint64_t words = 0;
     gfx_shader_spirv(cs, &words);
     int big = LB.big_words && words > LB.big_words;   // only from the caches (LB_BIG_WORDS)
+    if (big && !keep) {   // no run dispatched it: a pipeline of it would hold about 100 MiB of device memory unused
+        plat_mutex_lock(&LB.stat);
+        LB.big_unused++;
+        plat_mutex_unlock(&LB.stat);
+        return;
+    }
     if (big && !P.cache_control) {
         if (bg_on()) bg_queue(cs, iid, words);
         else lb_defer(iid, words);
@@ -4968,7 +5012,8 @@ static void lb_report(const char *how) {
            "cache only: vertex %llu (avg %.1f ms), fragment %llu (avg %.1f ms), compute %llu (avg %.1f ms); %llu failed, %llu not in the shader cache, "
            "%llu vertex/fragment skipped (graphics pipeline library off), %llu skipped (the driver crashed on them before, "
            "shader-prepare-skip.txt), %llu large compute shaders left to their first dispatch (NX2NAVI_LIB_PREBUILD_BIG), %zu "
-           "queued for the background builder (NX2NAVI_LIB_PREBUILD_BIG_BG); process working set %.0f MB", how, (unsigned long long)LB.done, LB.n,
+           "queued for the background builder (NX2NAVI_LIB_PREBUILD_BIG_BG), %llu large compute shaders not built because "
+           "no run has dispatched them; process working set %.0f MB", how, (unsigned long long)LB.done, LB.n,
            now_ms() - LB.t0, (unsigned long long)LB.built[0], LB.built[0] ? LB.ms[0] / LB.built[0] : 0.0,
            (unsigned long long)LB.have[0], (unsigned long long)LB.built[1], LB.built[1] ? LB.ms[1] / LB.built[1] : 0.0,
            (unsigned long long)LB.have[1], (unsigned long long)LB.built[2], LB.built[2] ? LB.ms[2] / LB.built[2] : 0.0,
@@ -4977,7 +5022,7 @@ static void lb_report(const char *how) {
            (unsigned long long)LB.warmed[2], LB.warmed[2] ? LB.warm_ms[2] / LB.warmed[2] : 0.0,
            (unsigned long long)(LB.fail[0] + LB.fail[1] + LB.fail[2]),
            (unsigned long long)LB.noshader, (unsigned long long)LB.nolib, (unsigned long long)LB.skipped,
-           (unsigned long long)LB.deferred, BG.n, (double)mem_proc);
+           (unsigned long long)LB.deferred, BG.n, (unsigned long long)LB.big_unused, (double)mem_proc);
     plat_mutex_unlock_shared(&LB.stat);
 }
 
@@ -4996,19 +5041,27 @@ static void lb_worker(void *arg) {
             plat_mutex_unlock(&LB.stat);
             continue;
         }
+        // A compute shader whose pipeline does not stay is read as a copy of this thread's own and released after its
+        // build: kept in the shader cache's memory, the 3,900 of an installed copy's list were 240 MB of the process's
+        // commit for shaders most runs never dispatch. A dispatch that does come reads its shader then (0.05 to
+        // 0.15 ms from the files this pass has just read). The shaders of kept pipelines and libraries stay loaded:
+        // their pipeline and library entries point at them.
+        int keep = i < LB.n_keep, owned = 0;
         plat_thread_priority(PLAT_PRIO_NORMAL);   // gfx_shader's cache lock, disk reads
-        const GfxShader *sh = gfx_shader_load_input(LB.e[i].iid, 0);
+        const GfxShader *sh = keep || LB.e[i].stage != GFX_STAGE_CS ? gfx_shader_load_input(LB.e[i].iid, 0)
+                                                                    : gfx_shader_load_private(LB.e[i].iid, &owned);
         plat_thread_priority(PLAT_PRIO_IDLE);
         if (!sh) {
             plat_mutex_lock(&LB.stat);
             LB.noshader++;
             plat_mutex_unlock(&LB.stat);
         } else if (gfx_shader_stage(sh) == GFX_STAGE_CS) {
-            lb_compute(sh, LB.e[i].iid, i < LB.n_keep);
-        } else if (gfx_shader_stage(sh) == GFX_STAGE_VS || gfx_shader_stage(sh) == GFX_STAGE_FS) {
-            if (P.gpl) lb_library(sh, gfx_shader_stage(sh) == GFX_STAGE_VS, 1);
+            lb_compute(sh, LB.e[i].iid, keep);
+        } else if (!owned && (gfx_shader_stage(sh) == GFX_STAGE_VS || gfx_shader_stage(sh) == GFX_STAGE_FS)) {
+            if (P.gpl) lb_library(sh, gfx_shader_stage(sh) == GFX_STAGE_VS, 1);   // a kept library points at sh: never a copy
             else lb_skip_lib();
         }
+        if (owned) gfx_shader_release_private(sh);
         plat_mutex_lock(&LB.stat);
         LB.done++;
         plat_mutex_unlock(&LB.stat);
@@ -5420,17 +5473,20 @@ int vk_pipeline_warm_shaders(void) {
 // the shader prewarm, the recorded pipelines and the compute pipeline prebuild, each followed by vk_mem_stage_log's
 // line, so the log tells what every stage leaves in device memory and in the process's commit. Then up to
 // PROBE_DISPATCHES compute shaders whose pipeline the boot did not keep are asked for as a dispatch would
-// (vk_pipeline_compute), which gives what a first dispatch costs on this machine and how many came from the pipeline
-// cache file. Fails when one of those pipelines is not created, when the prebuild kept a pipeline it should not have,
-// or when the record of dispatched shaders, written to a file of the probe's own and read back, does not hold the
-// probe's dispatches. compute-used.bin itself stays as it is; the pipeline cache is saved as after a boot.
+// (gfx_shader_load_input for the shader, then vk_pipeline_compute), which gives what a first dispatch costs on this
+// machine and how many of them the pipeline cache held. Fails when one of those pipelines is not created, when the
+// prebuild kept a pipeline it should not have, when a large compute shader went to the background builder although no
+// run dispatched it, or when the record of dispatched shaders, written to a file of the probe's own and read back,
+// does not hold the probe's dispatches. compute-used.bin itself stays as it is; the pipeline cache is saved as after
+// a boot.
 #define PROBE_DISPATCHES 256
 int vk_pipeline_probe_prewarm(void) {
     vk_pipeline_async_enable();
     CU.quiet = 1;
     vk_pipeline_prewarm();             // brings the device up itself: it has to own the key file before ensure_init runs
     if (!P.ready) {
-        printf("probe-prewarm: SKIP (no Vulkan device)\n");
+        printf("probe-prewarm: SKIP (the boot prewarm brought no Vulkan device up: none on this machine, NX2NAVI_GPU=null "
+               "or NX2NAVI_PIPE_SYNC=1)\n");
         return 0;
     }
     while (__atomic_load_n(&LB.running, __ATOMIC_ACQUIRE) > 0) plat_sleep_ms(50);
@@ -5442,27 +5498,36 @@ int vk_pipeline_probe_prewarm(void) {
     vk_pipeline_stats(&st);
     plat_mutex_lock_shared(&LB.stat);
     uint64_t kept = LB.built[2], cache_only = LB.warmed[2], failed = LB.fail[2], there = LB.have[2];
+    uint64_t big_unused = LB.big_unused;
+    size_t queued = BG.n;
     plat_mutex_unlock_shared(&LB.stat);
     printf("probe-prewarm: %zu compute shaders, %zu to keep: %llu kept, %llu built into the pipeline cache only, %llu "
-           "there already, %llu failed; %llu graphics pipelines\n", LB.n, LB.n_keep, (unsigned long long)kept,
+           "there already, %llu failed, %llu large ones not built (no run dispatched them), %zu large ones for the "
+           "background builder; %llu graphics pipelines\n", LB.n, LB.n_keep, (unsigned long long)kept,
            (unsigned long long)cache_only, (unsigned long long)there, (unsigned long long)failed,
-           (unsigned long long)st.graphics);
+           (unsigned long long)big_unused, queued, (unsigned long long)st.graphics);
     int fails = kept > LB.n_keep;      // a dispatch never waits in this mode, so nothing else may have been kept
     if (fails) printf("probe-prewarm: FAIL: %llu pipelines kept, %zu expected at most\n", (unsigned long long)kept, LB.n_keep);
+    if (queued > LB.n_keep)            // only a shader a run dispatched may be built ahead when it is large
+        fails++, printf("probe-prewarm: FAIL: %zu large compute shaders queued for the background builder, %zu kept "
+                        "shaders at most could be among them\n", queued, LB.n_keep);
     uint32_t asked = 0, got = 0;
-    double t_all = 0, t_max = 0;
+    double t_all = 0, t_max = 0, t_load = 0;
     for (size_t i = LB.n_keep; i < LB.n && asked < PROBE_DISPATCHES; i++) {
-        const GfxShader *sh = LB.e[i].stage == GFX_STAGE_CS ? gfx_shader_load_input(LB.e[i].iid, 0) : NULL;
+        if (LB.e[i].stage != GFX_STAGE_CS) continue;
+        double l0 = now_ms();
+        const GfxShader *sh = gfx_shader_load_input(LB.e[i].iid, 0);   // from the disk: the boot released its copy
+        double load = now_ms() - l0;
         uint64_t words = 0;
         if (!sh || gfx_shader_stage(sh) != GFX_STAGE_CS) continue;
         gfx_shader_spirv(sh, &words);
-        if (LB.big_words && words > LB.big_words) continue;   // those wait for the background builder
+        if (LB.big_words && words > LB.big_words) continue;   // a first dispatch of one compiles it: not what is timed here
         const VkPipeInfo *info = NULL;
         double t0 = now_ms();
         VkPipeline p = vk_pipeline_compute(sh, &info);
         double ms = now_ms() - t0;
         asked++, got += p != VK_NULL_HANDLE;
-        t_all += ms;
+        t_all += ms, t_load += load;
         if (ms > t_max) t_max = ms;
     }
     vk_mem_stage_log("the probe's first dispatches");
@@ -5470,8 +5535,8 @@ int vk_pipeline_probe_prewarm(void) {
     uint64_t hit = CF.hit;
     plat_mutex_unlock_shared(&P.lock);
     printf("probe-prewarm: %u first dispatches of pipelines the boot did not keep: %u created, avg %.2f ms, longest %.2f "
-           "ms, %llu read from the pipeline cache file\n", asked, got, asked ? t_all / asked : 0.0, t_max,
-           (unsigned long long)hit);
+           "ms, the pipeline cache held %llu of them; reading their shaders took avg %.2f ms\n", asked, got,
+           asked ? t_all / asked : 0.0, t_max, (unsigned long long)hit, asked ? t_load / asked : 0.0);
     if (got != asked) fails++, printf("probe-prewarm: FAIL: %u pipelines were not created\n", asked - got);
     if (CU.opened) {
         char rp[sizeof CU.path + 8];

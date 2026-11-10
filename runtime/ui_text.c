@@ -84,6 +84,11 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_ANISO] = "Texture filtering",
     [UI_MENU_ANISO_DESC] = "Anisotropic filtering of surface textures: ground, roads and walls seen at a shallow angle stay sharp into the distance instead of blurring. Game: the level the game asks for, as on the Switch.",
     [UI_MENU_ANISO_GAME] = "Game",
+    [UI_MENU_FPS_BOOST] = "Experimental FPS boost",
+    [UI_MENU_FPS_BOOST_DESC] = "What the game's shaders write into its memory is copied back from the video card only "
+                               "when the game's own code needs it, instead of after every step of a frame. About a "
+                               "third more frames per second in large open areas. Experimental: single frames can "
+                               "flicker with it on. Off by default.",
     [UI_MENU_SHARPNESS] = "FSR sharpness",
     [UI_MENU_SHARPNESS_DESC] = "How sharp FSR makes the picture. 0 turns it off.",
     [UI_MENU_SHARPNESS_NEEDS_FSR] = "only with AMD FSR 1 or FSR 3.1",
@@ -252,8 +257,9 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_PAD_LAYOUT_IN_USE] = "in use: %s",
     [UI_MENU_PROMPTS] = "Button prompts",
     [UI_MENU_PROMPTS_DESC] = "Which buttons the game's prompts show, in text, in the action prompt and on the "
-                             "ocarina's notes. Nintendo: the game's own. Xbox and PlayStation: that pad's buttons (LB, "
-                             "RB, LT, RT, Menu, View; L1, R1, L2, R2, Options, Create), and A, B, X and Y as the "
+                             "ocarina's notes. Nintendo: the game's own. Xbox, PlayStation and Steam Deck: that pad's "
+                             "buttons (LB, RB, LT, RT, Menu, View; L1, R1, L2, R2, Options, Create; the Deck's A, B, X, "
+                             "Y with L1, R1, L2, R2, Menu, View), and A, B, X and Y as the "
                              "button the layout above presses (with Nintendo (A right) the right button does A, so the "
                              "prompts for A show B, or circle). Keyboard and mouse: the key each button has (E, Ctrl, "
                              "Space, left click...), WASD for moving and the mouse for the camera. The prompt files "
@@ -262,7 +268,8 @@ static const char *const text_en[UI_TEXT_COUNT] = {
                              "are part of the game's files, so a button you remap in Controls keeps its old prompt on "
                              "screen until the files are made again.",
     [UI_MENU_PROMPTS_NINTENDO] = "Nintendo", [UI_MENU_PROMPTS_XBOX] = "Xbox",
-    [UI_MENU_PROMPTS_PLAYSTATION] = "PlayStation", [UI_MENU_PROMPTS_PC] = "Keyboard and mouse",
+    [UI_MENU_PROMPTS_PLAYSTATION] = "PlayStation", [UI_MENU_PROMPTS_STEAMDECK] = "Steam Deck",
+    [UI_MENU_PROMPTS_PC] = "Keyboard and mouse",
     [UI_MENU_PROMPTS_MISSING] = "prompt files missing: tools/pad_prompts.py makes them",
     [UI_MENU_PROMPTS_FAILED] = "prompt files damaged: make them again with tools/pad_prompts.py",
     [UI_MENU_PROMPTS_RESTART] = "prompts change after restart",
@@ -552,7 +559,20 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_FRAMEGEN_NEEDS_FSR] = "choose an FSR 3.1 mode under Upscaling first",
     [UI_MENU_FRAMEGEN_NOTE_FSR] = "needs FSR 3.1",
     [UI_MENU_FRAMEGEN_DESC_FSR] = "Adds generated frames for smoother motion. Needs FSR 3.1.",
+    [UI_MENU_UPSCALING_DESC_NO_FSR] = "How the picture is smoothed and scaled to your window. AMD FSR 3.1 is not offered "
+                                      "here: it needs amd_fidelityfx_vk.dll, which cannot be loaded.",
+    [UI_MENU_FSR3_OFF] = "in use: off, FSR 3.1 is not available",
+    [UI_MENU_FRAMEGEN_DESC_DLSS] = "Adds generated frames for smoother motion. Needs DLSS.",
+    [UI_MENU_FRAMEGEN_NOTE_DLSS] = "needs DLSS",
+    [UI_MENU_FRAMEGEN_NEEDS_DLSS] = "choose a DLSS mode under Upscaling first",
+    [UI_MENU_FRAMEGEN_DESC_NONE] = "Adds generated frames for smoother motion. Needs DLSS or FSR 3.1, and neither runs "
+                                   "here.",
+    [UI_MENU_FRAMEGEN_NEEDS_NONE] = "needs DLSS or FSR 3.1, which do not run here",
     [UI_MENU_FRAMEGEN_MULT] = "DLSS multiplier",
+    [UI_MENU_FG_MULT_DESC] = "Frames on screen for each frame the game draws with DLSS Frame Generation: 2x adds one "
+                             "generated frame, up to 6x on an RTX 50 card. Dynamic adds only the frames needed to "
+                             "reach your display's refresh rate. Changes take effect at once.",
+    [UI_MENU_FG_MULT_DYNAMIC] = "Dynamic",
     [UI_MENU_FRAMEGEN_MULT_DESC] = "Frames on screen for each frame the game draws: 2x adds one generated frame, 3x "
                                    "two, 4x three. Higher is smoother but adds a little delay. The frame limit counts "
                                    "the frames on screen, so the game draws the limit divided by this: set the limit "
@@ -628,6 +648,11 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_ANISO] = "Фильтрация текстур",
     [UI_MENU_ANISO_DESC] = "Анизотропная фильтрация текстур поверхностей: земля, дороги и стены под острым углом остаются чёткими вдали, а не размываются. Игра: уровень, который запрашивает игра, как на Switch.",
     [UI_MENU_ANISO_GAME] = "Игра",
+    [UI_MENU_FPS_BOOST] = "Экспериментальное ускорение FPS",
+    [UI_MENU_FPS_BOOST_DESC] = "То, что шейдеры игры записывают в её память, копируется с видеокарты обратно только "
+                               "тогда, когда это нужно коду самой игры, а не после каждого этапа кадра. Примерно на "
+                               "треть больше кадров в секунду на больших открытых пространствах. Экспериментально: "
+                               "отдельные кадры могут мерцать. По умолчанию выключено.",
     [UI_MENU_SHARPNESS] = "Резкость FSR",
     [UI_MENU_SHARPNESS_DESC] = "Насколько FSR повышает резкость. 0 отключает.",
     [UI_MENU_SHARPNESS_NEEDS_FSR] = "только с AMD FSR 1",
@@ -803,7 +828,8 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
                              "перезапуска. Подсказки записаны в файлах игры, поэтому у кнопки, переназначенной на "
                              "вкладке управления, на экране остаётся прежняя подсказка, пока файлы не созданы заново.",
     [UI_MENU_PROMPTS_NINTENDO] = "Nintendo", [UI_MENU_PROMPTS_XBOX] = "Xbox",
-    [UI_MENU_PROMPTS_PLAYSTATION] = "PlayStation", [UI_MENU_PROMPTS_PC] = "Клавиатура и мышь",
+    [UI_MENU_PROMPTS_PLAYSTATION] = "PlayStation", [UI_MENU_PROMPTS_STEAMDECK] = "Steam Deck",
+    [UI_MENU_PROMPTS_PC] = "Клавиатура и мышь",
     [UI_MENU_PROMPTS_MISSING] = "нет файлов подсказок: их создаёт tools/pad_prompts.py",
     [UI_MENU_PROMPTS_FAILED] = "файлы подсказок повреждены: создайте их снова tools/pad_prompts.py",
     [UI_MENU_PROMPTS_RESTART] = "подсказки сменятся после перезапуска",
@@ -1432,6 +1458,11 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
                            "ângulo raso continuam nítidos ao longe em vez de borrar. Jogo: o nível que o jogo pede, "
                            "como no Switch.",
     [UI_MENU_ANISO_GAME] = "Jogo",
+    [UI_MENU_FPS_BOOST] = "Aumento de FPS experimental",
+    [UI_MENU_FPS_BOOST_DESC] = "O que os shaders do jogo escrevem na memória dele só é copiado de volta da placa de "
+                               "vídeo quando o próprio código do jogo precisa, em vez de após cada etapa do quadro. "
+                               "Cerca de um terço a mais de quadros por segundo em grandes áreas abertas. "
+                               "Experimental: quadros isolados podem piscar com isto ligado. Desligado por padrão.",
     [UI_MENU_COLOR] = "Cor",
     [UI_MENU_COLOR_PRESET] = "Perfil de cor",
     [UI_MENU_COLOR_PRESET_DESC] = "Define os quatro valores abaixo. Vívido: mais contraste e saturação, sombras um "
@@ -2111,6 +2142,9 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_ANISO] = "纹理过滤",
     [UI_MENU_ANISO_DESC] = "表面纹理的各向异性过滤：以小角度看到的地面、道路和墙壁在远处依然清晰，而不会模糊。游戏：使用游戏请求的级别，与 Switch 上相同。",
     [UI_MENU_ANISO_GAME] = "游戏",
+    [UI_MENU_FPS_BOOST] = "实验性帧率提升",
+    [UI_MENU_FPS_BOOST_DESC] = "游戏着色器写入其内存的数据，只有在游戏自身的代码需要时才从显卡复制回来，而不是在每帧的每个阶段之后都"
+                               "复制。在大型开放区域中帧率提高约三分之一。实验性功能：开启后个别帧可能闪烁。默认关闭。",
     [UI_MENU_HDR_GROUP] = "HDR",
     [UI_MENU_HDR] = "HDR 输出",
     [UI_MENU_HDR_DESC] = "在 HDR 显示器上呈现更亮的高光。请先在 Windows 中开启 HDR。",
