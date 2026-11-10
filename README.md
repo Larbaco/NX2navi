@@ -44,7 +44,7 @@ Report problems as issues, following [CONTRIBUTING.md](CONTRIBUTING.md).
   background at each start, so play rarely stops to compile them; a shader or pipeline met for the first time can
   still hold a frame, and a draw that must wait for its pipeline has it built on worker threads, never on the game's
   drawing thread
-- In-game settings menu (F1, or Minus and Plus together on a gamepad) and performance overlay (F10)
+- In-game settings menu (F1, or Minus and Plus together on a gamepad) and performance overlay (F10); Ctrl+F5 reloads `nx2navi.ini` without a restart
 - Keyboard, mouse and gamepads with remapping, Nintendo, Xbox or PlayStation button layout, rumble and gyro; the game
   follows whichever connected gamepad you press, and DualShock 3 controllers are read directly when enabled
 - Xbox, PlayStation, Steam Deck and keyboard and mouse button prompts in the game's own text, drawn on your PC when the game is

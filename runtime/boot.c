@@ -414,6 +414,7 @@ void rt_boot(void) {
     frame_step_init();
     res_init();
     wide_init();   // Ocarina's widescreen sets (recomp/patches-v111.txt)
+    cfg_log_unsupported();   // the settings this build ignores
     cheats_init();   // after the patch sets: a cheat's set follows its setting
     cb_addr[0] = hostfn_register("<rtld loader_ready>", cb_loader_ready);
     cb_addr[1] = hostfn_register("<rtld module_inits>", cb_module_inits);

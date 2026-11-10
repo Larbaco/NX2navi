@@ -90,11 +90,14 @@ int vk_hdr_wanted(void) {
 }
 
 // The menu's HDR row: what is set takes a restart. To or from the game's own HDR, and switching HDR on in a run that
-// started without the HDR path (NX2NAVI_HDR_LIVE = 0).
-int vk_hdr_needs_restart(void) {
+// started without the HDR path (NX2NAVI_HDR_LIVE = 0). vk_hdr_restart_for: the same for a value not set yet (the
+// menu's draft holds HDR until Apply).
+int vk_hdr_restart_for(const char *value) {
     hdr_start();
-    return (!strcmp(cfg_value("NX2NAVI_HDR"), "native")) != g_native || (!g_armed && cfg_bool("NX2NAVI_HDR"));
+    int native = !strcmp(value, "native"), on = native || !strcmp(value, "1");
+    return native != g_native || (!g_armed && on);
 }
+int vk_hdr_needs_restart(void) { return vk_hdr_restart_for(cfg_value("NX2NAVI_HDR")); }
 
 void vk_hdr_off(void) { g_native = 0, g_armed = 0; }
 

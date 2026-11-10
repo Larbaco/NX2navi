@@ -74,6 +74,16 @@ void cfg_set(const char *, const char *) {}
 int cfg_save(void) { return 1; }
 int cfg_reset(const char *const *, int) { return 0; }
 int cfg_pending(const char *) { return 0; }   // nothing changed since the start: no "after restart" notes
+int cfg_pending_for(const char *, const char *) { return 0; }
+int cfg_supported(const char *) { return 1; }   // every row shown
+// the menu's draft: nothing is applied or saved here
+int cfg_state(const char *, const char **value) { *value = NULL; return 0; }
+void cfg_hold(const char *, int) {}
+void cfg_revert(const char *, const char *, int) {}
+int cfg_last_save_ok(void) { return 1; }
+int vk_dlaa_needs_restart(void) { return 0; }
+int vk_hdr_restart_for(const char *) { return 0; }
+int vk_dlssg_wanted(void) { return 0; }
 unsigned cfg_version(void) { return 1; }
 void menu_sound_play(MenuSound) {}
 const char *ov_language(void) { return "en-US"; }

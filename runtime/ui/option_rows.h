@@ -1,9 +1,10 @@
 // Settings pages in two panes (ui/option_rows.cpp): option rows on the left, the selected (controller) or hovered (mouse)
-// row's description on the right. Each row shows a setting of the cfg table (cfg.h) and changes it through cfg_set: A
-// steps it (toggle, next value), left and right step it, and the mouse steps it on the two framed arrows beside its
-// value and nowhere else on the row (a click on the row selects it; held on an arrow it repeats). A row marks the
-// default value, says "after restart" while a setting read at start differs from the value the game started with
-// (cfg_pending), and is greyed out with a note when an environment variable fixes it.
+// row's description on the right. Each row shows a setting of the cfg table (cfg.h) and changes it through the draft
+// (below; live settings are cfg_set at once, the others wait for Apply): A steps it (toggle, next value), left and right
+// step it, and the mouse steps it on the two framed arrows beside its value and nowhere else on the row (a click on the
+// row selects it; held on an arrow it repeats). A row marks the default value, says "after restart" while the value it
+// shows (the draft's, else the setting's) differs from the one the game started with (cfg_pending_for), and is greyed
+// out with a note when an environment variable fixes it.
 //
 //   opt_begin("##screen", scale);
 //   opt_toggle("NX2NAVI_FULLSCREEN", UI_MENU_FULLSCREEN, UI_MENU_FULLSCREEN_DESC);
@@ -56,7 +57,7 @@ bool opt_choice_list(const char *key, UiTextId label, const char *const *values,
 // stands for (its restart mark and the environment check).
 int opt_choice_index(const char *key, UiTextId label, const char *const *names, int n, int cur, int def, UiTextId desc,
                      const char *note = nullptr);
-void opt_apply(const char *key, const char *value);   // what a row writes: "" unsets the key; saved a moment later
+void opt_apply(const char *key, const char *value);   // what a row writes: "" unsets the key; joins the draft below
 // A row that runs an action: true on A or a click. id: unique on the page and not a setting ("##copy_info"); value:
 // shown on the right ("" none).
 bool opt_button(const char *id, UiTextId label, UiTextId desc, const char *value = "");
@@ -87,9 +88,44 @@ void opt_bind_header(UiTextId c0, UiTextId c1, UiTextId c2);
 int opt_bind_row(const char *key, const char *label, UiTextId desc, const char *const cells[3], const bool enabled[3],
                  const char *note = nullptr);
 
-// nx2navi.ini is written a moment after the last change (a held slider would rewrite it every frame) and when the menu
-// closes. opt_save_tick: on every frame the menu lays out; force: write now if anything is pending. 1 while a write is
-// pending.
-int opt_save_tick(int force);
-// A change made outside a row (Reset, F10): nx2navi.ini is written as after a row's change.
-void opt_save_soon(void);
+// ---- the draft. Changes made in the menu are not saved as they are made: they wait in a draft until the player applies
+// them (menu.cpp asks when the menu is about to close).
+//  - A preview key (a live setting that is cheap to show: volume, sharpness, the brightness, the bindings) is written at
+//    once with cfg_set so the effect shows; the first original is kept and Discard puts it back.
+//  - A staged key (every setting read at start, and FPS_LIMIT, VK_PRESENT, PAD_LAYOUT, WALK_KEY, MOTION, FULLSCREEN and
+//    WINDOW_SIZE, which would swap the picture, the pacing or the buttons under the player; is_staged in option_rows.cpp)
+//    only waits; Apply writes it.
+// Nothing is written to nx2navi.ini before Apply (opt_draft_apply). A change back to the original value leaves the draft.
+// Rows read their setting through opt_value & co. so a staged change shows; anything else reads cfg_value.
+const char *opt_value(const char *key);   // the draft's value of a staged key, else cfg_value
+const char *opt_get(const char *key);     // as opt_value, else cfg_get (NULL for a key not set)
+// cfg_pending_count over the values the rows show: the restart-only settings whose draft or setting differs from the
+// value the game started with (the Restart button applies the draft first, so its count takes the draft in).
+int opt_pending_count(void);
+int opt_int(const char *key);
+double opt_double(const char *key);
+bool opt_bool(const char *key);
+// A change made outside a row (a binding): key (with or without NX2NAVI_) to value ("" unsets it), named label in the
+// list, which shows from -> to.
+void opt_change(const char *key, const char *value, const char *label, const char *from, const char *to);
+int opt_draft_any(void);     // changes in the draft, hidden ones included; any thread
+int opt_draft_count(void);   // lines the player is shown
+struct OptDraftItem {
+    char label[96], from[96], to[96];
+    bool restart;   // some key of it is read at start only
+};
+bool opt_draft_item(int i, OptDraftItem *out);   // the i-th line, 0-based; false past the last
+void opt_draft_sync(void);                        // once a frame: a key something else changed leaves the draft
+// Writes the staged keys, releases the previews and saves; false if the write failed. timed: FULLSCREEN, WINDOW_SIZE and
+// VK_PRESENT are written but stay held out of every save until opt_display_keep (the "keep these?" timer); the caller
+// then wakes the window (gfx_window_apply_settings) and runs the timer. Without it every key is saved (Restart).
+bool opt_draft_apply(bool timed = false);
+int opt_display_pending(void);     // display keys written by a timed apply and not yet kept or reverted; present thread
+int opt_display_external(void);    // 1 when something else changed one of them since (F11): the player has control
+bool opt_display_keep(void);       // releases them and saves nx2navi.ini; false if the write failed
+// Puts the values from before the apply back (the caller wakes the window again), or, when opt_display_external, keeps
+// what is on screen instead.
+void opt_display_revert(void);
+void opt_draft_discard(void);                     // puts the previews back, drops the staged keys
+// Writes nx2navi.ini now (a toggle outside the draft: a cheat).
+void opt_save_now(void);

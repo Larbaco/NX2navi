@@ -9,6 +9,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <atomic>
+#include <string>
+#include <vector>
+
 #include "imgui.h"
 #include "imgui_internal.h"   // SetKeyOwner, SetFocusID, NavCursorVisible
 
@@ -195,7 +199,7 @@ static void click_test(const char *key, ImVec2 la, ImVec2 lb, ImVec2 ra, ImVec2 
     else if (f == 7) io.AddMouseButtonEvent(ImGuiMouseButton_Left, false);
     else if (f == 12) {
         rt_log("menu: test hook: click on %s of %s: now %s",
-               part == 'l' ? "the left arrow" : part == 'r' ? "the right arrow" : "the body", key, cfg_value(key));
+               part == 'l' ? "the left arrow" : part == 'r' ? "the right arrow" : "the body", key, opt_value(key));
         t.at++, t.frame = 0;
     }
 }
@@ -347,15 +351,15 @@ static int row_text(const char *key, const char *label, const char *desc, const 
         dl->AddText(font, small, ImVec2(nx, ny), v.note ? IM_COL32(250, 206, 130, 255) : SKIN_TEXT_DIM, t, NULL, 0, &nclip);
         if (tw > 0) note_right = nx - fs * 0.6f;
     }
-    // the label and its note, clipped before the value. A restart-only setting says "after restart" while its value
-    // differs from the one the game started with (cfg_pending), so the note marks what a restart would change; the
-    // description says it whatever the value (desc_set)
+    // the label and its note, clipped before the value. A restart-only setting says "after restart" while the value
+    // the row shows (the draft's, before Apply) differs from the one the game started with (cfg_pending_for), so the
+    // note marks what a restart would change; the description says it whatever the value (desc_set)
     ImVec4 clip(p.x, p.y, value_left - fs * 0.6f, p.y + h);
     dl->AddText(font, fs, ImVec2(p.x + pad, ty), off ? kGrey : SKIN_TEXT, label, NULL, 0, &clip);
-    const char *note = disabled                          ? disabled
-                     : off                               ? menu_text(UI_MENU_SET_BY_ENV)
-                     : m && !m->live && cfg_pending(key) ? menu_text(UI_MENU_AFTER_RESTART)
-                                                         : NULL;
+    const char *note = disabled                                               ? disabled
+                     : off                                                    ? menu_text(UI_MENU_SET_BY_ENV)
+                     : m && !m->live && cfg_pending_for(key, opt_value(key)) ? menu_text(UI_MENU_AFTER_RESTART)
+                                                                              : NULL;
     ImVec4 note_clip(p.x, p.y, note_right, p.y + h);
     if (note)
         dl->AddText(font, small, ImVec2(p.x + pad, ny), off ? IM_COL32(200, 150, 90, 255) : SKIN_TEXT_DIM, note, NULL, 0,
@@ -365,6 +369,10 @@ static int row_text(const char *key, const char *label, const char *desc, const 
 }
 
 static int row(const char *key, UiTextId label, UiTextId desc, const RowView &v) {
+    if (!cfg_supported(key)) {   // nothing on this game version reads it: no row, and no grey-out left for the next
+        g_disable_next = false;
+        return 0;
+    }
     return row_text(key, menu_text(label), menu_text(desc), v, false);
 }
 
@@ -374,31 +382,333 @@ int opt_text_row(const char *id, const char *label, const char *value, const cha
     return row_text(id, label, desc, v, movable);
 }
 
-// ---- writing a setting: at once in memory (live settings follow), to nx2navi.ini a moment later (opt_save_tick)
-static uint64_t g_save_at;   // plat_now_ns deadline of the pending write; 0 none
-static bool g_save_logged;
+// ---- the draft: what the player changed since the menu opened and has not applied
+//
+// A change is one of two kinds (is_staged). A preview change is written with cfg_set at once, so the effect shows (a volume
+// slider, the sharpness, the bindings), while its first original is kept: Discard puts it back (cfg_revert), and the entry
+// is held (cfg_hold) so no save made meanwhile writes it. A staged change only waits in the draft, the row shows it
+// (opt_value), and Apply is what writes it. Nothing reaches nx2navi.ini before Apply.
+//
+// The player sees one line per group: the row (or the binding) that made the changes, from what it showed to what it
+// shows. A row that sets several keys (the upscaler) is one group of several changes.
+namespace {
 
-static void apply(const char *key, const char *value) {
-    if (*value) {
-        cfg_set(key, value);
-    } else {   // the automatic choice: the key unset, its line removed from nx2navi.ini
-        const char *k = key;
-        cfg_reset(&k, 1);
-    }
-    opt_save_soon();
-    menu_sound_play(MENU_SOUND_CURSOR);
+struct Group {
+    std::string id;
+    bool has_id;
+    UiTextId label;
+    std::string label_str, from, to;
+};
+
+struct Change {
+    std::string key;       // NX2NAVI_ + upper case
+    std::string gid;       // the group
+    std::string new_val;   // as the row wrote it; "" is the key unset
+    std::string orig_eff;  // the value in effect before the first change
+    const char *orig_val;  // cfg_state's, for cfg_revert
+    int orig_state;
+    bool staged;
+};
+
+std::vector<Group> g_groups;
+std::vector<Change> g_changes;
+std::atomic<int> g_draft_n;   // g_changes.size(), for any thread (menu_toggle)
+unsigned g_sync_ver;
+// The row opt_choice_index answered for, which the opt_apply calls that follow belong to.
+struct { bool valid; std::string gid, from, to; UiTextId label; } g_ctx;
+
+std::string norm_key(const char *key) {
+    std::string k = key;
+    for (char &c : k) c = (char)toupper((unsigned char)c);
+    return k.compare(0, 8, "NX2NAVI_") ? "NX2NAVI_" + k : k;
 }
 
-void opt_save_soon(void) { g_save_at = plat_now_ns() + 400000000ull; }
+// Keys that are live in the table but stay in the draft until Apply: the window, the present mode, HDR and the frame
+// limit change the whole picture or the pacing at once (HDR makes the swapchain again in another format; step 4 puts a
+// "keep these?" timer on all but the frame limit), a pad layout
+// or walk key swaps what the buttons do under the player's hands, and motion starts or stops a device. Every key the
+// table marks as read at start is staged too.
+bool is_staged(const std::string &key) {
+    static const char *const forced[] = {"FPS_LIMIT", "VK_PRESENT", "HDR", "PAD_LAYOUT", "WALK_KEY", "MOTION", "FULLSCREEN", "WINDOW_SIZE"};
+    const CfgMeta *m = cfg_meta(key.c_str());
+    if (!m) return false;   // a key without a row (the bindings) is a live one
+    if (!m->live) return true;
+    for (const char *f : forced)
+        if (!strcmp(f, m->key)) return true;
+    return false;
+}
 
-int opt_save_tick(int force) {
-    if (!g_save_at || (!force && plat_now_ns() < g_save_at)) return g_save_at != 0;
-    g_save_at = 0;
+// The applied value of key, and what a value written for it comes to once "" (unset) is its default.
+std::string eff_now(const std::string &key) {
+    if (cfg_meta(key.c_str())) return cfg_value(key.c_str());
+    const char *v = cfg_get(key.c_str());
+    return v ? v : "";
+}
+
+std::string eff_of(const std::string &key, const std::string &value) {
+    if (!value.empty()) return value;
+    const char *d = cfg_default(key.c_str());
+    return d ? d : "";
+}
+
+Change *find_change(const std::string &key) {
+    for (Change &c : g_changes)
+        if (c.key == key) return &c;
+    return nullptr;
+}
+
+Group *find_group(const std::string &id) {
+    for (Group &g : g_groups)
+        if (g.id == id) return &g;
+    return nullptr;
+}
+
+void write_key(const std::string &key, const std::string &value) {
+    if (!value.empty()) {
+        cfg_set(key.c_str(), value.c_str());
+    } else {   // the automatic choice: the key unset, its line removed from nx2navi.ini
+        const char *k = key.c_str();
+        cfg_reset(&k, 1);
+    }
+}
+
+void erase_change(size_t i) {
+    std::string gid = g_changes[i].gid;
+    g_changes.erase(g_changes.begin() + (std::ptrdiff_t)i);
+    bool used = false;
+    for (const Change &c : g_changes) used |= c.gid == gid;
+    if (!used)
+        for (size_t g = 0; g < g_groups.size(); g++)
+            if (g_groups[g].id == gid) {
+                g_groups.erase(g_groups.begin() + (std::ptrdiff_t)g);
+                break;
+            }
+    g_draft_n.store((int)g_changes.size());
+}
+
+// Puts key at value in the draft. A change back to the value the key had when the draft began leaves the draft.
+void record(const std::string &key, const char *value, const std::string &gid, bool has_id, UiTextId label,
+            const char *label_str, const char *from, const char *to) {
+    Change *c = find_change(key);
+    if (!c) {
+        Change n;
+        n.key = key;
+        n.gid = gid;
+        n.staged = is_staged(key);
+        n.orig_eff = eff_now(key);
+        n.orig_state = cfg_state(key.c_str(), &n.orig_val);
+        if (!n.staged) cfg_hold(key.c_str(), 1);
+        g_changes.push_back(n);
+        c = &g_changes.back();
+    }
+    if (Group *g = find_group(gid)) {
+        g->to = to;
+    } else {
+        g_groups.push_back({gid, has_id, label, label_str ? label_str : "", from, to});
+    }
+    c->new_val = value;
+    if (!c->staged) write_key(key, c->new_val);
+    if (eff_of(key, c->new_val) == c->orig_eff) {   // back where it began
+        if (!c->staged) cfg_revert(key.c_str(), c->orig_val, c->orig_state);
+        erase_change((size_t)(c - g_changes.data()));
+    }
+    g_draft_n.store((int)g_changes.size());
+}
+
+}  // namespace
+
+const char *opt_value(const char *key) {
+    if (Change *c = find_change(norm_key(key)); c && c->staged) {
+        if (!c->new_val.empty()) return c->new_val.c_str();
+        const char *d = cfg_default(key);
+        return d ? d : "";
+    }
+    return cfg_value(key);
+}
+
+const char *opt_get(const char *key) {
+    if (Change *c = find_change(norm_key(key)); c && c->staged) return c->new_val.empty() ? nullptr : c->new_val.c_str();
+    return cfg_get(key);
+}
+
+int opt_int(const char *key) {
+    const char *v = opt_value(key);
+    char *end;
+    long l = strtol(v, &end, 10);
+    return end == v || *end ? cfg_int(key) : (int)l;   // a value that does not parse: the default's number
+}
+
+double opt_double(const char *key) {
+    const char *v = opt_value(key);
+    char *end;
+    double d = strtod(v, &end);
+    return end == v || *end || d != d ? cfg_double(key) : d;
+}
+
+bool opt_bool(const char *key) { return strcmp(opt_value(key), "0") != 0; }
+
+void opt_change(const char *key, const char *value, const char *label, const char *from, const char *to) {
+    std::string k = norm_key(key);
+    g_ctx.valid = false;
+    record(k, value, k, false, UI_MENU_CONTINUE, label, from, to);
+}
+
+int opt_draft_any(void) { return g_draft_n.load(std::memory_order_relaxed); }
+
+// The lines the player is shown: the groups whose text changed (an upscaler picked and picked back leaves keys written
+// but nothing to say).
+int opt_draft_count(void) {
+    int n = 0;
+    for (const Group &g : g_groups) n += g.from != g.to;
+    return n;
+}
+
+// Live settings that still wait for a restart in some states (the rows' own "after restart" notes in menu.cpp): the upscaler
+// cannot start in this run (vk_dlaa_needs_restart), NVIDIA frame generation is set up with the device (vk_dlssg_wanted),
+// and HDR to or from the game's own, or on in a run started without the HDR path (vk_hdr_restart_for).
+extern "C" int vk_dlaa_needs_restart(void);
+extern "C" int vk_hdr_restart_for(const char *value);
+extern "C" int vk_dlssg_wanted(void);
+static bool live_needs_restart(const Change &c) {
+    if (c.key == "NX2NAVI_FRAMEGEN") return (eff_of(c.key, c.new_val) == "dlss") != (vk_dlssg_wanted() != 0);
+    if (c.key == "NX2NAVI_HDR") return vk_hdr_restart_for(eff_of(c.key, c.new_val).c_str()) != 0;
+    if (c.key == "NX2NAVI_DLAA" || c.key == "NX2NAVI_DLSS" || c.key == "NX2NAVI_TAA" || c.key == "NX2NAVI_DLSS_PRESET") return vk_dlaa_needs_restart() != 0;
+    return false;
+}
+
+int opt_pending_count(void) {
+    int n = 0;
+    char name[80];
+    for (int i = 0; const CfgMeta *m = cfg_meta_at(i); i++) {
+        snprintf(name, sizeof name, "NX2NAVI_%s", m->key);
+        n += cfg_pending_for(name, opt_value(name));
+    }
+    return n;
+}
+
+bool opt_draft_item(int i, OptDraftItem *out) {
+    for (const Group &g : g_groups) {
+        if (g.from == g.to || i--) continue;
+        snprintf(out->label, sizeof out->label, "%s", g.has_id ? menu_text(g.label) : g.label_str.c_str());
+        snprintf(out->from, sizeof out->from, "%s", g.from.c_str());
+        snprintf(out->to, sizeof out->to, "%s", g.to.c_str());
+        out->restart = false;
+        for (const Change &c : g_changes) {
+            if (c.gid != g.id) continue;
+            const CfgMeta *m = cfg_meta(c.key.c_str());
+            if (c.staged) out->restart |= m && !m->live && cfg_pending_for(c.key.c_str(), eff_of(c.key, c.new_val).c_str());
+            out->restart |= live_needs_restart(c);
+        }
+        return true;
+    }
+    return false;
+}
+
+// Something else changed a key of the draft (F11 toggled the fullscreen the draft also changes, F10 the overlay): the
+// change that came from outside stays and that key leaves the draft.
+void opt_draft_sync(void) {
+    if (g_changes.empty() || cfg_version() == g_sync_ver) return;
+    g_sync_ver = cfg_version();
+    for (size_t i = g_changes.size(); i-- > 0;) {
+        const Change &c = g_changes[i];
+        if (eff_now(c.key) == (c.staged ? c.orig_eff : eff_of(c.key, c.new_val))) continue;
+        if (!c.staged) cfg_hold(c.key.c_str(), 0);
+        erase_change(i);
+    }
+}
+
+void opt_draft_discard(void) {
+    for (const Change &c : g_changes)
+        if (!c.staged) cfg_revert(c.key.c_str(), c.orig_val, c.orig_state);
+    g_changes.clear();
+    g_groups.clear();
+    g_ctx.valid = false;
+    g_draft_n.store(0);
+}
+
+static bool g_save_logged;
+
+void opt_save_now(void) {
     if (!cfg_save() && !g_save_logged) {
         g_save_logged = true;
         rt_log("menu: could not write nx2navi.ini; the changed settings hold for this session");
     }
+}
+
+// ---- the display keys a "keep these?" timer watches (menu.cpp keep_confirm)
+//
+// An Apply with timed set writes FULLSCREEN, WINDOW_SIZE and VK_PRESENT but keeps them held (cfg_hold), so no save made
+// while the timer runs (F10, a cheat, the window closing) writes them; opt_display_keep saves them, opt_display_revert puts
+// the values from before the Apply back. They are the live keys that change the window or the swapchain and so can leave
+// the player without a usable picture. The restart-only display keys (HDR, GPU_INDEX) and the other live ones are not here.
+namespace {
+struct Pending {
+    std::string key, applied;   // applied: the value in effect right after the Apply
+    const char *orig_val;
+    int orig_state;
+};
+std::vector<Pending> g_display;
+
+bool is_timed(const std::string &key) {
+    static const char *const timed[] = {"NX2NAVI_FULLSCREEN", "NX2NAVI_WINDOW_SIZE", "NX2NAVI_VK_PRESENT", "NX2NAVI_HDR"};
+    for (const char *t : timed)
+        if (key == t) return true;
+    return false;
+}
+}  // namespace
+
+bool opt_draft_apply(bool timed) {
+    g_display.clear();
+    for (const Change &c : g_changes) {
+        if (c.staged && timed && is_timed(c.key) && !live_needs_restart(c)) {   // HDR to or from native: no timer
+            cfg_hold(c.key.c_str(), 1);   // before the write: no save in between can take the new value
+            write_key(c.key, c.new_val);
+            g_display.push_back({c.key, eff_of(c.key, c.new_val), c.orig_val, c.orig_state});
+        } else if (c.staged) {
+            write_key(c.key, c.new_val);
+        } else {
+            cfg_hold(c.key.c_str(), 0);
+        }
+    }
+    g_changes.clear();
+    g_groups.clear();
+    g_ctx.valid = false;
+    g_draft_n.store(0);
+    opt_save_now();   // the held display keys stay out of it
+    return cfg_last_save_ok() != 0;
+}
+
+int opt_display_pending(void) { return (int)g_display.size(); }
+
+// F11 changed FULLSCREEN (or anything else set a pending key) after the Apply.
+int opt_display_external(void) {
+    for (const Pending &p : g_display)
+        if (eff_now(p.key) != p.applied) return 1;
     return 0;
+}
+
+bool opt_display_keep(void) {
+    for (const Pending &p : g_display) cfg_hold(p.key.c_str(), 0);
+    g_display.clear();
+    opt_save_now();
+    return cfg_last_save_ok() != 0;
+}
+
+void opt_display_revert(void) {
+    if (opt_display_external()) {   // the player took control with F11: what is on screen now stays
+        opt_display_keep();
+        return;
+    }
+    for (const Pending &p : g_display) cfg_revert(p.key.c_str(), p.orig_val, p.orig_state);
+    g_display.clear();
+}
+
+// What a row writes: the draft takes it (a preview key is written too), the cursor sound plays.
+static void apply(const char *key, const char *value, UiTextId label, const char *from, const char *to) {
+    std::string k = norm_key(key);
+    g_ctx.valid = false;
+    record(k, value, k, true, label, nullptr, from, to);
+    menu_sound_play(MENU_SOUND_CURSOR);
 }
 
 // ---- rows
@@ -411,11 +721,11 @@ static float on_off_width(void) {
 
 bool opt_toggle(const char *key, UiTextId label, UiTextId desc, bool inverted) {
     const char *d = cfg_default(key);
-    bool set = cfg_bool(key) != 0, def = d && *d && strcmp(d, "0") != 0;
+    bool set = opt_bool(key), def = d && *d && strcmp(d, "0") != 0;
     bool on = set != inverted;   // what the row shows
     RowView v = {menu_text(on ? UI_MENU_ON : UI_MENU_OFF), set == def, true, NULL, on_off_width()};
     if (!row(key, label, desc, v)) return false;   // any step flips it
-    apply(key, set ? "0" : "1");
+    apply(key, set ? "0" : "1", label, v.value, menu_text(on ? UI_MENU_OFF : UI_MENU_ON));
     return true;
 }
 
@@ -423,10 +733,10 @@ bool opt_toggle_value(const char *key, UiTextId label, UiTextId desc, const char
     // the default as the player's profile has it (cfg_default: the Steam Deck's fifo), which is also what "on" writes
     // when it is an on value, so turning the switch off and on again puts the profile's own value back
     const char *d = cfg_default(key);
-    bool on = strcmp(cfg_value(key), off_value) != 0, def = d && strcmp(d, off_value) != 0;
+    bool on = strcmp(opt_value(key), off_value) != 0, def = d && strcmp(d, off_value) != 0;
     RowView v = {menu_text(on ? UI_MENU_ON : UI_MENU_OFF), on == def, true, note, on_off_width()};
     if (!row(key, label, desc, v)) return false;   // any step flips it
-    apply(key, on ? off_value : def && *d ? d : on_value);
+    apply(key, on ? off_value : def && *d ? d : on_value, label, v.value, menu_text(on ? UI_MENU_OFF : UI_MENU_ON));
     return true;
 }
 
@@ -483,7 +793,7 @@ void opt_text(UiTextId text, bool warn) { column_text(menu_text(text), warn ? &k
 bool opt_choice_list(const char *key, UiTextId label, const char *const *values, const char *const *names, int n,
                      UiTextId desc, int cur, const char *note) {
     const char *d = cfg_default(key);
-    const char *now = cfg_value(key);
+    const char *now = opt_value(key);
     if (cur < 0)
         for (int i = 0; i < n; i++)
             if (!strcmp(values[i], now)) cur = i;
@@ -498,7 +808,7 @@ bool opt_choice_list(const char *key, UiTextId label, const char *const *values,
     else if (step == 2) nv = (cur + 1) % n;               // A / click: the next value, round to the first
     else nv = cur + step < 0 ? 0 : cur + step >= n ? n - 1 : cur + step;   // left / right stop at the ends
     if (nv == cur) return false;
-    apply(key, values[nv]);
+    apply(key, values[nv], label, v.value, names[nv]);
     return true;
 }
 
@@ -511,17 +821,14 @@ int opt_choice_index(const char *key, UiTextId label, const char *const *names, 
     int nv = cur < 0 ? (step < 0 ? n - 1 : 0) : step == 2 ? (cur + 1) % n : cur + step < 0 ? 0 : cur + step >= n ? n - 1 : cur + step;
     if (nv == cur) return -1;
     menu_sound_play(MENU_SOUND_CURSOR);
+    g_ctx = {true, norm_key(key), v.value, names[nv], label};
     return nv;
 }
 
 void opt_apply(const char *key, const char *value) {   // as apply, without its sound: a row writing several keys
-    if (*value) {
-        cfg_set(key, value);
-    } else {
-        const char *k = key;
-        cfg_reset(&k, 1);
-    }
-    opt_save_soon();
+    std::string k = norm_key(key);
+    if (g_ctx.valid) record(k, value, g_ctx.gid, true, g_ctx.label, nullptr, g_ctx.from.c_str(), g_ctx.to.c_str());
+    else record(k, value, k, false, UI_MENU_CONTINUE, key, "", value);   // not under a row: named by its key
 }
 
 bool opt_choice(const char *key, UiTextId label, const UiTextId *names, int n, UiTextId desc, const char *note) {
@@ -545,13 +852,13 @@ bool opt_choice(const char *key, UiTextId label, const UiTextId *names, int n, U
 
 bool opt_slider(const char *key, UiTextId label, float lo, float hi, UiTextId desc, float step, const char *fmt,
                 const char *note, const char *fallback) {
-    const char *set = cfg_get(key);
+    const char *set = opt_get(key);
     const char *src = fallback && !(set && *set) ? fallback : key;   // unset: show the value in effect, the fallback's
     const char *d = cfg_default(src);
     // A key without a default of its own (the per-stick dead zones) defaults to its fallback: the "default" mark
     // follows the fallback's default, not 0, even once the key is set.
     if (fallback && !(d && *d)) d = cfg_default(fallback);
-    double v = cfg_double(src), def = d && *d ? strtod(d, NULL) : lo;
+    double v = opt_double(src), def = d && *d ? strtod(d, NULL) : lo;
     char shown[48], ends[2][48];
     snprintf(shown, sizeof shown, fmt, v);
     snprintf(ends[0], sizeof ends[0], fmt, (double)lo);
@@ -570,7 +877,10 @@ bool opt_slider(const char *key, UiTextId label, float lo, float hi, UiTextId de
     if (step >= 1) snprintf(out, sizeof out, "%d", (int)lround(n));
     else snprintf(out, sizeof out, "%g", round(n / step) * step);
     // Landing on the fallback's value unsets the key (its line leaves nx2navi.ini), so the row follows the fallback again.
-    apply(key, fallback && fabs(n - cfg_double(fallback)) < step * 0.01 ? "" : out);
+    const bool unset = fallback && fabs(n - opt_double(fallback)) < step * 0.01;
+    char to[48];
+    snprintf(to, sizeof to, fmt, unset ? opt_double(fallback) : n);
+    apply(key, unset ? "" : out, label, shown, to);
     return true;
 }
 

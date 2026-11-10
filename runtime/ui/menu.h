@@ -4,7 +4,8 @@
 // present path's command buffer.
 //
 // F1 or Esc on the keyboard and Minus and Plus held together (consumed in poll_merged, input_menu_gate in input.h) open it;
-// F1, Esc, B or "Continue" close it. While it is open the game gets no input (input_menu, input.h) and keeps running; the
+// F1, Esc, B or "Continue" close it; with changes not applied yet (option_rows.h, the draft) they open "Apply changes?" first.
+// menu_toggle on another thread then only raises a request that the present thread answers. While it is open the game gets no input (input_menu, input.h) and keeps running; the
 // cursor is released from the mouse camera. Tabs Screen, Game, Mods, Sound, Controls and Menu (L / R or Q / E switch
 // them) hold option rows (ui/option_rows.h) over the cfg settings and the mods folder (mods.h); the bottom row has
 // "Continue" and "Quit game".
@@ -25,6 +26,7 @@ extern "C" {
 // ---- state, any thread
 int menu_is_open(void);
 void menu_toggle(void);                   // F1 / Esc on the keyboard, Minus+Plus on the pad; not before the game's first frame
+void menu_cfg_reload(void);               // Ctrl+F5: nx2navi.ini is read again on the present thread, with a short notice
 void menu_perf_cycle(void);               // F10: the performance overlay off, fps, full
 
 // ---- events from the window adapter, used only while the menu is open. key: an ImGuiKey; coordinates in pixels of the

@@ -682,6 +682,10 @@ int probe_cfg(void) {
         for (int j = i + 1; cfg_meta_at(j); j++)
             if (!strcmp(cfg_meta_at(i)->key, cfg_meta_at(j)->key))
                 fprintf(stderr, "FAIL cfg: %s has two rows in the defaults table\n", cfg_meta_at(i)->key), fails++;
+    // every setting the menu lists has a section for cfg_save (a key without one would go to [misc], not where it belongs)
+    for (int i = 0; cfg_meta_at(i); i++)
+        if (!cfg_has_section(cfg_meta_at(i)->key))
+            fprintf(stderr, "FAIL cfg: %s has no section in cfg.c's sections table\n", cfg_meta_at(i)->key), fails++;
     printf("probe-cfg: %s\n", fails ? "FAIL" : "ok");
     return fails ? 1 : 0;
 }

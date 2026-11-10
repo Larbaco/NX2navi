@@ -38,7 +38,7 @@ from other projects, with its license, is listed in [THIRD_PARTY_NOTICES.md](../
   connected gamepad is open; the game reads the one pressed last, `input.c`). Voice: libopus. Movies: a host VP9
   decoder over libvpx replaces the SDK's `movie::Decoder` (`runtime/ov_movie.c`).
 - Settings and menu: every key with its default is in one table (`cfg.c`), read from `nx2navi.ini` and `NX2NAVI_*`
-  variables and written back when the in-game menu changes it. The menu and the performance overlay are Dear ImGui,
+  variables and written back when the player applies the in-game menu's changes (a draft; `docs/controls.md`). The menu and the performance overlay are Dear ImGui,
   drawn into the swapchain image (`runtime/ui/`); their text is in `ui_text.c`.
 - Log: in a game run the lines go through a queue to a thread that writes them (`runtime/logq.c`), so a stalled
   write to the log file or the console does not hold the thread that logged. A thread's lines reach the log in the

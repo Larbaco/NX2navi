@@ -58,7 +58,7 @@ extern "C" bool tab_cheats(float scale) {
             snprintf(desc, sizeof desc, "%s", menu_text(text));
         if (opt_toggle_text(c->key, c->name, desc, cheats_on(i) != 0)) {
             cheats_set(i, !cheats_on(i));
-            opt_save_soon();
+            opt_save_now();   // a cheat is a switch of the game, not a setting of the draft: it is kept at once
         }
     }
     opt_end();

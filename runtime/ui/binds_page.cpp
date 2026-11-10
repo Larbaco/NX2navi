@@ -1,5 +1,6 @@
 // The remapping rows of the Controls tab (binds_page.h): edits a copy of the input tables (input_map.h), writes the NX2NAVI_BIND_* lines that
-// give the copy, and input_win.c applies them at its next poll; nx2navi.ini follows a moment later (opt_save_soon). The
+// give the copy, and input_win.c applies them at its next poll; the lines join the menu's draft (opt_change) and nx2navi.ini
+// is written when the player applies it. The
 // gamepad cells show and change the table of the button layout in use (NX2NAVI_PAD_LAYOUT).
 #include <stdio.h>
 #include <string.h>
@@ -103,7 +104,7 @@ static const char *pad_label(int p) {
 // The layout the gamepad cells show: the one in effect, or without a gamepad the one the setting names (Xbox for auto).
 static int shown_layout(void) {
     int l = input_pad_layout();
-    return l >= 0 ? l : input_pad_layout_pick(cfg_value("NX2NAVI_PAD_LAYOUT"), 0);
+    return l >= 0 ? l : input_pad_layout_pick(opt_value("NX2NAVI_PAD_LAYOUT"), 0);
 }
 
 // Writes the bind_ line of every action whose line for m differs from the one set; a line at the defaults goes away.
@@ -114,15 +115,10 @@ static void write_lines(const InputMap *m) {
         input_map_line(m, a, line, sizeof line);
         const char *now = cfg_get(var);
         if (!strcmp(line, now ? now : "")) continue;
-        if (line[0]) {
-            cfg_set(var, line);
-        } else {
-            const char *k = var + strlen("NX2NAVI_");
-            cfg_reset(&k, 1);
-        }
+        const char *def = menu_text(UI_MENU_DEFAULT_MARK);
+        opt_change(var, line, action_label(a), now && *now ? now : def, line[0] ? line : def);   // previewed now, saved on Apply
         rt_log("menu: bind_%s = %s", input_action_name(a), line[0] ? line : "(default)");
     }
-    opt_save_soon();
 }
 
 static void set_note(int action, UiTextId fmt, const char *a, const char *b) {
@@ -153,8 +149,15 @@ static void reset_binds(void) {
         snprintf(names[a], sizeof names[a], "BIND_%s", input_action_name(a));
         keys[a] = names[a];
     }
-    int n = cfg_reset(keys, ACTION_COUNT);
-    opt_save_soon();
+    int n = 0;
+    for (int a = 0; a < ACTION_COUNT; a++) {
+        char var[48];
+        snprintf(var, sizeof var, "NX2NAVI_%s", keys[a]);
+        const char *now = cfg_get(var);
+        if (!now || !*now || cfg_from_env(var)) continue;   // at the defaults already, or fixed by the environment
+        opt_change(var, "", action_label(a), now, menu_text(UI_MENU_DEFAULT_MARK));
+        n++;
+    }
     g_note_action = -1;
     rt_log("menu: reset %d button bindings", n);
 }

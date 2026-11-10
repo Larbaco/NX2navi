@@ -218,6 +218,7 @@ const char *const *vk_color_preset(const char *name);
 int vk_hdr_armed(void);
 int vk_hdr_wanted(void);
 int vk_hdr_needs_restart(void);   // the menu's HDR row: the value set takes effect at the next start
+int vk_hdr_restart_for(const char *value);   // the same for a value the menu's draft holds
 void vk_hdr_off(void);   // probes that read back 8-bit swapchain pixels: SDR whatever the setting
 int vk_hdr_surface_format(const VkSurfaceFormatKHR *f, uint32_t n, VkSurfaceFormatKHR *out);
 void vk_hdr_metadata(VkSwapchainKHR sc, int new_sc);

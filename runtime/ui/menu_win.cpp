@@ -66,6 +66,11 @@ extern "C" int menu_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res)
             *res = 0;
             return 1;
         }
+        if (w == VK_F5 && (GetKeyState(VK_CONTROL) & 0x8000)) {   // F5 alone stays a bindable key
+            if (!(l & (1 << 30))) menu_cfg_reload();
+            *res = 0;
+            return 1;
+        }
         // a held Esc's repeats: the press that opened the menu is not queued, so its first repeat would close it
         if (w == VK_ESCAPE && (l & (1 << 30))) return 0;
         [[fallthrough]];

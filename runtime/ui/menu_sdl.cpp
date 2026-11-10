@@ -57,6 +57,10 @@ extern "C" void menu_sdl_event(const SDL_Event *e) {
             if (!e->key.repeat) menu_perf_cycle();
             return;
         }
+        if (e->key.scancode == SDL_SCANCODE_F5 && (e->key.mod & SDL_KMOD_CTRL)) {   // F5 alone stays a bindable key
+            if (!e->key.repeat) menu_cfg_reload();
+            return;
+        }
         // a held Esc's repeats: the press that opened the menu is not queued, so its first repeat would close it
         if (e->key.scancode == SDL_SCANCODE_ESCAPE && e->key.repeat) return;
         [[fallthrough]];

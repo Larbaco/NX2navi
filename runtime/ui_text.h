@@ -113,6 +113,16 @@ typedef enum {
     // "Restart now" under the prompts while they change after restart, and its confirmation (Cancel: UI_MENU_RESET_NO)
     UI_MENU_RESTART, UI_MENU_RESTART_DESC, UI_MENU_RESTART_CONFIRM, UI_MENU_QUIT_CONFIRM, UI_MENU_RESTART_YES, UI_MENU_RESTART_SAVING, UI_MENU_QUIT_SAVING,
     UI_MENU_RESTART_COUNT,   // the bar's Restart with the count of settings waiting for it (printf: %d)
+    // the box that asks about the changes made in the menu when it is left (ui/menu.cpp apply_confirm), and the lines
+    // restarting and quitting add to their confirmation while there are such changes
+    UI_MENU_DRAFT_TITLE, UI_MENU_DRAFT_APPLY, UI_MENU_DRAFT_DISCARD, UI_MENU_DRAFT_KEEP,
+    UI_MENU_DRAFT_RESTART_NOTE, UI_MENU_DRAFT_QUIT_NOTE,
+    // after Apply: the "keep these display settings?" box with its countdown (a printf format with one %d), and the
+    // "restart now / later" box for settings read at start
+    UI_MENU_KEEP_TITLE, UI_MENU_KEEP_COUNTDOWN, UI_MENU_KEEP_YES, UI_MENU_KEEP_REVERT,
+    UI_MENU_RESTART_NOW_TITLE, UI_MENU_RESTART_NOW, UI_MENU_RESTART_LATER,
+    // the notice Ctrl+F5 shows after reading nx2navi.ini again (printf formats: changed / after restart [/ rejected])
+    UI_MENU_RELOAD_NONE, UI_MENU_RELOAD_DONE, UI_MENU_RELOAD_REJECTED, UI_MENU_RELOAD_FAILED, UI_MENU_RELOAD_BUSY,
     UI_MENU_GROUP_STICKS, UI_MENU_LSTICK_DEADZONE, UI_MENU_RSTICK_DEADZONE, UI_MENU_STICK_DEADZONE_DESC,
     UI_MENU_STICK_DEADZONE_NOW, UI_MENU_STICK_SENS, UI_MENU_STICK_SENS_DESC,
     UI_MENU_MOUSE_MODE, UI_MENU_MOUSE_MODE_DESC, UI_MENU_MOUSE_STICK, UI_MENU_MOUSE_DIRECT,
