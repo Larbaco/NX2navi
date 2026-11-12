@@ -80,6 +80,7 @@
 #include "gfx.h"
 #include "host.h"
 #include "platform/platform.h"
+#include "prp_file.h"
 
 #define CONTROL_SIZE 0x880
 #define CODE_SKIP 0x30                                     // graphics code starts after the first 0x30 bytes of the program
@@ -129,6 +130,7 @@ struct GfxShader {
                                                            // (4 bits per target, the SPH omap); 0 unknown (older translations)
     uint8_t carried;                                       // 1 + the previous identity (C.prev) that translated it; 0 the
                                                            // current translator
+    uint8_t fresh;                                         // translated in this process (translate_one)
 };
 
 static PlatMutex cache_lock = PLAT_MUTEX_INIT;                  // memory cache
@@ -1973,6 +1975,7 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
     }
     in_store(s->iid, stage, control, code, r, a);
     plat_inc64(&n_xlated);
+    s->fresh = 1;
     return mem_insert(s);
 }
 
@@ -2211,24 +2214,31 @@ static const GfxShader *get_async_one(Req r, int stage, const uint8_t *control, 
 }
 
 const GfxShader *gfx_shader_await(int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size,
-                                  const GfxShaderAnswers *a) {
-    int pending;
+                                  const GfxShaderAnswers *a, uint32_t wait_ms, int *pending) {
     uint8_t ctl2[CONTROL_SIZE];
     control = nvn2_control(control, ctl2);
-    const GfxShader *s = gfx_shader_get_async(stage, control, code, code_size, a, &pending);
+    const GfxShader *s = gfx_shader_get_async(stage, control, code, code_size, a, pending);
     Req r;
-    if (!pending || !req_init(&r, stage, control, code, code_size, NULL, a)) return s;
+    if (!*pending) return s;
+    *pending = 0;
+    if (!req_init(&r, stage, control, code, code_size, NULL, a)) return s;
     uint64_t p0 = perf_begin();   // the wait counts as the render thread's translation time
+    uint64_t end = wait_ms == UINT32_MAX ? 0 : plat_now_ms() + wait_ms, now = 0;
     plat_mutex_lock(&X.lock);
     to_front(&X.lhead, &X.ltail, r.key);                   // queued: to the front, a worker takes it next
     to_front(&X.head, &X.tail, r.key);
     XWait *w;
-    while ((w = *wait_slot(r.key)) && !w->failed) plat_cond_wait(&X.done, &X.lock);
+    while ((w = *wait_slot(r.key)) && !w->failed && (!end || (now = plat_now_ms()) < end)) {
+        if (end) plat_cond_wait_ms(&X.done, &X.lock, (uint32_t)(end - now));
+        else plat_cond_wait(&X.done, &X.lock);
+    }
+    int failed = w && w->failed;
     plat_mutex_unlock(&X.lock);
     perf_end(PERF_XLATE, p0);
-    if (w) return NULL;                                    // failed: logged by the worker
-    s = gfx_shader_get_async(stage, control, code, code_size, a, &pending);
-    return pending ? NULL : s;
+    if (failed) return NULL;                               // logged by the worker
+    if (w) return *pending = 1, NULL;                      // the wait ended first
+    s = gfx_shader_get_async(stage, control, code, code_size, a, pending);
+    return *pending ? NULL : s;
 }
 
 uint64_t gfx_shader_async_done(void) { return (uint64_t)n_async; }
@@ -2236,6 +2246,8 @@ uint64_t gfx_shader_async_done(void) { return (uint64_t)n_async; }
 void gfx_shader_counts(uint64_t *keys, uint64_t *translated) { *keys = (uint64_t)n_keys, *translated = (uint64_t)n_xlated; }
 
 const uint8_t *gfx_shader_key(const GfxShader *s) { return s->key; }
+
+int gfx_shader_origin(const GfxShader *s) { return s->fresh ? 2 : s->carried ? 1 : 0; }
 
 const uint8_t *gfx_shader_input_id(const GfxShader *s) { return s->iid; }
 
@@ -2411,6 +2423,8 @@ const uint32_t *gfx_shader_spirv(const GfxShader *s, uint64_t *words) {
     if (words) *words = s->words;
     return s->spirv;
 }
+
+const char *gfx_shader_res_json(const GfxShader *s) { return s->reflection; }
 
 // The guest program a shader was translated from, as its stored inputs hold it (the whole program: NVN2 code from its
 // first byte), written to path for a disassembler (NX2NAVI_DUMP's sh_<hash>.code), and next to it <path>.job, the
@@ -2809,10 +2823,40 @@ void gfx_shader_prepare_recorded(int threads, int procs) {
 }
 
 // ---- prepared variants (shader-prepared.bin next to pipeline-keys.bin)
-// "NX2NSPRP", version, record size; records: stage, priority, 2 zero bytes, input id. gfx_shader_prepare_seed writes
+// The layout is prp_file.h's: a head that says what the list was prepared from (the two seed files and the
+// translator), then one record per variant: stage, priority, 2 zero bytes, input id. gfx_shader_prepare_seed writes
 // them in priority order, one per input id; gfx_shader_warm_list reads them at boot.
-#define PRP_VERSION 1
-#define PRP_REC 36
+
+// The sha256 of the whole file; 0 when it cannot be read.
+static int file_sha256(const char *path, uint8_t out[32]) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);   // a seed past 2 GB is not read by rec_read either
+    fseek(f, 0, SEEK_SET);
+    uint8_t *b = len > 0 ? malloc((size_t)len) : NULL;
+    int ok = b && fread(b, 1, (size_t)len, f) == (size_t)len;
+    fclose(f);
+    if (ok) rt_sha256(b, (size_t)len, out);
+    free(b);
+    return ok;
+}
+
+// The records of the prepared list at path (PRP_REC bytes each, malloc'd; their count in *n), NULL without any.
+// *from, *has_from (both optional): what a version 2 file says it was prepared from.
+uint8_t *gfx_shader_prepared_read(const char *path, size_t *n, PrpFrom *from, int *has_from) {
+    uint64_t size = 0;
+    uint8_t *f = plat_file_read(path, &size), *out = NULL;
+    PrpFrom fr = {{0}};
+    int has = 0;
+    const uint8_t *recs = prp_parse(f, f ? size : 0, n, &fr, &has);
+    if (recs && (out = malloc(*n * PRP_REC))) memcpy(out, recs, *n * PRP_REC);
+    if (!out) *n = 0;
+    if (from) *from = fr;
+    if (has_from) *has_from = has;
+    free(f);
+    return out;
+}
 
 int gfx_shader_prepare_seed(const char *dir, int threads, int procs) {
     char ans[PATH_CAP + 32], prg[PATH_CAP + 32], out[PATH_CAP + 32];
@@ -2822,6 +2866,23 @@ int gfx_shader_prepare_seed(const char *dir, int threads, int procs) {
     double t0 = (double)plat_now_ms();
     uint64_t fail0 = (uint64_t)n_failures;
     uint8_t *ab = NULL, (*iid)[32] = NULL;
+    // What this list is prepared from goes into its head (prp_file.h): the seed as it is on the disk now, and the
+    // translator before the host options are mixed in, which is what nx2navi_xlate.id holds. The list there before
+    // is replaced whole at the end; the log says whether it came from this seed.
+    paths();
+    PrpFrom from = {{0}}, was;
+    int seeded = file_sha256(prg, from.programs) && file_sha256(ans, from.answers), had = 0;
+    memcpy(from.translator, xlate_base, 32);
+    size_t n_was = 0;
+    free(gfx_shader_prepared_read(out, &n_was, &was, &had));
+    if (seeded && n_was) {
+        int same_seed = had && !memcmp(was.programs, from.programs, 32) && !memcmp(was.answers, from.answers, 32);
+        int same_xl = had && !memcmp(was.translator, from.translator, 32);
+        rt_log("gfx_shader: prepare: %s holds %zu variants %s; it is replaced by this preparation", out, n_was,
+               !had ? "and does not say what they were prepared from"
+               : !same_seed ? "prepared from another seed"
+               : !same_xl ? "prepared from this seed by another translator" : "prepared from this seed and translator");
+    }
     // For the whole run: the variants built into the driver's cache after it (vk_pipeline.c lb_warm_prepared) are the
     // current translator's, as before carrying existed.
     plat_inc32(&C.suspended);
@@ -2841,18 +2902,21 @@ int gfx_shader_prepare_seed(const char *dir, int threads, int procs) {
         by[r[1]]++, stages[r[0]]++, u++;
     }
     free(seen.v);
-    RecHeader h = {{'N', 'X', '2', 'N', 'S', 'P', 'R', 'P'}, PRP_VERSION, PRP_REC};
-    uint8_t *file = recs ? malloc(sizeof h + u * PRP_REC + 1) : NULL;
+    uint8_t *file = recs ? malloc(PRP_HEAD + PRP_FROM_SIZE + u * PRP_REC + 1) : NULL;
     int ok = file != NULL;
     if (ok) {
-        memcpy(file, &h, sizeof h), memcpy(file + sizeof h, recs, u * PRP_REC);
-        ok = plat_file_write_atomic(out, file, sizeof h + u * PRP_REC);
+        size_t head = prp_head_write(file, &from);
+        memcpy(file + head, recs, u * PRP_REC);
+        ok = plat_file_write_atomic(out, file, head + u * PRP_REC);
     }
-    char msg[640];
+    char msg[768];
     snprintf(msg, sizeof msg, "gfx_shader: prepared %zu shader variants (vertex %zu, fragment %zu, compute %zu; title %zu, "
-             "warm-up %zu, other %zu) from %lld seed records, %llu translations failed, in %.0f ms; %s %s", u,
+             "warm-up %zu, other %zu) from %lld seed records (seed programs %02x%02x%02x%02x, answers %02x%02x%02x%02x, "
+             "translator %02x%02x%02x%02x), %llu translations failed, in %.0f ms; %s %s", u,
              stages[GFX_STAGE_VS], stages[GFX_STAGE_FS], stages[GFX_STAGE_CS], by[0], by[1], by[2], n,
-             (unsigned long long)((uint64_t)n_failures - fail0), (double)plat_now_ms() - t0,
+             from.programs[0], from.programs[1], from.programs[2], from.programs[3], from.answers[0], from.answers[1],
+             from.answers[2], from.answers[3], from.translator[0], from.translator[1], from.translator[2],
+             from.translator[3], (unsigned long long)((uint64_t)n_failures - fail0), (double)plat_now_ms() - t0,
              ok ? "wrote" : "cannot write", out);
     rt_log("%s", msg);
     printf("%s\n", msg);
@@ -2873,7 +2937,17 @@ size_t gfx_shader_warm_list(GfxWarmEnt **out) {
     plat_mutex_lock(&rec_io);                      // no append meanwhile
     rec_read(RC.ans_path, "NX2NSANS", ANS_VERSION, ANS_REC, &ab, &an);
     plat_mutex_unlock(&rec_io);
-    rec_read(prp, "NX2NSPRP", PRP_VERSION, PRP_REC, &pb, &pn);
+    PrpFrom from;
+    int has_from = 0;
+    pb = gfx_shader_prepared_read(prp, &pn, &from, &has_from), pn *= PRP_REC;
+    if (pb && has_from)
+        rt_log("gfx_shader: %s was prepared from seed programs %02x%02x%02x%02x, answers %02x%02x%02x%02x, by translator "
+               "%02x%02x%02x%02x%s", prp, from.programs[0], from.programs[1], from.programs[2], from.programs[3],
+               from.answers[0], from.answers[1], from.answers[2], from.answers[3], from.translator[0], from.translator[1],
+               from.translator[2], from.translator[3],
+               memcmp(from.translator, xlate_base, 32) ? " (not this one: its translations are carried over)" : "");
+    else if (pb)
+        rt_log("gfx_shader: %s does not say what it was prepared from (written before the list recorded it)", prp);
     size_t na = an / ANS_REC, np = pn / PRP_REC, n = 0;
     GfxWarmEnt *e = calloc(na + np + 1, sizeof *e);
     Set64 seen = {0};
@@ -3292,4 +3366,32 @@ void gfx_shader_carry_start(void) {
         return;
     }
     if (!plat_thread_spawn(carry_main, NULL, "shader carry", 0)) rt_log("gfx_shader: carry: cannot start the background pass");
+}
+
+// NX2NAVI_TRACE=perf "mem: sizes" (perf.c): the shader memory cache's entries with their SPIR-V and reflection bytes
+// (kept for the life of the process), the remembered failures, the translation and load queues, and the translator
+// processes. cache_lock is held shared: lookups go on, a translator's insert waits for the walk.
+void gfx_shader_sizes(PerfSizes *s) {
+    uint64_t n = 0, spv = 0, refl = 0, failed = 0, xq = 0, lq = 0, procs = 0, busy = 0;
+    plat_mutex_lock_shared(&cache_lock);
+    for (int i = 0; i < BUCKETS; i++)
+        for (const GfxShader *g = buckets[i]; g; g = g->next) n++, spv += g->words * 4, refl += g->reflection_size;
+    plat_mutex_unlock_shared(&cache_lock);
+    plat_mutex_lock(&failed_lock);
+    for (int i = 0; i < FAILED_N; i++) failed += failed_used[i] != 0;
+    plat_mutex_unlock(&failed_lock);
+    plat_mutex_lock(&X.lock);
+    for (const XJob *j = X.head; j; j = j->next) xq++;
+    for (const XJob *j = X.lhead; j; j = j->next) lq++;
+    plat_mutex_unlock(&X.lock);
+    plat_mutex_lock(&S.lock);
+    for (int i = 0; i < MAX_SVC; i++) procs += S.s[i].child != NULL, busy += S.s[i].busy != 0;
+    plat_mutex_unlock(&S.lock);
+    perf_size(s, "shader memory cache", n, 0, spv + refl);
+    perf_size(s, "of it reflection", PERF_SIZE_NONE, 0, refl);
+    perf_size(s, "failed shader keys", failed, FAILED_N, PERF_SIZE_NONE);
+    perf_size(s, "translations queued", xq, 0, PERF_SIZE_NONE);
+    perf_size(s, "shader loads queued", lq, 0, PERF_SIZE_NONE);
+    perf_size(s, "translator processes", procs, MAX_SVC, PERF_SIZE_NONE);
+    perf_size(s, "busy", busy, 0, PERF_SIZE_NONE);
 }

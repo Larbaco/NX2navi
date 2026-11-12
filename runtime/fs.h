@@ -51,6 +51,9 @@ enum { ROMFS_PROMPTS_OK, ROMFS_PROMPTS_MISSING, ROMFS_PROMPTS_FAILED, ROMFS_PROM
 const char *romfs_prompts(void);
 int romfs_prompts_ready(const char *folder);
 int romfs_prompts_off(const char *folder);
+// The pad layout (PAD_LAYOUT_*, input_map.h) the action prompt's diamond of face buttons has from start
+// (action_prompt.c); -1 when the layout by label was asked for but the layout file could not be changed.
+int romfs_action_prompt(void);
 const char *romfs_overlay(size_t k, const char **file, uint64_t *size, int *is_added);   // RomFS path of overlay k
 void fs_trace(const char *what, const char *path);         // NX2NAVI_TRACE=fs: one line per open
 
@@ -76,3 +79,12 @@ int fs_save_import_waiting(void);                          // 1 while an import 
 int fs_save_import_cancel(void);                           // drops it; 0 on success
 const char *fs_save_import_done(void);                     // the backup of the save an import replaced at this start,
                                                            // "-" when there was none, "" when no import ran
+// A copy of the newest committed save (every slot) in <profile>/<folder>/<UTC time>/, flushed, taken while no Commit
+// runs; the newest keep copies stay. prefix (NULL: none) goes before the time, and a copy whose name it begins is
+// never pruned: the copy from before a co-op room, say, outlasts the ones made later. 1 and the copy's path in out
+// (empty when nothing is saved yet: nothing to copy), 0 when it could not be made (logged). Slow (the whole save): not
+// on the game's thread.
+int fs_save_snapshot(const char *folder, const char *prefix, int keep, char *out, size_t cap);
+// <profile>/rel into out: a file of the profile folder beside the saves (the co-op maker's room keys). 0 when there is
+// no profile folder or the path does not fit.
+int fs_profile_path(const char *rel, char *out, size_t cap);

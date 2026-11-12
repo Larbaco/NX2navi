@@ -103,6 +103,10 @@ typedef struct VkExec {
     void *views;                         // image views created for this command buffer (freed at its fence)
     int nviews, cap_views;
     int barrier_at;                      // recorded right after the last full barrier (-1: none yet)
+    // NX2NAVI_BARRIER_GAME (vk_exec.c barrier_to_why): the last full barrier was one the replay itself needed (a copy,
+    // clear or fill of its own follows it), so the next pass or dispatch gets a full one too; passes and dispatches
+    // begun since the last full barrier
+    int bar_dirty, bar_passes, bar_dispatches;
 
     // Feedback loops (vk.h VkCtx.feedback, vk_exec_draw.c feedback_prepare). Learned targets are attached in
     // ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT; they stay in it across consecutive passes and go back to GENERAL at the next
@@ -128,12 +132,21 @@ void vk_exec_pass_end(VkExec *ex);
 // Full memory barrier (all commands, all memory); ends the open pass first. Copies and dispatches order themselves with
 // it. Skipped when nothing was recorded since the last one.
 void vk_exec_barrier(VkExec *ex);
+// The barrier before a game dispatch: a full one, or with NX2NAVI_BARRIER_GAME none unless the replay's own commands
+// came since the last full barrier (vk_exec.c barrier_to_why). Ends the open pass.
+void vk_exec_barrier_dispatch(VkExec *ex);
+// NX2NAVI_TRACE=perf, every 600 frames: the barriers per frame by kind.
+void vk_exec_barrier_log(uint64_t frame);
 // vk_texture.c (NX2NAVI_TEX_ALIAS): commands that must run at the replay's current position. vk_exec_inline_begin returns
 // the command buffer being recorded after a full barrier (an open pass is ended; *reopen says so), or VK_NULL_HANDLE
 // when this thread is not recording a replay. vk_exec_inline_end begins the pass again when it was open.
 // vk_exec_inline_buffer: a device buffer for transfers, destroyed when the submission completes.
 VkCommandBuffer vk_exec_inline_begin(int *reopen);
 void vk_exec_inline_end(int reopen);
+// A test's hook (tex_probe.c): between a call with cb and one with VK_NULL_HANDLE, the calling thread counts as
+// recording a replay into cb for submission `fence`, so vk_exec_inline_begin hands cb out. Called from the record
+// callback of vk_sync_submit_own, where a replay would be recorded.
+void vk_exec_probe_inline(VkCommandBuffer cb, uint64_t fence);
 // vk_exec_draw.c: forget what the command buffer being recorded has bound (pipeline, sets, dynamic state, vertex
 // buffers): the replay continues in a new one (vk_sync_split).
 void vk_exec_draw_new_cb(void);
@@ -159,9 +172,10 @@ VkRect2D vk_exec_scissor(const VkExec *ex);
 void vk_exec_feedback_war(VkExec *ex, uint32_t written);
 void vk_exec_noatt_dims(const VkExec *ex, uint32_t *w, uint32_t *h);   // pass size when no attachment is set
 // 1: every target of the current pass (any 1: at least one, and not only the depth target while a colour target is
-// rendered for the first time) was rendered in the previous presented frame (per-frame targets); 0 otherwise, or when
-// the pass has none.
+// rendered for the first time) is one the game renders frame after frame: rendered in the last few presented frames,
+// or steady (vk_target_frames.h tfr_pass_recent); 0 otherwise, or when the pass has none.
 int vk_exec_targets_recent(VkExec *ex, int any);
+extern uint64_t vk_exec_steady_passes;   // its answers of 1 that only a steady target gave (vk_target_frames.h)
 // Looking ahead (vk_exec.c): called by a draw that found its shader or pipeline missing, before it waits or is skipped.
 // The rest of the submission being replayed is read once and the stage libraries of the pipelines its later draws need
 // are queued to the workers (vk_pipeline_hint). vk_exec_ahead_op (vk_exec_draw.c) applies one bind or draw op of that
@@ -253,6 +267,9 @@ uint64_t vk_exec_event_late_take(void);       // waits only a CPU signal after t
 // signal met, and the sum of how many submissions later it came.
 void vk_exec_event_stats(uint64_t *waits, uint64_t *unmet, uint64_t *late, uint64_t *late_subs);
 extern uint64_t vk_exec_submit_seq;   // replay thread: submissions replayed so far
+extern uint32_t vk_exec_brk;          // replay thread: bumped by every op that is not state or a draw (vk_exec.c op_linear)
+int vk_exec_mesh_run(const void *cur, const void **out, int max);
+void vk_exec_mesh_run_stops(char *out, size_t n);
 // NX2NAVI_EVO_TRACE=1 (diagnostics, vk_exec.c "event order trace"): one token per step of the replay's event order.
 void vk_exec_evt(char what, const void *event, uint32_t value);
 void vk_exec_evt_frame(uint64_t frame);   // the game's present call: the frame's tokens are closed and logged

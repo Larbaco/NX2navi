@@ -1315,3 +1315,24 @@ const char *nvn_op_name(uint32_t op) {
     _Static_assert(sizeof names / sizeof *names == OP_COUNT_, "one name per op");
     return op < OP_COUNT_ ? names[op] : "?";
 }
+
+// NX2NAVI_TRACE=perf "mem: sizes" (perf.c): live recording copies and the zombies waiting for their submissions, texture
+// pins with their sweep queue, and the recording-buffer pool.
+void nvn_cmd_sizes(PerfSizes *s) {
+    plat_mutex_lock_shared(&copy_lock);
+    uint64_t nc = ncopies, cb = copy_bytes, nz = nzombies, zb = 0;
+    for (uint32_t i = 0; i < nzombies; i++) zb += zombies[i]->bytes;
+    plat_mutex_unlock_shared(&copy_lock);
+    plat_mutex_lock(&pin_lock);
+    uint64_t pins = pins_live, pq = pin_qn - pin_qh;
+    plat_mutex_unlock(&pin_lock);
+    plat_mutex_lock(&pool_lock);
+    uint64_t np = npool, pb = 0;
+    for (uint32_t i = 0; i < npool; i++) pb += pool[i].size;
+    plat_mutex_unlock(&pool_lock);
+    perf_size(s, "recording copies", nc, 0, cb);
+    perf_size(s, "recording copy zombies", nz, 0, zb);
+    perf_size(s, "texture pins", pins, 0, PERF_SIZE_NONE);
+    perf_size(s, "pin sweep queue", pq, 0, PERF_SIZE_NONE);
+    perf_size(s, "recording-buffer pool", np, POOL_SLOTS, pb);
+}

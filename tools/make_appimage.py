@@ -8,9 +8,10 @@ with --events and reads its progress lines).
 
 The AppImage holds no game files: the kit's tools/, recomp/, runtime/ and docs, the shader translator built by
 tools/build_xlate.py (bin/nx2navi_xlate), NVIDIA's DLSS library with its notice (bin/, tools/dlss_pin.py: downloaded
-from NVIDIA's DLSS SDK repository and checked, or --dlss; not with --no-dlss), the pinned Vulkan Memory Allocator
-header (an AppImage made without the library downloads it after a build on machines with NVIDIA's driver: AppRun's
-get_dlss), and a relocatable CPython 3.14 (python-build-standalone, as `uv python install 3.14` puts in
+from NVIDIA's DLSS SDK repository and checked, or --dlss; not with --no-dlss: an AppImage made without the library
+downloads it after a build on machines with NVIDIA's driver, AppRun's get_dlss), the pinned Vulkan Memory Allocator
+header, the pinned Vulkan headers (toolchain/vulkan-headers, tools/vulkan_pin.py: the runtime names Vulkan extensions
+newer than the headers many distributions package), and a relocatable CPython 3.14 (python-build-standalone, as `uv python install 3.14` puts in
 ~/.local/share/uv/python) with numpy, lz4, zstandard, fonttools and pillow, and with --prompt-art the button art
 make_game.py's prompts step draws from (as make_kit.py --prompt-art: the pictures tools/prompt_art.py art_files names,
 into the kit's prompt-art folder; without it that step is skipped and the game keeps the Switch prompts). zbic, the GPL
@@ -18,7 +19,9 @@ package that unpacks the game's program files, is not bundled: the AppImage inst
 ~/.local/share/nx2navi/pydeps the first time it runs, as the Windows launcher downloads it.
 
 The compiler and the libraries come from the system (README-BuildKit.md, "Linux"): the AppImage checks for clang,
-clang++, lld and the headers before it starts, and names the packages for Arch, Fedora and Debian/Ubuntu.
+clang++, lld and the headers before it starts, and names the packages for Arch, Fedora and Debian/Ubuntu. Whether
+they are new enough is found out by trying them: tools/make_game.py checks the runtime's sources with that compiler
+and links against those libraries before the build's long steps (preflight).
 """
 import argparse
 import os
@@ -72,7 +75,8 @@ ev step deps '"state":"start"'
 
 missing=()
 for tool in clang clang++ ld.lld; do command -v "$tool" >/dev/null || missing+=("$tool"); done
-for h in SDL3/SDL.h vulkan/vulkan.h opus/opus.h vpx/vpx_decoder.h dav1d/dav1d.h zstd.h; do
+# The Vulkan headers come with this file (the kit's toolchain/vulkan-headers): a distribution's may be too old.
+for h in SDL3/SDL.h opus/opus.h vpx/vpx_decoder.h dav1d/dav1d.h zstd.h; do
     [ -e "/usr/include/$h" ] || [ -e "/usr/local/include/$h" ] || missing+=("$h")
 done
 if [ ${#missing[@]} -gt 0 ]; then
@@ -91,7 +95,7 @@ EOF
     exit 1
 fi
 
-if ! PYTHONPATH="$PYDEPS" "$PY" -c 'import zbic' 2>/dev/null; then
+if ! "$PY" -I -c 'import sys; sys.path[:0] = [sys.argv[1]]; import zbic' "$PYDEPS" 2>/dev/null; then
     echo "Installing zbic (GPL-2.0, unpacks the game's program files) into $PYDEPS ..."
     "$PY" -m pip install --quiet --disable-pip-version-check --target "$PYDEPS" zbic || {
         echo "error: pip could not install zbic (it needs the internet once)" >&2
@@ -149,14 +153,11 @@ else
     ev step dlss '"state":"skip"'
 fi
 
-# play.sh: the environment the game wants on this machine, then the game
+# play.sh: starts the game from its own folder. It sets no storage mode: the game leaves shadow storage off for
+# NVIDIA's own driver itself (runtime/vk_memory.c mirror_mode), by the driver of the device it runs on.
 {
     echo '#!/bin/bash'
     echo 'cd "$(dirname "$(readlink -f "$0")")"'
-    if [ -e /proc/driver/nvidia/version ]; then
-        echo '# NVIDIA: the default shadow storage leaves the 3D world black (issue #72)'
-        echo 'export NX2NAVI_SHADOW="${NX2NAVI_SHADOW:-0}"'
-    fi
     echo 'exec ./ocarina "$@"'
 } > "$OUT/play.sh"
 chmod +x "$OUT/play.sh"
@@ -226,6 +227,10 @@ def main():
         dlss_pin.place(dlss, kit / 'bin', linux=True)
     (kit / 'toolchain' / 'vma').mkdir(parents=True)
     shutil.copy2(ROOT / 'toolchain' / 'vma' / 'vk_mem_alloc.h', kit / 'toolchain' / 'vma' / 'vk_mem_alloc.h')
+    # The Vulkan headers the runtime is written against, ahead of the system's on the player's machine
+    # (tools/build_game.py vulkan_include finds them in the kit): fetched and checked here when not there yet
+    import vulkan_pin
+    shutil.copytree(vulkan_pin.resolve(ROOT / vulkan_pin.FOLDER), kit / vulkan_pin.FOLDER)
     if a.prompt_art:
         import prompt_art
         n, size = prompt_art.copy_art(a.prompt_art, kit / prompt_art.FOLDER)

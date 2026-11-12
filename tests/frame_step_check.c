@@ -30,14 +30,18 @@ void rt_log(const char *fmt, ...) { (void)fmt; }
 double gfx_window_refresh_hz(void) { return 144; }
 int ov_movie_live(void) { return 0; }
 int vk_fg_generating(void) { return 0; }
+float dbg_speed_factor(void) { return 1.0f; }   // the debug menu's game speed: normal
 int vk_fg_active(void) { return 0; }
 int vk_fg_wanted(void) { return 0; }
-int vk_dlssg_multiplier(void) { return 1; }
-int vk_dlssg_active(void) { return 0; }
+static int fg_mult = 1;   // frames on screen per game frame
+int vk_dlssg_multiplier(void) { return fg_mult; }
+int vk_dlssg_active(void) { return fg_mult > 1; }
 void rtss_limit_want(int64_t millihz) { (void)millihz; }
 int rtss_limit_active(void) { return 0; }
 int plat_mem_read(uint64_t a, void *out, size_t n) { (void)a, (void)out, (void)n; return 0; }
 int plat_mem_readable(uint64_t a, size_t n) { (void)a, (void)n; return 0; }
+void mem_kernel_access(uint64_t a, uint64_t n) { (void)a, (void)n; }
+int mem_host_readable(uint64_t a, uint64_t n) { (void)a, (void)n; return 0; }
 uint64_t kern_now_ns(void) { return 0; }
 
 // ---- one present: the pacer asks for the period, then reports the display time. Returns the step in 60 Hz frames.
@@ -135,6 +139,21 @@ int main(int argc, char **argv) {
         float g = present(0.0011);   // 900 fps, as a quick menu without the pacer would run
         CHECK(g >= 0.125f, "short frames: %.4f frames", g);
     }
+    // The limit counts the frames the game draws: frame generation's multiplier leaves the pace of a numeric limit and
+    // of unlimited alone, and divides only the monitor's rate (144 Hz here), which is a rate on the screen.
+    static const struct { const char *l; int gen; double hz, game_hz; } caps[] = {
+        {"60", 1, 60, 60},        {"60", 4, 60, 60},      {"120", 2, 120, 120},     {"240", 4, 240, 240},
+        {"display", 1, 144, 144}, {"display", 4, 36, 36}, {"unlimited", 1, 240, 0}, {"unlimited", 4, 240, 0}};
+    for (unsigned i = 0; i < sizeof caps / sizeof *caps; i++) {
+        set_limit(caps[i].l);
+        fg_mult = caps[i].gen;
+        double hz = 1e9 / (double)frame_step_cap_ns(), game = frame_step_game_hz();
+        CHECK(fabs(hz - caps[i].hz) < 0.01, "limit %s at %dx paces the game at %.3f fps, not %.0f", caps[i].l, caps[i].gen,
+              hz, caps[i].hz);
+        CHECK(fabs(game - caps[i].game_hz) < 0.01, "limit %s at %dx reports %.3f game fps, not %.0f", caps[i].l,
+              caps[i].gen, game, caps[i].game_hz);
+    }
+    fg_mult = 1;
     printf("frame_step_check: %s\n", fails ? "FAILED" : "ok");
     return fails != 0;
 }

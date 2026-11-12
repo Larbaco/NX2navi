@@ -34,12 +34,18 @@ class Context:
                      'it was is kept as launcher.json.bad')
 
     def log(self, line):
+        """One line (or several) into launcher.log. A log that cannot be written (a full disk, a file closed under
+        it) loses the line and nothing else: the callers log from the build's reader thread and from the window's
+        timers, where an exception would stop the build's output from being read or the timer from running."""
         stamp = time.strftime('%H:%M:%S')
         with self._lock:
             if self._file:
-                for part in str(line).splitlines() or ['']:
-                    self._file.write(f'{stamp} {part}\n')
-                self._file.flush()
+                try:
+                    for part in str(line).splitlines() or ['']:
+                        self._file.write(f'{stamp} {part}\n')
+                    self._file.flush()
+                except (OSError, ValueError):   # ValueError: the file was closed
+                    pass
         if self.echo:
             print(line, flush=True)
 

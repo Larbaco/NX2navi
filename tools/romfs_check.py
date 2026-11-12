@@ -35,7 +35,12 @@ import zstandard
 STANDIN_MOD = 'Damaged file stand-ins'
 DICTIONARIES = 'Pack/ZsDic.pack.zs'
 ZSTD_MAGIC = b'\x28\xb5\x2f\xfd'
-PIECE = 1 << 22
+# How much of a file the decompressor is given at a time. Each call returns its output as one bytes object, which
+# the library grows as the output comes: with 4 MiB of input a call's output is tens of MiB, grown by copying, and
+# the copying holds the interpreter's lock, so the worker threads wait on each other. Measured on 32 MiB frames
+# with 12 threads: about 120 MB/s of packed data with 4 MiB pieces, about 2,500 MB/s with 64 KiB pieces; files
+# smaller than a piece are the same either way.
+PIECE = 1 << 16
 TEXTURE = re.compile(r'Tex/([^/]+)\.bntx\.zs')
 
 
@@ -110,6 +115,8 @@ def problem(image, entry):
         size = 0
         for at in range(0, len(data), PIECE):
             size += len(out.decompress(data[at:at + PIECE]))
+            if out.eof:   # the frame is whole: bytes after it are not the frame's, whichever piece they fall in
+                break
     except zstandard.ZstdError as e:
         return f'does not decompress ({e})'
     if params.content_size and size != params.content_size:

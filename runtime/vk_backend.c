@@ -219,6 +219,7 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
     if (!vram_probe) vram_probe = 1, perfmon_set_vram_game(vk_mem_device_used_mb);   // the overlay's "game" beside VRAM
     vk_exec_frame_log(t, frame);
     dynres_frame();   // before vk_dlaa_frame reads the DLSS mode it may override
+    vk_exec_barrier_log(frame);
     vk_dlaa_frame();
     vk_sampler_aniso_live();   // NX2NAVI_ANISO changed in the menu: the surface textures' samplers take the new level
     vk_mvsurvey_frame();
@@ -615,7 +616,7 @@ static void vk_be_program_release(const prog_t *p) { replay_drain(DR_PROG_RELEAS
 // the value returned is the one the replay will signal.
 static uint64_t vk_be_submit(const uint64_t *handles, int n) {
     if (!gfx_replay_async()) {
-        vk_sub_in_frame = nvn_submits_in_frame;   // the front end counts it up after the submit returns
+        vk_sub_in_frame = __atomic_load_n(&nvn_submits_in_frame, __ATOMIC_RELAXED);   // the front end counts it up after the submit returns
         return submit_sync(handles, n);
     }
     vk_sync_start();
@@ -731,7 +732,24 @@ static void vk_be_guest_read(uint64_t addr, uint64_t size) {
 }
 // After a fence wait: the value is done, so its replay is too; a later submission the replay records meanwhile marks
 // its targets with a later fence, which write_back_small leaves alone. No drain.
+// The count of such waits that came back while event-ordered work was still held (vk_exec.c): a submission stopped at an
+// event wait returns its value with its remainder held for a later replay, so the game may take a wait for that value
+// as the whole submission done and reuse what the held part still reads. How often that happens decides whether the
+// value should be signalled only after the remainder (audit finding F-2-05). The count is unlocked: a diagnostic.
+static uint64_t synced_n, synced_held;
+static void synced_held_count(uint64_t fence) {
+    synced_n++;
+    int held = vk_exec_held();
+    if (!held) return;
+    synced_held++;
+    if (synced_held <= 10 || synced_held % 600 == 0)
+        rt_log("vk: a game's wait for %llu returned with %d event-ordered submission(s) still held (%llu of %llu such "
+               "waits so far)", (unsigned long long)fence, held, (unsigned long long)synced_held,
+               (unsigned long long)synced_n);
+}
+
 static void vk_be_cpu_synced(uint64_t fence) {
+    synced_held_count(fence);
     if (!vk_texture_small_dirty()) return;
     vk_sync_start();
     vk_present_drain();

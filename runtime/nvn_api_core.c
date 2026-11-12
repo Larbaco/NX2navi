@@ -624,12 +624,47 @@ static uint64_t lod_entered, lod_issued, lod_fence[LOD_RING];
 // core given up (section 2.2), or queued for the replay thread (NX2NAVI_REPLAY_ASYNC, vk_backend.c); the newest fence
 // value is what QueueFenceSync records. With the queue the fence covers replay and GPU, so the LOD guard below waits
 // for both.
+// NX2NAVI_TRACE=perf (nvn_api.h): which threads submit and present, and whether two of these calls run at once. The
+// synchronous replay's front end (vk_backend.c submit_sync, vk_be_present's held present, nvn_submits_in_frame) takes
+// no lock of its own, so it relies on one thread at a time; this tells a run whether that holds.
+void nvn_call_note(int present, uintptr_t q, int enter) {
+    if (!(rt_trace & RT_TRACE_PERF)) return;
+    static volatile int32_t inside;
+    static volatile int32_t overlaps;
+    static PlatMutex seen_lock = PLAT_MUTEX_INIT;
+    static struct { uint32_t tid; uintptr_t q; int present; } seen[32];
+    static int nseen;
+    if (!enter) {
+        plat_dec32(&inside);
+        return;
+    }
+    int32_t n = plat_inc32(&inside);
+    uint32_t tid = plat_thread_id();
+    if (n > 1) {
+        int32_t k = plat_inc32(&overlaps);
+        if (k <= 16 || !(k & (k - 1)))
+            rt_log("nvn: thread %u enters %s on queue %#llx while %d other submit or present call%s run (overlap %d, "
+                   "frame %llu)", tid, present ? "a present" : "a submit", (unsigned long long)q, n - 1, n > 2 ? "s" : "",
+                   k, (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED));
+    }
+    plat_mutex_lock(&seen_lock);
+    int i = 0;
+    while (i < nseen && !(seen[i].tid == tid && seen[i].q == q && seen[i].present == present)) i++;
+    int fresh = i == nseen && nseen < 32;
+    if (fresh) seen[nseen++] = (typeof(seen[0])){tid, q, present};
+    plat_mutex_unlock(&seen_lock);
+    if (fresh)
+        rt_log("nvn: thread %u %s on queue %#llx (first at frame %llu)", tid, present ? "presents" : "submits",
+               (unsigned long long)q, (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED));
+}
+
 NVN_API(nvnQueueSubmitCommands) {
     queue_t *q = arg_p(c, 0);
     int n = (int)arg_x(c, 1);
     const uint64_t *h = arg_p(c, 2);
     if (n < 0 || (n && !h)) rt_fatal("nvn: QueueSubmitCommands with %d handles at %p", n, (const void *)h);
     NVN_BLOCKING();
+    nvn_call_note(0, (uintptr_t)q, 1);
     uint64_t no = __atomic_add_fetch(&lod_entered, 1, __ATOMIC_SEQ_CST);
     q->submits++;
     uint64_t f;
@@ -664,17 +699,21 @@ NVN_API(nvnQueueSubmitCommands) {
     // point). Copies of the data at submit made it worse, a mix of two frames' versions.
     // NX2NAVI_SUBMIT_FINISH=<mask>: bit i waits after the i-th submission of a frame (default 0x1); a plain 1 waits
     // after every submission, 0 never.
-    // The wait is for the submission's passes, which is what the rewrite races with: exec_wait leaves out the
-    // write-backs of what they wrote (vk_sync.c exec_tl), which nothing here needs before the game goes on. The fences
-    // the game itself waits on cover them as before.
+    // The wait (exec_wait, vk_sync.c vk_sync_exec_wait) ends when the GPU has run the submission's passes and the
+    // results the game reads once it goes on are in its memory, the last frame's occlusion counts among them; the
+    // write-backs and the completion thread's other side effects are not waited for. NX2NAVI_WB_SPLIT=0 makes it
+    // the fence's wait, which covers those too (vk_sync.c "the executed timeline" has what each leaves out and costs).
     static long long finish_mask = -2;
     if (finish_mask == -2) {
         const char *e = cfg_get("NX2NAVI_SUBMIT_FINISH");
         finish_mask = e && *e ? strtoll(e, NULL, 0) : 1;
         if (e && *e && finish_mask == 1 && !(e[0] == '0' && (e[1] == 'x' || e[1] == 'X'))) finish_mask = -1;   // "1": all
     }
-    int idx = nvn_submits_in_frame++;
+    // several guest threads submit at once (the pause menu's first frame on): a plain ++ lost counts, and with one the
+    // frame's first submission went without its wait, or a later one waited
+    int idx = __atomic_fetch_add(&nvn_submits_in_frame, 1, __ATOMIC_RELAXED);
     if (finish_mask && f && (finish_mask == -1 || (idx < 63 && (finish_mask >> idx & 1)))) gfx_backend()->exec_wait(f, UINT64_MAX);
+    nvn_call_note(0, (uintptr_t)q, 0);
 }
 
 // The producer (1.2.1 main f_70008c6460) releases the read lock on obj+0x538 at lr 0x70008c70c8; when

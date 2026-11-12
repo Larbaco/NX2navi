@@ -13,10 +13,11 @@
 // keeps the guest's result and logs every call where the two differ.
 //
 // Ocarina of Time 1.1.1 has the same decoder at other addresses (recomp/patches-v111.txt: three calls of
-// ZSTD_decompressMultiFrame, main+0xeb380). Its sites have not been through a check run yet, and 1.4.3 has a caller
-// whose result the game relies on being the game decoder's own, so on that build the host decodes only when
-// zstd_native = 1 is set outright or the check runs (trusted); an unset key sends every call on to the game's decoder.
-// Its loading threads decode most data through the game's stream feed (main+0xf5c80): host_stream, further down.
+// ZSTD_decompressMultiFrame, main+0xeb380). Its loading threads decode most data through the game's stream feed
+// (main+0xf5c80): host_stream, further down. The host decodes there by default since a check run (zstd_check = 1) over a
+// village and a field: 3,072 streams, 31.7 GiB of output, compared byte for byte with the game decoder's, none
+// different. Until then an unset key sent every call on to the game's decoder, which took about a fifth of the
+// running time of the game's threads in a village and a second of each area load. zstd_native = 0 keeps the game's.
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -151,7 +152,9 @@ static size_t tracked_decode(Cpu *c, uint64_t dst, uint64_t cap, uint64_t src, u
     if (d) __atomic_store_n(d, *d + 1, __ATOMIC_RELAXED);
     int away = size >= AWAY_BYTES ? kern_core_away() : 0;
     if (away) __atomic_add_fetch(&S.away, 1, __ATOMIC_RELAXED);
+    uint64_t t0 = perf_mark_begin();
     size_t r = host_decode(dst, cap, src, size, dict, dict_size, ddict, ok);
+    perf_mark_end(PERF_M_ZSTD, t0, *ok && !ZSTD_isError(r) ? r : 0);
     kern_core_back(&away);
     if (d) {
         int n = *d - 1;
@@ -173,15 +176,14 @@ static void count(uint64_t in, uint64_t out, uint64_t ns) {
                (unsigned long long)S.inplace, (unsigned long long)S.away);
 }
 
-// Whether this build's sites may decode on the host: always but on 1.1.1, where it takes zstd_native = 1 in the
-// settings or the check (see the top of the file).
+// Whether this build's sites may decode on the host: unless zstd_native = 0 says the game's own decoder (the patch set's
+// switch already leaves the sites alone then on the other builds; 1.1.1 reads the key here as well), or in the check.
 static int trusted(void) {
     static int v = -1;
     if (v < 0) {
         const char *e = cfg_get("NX2NAVI_ZSTD_NATIVE");
-        v = rt_game_version != 111 || (e && *e && strcmp(e, "0") != 0) || check_mode();
-        if (!v) rt_log("zstd: the game's own decoder (the host decoder is not checked on this build yet: zstd_native = 1 "
-                       "turns it on, zstd_check = 1 compares the two)");
+        v = !(e && !strcmp(e, "0")) || check_mode();
+        if (!v) rt_log("zstd: the game's own decoder (zstd_native = 0; zstd_check = 1 compares the two)");
     }
     return v;
 }
@@ -346,6 +348,20 @@ static void stream_drop(Stream *st) {
     plat_mutex_unlock(&stream_lock);
 }
 
+// Drops the slot of stream state s, if it has one. Found and cleared under one hold of the lock: between a
+// stream_find and a stream_drop another thread can take a spent slot for its own stream (stream_take), and the drop
+// then cleared that thread's slot, which a third thread took as free and reset the decoder context in use.
+static void stream_drop_of(uint64_t s) {
+    plat_mutex_lock(&stream_lock);
+    for (int i = 0; i < NSTREAM; i++)
+        if (streams[i].s == s) {
+            free(streams[i].shadow);
+            streams[i].shadow = NULL;
+            streams[i].s = 0, streams[i].spent = 0;
+        }
+    plat_mutex_unlock(&stream_lock);
+}
+
 static void stream_spent(Stream *st) {
     plat_mutex_lock(&stream_lock);
     st->spent = 1;
@@ -372,12 +388,14 @@ static size_t stream_run(Cpu *c, Stream *st, ZSTD_outBuffer *out, ZSTD_inBuffer 
     if (d) __atomic_store_n(d, *d + 1, __ATOMIC_RELAXED);
     int away = in->size >= AWAY_BYTES ? kern_core_away() : 0;
     if (away) __atomic_add_fetch(&S.away, 1, __ATOMIC_RELAXED);
-    size_t r = 1;
+    size_t r = 1, o_start = out->pos;
+    uint64_t t0 = perf_mark_begin();
     while (in->pos < in->size) {
         size_t i0 = in->pos, o0 = out->pos;
         r = ZSTD_decompressStream(st->dctx, out, in);
         if (ZSTD_isError(r) || !r || (in->pos == i0 && out->pos == o0)) break;
     }
+    perf_mark_end(PERF_M_ZSTD, t0, out->pos - o_start);
     kern_core_back(&away);
     if (d) {
         int n = *d - 1;
@@ -556,7 +574,7 @@ static void host_stream(Cpu *c) {
     if (trusted() && s && s < RT_ADDRESS_LIMIT - 0x38) {
         uint8_t ph = *(const uint8_t *)gp(s);
         if (ph == 1) {
-            stream_drop(stream_find(s));   // a stream the game gave up without ending it
+            stream_drop_of(s);   // a stream the game gave up without ending it
             st = stream_begin(s, src, size, ddict);
             if (!st) __atomic_add_fetch(&SS.guest, 1, __ATOMIC_RELAXED);
         } else if (ph == 2) {
@@ -735,3 +753,16 @@ int probe_zstd(void) {
 }
 
 #endif
+
+// NX2NAVI_TRACE=perf "mem: sizes" (perf.c): host dictionaries (never freed) and stream slots taken.
+void zstd_sizes(PerfSizes *s) {
+    uint64_t d, st = 0;
+    plat_mutex_lock(&dict_lock);
+    d = (uint64_t)ndicts;
+    plat_mutex_unlock(&dict_lock);
+    plat_mutex_lock(&stream_lock);
+    for (int i = 0; i < NSTREAM; i++) st += streams[i].s != 0;
+    plat_mutex_unlock(&stream_lock);
+    perf_size(s, "zstd dictionaries", d, NDICT, PERF_SIZE_NONE);
+    perf_size(s, "zstd stream slots", st, NSTREAM, PERF_SIZE_NONE);
+}

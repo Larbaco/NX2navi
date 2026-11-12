@@ -60,8 +60,12 @@ NEVER(fs_init) NEVER(hostfn_override) NEVER(hostfn_register) NEVER(mem_kernel_al
 NEVER(mem_thaw) NEVER(romfs_close) NEVER(romfs_entry) NEVER(romfs_entry_type) NEVER(romfs_file_count)
 NEVER(romfs_handle) NEVER(romfs_image_path) NEVER(romfs_list) NEVER(romfs_open) NEVER(romfs_overlay)
 NEVER(romfs_overlay_count) NEVER(romfs_read) NEVER(romfs_size) NEVER(rt_call)
+NEVER(perf_size)   // fs_host_sizes: only the perf trace's size lines call it
 int romfs_owns(const char *path) { (void)path; return 0; }
+int mem_probing(void) { return 0; }   // write_file asks before each write: no probe, no lazy heap here
+void mem_kernel_access(uint64_t a, uint64_t n) { (void)a, (void)n; }
 void fs_trace(const char *what, const char *path) { (void)what, (void)path; }
+void coop_game_rom_open(const char *path) { (void)path; }   // co-op watches for the title screen's start: not here
 
 int main(int argc, char **argv) {
     if (argc < 3) return 2;

@@ -35,7 +35,29 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - name: Shader compilers
         # make_appimage.py compiles the runtime's own shaders (tools/build_shaders.py: glslc, spirv-as, spirv-val)
-        run: sudo apt-get update && sudo apt-get install -y glslc spirv-tools
+        # On 2026-11-11 the runners could not resolve Ubuntu's archive hosts (azure.archive.ubuntu.com, then
+        # archive.ubuntu.com) and apt failed every fetch for hours. When they do not resolve, the three tools come from
+        # LunarG's Vulkan SDK for Linux instead, which holds all of them.
+        run: |
+          if getent hosts azure.archive.ubuntu.com >/dev/null || getent hosts archive.ubuntu.com >/dev/null; then
+            sudo apt-get update && sudo apt-get install -y glslc spirv-tools && exit 0
+            echo "::warning::apt failed: the shader compilers come from the Vulkan SDK"
+          else
+            echo "::warning::Ubuntu's archive does not resolve: the shader compilers come from the Vulkan SDK"
+          fi
+          sdk="$RUNNER_TEMP/vulkan-sdk"
+          mkdir -p "$sdk"
+          for f in vulkan-sdk.tar.xz vulkan-sdk.tar.gz; do
+            curl -fsSL --retry 3 -o "$RUNNER_TEMP/$f" "https://sdk.lunarg.com/sdk/download/latest/linux/$f" &&
+              tar -xf "$RUNNER_TEMP/$f" -C "$sdk" && break
+          done
+          bin=$(dirname "$(find "$sdk" -type f -name glslc -path '*/bin/*' | head -1)")
+          test -x "$bin/glslc" && test -x "$bin/spirv-as" && test -x "$bin/spirv-val"
+          echo "$bin" >> "$GITHUB_PATH"
+          if ! "$bin/spirv-as" --version >/dev/null 2>&1; then   # the SDK's tools may link its own shared libraries
+            echo "LD_LIBRARY_PATH=$(cd "$bin/../lib" && pwd)${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          fi
+          "$bin/glslc" --version | head -1
       - name: Shader translator and VMA
         run: |
           uv venv -q --python 3.12 .venv

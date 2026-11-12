@@ -47,6 +47,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "debug_tools.h"
 #include "cfg.h"
 #include "gfx.h"
 #include "host.h"
@@ -115,8 +116,7 @@ int frame_step_realtime(void) { return step_word != NULL; }
 
 // The frame limit (menu, NX2NAVI_FPS_LIMIT, live): 30, 60, 90, 120, 144, any whole rate from 30 to 240, or display (the
 // refresh rate of the window's monitor, at most 240). A higher number gives 240, the rate of the shortest step the
-// game survives (STEP_MIN_S). Unset, the older NX2NAVI_FPS60=0 still means 30, and frame generation in use means display
-// (frame_limit_follows_display). A limit of 30 switches the set
+// game survives (STEP_MIN_S). Unset, the older NX2NAVI_FPS60=0 still means 30. A limit of 30 switches the set
 // fps60 off (the shipping minimum interval 2), every other limit switches it on; the controller reads its minimum
 // interval from the patched sites each frame. With the real-time step the pacer holds frames to the limit; above 60
 // only the pacer changes, as the step's floor is the limit's ceiling. Without it the game steps whole 60 Hz vsyncs and the pacer
@@ -144,11 +144,9 @@ int frame_limit_adjustable(void) { return 1; }
 static unsigned limit_seen;
 static int limit_read;
 static int limit_hz = -1;   // 0: display; -2: unlimited (free-running builds); -1 before the first read
-static int limit_unset;     // neither NX2NAVI_FPS_LIMIT nor the older NX2NAVI_FPS60=0 is set: the default 60
 
 static int limit_parse(void) {
     const char *e = cfg_get("NX2NAVI_FPS_LIMIT"), *old = cfg_get("NX2NAVI_FPS60");
-    limit_unset = (!e || !*e) && !(old && !strcmp(old, "0"));
     if (!e || !*e) return old && !strcmp(old, "0") ? 30 : 60;
     if (!strcmp(e, "display")) return 0;
     int free_run = frame_free_running();
@@ -215,20 +213,23 @@ static int movie_cap_hz(void) {
 // multiplier with NVIDIA's (vk_dlssg.c, one to three); 1 while neither generates (off, or paused for the menu).
 static int generated_factor(void) { return vk_fg_generating() ? 2 : vk_dlssg_multiplier(); }
 
-// The limit in effect, as limit_hz counts it (0 display, -2 unlimited, else the rate). With frame generation's
-// swapchain in use and no limit chosen it is the display's rate: the pacer divides the limit by generated_factor, so
-// the default 60 held the game to 30, 20 or 15 rendered frames a second on any monitor, 15 at DLSS 4x on a 165 Hz one,
-// where the display rate gives 41 rendered and 165 shown. "In use" rather than generating keeps the limit still while
-// the menu pauses generation. A limit the player set is kept as it is.
-int frame_limit_follows_display(void) { return limit_unset && limit_hz > 0 && (vk_fg_active() || vk_dlssg_active()); }
-static int limit_effective(void) { return frame_limit_follows_display() ? 0 : limit_hz; }
-
-// The rate the game renders at under the limit: frame_step_limit_hz over the frames shown per game frame (mouse_direct.c,
-// whose camera input follows the game's own frame time); 0 unknown.
-double frame_step_game_hz(void) {
-    double hz = frame_step_limit_hz();
-    int gen = generated_factor();
+// The limit counts the frames the game draws, and frame generation adds its frames on top: a limit of 60 at 4x is 60
+// drawn and 240 shown. Counted on the screen instead, the game was paced at the limit over the factor, so each step up
+// of the multiplier took drawn frames away (60 at 4x drew 15) and the generated ones had less to work from and more
+// delay. Only "display" is a rate on the screen, the monitor's: there the game draws that rate over the factor, since a
+// frame past the monitor's refresh is never seen. The result is game frames a second, before the ceiling of the step.
+static double limit_game_hz(int limit, int gen) {
+    if (limit) return shown_hz(limit);
+    double hz = shown_hz(gfx_window_refresh_hz());
     return gen > 1 ? hz / gen : hz;
+}
+
+// The rate the game renders at under the limit (mouse_direct.c, whose camera input follows the game's own frame time);
+// 0 unknown or unlimited.
+double frame_step_game_hz(void) {
+    if (frame_step_limit_hz() <= 0) return 0;
+    double hz = limit_game_hz(limit_hz, generated_factor());
+    return !frame_free_running() && !step_word && hz > 60 ? 60 : hz > LIMIT_MAX_HZ ? LIMIT_MAX_HZ : hz;
 }
 
 // RivaTuner Statistics Server (rtss_limit.c) gets the same limit; while it limits this process the pacer holds no
@@ -257,26 +258,17 @@ uint64_t frame_step_cap_ns(void) {
         paced_hz = 0;
         return 0;
     }
-    // unlimited in a build that steps by the clock: LIMIT_FREE_MAX_HZ game frames; during a movie, the movie's rate.
-    // Both times frame generation's factor for the division below.
-    int follow = frame_limit_follows_display(), limit = follow ? 0 : limit_hz;
-    static int follow_was, follow_logs;
-    if (follow != follow_was) {
-        follow_was = follow;
-        if (follow_logs++ < 20) {
-            if (follow) rt_log("frame rate: frame generation with no limit set: the limit is the monitor's refresh rate");
-            else rt_log("frame rate: limit %d fps again", limit_hz);
-        }
-    }
-    double hz = limit == -2 ? (double)(movie_hz ? movie_hz : LIMIT_FREE_MAX_HZ) * gen
-                            : shown_hz(limit ? limit : gfx_window_refresh_hz());
+    // unlimited in a build that steps by the clock: LIMIT_FREE_MAX_HZ game frames; during a movie, the movie's rate
+    double hz = limit_hz == -2 ? LIMIT_FREE_MAX_HZ : limit_game_hz(limit_hz, gen);
     double max = frame_free_running() ? LIMIT_FREE_MAX_HZ : LIMIT_MAX_HZ;
-    if (limit == -2) max *= gen;   // the cap is on the game's frames there, not the ones shown
     if (hz > max) hz = max;
-    // Frame generation presents one to three generated frames between each two of the game's: the game is paced at the
-    // limit over that factor (half, a third, a quarter), so the screen shows the limit. With VSync and the limit at the
-    // display's rate, the generated frames then fill the display's refreshes and none is dropped.
-    if (gen > 1) hz /= gen;
+    static double logged_hz;
+    static int logged_gen, gen_logs;
+    if (gen > 1 && (hz != logged_hz || gen != logged_gen) && gen_logs < 40) {
+        gen_logs++, logged_hz = hz, logged_gen = gen;
+        rt_log("frame rate: the game draws up to %.0f frames a second and frame generation shows %d for each (%.0f on "
+               "screen)", hz, gen, hz * gen);
+    }
     if (movie_hz) hz = movie_hz;
     paced_hz = hz;
     rtss_limit_want(rtss ? (int64_t)(hz * 1000 + 0.5) : -1);
@@ -284,17 +276,17 @@ uint64_t frame_step_cap_ns(void) {
     return (uint64_t)(1e9 / hz + 0.5);
 }
 
-// The frame rate the limit gives, for the performance overlay: the setting, the monitor's rate for "display", 60 at
+// The limit as it is set, for the performance overlay: the setting, the monitor's rate for "display", 60 at
 // most without the real-time step; the game's own rate (60 Hz over its present interval) in a build without the patch
 // sets; 0 before the first frame read the setting.
 double frame_step_limit_hz(void) {
     if (frame_free_running()) {   // 0 for unlimited, as before the first read
         frame_limit_live();
-        int limit = limit_effective();
+        int limit = limit_hz;
         if (limit == -2 || limit == -1) return 0;
         return shown_hz(limit ? limit : gfx_window_refresh_hz());
     }
-    int hz = limit_effective();
+    int hz = limit_hz;
     if (hz < 0) return 0;
     double r = shown_hz(hz ? hz : gfx_window_refresh_hz());
     return !step_word && r > 60 ? 60 : r > LIMIT_MAX_HZ ? LIMIT_MAX_HZ : r;
@@ -307,7 +299,12 @@ static int probe = -1;
 static float last_pos[3];
 static uint64_t last_pos_ns;
 
-static int read_guest(uint64_t a, void *out, size_t n) { return a && plat_mem_read(a, out, n); }
+// plat_mem_read copies through the kernel, which fails on a heap page NX2NAVI_HEAP_LAZY has not committed yet
+static int read_guest(uint64_t a, void *out, size_t n) {
+    if (!a) return 0;
+    mem_kernel_access(a, n);
+    return plat_mem_read(a, out, n);
+}
 static uint64_t read_ptr(uint64_t a) {
     uint64_t p = 0;
     return read_guest(a, &p, 8) ? p : 0;
@@ -438,6 +435,16 @@ static double ocarina_step(double dt) {
     return step;
 }
 
+// The 60 Hz frames the game steps at each update where the set ostep gives them (Ocarina); 1 elsewhere, the game's own
+// nominal frame. The mouse camera divides by it (mouse_direct.c): the game multiplies camera input by this step.
+float frame_step_frames(void) {
+    if (!ostep_page) return 1.0f;
+    uint32_t bits = atomic_load_explicit(ostep_page, memory_order_acquire);
+    float f;
+    memcpy(&f, &bits, 4);
+    return f > 0 ? f : 1.0f;
+}
+
 static void ocarina_step_write(double dt) {
     static int on = -1;
     if (on < 0) {
@@ -456,7 +463,7 @@ static void ocarina_step_write(double dt) {
         return;
     }
     uint64_t slot = read_ptr(MOD_MAIN_BASE + 0x4c7e890), mgr = slot ? read_ptr(slot) : 0;
-    if (!mgr || !plat_mem_readable(mgr + 0x1c0, 4)) return;
+    if (!mgr || !mem_host_readable(mgr + 0x1c0, 4)) return;
     _Atomic uint32_t *word = (_Atomic uint32_t *)(uintptr_t)(mgr + 0x1c0);
     uint32_t now_bits = atomic_load_explicit(word, memory_order_relaxed);
     float now_v;
@@ -582,7 +589,8 @@ void frame_step_present(uint64_t display_ns, int interval) {
         }
     }
     if (frame_free_running() && last_ns) {
-        if (dt > 0 && dt < STEP_RESET_S) ocarina_step_write(ocarina_step(dt));
+        // the debug menu's speed factor (debug_tools.c) multiplies the step the game is given
+        if (dt > 0 && dt < STEP_RESET_S) ocarina_step_write(ocarina_step(dt) * (double)dbg_speed_factor());
         else ocarina_step_reset();   // a load or a debugger stop: the intervals before it say nothing about the next
     }
     last_ns = display_ns;

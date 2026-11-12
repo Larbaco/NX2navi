@@ -25,6 +25,10 @@ static uint32_t g_gfx_queues = 1;   // queues the graphics family offers (pick_d
 static VkCtx g_vk;
 static int g_ready;
 static PlatMutex g_lock = PLAT_MUTEX_INIT;
+// The fence vk_device_lost_poll asks about. Nothing submits with it, so its status is "not ready" for as long as the
+// device lives.
+static VkFence lost_fence;
+static PlatMutex lost_fence_lock = PLAT_MUTEX_INIT;
 
 static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBitsEXT sev, VkDebugUtilsMessageTypeFlagsEXT type,
                                                const VkDebugUtilsMessengerCallbackDataEXT *d, void *user) {
@@ -85,8 +89,8 @@ static void mesa_cache_beside_exe(void) {
 // beside the exe, which nothing else writes, with a limit of NV_CACHE_BYTES. The driver makes GLCache inside that
 // folder but not the folder, so it is made here; pointed at a folder that is missing or not writable it caches nothing
 // at all, so when that folder cannot be made or written neither variable is set and the driver keeps its own folder
-// and limit. Without NVIDIA's kernel driver (no /proc/driver/nvidia/version, the test play.sh makes) the variables do
-// nothing and the folder would stay empty, so nothing is done.
+// and limit. Without NVIDIA's kernel driver (no /proc/driver/nvidia/version, the test the AppImage's build makes for
+// DLSS) the variables do nothing and the folder would stay empty, so nothing is done.
 #define NV_CACHE_BYTES "8589934592"   // 8 GiB
 static void nvidia_cache_beside_exe(void) {
     if (plat_fs_kind("/proc/driver/nvidia/version") != PLAT_FS_FILE) return;
@@ -270,6 +274,7 @@ retry:
         }
     free(qp);
     rt_log("vk: using gpu %d: %s", best, g_vk.props.deviceName);
+    vk_caps_driver(g_vk.phys);   // before vk_mem_class_log, which chooses the pools' storage by driver
     vk_mem_class_log(&g_vk.props, &g_vk.mem_props);
     return 1;
 }
@@ -300,6 +305,15 @@ typedef struct {
     VkPhysicalDeviceMaintenance5FeaturesKHR m5;
     VkPhysicalDevicePipelineBinaryFeaturesKHR pbin;
 } FeatureChain;
+
+// One line for a fatal error's report (dispatch.h rt_fatal_note_add): the card, its driver, and the settings in effect
+// that change how the game's memory behaves. A report often arrives as the end of a log alone, or as a picture of it,
+// and the lines that say these things are at its start. No lock is taken: the failing thread may hold any.
+static void fatal_note(void) {
+    char mem[512];
+    vk_mem_fatal_note(mem, sizeof mem);
+    rt_log("fatal: gpu %s; %s; texture detail %s", vk_caps_summary(), mem, vk_texture_detail_name());
+}
 
 static int create_device(void) {
     uint32_t ne = 0;
@@ -408,7 +422,6 @@ static int create_device(void) {
     // The driver fills the chain with what it supports; the same chain then enables all of it (robustBufferAccess
     // stays on: guest shaders index constant buffers freely and out-of-range reads must stay harmless).
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &c->f2);
-    vk_caps_driver(g_vk.phys);
     vk_caps_features(&c->f2.features);
     if (gpl_link) {
         VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT gp = {
@@ -446,8 +459,17 @@ static int create_device(void) {
         g_vk.has_mesh_queries = want && c->mesh.meshShaderQueries && h->pipelineStatisticsQuery && c->f12.hostQueryReset;
         c->mesh.meshShaderQueries = g_vk.has_mesh_queries ? VK_TRUE : VK_FALSE;
         if (!c->mesh.meshShader || !c->mesh.taskShader) g_vk.has_mesh_shader = 0;
-        rt_log("vk: mesh shaders: %s", g_vk.has_mesh_shader ? "VK_EXT_mesh_shader" : "not supported (task/mesh draws are skipped)");
+        rt_log("vk: mesh shaders: %s", g_vk.has_mesh_shader ? "VK_EXT_mesh_shader" : "the extension is there, its task or mesh feature is not");
     }   // vkGetDeviceFaultInfoEXT needs the feature, not just the extension
+    {   // mesh_fallback: auto (on a device without mesh shaders), 1 (on every device, for testing) or 0
+        const char *mf = cfg_value("NX2NAVI_MESH_FALLBACK");
+        g_vk.mesh_fallback = !strcmp(mf, "1") || (strcmp(mf, "0") && !g_vk.has_mesh_shader);
+        if (g_vk.mesh_fallback)
+            rt_log("vk: mesh fallback: task and mesh programs run as compute passes and are drawn from their buffers (%s)",
+                   g_vk.has_mesh_shader ? "mesh_fallback = 1" : "this device has no mesh shaders");
+        else if (!g_vk.has_mesh_shader)
+            rt_log("vk: mesh shaders: not supported and mesh_fallback = 0 (task/mesh draws are skipped)");
+    }
     if (g_vk.has_maximal_reconvergence && !c->mrc.shaderMaximalReconvergence) g_vk.has_maximal_reconvergence = 0;
     if (g_vk.has_pipeline_binary && !(c->pbin.pipelineBinaries && c->m5.maintenance5)) g_vk.has_pipeline_binary = 0;
     g_vk.has_buffer_device_address = c->f12.bufferDeviceAddress;
@@ -480,7 +502,7 @@ static int create_device(void) {
     VkResult r = vk_dlssg_create_device(g_vk.instance, g_vk.phys, &di, &g_vk.device);
     free(c);
     if (r != VK_SUCCESS) { rt_log("vk: vkCreateDevice failed (%d)", (int)r); return 0; }
-    vk_dlssg_device_ready(g_vk.device);
+    vk_dlssg_device_ready(g_vk.phys, g_vk.device);
     if (vk_dlssg_dpa()) {   // Streamline's, so its plugins hook every entry point the replay fetches
         vk_dpa = vk_dlssg_dpa();
         rt_log("vk: device entry points come through Streamline's interposer (DLSS Frame Generation)");
@@ -500,6 +522,8 @@ static int create_device(void) {
     vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
     g_vk.min_imported_host_alignment = (uint32_t)emh.minImportedHostPointerAlignment;
     vk_caps_init(&g_vk);
+    vk_mem_lazy_decide();   // the driver is known: the lazy write-back's default depends on it
+    rt_fatal_note_add(fatal_note);
 
     VmaAllocatorCreateInfo ai = {.physicalDevice = g_vk.phys, .device = g_vk.device, .instance = g_vk.instance,
                                  .vulkanApiVersion = VK_API_VERSION_1_3,
@@ -529,6 +553,8 @@ static void destroy_all(void) {
     if (g_vk.device) vk_astc_release();
     if (g_vk.device) vk_crumbs_release();
     if (g_vk.timeline) vkDestroySemaphore(g_vk.device, g_vk.timeline, NULL);
+    if (lost_fence) vkDestroyFence(g_vk.device, lost_fence, NULL);   // vk_device_lost_poll
+    lost_fence = VK_NULL_HANDLE;
     vk_headroom_stop();
     if (g_vk.vma) vmaDestroyAllocator(g_vk.vma);
     if (g_vk.device) vkDestroyDevice(g_vk.device, NULL);
@@ -577,17 +603,12 @@ static const char *fault_address_type(VkDeviceFaultAddressTypeEXT t) {
     }
 }
 
-// The query runs once per process. Threads that hit the loss at the same time wait on the lock until it is logged, so
-// none of them reaches its rt_fatal and ends the process before the report is written.
-void vk_device_fault_report(VkResult r) {
-    static PlatMutex lock = PLAT_MUTEX_INIT;
-    static int done;
-    if (r != VK_ERROR_DEVICE_LOST) return;
-    plat_mutex_lock(&lock);
-    if (done) { plat_mutex_unlock(&lock); return; }
-    done = 1;
+// The report of a lost device: the breadcrumbs, the pass marks, the video memory and the driver's fault information.
+// Once per process, on the thread that saw the loss first (vk_device_lost_check).
+static void device_fault_report(void) {
     vk_crumbs_report();
     vk_pass_marks_report();
+    vk_mem_lost_report();
     VkCtx *c = vk_ctx();
     PFN_vkGetDeviceFaultInfoEXT get =
         c && c->has_device_fault ? (PFN_vkGetDeviceFaultInfoEXT)vk_dpa(c->device, "vkGetDeviceFaultInfoEXT")
@@ -595,7 +616,6 @@ void vk_device_fault_report(VkResult r) {
     if (!get) {
         rt_log("vk: device lost; no fault report (VK_EXT_device_fault %s)", c && c->has_device_fault ? "has no entry point"
                                                                                                     : "not enabled");
-        plat_mutex_unlock(&lock);
         return;
     }
     VkDeviceFaultCountsEXT n = {.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
@@ -621,7 +641,53 @@ void vk_device_fault_report(VkResult r) {
     }
     free(ai);
     free(vi);
-    plat_mutex_unlock(&lock);
+}
+
+// ---- the end of a run whose device is lost (vk.h vk_device_lost_check)
+// A lost device stays lost: every later call on it fails or, worse, answers as if it had worked, and a driver that is
+// called on from several threads after the loss can fault inside itself. So the first thread that sees the loss ends
+// the run, and nothing else touches the device meanwhile: the paths that would read vk_lost and return, and a thread
+// that gets the loss as a result of its own stops here for good.
+// LOST_EXIT_MS bounds the end. The first thread writes the report and waits for a save commit (fs_host.c
+// fs_save_crash_wait, 2 s at most); should it hang on a lock that a stopped thread holds, the watchdog ends the
+// process with the same code, and the lines already written are in the log (rt_fatal_code wrote them itself).
+#define LOST_EXIT_MS 10000
+volatile int32_t vk_lost;
+
+static void lost_wait_exit(void *arg) {
+    (void)arg;
+    for (int t = 0; t < LOST_EXIT_MS; t += 50) plat_sleep_ms(50);
+    _Exit(RT_LOST_EXIT);
+}
+
+void vk_device_lost_check(VkResult r, const char *where) {
+    if (r != VK_ERROR_DEVICE_LOST) return;
+    if (plat_xchg32(&vk_lost, 1)) lost_wait_exit(NULL);   // another thread is ending the run: this one stops here
+    plat_thread_spawn(lost_wait_exit, NULL, "vk lost exit", 0);
+    device_fault_report();
+    rt_fatal_code(RT_LOST_EXIT, "vk: the GPU device was lost (seen at: %s). The run ends here; the lines above name what "
+                                "the GPU was doing", where);
+}
+
+
+void vk_device_lost_poll(void) {
+    VkCtx *c = vk_ctx();
+    if (!c || vk_device_is_lost()) return;
+    VkFence f = __atomic_load_n(&lost_fence, __ATOMIC_ACQUIRE);
+    if (!f) {
+        plat_mutex_lock(&lost_fence_lock);
+        if (!lost_fence) {
+            VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+            VkFence n = VK_NULL_HANDLE;
+            VkResult r = vkCreateFence(c->device, &fi, NULL, &n);
+            if (r == VK_SUCCESS) __atomic_store_n(&lost_fence, n, __ATOMIC_RELEASE);
+            else vk_device_lost_check(r, "the fence that asks whether the device lives");
+        }
+        f = lost_fence;
+        plat_mutex_unlock(&lost_fence_lock);
+        if (!f) return;
+    }
+    vk_device_lost_check(vkGetFenceStatus(c->device, f), "a poll of the device");
 }
 
 int vk_selftest(void) {
@@ -663,6 +729,7 @@ int probe_vkdevice(void) {
            c->has_conditional_rendering, c->has_transform_feedback, c->has_provoking_vertex, c->has_robustness2,
            c->has_device_fault, c->has_memory_budget, c->has_buffer_device_address, c->has_fragment_shader_interlock,
            c->has_buffer_marker, c->has_nv_checkpoints, c->validation);
+    fatal_note();   // the line a fatal error or a crash would add to the log, to read it without one
     vk_shutdown();
     printf("probe-vkdevice: %s (validation errors %ld)\n", g_errors_total ? "FAILED" : "passed", g_errors_total);
     return g_errors_total ? 1 : 0;

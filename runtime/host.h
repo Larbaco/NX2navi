@@ -25,8 +25,8 @@ void rt_log_raw(const char *p, size_t n);
 const char *rt_log_path(void);                  // the log file, NULL when this run writes none
 void rt_log_sync(void);                         // writes the queued log lines now; later lines are written as they are made
 enum { RT_TRACE_SVC = 1, RT_TRACE_HOSTCALL = 2, RT_TRACE_IPC = 4, RT_TRACE_FS = 8, RT_TRACE_GFX = 16, RT_TRACE_PERF = 32,
-       RT_TRACE_SCHED = 64, RT_TRACE_AUDIO = 128, RT_TRACE_PRESENT = 256 };
-extern unsigned rt_trace;                       // from NX2NAVI_TRACE=svc,host,ipc,fs,gfx,perf,sched,audio,present (or all)
+       RT_TRACE_SCHED = 64, RT_TRACE_AUDIO = 128, RT_TRACE_PRESENT = 256, RT_TRACE_COOP = 512 };
+extern unsigned rt_trace;                       // from NX2NAVI_TRACE=svc,host,ipc,fs,gfx,perf,sched,audio,present,coop (or all)
 // prof_win.c: NX2NAVI_PROFILE=<path> sampling profiler; NX2NAVI_TRACE=perf frame timing (waits of the render thread)
 // PERF_TEX: texture uploads on the render thread (deswizzle, decode, staging), PERF_ASTC included
 enum { PERF_PACE, PERF_FENCE, PERF_DRAIN, PERF_PIPE, PERF_XLATE, PERF_TEX, PERF_ASTC, PERF_N };
@@ -48,6 +48,44 @@ enum { PERF_CNT_PIPE_ASYNC, PERF_CNT_PIPE_SKIP, PERF_CNT_TEX_UP, PERF_CNT_TEX_RE
        PERF_CNT_PIPE_WAIT, PERF_CNT_ONESHOT_WAIT, PERF_CNT_PIPE_BUILT, PERF_CNT_TEX_NEW, PERF_CNT_TEX_ALIAS,
        PERF_CNT_WB, PERF_CNT_WB_SKIP, PERF_CNT_N };
 void perf_count(int kind);
+// NX2NAVI_TRACE=perf: work on any thread that a frame can wait for besides the render thread's waits above, summed per
+// frame and per 60-frame window (perf.c perf_mark_add): RomFS reads, host zstd decodes, pipeline creates (vk_pipeline.c
+// pipe_create_in), guest memory maps (heap size, MapPhysicalMemory), NVN memory pool initialize and finalize
+// (vk_memory.c vk_pool_init, vk_pool_fini), device memory VMA allocates (blocks and dedicated memory: count and
+// bytes, no time), and DLSS and DLSS frame generation feature creates (vk_dlaa.c). perf_mark_begin returns 0 while the trace is off, so a normal run pays one branch per site.
+enum { PERF_M_FILE, PERF_M_ZSTD, PERF_M_PIPE, PERF_M_GMEM, PERF_M_POOL, PERF_M_DEVMEM, PERF_M_NGX, PERF_M_N };
+uint64_t perf_mark_begin(void);
+void perf_mark_end(int kind, uint64_t t0, uint64_t bytes);   // nothing when t0 is 0
+void perf_mark_add(int kind, uint64_t ns, uint64_t bytes);   // nothing while the trace is off
+// NX2NAVI_TRACE=perf segments and scenes (perf.c): perf_segment ends the running segment of presents at the next present
+// with a line of its frame times (mean, 1% low, worst), the work marks above, process memory and VRAM, then the memory
+// snapshot, and starts one named name (the input script's MARK lines, input.c). perf_scene notes an area's load
+// (romfs.c, the area's static placement file) and takes the memory snapshot once no area has loaded for 10 s.
+void perf_segment(const char *name);
+void perf_scene(const char *name);
+// NX2NAVI_TRACE=perf "mem: sizes" lines (perf.c sizes_log): the entries and bytes of the caches, pools and tables no
+// other line gives, every 600 presents and with each memory snapshot. Each subsystem's *_sizes function (weak no-ops
+// in perf.c) adds its own with perf_size, taking its locks briefly on the present thread. count or bytes UINT64_MAX:
+// not known; limit 0: none.
+typedef struct { char line[1800]; int n; uint64_t frame; const char *group; } PerfSizes;
+void perf_size(PerfSizes *s, const char *name, uint64_t count, uint64_t limit, uint64_t bytes);
+#define PERF_SIZE_NONE UINT64_MAX
+void mem_sizes(PerfSizes *s);         // memory.c
+void kern_sizes(PerfSizes *s);        // kernel.c
+void setjmp_sizes(PerfSizes *s);      // guest_setjmp.c
+void fs_host_sizes(PerfSizes *s);     // fs_host.c
+void romfs_sizes(PerfSizes *s);       // romfs.c
+void zstd_sizes(PerfSizes *s);        // ov_zstd.c
+void cfg_sizes(PerfSizes *s);         // cfg.c
+void vk_mem_sizes(PerfSizes *s);      // vk_memory.c
+void vk_gpa_sizes(PerfSizes *s);      // vk_gpa.c
+void vk_texture_sizes(PerfSizes *s);  // vk_texture.c
+void vk_exec_sizes(PerfSizes *s);     // vk_exec_draw.c
+void vk_sync_sizes(PerfSizes *s);     // vk_sync.c
+void vk_usnap_sizes(PerfSizes *s);    // vk_usnap.c
+void nvn_cmd_sizes(PerfSizes *s);     // nvn_api_cmd.c
+void vk_pipeline_sizes(PerfSizes *s); // vk_pipeline.c
+void gfx_shader_sizes(PerfSizes *s);  // gfx_shader.c
 // NX2NAVI_REPLAY_TIME=1: how long the replay spends in each kind of op (perf.c perf_replay_op reports it with the
 // frame-time summary). Draws and dispatches include their bindings and the vkCmd calls they record; binds are the state
 // and resource binds between them; xfer is copies and clears.
@@ -153,7 +191,10 @@ typedef struct { uint64_t base, size; uint32_t state, attr, perm, ipc, device, p
 void mem_init(void);                                       // reserve every region; on a collision re-run the process
                                                            // (up to 20 times, NX2NAVI_REEXEC), then fatal
 const RtGuestLayout *mem_layout(void);
+int mem_start_note(int probe);                             // a game's start: a warning line when the free commit is
+                                                           // below the game's need (mem_need.h); 1 when it is
 void mem_guest_census(uint64_t frame);   // NX2NAVI_TRACE=perf: committed bytes per guest region
+void mem_lazy_heap_report(uint64_t frame);   // NX2NAVI_TRACE=perf: the lazy heap's faults since the last line
 uint32_t mem_set_heap_size(uint64_t size, uint64_t *addr);                      // 0x01
 uint32_t mem_set_permission(uint64_t a, uint64_t n, uint32_t perm);             // 0x02
 uint32_t mem_set_attribute(uint64_t a, uint64_t n, uint32_t mask, uint32_t at); // 0x03
@@ -161,6 +202,7 @@ uint32_t mem_map(uint64_t dst, uint64_t src, uint64_t n);                       
 uint32_t mem_unmap(uint64_t dst, uint64_t src, uint64_t n);                     // 0x05
 uint32_t mem_query(uint64_t a, RtMemoryInfo *out);                              // 0x06
 int mem_readable(uint64_t a, uint64_t n);                                        // every page readable
+uint32_t mem_map_gen(void);   // changes with everything mem_readable answers from (mapping, heap, permissions)
 int mem_read_hold(uint64_t a, uint64_t n);   // mem_readable that keeps the range mapped until mem_read_release
 void mem_read_release(void);
 uint32_t mem_map_physical(uint64_t a, uint64_t n);                              // 0x2C
@@ -183,8 +225,16 @@ int mem_freeze(uint64_t a);                                // makes the 2 MiB re
 int mem_frozen(uint64_t a);                                // the 2 MiB region of a is frozen: no page in it changed
                                                            // since its freeze
 void mem_thaw(uint64_t a, uint64_t n);                     // makes the frozen regions over [a, a+n) writable again;
-                                                           // before a kernel write (file read) into guest memory
-void mem_freeze_stats(uint64_t *frozen, uint64_t *freezes, uint64_t *fault_thaws, uint64_t *other_thaws);
+                                                           // before a kernel write (file read) into guest memory;
+                                                           // also commits pages the lazy heap left reserved
+void mem_kernel_access(uint64_t a, uint64_t n);            // NX2NAVI_HEAP_LAZY: commits the reserved heap pages of
+                                                           // [a, a+n) before the kernel reads them (a file write)
+uint64_t mem_untouched_run(uint64_t a, uint64_t end);    // NX2NAVI_HEAP_LAZY: the end of the run of heap pages at a
+                                                           // that were never committed (a scan steps over it), else 0
+int mem_host_readable(uint64_t a, uint64_t n);             // plat_mem_readable that first commits the untouched
+                                                           // pages of the lazy heap in [a, a+n), which read zero
+void mem_freeze_stats(uint64_t *frozen, uint64_t *freezes, uint64_t *fault_thaws, uint64_t *other_thaws,
+                      uint64_t *hot_holds);   // hot_holds: quick thaws that held their region thawed (memory.c "Hot regions")
 // NX2NAVI_WB_PROBE=1 (memory.c, "Probed regions"): who reads what the GPU wrote back into guest memory.
 // NX2NAVI_WB_LAZY (memory.c, "Lazy write-back"): pages the GPU wrote that come down only when the CPU touches them.
 int mem_lazy_enable(void (*fetch)(uint64_t h0, uint64_t h1, uint64_t off, uint64_t size),
@@ -195,6 +245,7 @@ int mem_lazy_armed(uint64_t a, uint64_t n);
 void mem_lazy_window(int open);
 void mem_lazy_release(uint64_t a, uint64_t n);
 void mem_lazy_report(uint64_t frame, uint64_t skipped);
+void mem_lazy_note(char *out, size_t n);                   // its state as a phrase, without a lock (a fatal error's line)
 int mem_lazy_pick(uint64_t *addr, int max);                // test: addresses of armed pages
 int mem_probe(uint64_t a, uint64_t n);                     // the 2 MiB regions inside [a, a+n) fault on their next access
 int mem_probing(void);                                     // the probe is on
@@ -232,6 +283,7 @@ extern const char rt_port_version[];                       // VERSION at the bui
 // ---- kernel (kernel.c)
 typedef struct RtThread RtThread;
 Cpu *kern_cpu(void);                                       // current guest thread's Cpu, NULL on host threads
+void fs_save_crash_wait(void);                             // fs_host.c: the crash report's and rt_fatal's bounded wait for a save Commit under way
 void kern_free_cores_note(void);                           // for crash reports: logs that free_cores = 1 lifted the
                                                            // virtual core gate, nothing when the gate is on
 uint32_t kern_main_thread(Cpu **cpu);                      // main thread object and Cpu for the calling host thread
@@ -336,8 +388,8 @@ int ov_movie_live(void);                                   // ov_movie2.c: a mov
 int frame_limit_adjustable(void);                         // the frame limit setting changes the rate (always)
 int frame_free_running(void);                             // no fps60/realtime patch set: the game steps by the clock
 double frame_step_limit_hz(void);                         // the frame rate the limit gives (overlay); 0 unknown
-double frame_step_game_hz(void);                          // ... over frame generation's factor: the game's rate
-int frame_limit_follows_display(void);                    // no limit set and frame generation in use: the display's rate
+double frame_step_game_hz(void);                          // the rate the game draws at under the limit; 0 unknown
+float frame_step_frames(void);                            // the 60 Hz frames the game steps per update (set ostep), else 1
 // rtss_limit.c: RivaTuner Statistics Server takes the frame limit where it runs
 void rtss_limit_want(int64_t mhz);                        // the pacer's limit in millihertz: >0, 0 none, -1 keep RTSS out
 int rtss_limit_active(void);                              // RTSS limits to the wanted rate: the pacer holds no frames
@@ -379,17 +431,22 @@ int probe_discord(void);                                   // discord_rpc.c
 int probe_loader(void), probe_kernel(void), probe_ipc(void), probe_services(void), probe_fs(void);
 int probe_gfx_abi(void);                                   // gfx_abi_probe.c
 int probe_vkdevice(void);                                 // vk_device.c
+int vk_sync_probe_devlost(void);                          // vk_sync.c: --probe-devlost
 int probe_nvn(void), probe_nvn_tex(void);                  // nvn_probe.c, nvn_tex_probe.c
 int probe_window(void);                                    // gfx_window_probe.c
 int probe_shader(void);                                    // gfx_shader.c
 int probe_census_dir(char *dir, size_t n);                 // gfx_shader_probe.c: build/<version>/shaders for the probes
 int probe_vkmem(void), probe_vkexec(void), probe_astc(void);                 // tex_probe.c, vk_exec_probe.c, astc_probe.c
+int probe_meshfb(void);                                                      // mesh_fb_probe.c
 int probe_zstd(void);                                      // ov_zstd.c
 int probe_gamepad(void);                                   // input.c
-int probe_movie(void);                                     // movie_probe.c: host VP9 movie::Decoder on one RomFS movie
+int probe_movie(void);                                     // movie_probe.c: the host movie decoders on one RomFS movie
 int vk_pipeline_prepare_shaders(void);                     // vk_pipeline.c: --prepare-shaders (tools/prepare_shaders.py)
 int vk_pipeline_warm_shaders(void);                        // vk_pipeline.c: --warm-shaders (tools/build_game.py)
+int vk_pipeline_prepare_pipelines(void);                   // vk_pipeline.c: --prepare-pipelines (the shared pipeline list)
 int vk_pipeline_probe_prewarm(void);                       // vk_pipeline.c: --probe-prewarm
+int vk_pipeline_probe_buildgate(void);                     // vk_pipeline.c: --probe-buildgate
+int vk_ffx_probe_cache(void);                              // vk_ffx.cpp: --probe-ffx-cache
 // vk_device.c: the drivers' own shader caches beside the exe (MESA_SHADER_CACHE_DIR, on NVIDIA's Linux driver
 // __GL_SHADER_DISK_CACHE_PATH and _SIZE) in the environment, once; before any thread can load a Vulkan driver
 void vk_driver_cache_env(void);

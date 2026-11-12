@@ -28,6 +28,9 @@ void ipc_handle_closed(int kind, void *obj) { (void)kind, (void)obj; }
 const char *ldr_describe(uint64_t a, char *buf, int n) { snprintf(buf, (size_t)n, "%#llx", (unsigned long long)a); return buf; }
 uint64_t ldr_symbol(const char *name) { (void)name; return 0; }
 void perf_main_thread(void) {}
+void perf_size(PerfSizes *s, const char *name, uint64_t count, uint64_t limit, uint64_t bytes) {
+    (void)s, (void)name, (void)count, (void)limit, (void)bytes;   // kern_sizes is not called here
+}
 int rt_linked_modules(RtModule *out, int max) { (void)out, (void)max; return 0; }
 const RtGuestLayout *mem_layout(void) { return NULL; }
 void *mem_kernel_alloc(uint64_t size, uint64_t align) {

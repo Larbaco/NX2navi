@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "coop_game.h"
 #include "fs.h"
 #include "host.h"
 #include "platform/platform.h"
@@ -558,7 +559,9 @@ static uint32_t save_commit_locked(void) {
     return 0;
 }
 
-// The background commit: commit_pending from the game's Commit until the thread has run save_commit_locked.
+// The background commit: commit_pending counts the game's Commits whose thread has not run save_commit_locked to its
+// end yet. A count, not a flag: with two Commits entered at once the first thread's end cleared the flag while the
+// second still waited for tx_lock, and a save write then went into the working copy the second was copying.
 static PlatMutex pend_lock = PLAT_MUTEX_INIT;
 static PlatCond pend_cv = PLAT_COND_INIT;
 static volatile int32_t commit_pending;
@@ -580,13 +583,92 @@ void fs_save_flush(void) {
     plat_mutex_unlock(&pend_lock);
 }
 
+// The process is about to end on a crash or a fatal error (main.c crash_handler, dispatch.c rt_fatal). The game's
+// Commit returns once its commit is queued, so the game may already have told the player the save is done while the
+// commit thread still copies (95-135 ms): ending now would leave an unfinished copy, which the next start rolls back.
+// The thread goes on while this one waits, for at most CRASH_WAIT_MS, without taking a lock (the failing thread may
+// hold one). Not when the failing thread is the one committing: its commit cannot finish.
+#define CRASH_WAIT_MS 2000
+static _Thread_local int committing;
+
+void fs_save_crash_wait(void) {
+    if (committing || !plat_cas32(&commit_pending, 0, 0)) return;
+    uint64_t t0 = plat_now_ms();
+    while (plat_cas32(&commit_pending, 0, 0) && plat_now_ms() - t0 < CRASH_WAIT_MS) plat_sleep_ms(5);
+    rt_log("fs: a save commit was under way when the process failed: %s after %llu ms",
+           plat_cas32(&commit_pending, 0, 0) ? "not finished; the next start keeps the save before it" : "finished",
+           (unsigned long long)(plat_now_ms() - t0));
+}
+
+int fs_profile_path(const char *rel, char *out, size_t cap) {
+    if (cap) out[0] = 0;
+    return *profile && snprintf(out, cap, "%s/%s", profile, rel) < (int)cap;
+}
+
+int fs_save_snapshot(const char *folder, const char *prefix, int keep, char *out, size_t cap) {
+    char root[1100];
+    if (cap) out[0] = 0;
+    if (!*profile || snprintf(root, sizeof root, "%s/%s", profile, folder) >= (int)sizeof root) return 0;
+    make_dirs(root);
+    uint64_t ns = plat_unix_time_ns();
+    struct tm t;
+    plat_gmtime((int64_t)(ns / 1000000000u), &t);
+    char name[64];
+    if (!prefix) prefix = "";
+    if (*prefix >= '0' && *prefix <= '9') return 0;   // a name that begins with a digit is one the pruning may take
+    int len = snprintf(name, sizeof name, "%.16s%04d%02d%02d-%02d%02d%02d-%03u", prefix, t.tm_year + 1900, t.tm_mon + 1,
+                       t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec, (unsigned)(ns / 1000000u % 1000u));
+    char *dst = join(root, name);
+    for (unsigned k = 1; exists(dst) && k < 1000; k++) {   // two in one millisecond
+        free(dst);
+        snprintf(name + len, sizeof name - (size_t)len, "-%03u", k);
+        dst = join(root, name);
+    }
+    int nfiles = 0, nlinked = 0, have = 0, ok = 0;
+    uint64_t bytes = 0;
+    plat_mutex_lock(&tx_lock);   // no Commit swaps the save while it is copied
+    const char *src = newest_save();
+    have = exists(src);
+    if (have) ok = !copy_tree(src, dst, NULL, 1, &nfiles, &nlinked, &bytes);
+    plat_mutex_unlock(&tx_lock);
+    if (!have) {
+        free(dst);
+        return 1;   // nothing saved yet: nothing to go back to
+    }
+    if (!ok) {
+        rt_log("fs: cannot copy the save to %s", dst);
+        remove_tree(dst);
+        free(dst);
+        return 0;
+    }
+    if (cap) snprintf(out, cap, "%s", dst);
+    free(dst);
+    Listing l;   // the newest keep copies stay; their names sort by time; a prefixed one is never pruned
+    if (!list_dir(root, &l)) {
+        qsort(l.e, (size_t)l.n, sizeof *l.e, listed_cmp);
+        int dirs = 0;
+        for (int i = 0; i < l.n; i++) dirs += l.e[i].kind == PLAT_FS_DIR && l.e[i].name[0] >= '0' && l.e[i].name[0] <= '9';
+        for (int i = 0; i < l.n && dirs > keep; i++) {
+            if (l.e[i].kind != PLAT_FS_DIR || l.e[i].name[0] < '0' || l.e[i].name[0] > '9') continue;
+            char *p = join(root, l.e[i].name);
+            remove_tree(p);
+            free(p);
+            dirs--;
+        }
+        listing_free(l.e, l.n);
+    }
+    return 1;
+}
+
 static uint32_t commit_run(void) {
+    committing = 1;
     plat_mutex_lock(&tx_lock);
     uint32_t r = save_commit_locked();
     plat_dec32(&save_writers);
     plat_mutex_unlock(&tx_lock);
+    committing = 0;
     plat_mutex_lock(&pend_lock);
-    commit_pending = 0;
+    plat_dec32(&commit_pending);
     plat_mutex_unlock(&pend_lock);
     plat_cond_broadcast(&pend_cv);
     return r;
@@ -612,7 +694,7 @@ static uint32_t save_commit(void) {
         return 0;
     }
     plat_inc32(&save_writers);   // fs_save_busy until the thread is done
-    plat_xchg32(&commit_pending, 1);
+    plat_inc32(&commit_pending);
     plat_mutex_unlock(&pend_lock);
     if (plat_thread_spawn(commit_main, NULL, "save commit", 0)) {
         return 0;
@@ -1086,7 +1168,10 @@ static int64_t host_read_at(PlatFile *f, void *buf, uint32_t n, uint64_t off) {
 }
 
 static uint32_t open_file(uint64_t *out, const char *path, int mode) {
-    if (romfs_owns(path)) return romfs_open(out, path, mode);
+    if (romfs_owns(path)) {
+        coop_game_rom_open(path);   // coop_game.c: the title screen's start
+        return romfs_open(out, path, mode);
+    }
     fs_trace(mode & FS_OPEN_WRITE ? "write" : "read", path);
     if (!out || !(mode & (FS_OPEN_READ | FS_OPEN_WRITE)) || (mode & ~7)) return FS_R_INVALID_ARGUMENT;
     char p[PATH_CAP];
@@ -1152,8 +1237,10 @@ static uint32_t write_file(uint64_t h, int64_t offset, const void *buffer, uint6
     if (file->save) save_touched();
     for (uint64_t done = 0; done < size;) {
         uint32_t chunk = size - done > 0x40000000 ? 0x40000000 : (uint32_t)(size - done);
-        // NX2NAVI_WB_PROBE: the kernel reads the buffer, and a probed page would fail the write instead of faulting
+        // NX2NAVI_WB_PROBE: the kernel reads the buffer, and a probed page would fail the write instead of faulting;
+        // so would a heap page NX2NAVI_HEAP_LAZY has not committed yet
         if (mem_probing()) mem_thaw((uintptr_t)buffer + done, chunk);
+        mem_kernel_access((uintptr_t)buffer + done, chunk);
         int64_t put = plat_file_pwrite(f, (const uint8_t *)buffer + done, chunk, (uint64_t)offset + done);
         if (put <= 0) rt_fatal("fs: host save write failure");
         done += (uint64_t)put;
@@ -1306,8 +1393,13 @@ static uint32_t open_directory(uint64_t *out, const char *path, int mode) {
 
 static uint32_t read_directory(int64_t *count, DirectoryEntry *out, uint64_t h, int64_t max) {
     if (h < DIR_BASE || h >= DIR_BASE + NDIRS || !count || max < 0 || (!out && max)) return FS_R_INVALID_ARGUMENT;
+    // lock held to the end: CloseDirectory on another guest thread frees the listing this copies from
+    plat_mutex_lock(&lock);
     Dir *d = &dirs[h - DIR_BASE];
-    if (!d->used) return FS_R_INVALID_ARGUMENT;
+    if (!d->used) {
+        plat_mutex_unlock(&lock);
+        return FS_R_INVALID_ARGUMENT;
+    }
     int64_t n = 0;
     while (n < max && d->next < d->n) {
         const Listed *e = &d->e[d->next++];
@@ -1321,6 +1413,7 @@ static uint32_t read_directory(int64_t *count, DirectoryEntry *out, uint64_t h, 
         out[n].size = is_dir ? 0 : (int64_t)e->size;
         n++;
     }
+    plat_mutex_unlock(&lock);
     *count = n;
     return 0;
 }
@@ -1328,11 +1421,16 @@ static uint32_t read_directory(int64_t *count, DirectoryEntry *out, uint64_t h, 
 // Result GetDirectoryEntryCount(int64_t *out, DirectoryHandle h): the entries ReadDirectory would still return
 static uint32_t directory_entry_count(int64_t *count, uint64_t h) {
     if (h < DIR_BASE || h >= DIR_BASE + NDIRS || !count) return FS_R_INVALID_ARGUMENT;
+    plat_mutex_lock_shared(&lock);   // against a CloseDirectory on another guest thread
     Dir *d = &dirs[h - DIR_BASE];
-    if (!d->used) return FS_R_INVALID_ARGUMENT;
+    if (!d->used) {
+        plat_mutex_unlock_shared(&lock);
+        return FS_R_INVALID_ARGUMENT;
+    }
     int64_t n = 0;
     for (int i = d->next; i < d->n; i++)
         if (strlen(d->e[i].name) < 769 && (d->mode & (d->e[i].kind == PLAT_FS_DIR ? 1 : 2))) n++;
+    plat_mutex_unlock_shared(&lock);
     *count = n;
     return 0;
 }
@@ -1976,6 +2074,21 @@ static void probe_storage(void) {
     CHECK(tx_commit() == 0 && !fs_save_busy(), "Commit after the changes");
     probe_save_tx(uid);
 
+    // copies of the save: the first one, prefixed, outlasts the rotation of the later ones
+    char first[PLAT_PATH_MAX], later[PLAT_PATH_MAX];
+    int copies = fs_save_snapshot("coop-backup", "first-", 3, first, sizeof first);
+    for (int i = 0; i < 6; i++) copies += fs_save_snapshot("coop-backup", NULL, 3, later, sizeof later);
+    char backup[PLAT_PATH_MAX * 3 + 96];
+    snprintf(backup, sizeof backup, "%s/coop-backup", dir);
+    Listing bl;
+    int dated = 0, prefixed = 0;
+    if (!list_dir(backup, &bl)) {
+        for (int i = 0; i < bl.n; i++) dated += bl.e[i].name[0] >= '0' && bl.e[i].name[0] <= '9', prefixed += !strncmp(bl.e[i].name, "first-", 6);
+        listing_free(bl.e, bl.n);
+    }
+    CHECK(copies == 7 && first[0] && exists(first) && prefixed == 1 && dated == 3,
+          "save copies: the first (prefixed) stays beside the newest 3 of 6 later ones (%d made, %d first, %d dated)", copies, prefixed, dated);
+
     // temporary and cache storage
     CHECK(RES(S_MOUNT_TEMP, U("temp")) == 0 && RES(S_CREATE_FILE, U("temp:/t.bin"), 4) == 0 && !fs_save_busy(),
           "temporary storage");
@@ -2032,4 +2145,15 @@ int probe_fs(void) {
     }
     printf("probe-fs: passed (%llu files, %d sampled)\n", (unsigned long long)files, SAMPLES);
     return 0;
+}
+
+// NX2NAVI_TRACE=perf "mem: sizes" (perf.c): open save-data files and directory listings against their tables.
+void fs_host_sizes(PerfSizes *s) {
+    uint64_t nf = 0, nd = 0;
+    plat_mutex_lock_shared(&lock);
+    for (int i = 0; i < NFILES; i++) nf += files[i].h != NULL;
+    for (int i = 0; i < NDIRS; i++) nd += dirs[i].used != 0;
+    plat_mutex_unlock_shared(&lock);
+    perf_size(s, "save files open", nf, NFILES, PERF_SIZE_NONE);
+    perf_size(s, "save listings open", nd, NDIRS, PERF_SIZE_NONE);
 }

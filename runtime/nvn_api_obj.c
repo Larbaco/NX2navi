@@ -12,6 +12,7 @@
 
 #include "gfx.h"
 #include "cfg.h"
+#include "coop_game.h"
 #include "host.h"
 #include "nvn_api.h"
 #include "nvn_hmap.h"
@@ -830,7 +831,10 @@ NVN_API(nvnWindowAcquireTexture) {
     // first submission (nvn_api_core.c nvnQueueSubmitCommands) removes the rest. NX2NAVI_ACQUIRE_WAIT=0 leaves it to the
     // clock; =2 waits for the newest present of any image (one frame in flight at most).
     static int acq_wait = -1;
-    if (acq_wait < 0) acq_wait = rt_knob("ACQUIRE_WAIT", "1");
+    if (acq_wait < 0) {   // a number: the on/off reader took every value but 0 for 1, so 2 could not be chosen
+        const char *e = cfg_get("NX2NAVI_ACQUIRE_WAIT");
+        acq_wait = e && (*e == '0' || *e == '2') && !e[1] ? *e - '0' : 1;
+    }
     uint64_t *fe = img_fence_of(o, idx), want = fe ? *fe : 0;
     if (acq_wait == 2) want = last_present_fence;
     if (acq_wait && want) {
@@ -861,11 +865,13 @@ NVN_API(nvnQueuePresentTexture) {
     movie_tick(c);   // ov_movie.c: hand over decoded movie frames that are due; needs the core, so before the wait
     res_present(c);  // resolution.c: a DLSS mode change sets the game's render size again, between frames
     wide_present();  // widescreen.c: Ocarina's DLSS render scale
+    coop_present(c); // coop_game.c: co-op progress sync reads and sets the game's flags, between frames
     NVN_BLOCKING();
     if (o->magic != NVN_WIN_MAGIC || idx < 0 || idx >= o->ntex || idx >= 4 || !o->tex[idx])
         rt_fatal("nvn: QueuePresentTexture of image %d on window %p", idx, (void *)o);
+    nvn_call_note(1, (uintptr_t)arg_p(c, 0), 1);
     o->presents++;
-    nvn_submits_in_frame = 0;
+    __atomic_store_n(&nvn_submits_in_frame, 0, __ATOMIC_RELAXED);
     const tex_t *t = (const tex_t *)o->tex[idx];
     uint64_t period = present_period(o), now = kern_now_ns();
     uint64_t slot = now + pace(&o->pace, now, period);
@@ -877,4 +883,5 @@ NVN_API(nvnQueuePresentTexture) {
     last_present_fence = nvn_fence_last();
     frame_step_present(slot, o->interval);   // frame_rate.c: the real-time step follows the display times
     rt_frame_presented(t, o->presents);
+    nvn_call_note(1, (uintptr_t)arg_p(c, 0), 0);
 }

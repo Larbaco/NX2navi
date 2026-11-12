@@ -13,7 +13,7 @@ downloads included, and keeps the game up to date. This page is the same build b
   NVIDIA).
 - Your own dump of the game as a `.nup` file (or its `exefs` and `romfs` folders), with the 1.1.1 update: program
   `0400486024DEC000`, main build `e0f3ccfa`. Other versions are refused.
-- About 30 GB free on the disk you build to, besides the dump.
+- About 34 GB free on the disk you build to, besides the dump.
 
 ## One-time setup (about 15 minutes)
 
@@ -58,7 +58,7 @@ last draws the Xbox, PlayStation, Steam Deck and keyboard and mouse button promp
 meanwhile. If it stops, run the same command again: finished steps are skipped.
 
 When it says `finished`, start `C:\Games\Ocarina\ocarina.exe`. You can delete `C:\Games\Ocarina\build-cache` (about
-5 GB) afterwards.
+1.5 GB) afterwards.
 
 ## Linux
 
@@ -78,6 +78,17 @@ RADV). It takes clang, clang++ and lld from `PATH` and links against the system'
    (GPL-2.0): `pip install --user zbic`, or in a virtual environment with the packages above.
    Vulkan Memory Allocator is one header: the system's (AUR `vulkan-memory-allocator`), else the build fetches the
    pinned 3.4.0 into `toolchain/vma/` and checks its hash.
+   The Vulkan headers must be release 363 (1.4.363) or newer: the runtime names extensions that older headers do not
+   declare (`VK_KHR_pipeline_binary` among them), and distributions with long support package older ones. The
+   AppImage carries the pinned headers (`toolchain/vulkan-headers/`, `tools/vulkan_pin.py`) and builds against them
+   whatever the system has; a build from a kit or a source checkout uses the system's when they are new enough and
+   otherwise fetches the pinned ones there once and checks their hash. The loader's library still comes from the
+   system (`vulkan-icd-loader`, `libvulkan-dev`, `vulkan-loader-devel`).
+   The compiler is the system's too. The releases are built with clang 23; an older one works as far as it compiles
+   the runtime (one without `#embed`, before clang 19, takes the menu's font from a header the kit carries). Before
+   its long steps the build checks every runtime source with that compiler and links against the libraries, so a
+   compiler, a header or a library it cannot use stops it in the first seconds, with the compiler's own words, and
+   not after the RomFS image.
 
 2. The shader translator: a kit with `bin/nx2navi_xlate` has it; from a source checkout, build it once with
    `python tools/build_xlate.py` (needs the .NET 10 SDK). The build copies it beside the game. A kit also carries the
@@ -112,7 +123,8 @@ cannot give back what the game needs after its start: about 10 GB in Kokiri Fore
 
 AMD FSR 3.1 loads AMD's `amd_fidelityfx_vk.dll`, which only the Windows build can use: on Linux the menu offers neither
 FSR 3.1 upscaling nor FSR 3.1 frame generation, and `taa = fsr3` or `framegen = fsr3` in `nx2navi.ini` leave the
-game's own scaling and swapchain as they are (the log says so).
+game's own scaling and swapchain as they are (the log says so). AMD FSR 4 is in the Windows build alone for the same
+reason, and `fsr4 = 1` does nothing on Linux.
 
 NVIDIA DLSS (RTX cards) needs the driver's own `libnvidia-ngx.so.1` on the library path (the proprietary driver's
 utilities package, `nvidia-utils` on Arch) and NVIDIA's DLSS library `libnvidia-ngx-dlss.so.<version>` beside
@@ -132,8 +144,9 @@ switches at once, with a *DLSS multiplier* of 2x to 6x (above 2x on RTX 50 cards
 frames needed to reach the display's refresh rate (`framegen = dlss` and `fg_mult` in `nx2navi.ini`). The log says
 `ngxfg: DLSS Frame Generation available` when NGX found the library.
 
-`tools/make_appimage.py` packs this kit into one `NX2navi-Linux-<version>-x86_64.AppImage` with its own Python, for
-players without a source checkout: it checks for the packages above, installs zbic with pip on its first run, picks
+`tools/make_appimage.py` packs this kit into one `NX2navi-Linux-<version>-x86_64.AppImage` with its own Python and the
+pinned Vulkan headers, for players without a source checkout: it checks for the packages above (their Vulkan headers
+are not needed), installs zbic with pip on its first run, picks
 `--jobs` from the memory, builds into `~/Games/Ocarina` (or the folder given after the dump) and writes `play.sh`
 beside the game.
 
@@ -148,13 +161,18 @@ beside the game.
   driver keeps the prepared shaders' libraries in that cache, and a smaller limit drops the oldest as new ones come in
   (a 2048 MB cache could not hold them): every start then builds them again in the background, and play stutters, with
   some things missing for a few frames, until that is done. The log's `library warm` lines say when this happens.
+- With 16 GB of RAM, give Windows a fixed page file whose initial size is at least 32 GB (System, About, Advanced
+  system settings, Performance Settings, Advanced, Virtual memory: untick the automatic management, Custom size with
+  an initial size of 32768 MB or more, Set, then restart). Windows counts the game's video memory
+  against RAM plus page file, and a page file Windows sizes itself grows too slowly for Hyrule Field: the game then
+  lets textures go and the ground can flash white or black. The log says `system commit low` when this happens.
 - **Screen** in the menu has Texture filtering (anisotropic, up to 16x, at once), Texture detail (Reduced and Low
   leave out the largest versions of the big surface textures so that the game fits the video memory of 6 and 8 GB
   cards; Automatic picks by the card), Upscaling (DLSS on NVIDIA RTX cards,
-  FSR 3.1 on any card where `amd_fidelityfx_vk.dll` loads), Frame generation (NVIDIA DLSS on RTX 40 and 50 cards, with
+  FSR 3.1 on any card where `amd_fidelityfx_vk.dll` loads, FSR 4 on the Radeon cards AMD's FSR 4 libraries list it
+  for), Frame generation (NVIDIA DLSS on RTX 40 and 50 cards, with
   a DLSS multiplier of 2x, or 3x and 4x on RTX 50 cards; FSR 3.1 on any card where it loads; it needs DLSS or FSR 3.1
-  upscaling on, and the frame limit then counts the frames on screen; with no limit chosen it is the display's refresh
-  rate), HDR (the game's picture tone mapped to your display, with its own grading rows, or Native, the game's own HDR; turn HDR on in Windows first) and the
+  upscaling on; the frame limit counts the frames the game draws and the generated ones come on top), HDR (the game's picture tone mapped to your display, or Native, the game's own HDR, with peak, game and HUD brightness; turn HDR on in Windows first) and the
   resolution. A setting that takes effect only when the game starts again says "after restart" once you change it,
   until you set it back, and the Restart button at the bottom then counts the settings waiting for it.
 - **Controls** in the menu has Button prompts: the game's own, or Xbox, PlayStation, Steam Deck or keyboard and mouse ones when
@@ -162,7 +180,9 @@ beside the game.
   the keys `nx2navi.ini` binds when the build runs: after rebinding keys, run
   `py -I tools\make_game.py --rebuild --out "C:\Games\Ocarina"` to draw them again (it skips everything else).
 - The build copies NVIDIA's DLSS library `nvngx_dlss.dll` (with `nvngx_dlss-NOTICE.txt`, which names its licence)
-  and FSR 3.1's `amd_fidelityfx_vk.dll` beside `ocarina.exe` from the kit's `bin\`. To use another DLSS version, put
+  and FSR 3.1's `amd_fidelityfx_vk.dll` beside `ocarina.exe` from the kit's `bin\`, and FSR 4's
+  `amd_fidelityfx_loader_vk.dll` and `amd_fidelityfx_upscaler_vk.dll` when the kit has both (and
+  `amd_fidelityfx_framegeneration_vk.dll` for `fsr4_fg`). To use another DLSS version, put
   your own `nvngx_dlss.dll` there: later builds keep it. On Linux the library is `libnvidia-ngx-dlss.so.<version>`
   (see "Linux").
 - A kit with `bin\dlssg\` (made with `tools/make_kit.py --dlssg`) also brings DLSS Frame Generation on GeForce RTX 40

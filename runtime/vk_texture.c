@@ -54,8 +54,10 @@ typedef struct Tex {
                                   // other than the texture pool refresh reached it ("disuse")
     uint8_t retiring;             // evicted by disuse, in retiring[], not destroyed yet: the pool refresh leaves it out
     uint64_t retire_takes;        // vk_pool_takes when it was retired
+    uint64_t retire_frame;        // gfx_counters.frames when it was retired
     uint64_t retire_due;          // vk_sync_issued once every pool set was taken since (0: not yet); destroyed after it
     int uploaded, released;
+    uint64_t up_retry;            // gfx_counters.frames from which an upload that had no memory is tried again (upload)
     uint64_t uid;                 // names the entry in its bucket's released set (tex_gen_flip); 0 until its first release
     uint64_t rel_frame;           // gfx_counters.frames when it was released (drop_stale)
     uint32_t back_gap;            // most presents between a release and its taking back so far (stale_after)
@@ -89,6 +91,21 @@ typedef struct Tex {
     uint64_t ow_frame;            // gfx_counters.frames when overwritten was set
     uint8_t overwritten;          // released, and a texture at another address was drawn over its storage (overwrite_others)
     uint8_t in_gwin;              // in gwin[]
+    int pidx;                     // 1 + its index in pent[] (vk_texture_pool_note_locked); 0: not listed
+    int ph;                       // 1 + its index in pref[] (pool_ref); 0: none
+    // Where the entry and its content came from ("origins", below drop_note), for the lines of NX2NAVI_TRACE=perf
+    uint8_t had;                  // HAD_*: what put content into the image of an entry the CPU does not write
+    uint8_t og_start;             // START_*: how its content started (start_at)
+    uint8_t og_drop;              // DROP_*: the drop of this descriptor's last entry, when the ring still knew it
+    uint8_t og_reimg;             // made with the image of a released entry (create_tex, reuse)
+    uint8_t bc1_try;              // ASTC as BC3 that its first upload makes BC1 when every block is opaque (upload)
+    uint8_t said;                 // marks_check wrote its line for this entry
+    uint8_t sfill;                // split fill: the CPU does not write it, and its image is the storage's bytes: 1 as a
+                                  // CPU-written one's until the GPU writes it, 2 once (from_storage)
+    uint32_t og_backs;            // times it was taken back after a release (entry_of)
+    uint64_t og_frame;            // gfx_counters.frames when it was made
+    uint64_t og_drop_frame;       // gfx_counters.frames of the drop og_drop names
+    uint64_t og_back_frame;       // gfx_counters.frames when it was last taken back
 } Tex;
 
 // A slot keeps what vk_texture_by_id resolved for it, so a draw binding skips the key lookup and the address chain: the
@@ -132,6 +149,9 @@ static uint64_t ru_same_n, ru_same_bytes;   // re-uploads skipped: the pages wer
 // live image that the GPU wrote gets that image's content (alias_copy). Counts since the last log line.
 static int tex_alias = -1;
 static uint64_t n_alias_copied, n_alias_upload, n_alias_uninit, n_alias_kept, n_alias_released;
+// New depth and stencil images (not reused) init_new started at the replay's position, those of them for which an open
+// pass was ended, and those that went in the upload batch (no replay recording), since the last perf line.
+static uint64_t n_dinit_inline, n_dinit_inpass, n_dinit_upload;
 static uint32_t submit_epoch = 1;   // bumped per queue submit: draw bindings check a texture's storage once per submit
 // The thresholds further down that count presents (STALE_FRAMES, GPU_STALE_FRAMES, OVERWRITTEN_KEEP, DISUSE_FRAMES)
 // were set at 60 presents a second. Without a limit the game presents 85 to 240 a second (a menu), and "120 presents"
@@ -296,32 +316,135 @@ static void tex_gen_flip(Tex *e, int plain) {
     dirty_push(DIRTY_BUCKET | b);
 }
 
-// Moves slot id into bucket b's list (the lists exist once a slot was registered: vk_texture_register).
-static void slot_rebucket(int id, uint32_t b) {
+// Slot groups: the GPU-written slots of one address bucket that share a descriptor hash (TexSlot.khash) resolve alike
+// under the same address and entry generations, as the texture pool's memo has it (vk_exec_draw.c pool_fill). Ocarina
+// keeps up to ~400 descriptors of each transient render target registered over its storage, and the fullest bucket,
+// 1,281 slots, moves 8 times a submission in Kokiri Forest: 12,800 of the 17,600 slots a submission's dirty walks
+// refilled held their views already. The dirty walk can hand each group to the pool whole (vk_texture_dirty_slots_locked's
+// gfn), which leaves its members alone when their resolution did not change (NX2NAVI_POOL_GROUP). A slot is in its
+// bucket's own list (khash 0: a CPU-written texture) or in its group's member list, through the same links. A slot that
+// joins a group goes to its tail and leaves the group's stamp as it was: its registration put it on the dirty ring, so
+// the walk that follows refills it on its own, and the head, whose state the pool tests, is a member from before. (The
+// game's 118 registrations a submission cleared the stamps of the groups they joined, and the walk at a submission's
+// start went member by member as before: 11,300 of 11,550 slots.)
+typedef struct { VkSlotGroup pub; int32_t gnext, gprev, tail; uint32_t bucket; } SlotGroup;
+static SlotGroup *grp;
+static int ngrp, cgrp, grp_free = -1, ngrp_live;
+static uint64_t n_grouped;               // slots in groups
+static int32_t bucket_ghead[AGEN_N];     // per bucket: its first group (-1: none; set with the lists)
+static int32_t *slot_grp;                // per slot id: its group, -1 none
+typedef struct { uint64_t kh, b; } GrpKey;
+static nvn_hmap grp_by = {.klen = sizeof(GrpKey)};   // -> group + 1
+
+static int grp_get(uint64_t kh, uint32_t b) {
+    GrpKey k = {kh, b};
+    void *v = nvn_hm_get(&grp_by, &k);
+    if (v) return (int)((intptr_t)v - 1);
+    int g;
+    if (grp_free >= 0) {
+        g = grp_free, grp_free = grp[g].gnext;
+    } else {
+        if (ngrp == cgrp) {
+            int n = cgrp ? cgrp * 2 : 1024;
+            SlotGroup *p = realloc(grp, sizeof *p * (size_t)n);
+            if (!p) rt_fatal("vk: out of memory for texture slot groups");
+            grp = p, cgrp = n;
+        }
+        g = ngrp++;
+    }
+    SlotGroup *G = &grp[g];
+    memset(G, 0, sizeof *G);
+    G->pub.kh = kh, G->pub.head = G->tail = -1, G->bucket = b;
+    G->gprev = -1, G->gnext = bucket_ghead[b];
+    if (G->gnext >= 0) grp[G->gnext].gprev = g;
+    bucket_ghead[b] = g;
+    nvn_hm_put(&grp_by, &k, (void *)(intptr_t)(g + 1));
+    ngrp_live++;
+    return g;
+}
+
+static void grp_drop(int g) {
+    SlotGroup *G = &grp[g];
+    GrpKey k = {G->pub.kh, G->bucket};
+    nvn_hm_del(&grp_by, &k);
+    if (G->gprev >= 0) grp[G->gprev].gnext = G->gnext;
+    else bucket_ghead[G->bucket] = G->gnext;
+    if (G->gnext >= 0) grp[G->gnext].gprev = G->gprev;
+    G->pub.kh = 0, G->pub.head = G->tail = -1, G->pub.n = 0, G->pub.stamp = 0;
+    G->gnext = grp_free, grp_free = g;
+    ngrp_live--;
+}
+
+// Places slot id in bucket b: at the tail of its group when it has a descriptor hash, else at the head of the bucket's
+// own list (the lists exist once a slot was registered: vk_texture_register).
+static void slot_place(int id, uint32_t b, uint64_t kh) {
     if (slot_prev[id] != -2) {   // out of its old list
+        int32_t g = slot_grp[id];
+        int32_t *head = g >= 0 ? &grp[g].pub.head : &bucket_head[slot_bucket[id]];
         if (slot_prev[id] >= 0) slot_next[slot_prev[id]] = slot_next[id];
-        else bucket_head[slot_bucket[id]] = slot_next[id];
+        else *head = slot_next[id];
         if (slot_next[id] >= 0) slot_prev[slot_next[id]] = slot_prev[id];
+        else if (g >= 0) grp[g].tail = slot_prev[id];
+        slot_grp[id] = -1;
+        if (g >= 0) {
+            n_grouped--;
+            if (!--grp[g].pub.n) grp_drop(g);
+        }
     }
     slot_bucket[id] = (uint16_t)b;
+    if (kh) {
+        int g = grp_get(kh, b);   // may move grp
+        SlotGroup *G = &grp[g];
+        slot_grp[id] = g;
+        G->pub.n++, n_grouped++;
+        slot_next[id] = -1;
+        slot_prev[id] = G->tail;
+        if (G->tail >= 0) slot_next[G->tail] = id;
+        else G->pub.head = id;
+        G->tail = id;
+        return;
+    }
     slot_prev[id] = -1;
     slot_next[id] = bucket_head[b];
     if (bucket_head[b] >= 0) slot_prev[bucket_head[b]] = id;
     bucket_head[b] = id;
 }
 
+VkSlotGroup *vk_texture_group_locked(int g) { return &grp[g].pub; }
+int vk_texture_group_next_locked(int id) { return slot_next[id]; }
+void vk_texture_groups_unstamp_locked(void) {
+    for (int g = 0; g < ngrp; g++) grp[g].pub.stamp = 0;
+}
+
 uint64_t vk_texture_dirty_pos_locked(void) { return ndirty; }
 
-int vk_texture_dirty_slots_locked(uint64_t *pos, void (*fn)(int id, void *arg), void *arg) {
+// A bucket listed several times since *pos is walked once a round: the walk reads its slots' tokens after every change
+// listed before the round began (the lock is held). Changes the walk itself makes (an entry a lookup created) are the
+// next round's. A bucket's slot groups go to gfn when given, else their members to fn.
+int vk_texture_dirty_slots_locked(uint64_t *pos, void (*fn)(int id, void *arg), void (*gfn)(int g, void *arg), void *arg) {
     if (!slot_next || ndirty - *pos > DIRTY_N) {
         *pos = ndirty;
         return 0;
     }
-    for (uint64_t q = *pos; q < ndirty; q++) {
-        uint32_t x = dirty[q % DIRTY_N];
-        if (x & DIRTY_BUCKET)
-            for (int32_t id = bucket_head[x & ~DIRTY_BUCKET]; id >= 0; id = slot_next[id]) fn(id, arg);
-        else fn((int)x, arg);
+    static uint32_t seen[AGEN_N], round;
+    for (uint64_t q = *pos; q < ndirty;) {
+        uint64_t end = ndirty;
+        if (!++round) memset(seen, 0, sizeof seen), round = 1;
+        for (; q < end; q++) {
+            uint32_t x = dirty[q % DIRTY_N];
+            if (x & DIRTY_BUCKET) {
+                uint32_t b = x & ~DIRTY_BUCKET;
+                if (seen[b] == round) continue;
+                seen[b] = round;
+                for (int32_t id = bucket_head[b]; id >= 0; id = slot_next[id]) fn(id, arg);
+                for (int32_t g = bucket_ghead[b]; g >= 0; g = grp[g].gnext) {   // the walk registers nothing
+                    if (gfn) gfn(g, arg);
+                    else for (int32_t id = grp[g].pub.head; id >= 0; id = slot_next[id]) fn(id, arg);
+                }
+            } else {
+                fn((int)x, arg);
+            }
+        }
     }
     *pos = ndirty;
     return 1;
@@ -373,17 +496,23 @@ static int same_but_swizzle(const TexKey *a, const TexKey *b) {
 
 // Textures whose content the CPU provides in pool memory. Display, compressible, zcull,
 // depth, multisample and GPU-only storage stays GPU-owned.
-static int tex_mirrored(const tex_t *t) {
-    if (!t->mem || nvn_gpu_only((uintptr_t)t->mem)) return 0;
-    if (t->has_layout) return 1;
-    if (!(t->pool_flags & (NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_CPU_CACHED))) return 0;
+// mirror_refused: NULL for such a texture, else the rule that leaves it out, in words for a log line.
+static const char *mirror_refused(const tex_t *t) {
+    if (!t->mem) return "no storage";
+    if (nvn_gpu_only((uintptr_t)t->mem)) return "storage in the GPU-only address window";
+    if (t->has_layout) return NULL;
+    if (!(t->pool_flags & (NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_CPU_CACHED)))
+        return "a pool the CPU has no access to";
     if (t->d.flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_ADAPTIVE_ZCULL |
                       NVN_TEXTURE_FLAGS_DEPTH16_PREFER_FAST_CLEAR | NVN_TEXTURE_FLAGS_ZCULL_SUPPORT_STENCIL))
-        return 0;
-    if (t->d.samples > 1 || t->d.target == NVN_TEXTURE_TARGET_BUFFER) return 0;
-    if (t->d.format >= 0x31 && t->d.format <= 0x36) return 0;   // stencil / depth formats
-    return 1;
+        return "texture flags (one of 0x1, 0x8, 0x80, 0x100, 0x400)";
+    if (t->d.samples > 1) return "multisample";
+    if (t->d.target == NVN_TEXTURE_TARGET_BUFFER) return "a buffer texture";
+    if (t->d.format >= 0x31 && t->d.format <= 0x36) return "a depth or stencil format";
+    return NULL;
 }
+
+static int tex_mirrored(const tex_t *t) { return !mirror_refused(t); }
 
 static void log_limited(volatile int32_t *n, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 static void log_limited(volatile int32_t *n, const char *fmt, ...) {
@@ -517,6 +646,85 @@ static int tex_reuse_on(void) {
 
 static void destroy_tex(Tex *e);
 
+// Why an entry was destroyed (drop_tex), in the order of drop_names.
+enum { DROP_NONE, DROP_MAX, DROP_CAP, DROP_COMMIT, DROP_VRAM, DROP_IDLE_VRAM, DROP_IDLE_COMMIT, DROP_DISUSE,
+       DROP_OVERWRITTEN, DROP_REPLACED, DROP_REUSED, DROP_RANGE, DROP_EXACT, DROP_SHUTDOWN, DROP_N };
+static void drop_tex(Tex *e, int why);
+// How an entry's content started (start_at; Tex.og_start), in the order of start_names.
+enum { START_NEW, START_UPLOAD_LIVE, START_COPY_LIVE, START_COPY_RELEASED, START_EMPTY_LIVE, START_EMPTY_RELEASED,
+       START_COPY_GONE, START_FILL, START_N };
+// What put content into the image of an entry the CPU does not write (Tex.had); a GPU write is pub.gpu_owned.
+enum { HAD_COPY = 1, HAD_TEXELS = 2, HAD_FILL = 4 };
+
+// ---- split fill (NX2NAVI_TEX_SPLIT_FILL, tex_split_fill in nx2navi.ini: 1 the default, 0 off, 2 filled once)
+// Two descriptors can name one storage the CPU writes: a texture whose content the cache takes from the CPU
+// (tex_mirrored), and a second one with a texture flag for which tex_mirrored refuses. The second has no upload of its
+// own: its slot shows the first one's image for as long as that entry is live (slot_resolve). Once the first is
+// released, a lookup of the second's slot makes the second an entry of its own (entry_of), start_at destroys the
+// released first one, and the new image has nothing to start from: cleared, never uploaded, and from then on what
+// the slot shows, also after the first descriptor is registered again and gets a new entry beside it. On the console
+// both descriptors read the same bytes. tex_probe.c test_split makes the sequence and reads the image back: zeros.
+//
+// With split fill, a new entry the CPU does not write, at storage the CPU can see, starts with those bytes:
+//  - by a copy on the GPU from the released CPU-written entry start_at is about to destroy, when that image holds the
+//    storage as it is now (uploaded, and no write since its last check) or content the GPU wrote, and
+//    alias_compatible allows;
+//  - else from the storage itself, uploaded as a CPU-written texture's is (upload).
+// With 1 the image then follows the storage as a CPU-written one's does (from_storage: make_fresh, the pool's list)
+// until the GPU or WriteTexels writes it. The texture pool refresh makes such an entry also for a slot whose descriptor
+// the game has let go of, long before the next texture's bytes arrive in that memory, and when both descriptors are
+// registered again the slot finds that entry: filled once (2), it shows the texture that was there before.
+// Left out: depth, stencil and multisample images, buffer textures, pools the CPU has no access to, storage over
+// SPLIT_FILL_MAX, and an entry made with a released entry's image, whose first transition is recorded at the replay's
+// position, after the upload batch (init_new); so create_tex gives an entry that is to be filled a new image. Nothing
+// is filled where a live entry at the address holds content the GPU wrote (that is what the new one should show, and
+// start_at copies it when it can), nor with NX2NAVI_TEX_ALIAS off.
+//
+// What follows the storage also takes what a stale descriptor's entry does not need: an entry made for a slot the game
+// let go of is uploaded again whenever its pages are written, by the next textures loaded into that memory, read in
+// its own format. The perf line counts those ("filled again after a write"); 2 does without them.
+//
+// What it costs: an upload (a copy out of the storage, a decode for ASTC) for each such entry that finds no image to
+// copy from, where the image was only cleared before. A render target in a CPU pool that the game makes anew often
+// pays that every time and no longer takes a released entry's image; the perf line counts the fills, their bytes and
+// their time. Until the GPU first writes it, its storage is also checked for writes once a submission.
+// What it can show: the bytes in the storage, whatever they are. For a render target that is the last picture the
+// game or a write-back left there, where the image was zero before: a pass that reads a new target before anything
+// drew into it sees that older picture instead of nothing.
+#define SPLIT_FILL_MAX ((uint64_t)32 << 20)
+static int split_mode = -1;
+// since the last perf line: entries started by a copy from the released entry they replace, filled from storage (with
+// the bytes and the time), filled again after a write; left empty for a reused image, for their size
+static uint64_t n_split_copy, n_split_fill, n_split_bytes, n_split_ns, n_split_refill, n_split_reused, n_split_big;
+static uint64_t split_total[2];   // copies and fills so far (vk_texture_split_counts)
+
+static int split_fill_mode(void) {
+    if (split_mode < 0) {
+        int v = cfg_int("NX2NAVI_TEX_SPLIT_FILL");
+        split_mode = v == 0 ? 0 : v == 2 ? 2 : 1;
+        rt_log("vk: a texture the CPU does not write, made at storage the CPU writes, %s (NX2NAVI_TEX_SPLIT_FILL=%d)",
+               !split_mode ? "starts empty" : split_mode == 2 ? "starts with the storage's bytes, once"
+                                                             : "starts with the storage's bytes and follows them", split_mode);
+    }
+    return split_mode;
+}
+
+// A test's hook (tex_probe.c): the mode from here on, and the copies and fills made so far.
+void vk_texture_split_fill_set(int mode) { split_mode = mode; }
+void vk_texture_split_counts(uint64_t *copies, uint64_t *fills) { *copies = split_total[0], *fills = split_total[1]; }
+
+// Whether split fill gives a new entry for t its storage's bytes, apart from the size (SPLIT_FILL_MAX).
+static int split_wants(const tex_t *t, const TexVkFormat *f) {
+    if (!split_fill_mode() || !t->mem || nvn_gpu_only((uintptr_t)t->mem) || tex_mirrored(t)) return 0;
+    if (!(t->pool_flags & (NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_CPU_CACHED))) return 0;
+    if (f->depth || f->stencil || t->d.samples > 1 || t->d.target == NVN_TEXTURE_TARGET_BUFFER) return 0;
+    int bw, bh;
+    return nvn_fmt_bpb(t->d.format, &bw, &bh) != 0;
+}
+
+// Whether e's image takes its content from the storage: a texture the CPU writes, or one split fill fills.
+static int from_storage(const Tex *e) { return e->pub.mirrored || e->sfill == 1 || (e->sfill == 2 && !e->uploaded); }
+
 // Whether an image with these requirements can lie in the pool memory at e's address (*sp: that memory).
 static int pool_fits(VkCtx *c, const Tex *e, const VkMemoryRequirements *req, uint64_t guest_size, VkMemSpan *sp) {
     if ((e->f.depth || e->f.stencil) && req->size > guest_size) return 0;
@@ -617,18 +825,35 @@ static void init_image(Tex *e, VkCommandBuffer cb) {
     }
 }
 
+// NX2NAVI_DEPTH_INIT_INLINE (default 1; 0: in the upload batch, as before): a new depth or stencil image goes through
+// init_image at the replay's position too. Its clear writes the image's memory, and an image bound into pool memory
+// (bind_pool_memory) shares that with the live texture at its address; from the upload batch, which runs before the
+// whole part being recorded (vk_sync.c split_part), the clear can zero what earlier commands of the part still read as
+// that texture. Ocarina makes a new depth descriptor over a live one about 40 times a second at the castle town gate
+// (a 1280x720 DEPTH32F over a 640x360 one, its sun shadow maps as they resize), and for one frame a few times a minute
+// the shadowing went fully dark. At the replay's position vk_exec_inline_begin's barrier orders the clear after them.
+static int depth_init_inline(void) {
+    static int on = -1;
+    if (on < 0) on = rt_knob("DEPTH_INIT_INLINE", "1") != 0;
+    return on;
+}
+
 // A new entry's first transition. A reused image goes through it at the replay's current position: earlier commands
 // of the part being recorded may still use the image as the texture it was, and the upload batch runs before the part.
+// So does a new depth or stencil image (depth_init_inline).
 static void init_new(Tex *e) {
-    if (e->reused) {
+    int ds = !e->reused && (e->f.depth || e->f.stencil) && depth_init_inline();
+    if (e->reused || ds) {
         int reopen;
         VkCommandBuffer cb = vk_exec_inline_begin(&reopen);
         if (cb) {
             init_image(e, cb);
             vk_exec_inline_end(reopen);
+            if (ds) n_dinit_inline++, n_dinit_inpass += reopen != 0;
             return;
         }
     }
+    if (ds) n_dinit_upload++;
     init_image(e, vk_upload_begin());
     vk_upload_end();
 }
@@ -660,37 +885,32 @@ static int shadow_scale_of(const nvn_texdesc *d, const TexVkFormat *f, uint32_t 
     return d->width * (uint32_t)scale <= most ? scale : 1;
 }
 
-// NX2NAVI_ASTC_BC_PROBE=1 (astc_bc_probe in nx2navi.ini): measures, without changing any format, how much of the ASTC
-// set could be compressed if the alpha rule were data-driven instead of footprint-driven: the opaque part could be BC1,
-// half the size of the BC3 every decoded ASTC texture is now. Each texture's source blocks are decoded on the CPU with
-// tex_astc.c astc_decode_block (up to 512 spread over the level) and counted by whether any block has alpha below 250.
-#define ASTC_BC_PROBES 512
-static uint64_t n_probe_calls, n_probe_alpha, n_probe_opaque, n_probe_bytes_alpha, n_probe_bytes_opaque;
+// ---- ASTC as BC1 (NX2NAVI_ASTC_BC1, vk_astc.c)
+// A texture the CPU provides whose ASTC blocks all decode opaque is held as BC1, not BC3: the encoder then writes only
+// the colour half of the BC3 blocks it would have written (bc3_encode.comp), which BC1 decodes to the same texels, in
+// half the memory. Every ASTC texture is made BC3 (create_tex); its first upload checks its blocks inside the copy into
+// staging it makes anyway (astc_copy_opaque, tex_astc.c astc_blocks_opaque), and when all are opaque the entry gets a
+// BC1 image in place of the BC3 one before the decode (astc_reformat). A check of its own where the texture is made
+// cost 1.7 s of the render thread over a seven-minute teleport tour; the image made again costs a fraction of that.
+// The check covers every 16-byte block of the storage that is copied, the padding between levels and layers included
+// (zeros there decode as error blocks, opaque magenta; other bytes can only make it stricter). Each later upload into a
+// BC1 image checks again: the game may load other content into the same storage, and content with alpha gets a BC3
+// image back before it is decoded. Blocks of the endpoint modes with alpha are decoded to tell; past
+// ASTC_OPAQUE_DECODES of them in one texture it counts as not opaque, as the check would cost more than it saves.
+// Blocks the CPU untiles first (not astc_bl_regions) are checked in the storage before the copy (astc_opaque).
+#define ASTC_OPAQUE_DECODES 4096
+static uint64_t n_bc1_made, n_bc1_made_bytes, n_bc1_widened, n_bc1_checks, n_bc1_check_ns, n_bc1_check_bytes;
 
-static void astc_probe_alpha(const tex_t *t, const TexVkFormat *f) {
-    uintptr_t mem = (uintptr_t)t->mem;
-    // only a real host pointer can be read: 0 and the GPU address window are not readable from here
-    if (!mem || nvn_gpu_only(mem) || mem < 0x10000 || mem > 0x7ffffffeffffull || !f->astc_bw || !f->astc_bh) return;
-    uint32_t bw = f->astc_bw, bh = f->astc_bh;
-    uint64_t w = t->d.width ? t->d.width : 1, h = t->d.height ? t->d.height : 1;
-    uint64_t bx = (w + bw - 1) / bw, by = (h + bh - 1) / bh, n = bx * by;
-    if (!n) return;
-    uint64_t probes = n < ASTC_BC_PROBES ? n : ASTC_BC_PROBES, bytes = n * 16u;
-    uint8_t rgba[16 * 16 * 4];   // a block decodes to bw x bh texels, up to 12 x 12 (astc_decode_block writes them all)
-    int opaque = 1;
-    for (uint64_t s = 0; s < probes && opaque; s++) {
-        uint64_t i = probes == n ? s : (s * n) / probes;
-        if (!astc_decode_block((const uint8_t *)mem + i * 16u, bw, bh, f->astc_srgb != 0, rgba)) continue;
-        for (int k = 0; k < (int)(bw * bh); k++)
-            if (rgba[k * 4 + 3] < 250) { opaque = 0; break; }
-    }
-    n_probe_calls++;
-    if (opaque) n_probe_opaque++, n_probe_bytes_opaque += bytes;
-    else n_probe_alpha++, n_probe_bytes_alpha += bytes;
-    if (n_probe_calls == 1 || n_probe_calls % 512 == 0)
-        rt_log("vk: ASTC alpha probe: %llu textures, %llu opaque (%.1f MiB) and %llu with alpha (%.1f MiB) so far",
-               (unsigned long long)n_probe_calls, (unsigned long long)n_probe_opaque, n_probe_bytes_opaque / 1048576.0,
-               (unsigned long long)n_probe_alpha, n_probe_bytes_alpha / 1048576.0);
+// 1 when every block of t's storage at addr decodes opaque; 0 when one does not or the storage is not mapped.
+static int astc_opaque(const tex_t *t, uint64_t addr, const TexVkFormat *f) {
+    uint64_t t0 = kern_now_ns(), n = t->L.size / 16;
+    if (!t->mem || !n || !mem_read_hold(addr, t->L.size)) return 0;
+    uint32_t decoded = 0;
+    int ok = astc_blocks_opaque_mt((const uint8_t *)t->mem, n, f->astc_bw, f->astc_bh, f->astc_srgb != 0,
+                                   ASTC_OPAQUE_DECODES, &decoded, NULL);
+    mem_read_release();
+    n_bc1_checks++, n_bc1_check_ns += kern_now_ns() - t0, n_bc1_check_bytes += t->L.size;
+    return ok;
 }
 
 // ---- texture detail (NX2NAVI_TEXTURE_DETAIL = auto | full | reduced | low, texture_detail in nx2navi.ini; read at
@@ -739,6 +959,11 @@ static void astc_probe_alpha(const tex_t *t, const TexVkFormat *f) {
 #define DETAIL_LOW_MIN 1024
 #define DETAIL_FULL_MB 8192
 #define DETAIL_LOW_MB 6144
+// The levels above assume the ASTC textures end as BC3 (or stay ASTC), a byte a texel. Where they stay RGBA8 (astc =
+// cpu, a card without the decoder, astc_bc = 0) they take four times that, which is what one level left out gives
+// back: under this budget auto then goes one step lower. A card with 8 GiB that decoded on the CPU held two texture
+// arrays of 852 MiB each, was 560 MiB over its budget and lost its device.
+#define DETAIL_RGBA8_MB 20480
 #define EXACT_MAX 65536
 static nvn_hmap exact = {.klen = sizeof(TexKey)};   // keys made whole whatever the setting; value 1
 static uint64_t n_exact;                             // textures made whole again so far
@@ -756,11 +981,21 @@ int vk_texture_detail_auto(void) {
         mb = vk_mem_vram(&used, &budget, &exact_budget) ? (int64_t)(budget >> 20) : 0;
         __atomic_store_n(&detail_budget_mb, mb, __ATOMIC_RELAXED);
     }
-    return !mb || mb >= DETAIL_FULL_MB ? 0 : mb >= DETAIL_LOW_MB ? 1 : 2;
+    int most = !mb || mb >= DETAIL_FULL_MB ? 0 : mb >= DETAIL_LOW_MB ? 1 : 2;
+    if (mb && mb < DETAIL_RGBA8_MB && most < 2 && vk_astc_mode() != VK_ASTC_NATIVE && !vk_astc_bc()) most++;
+    return most;
+}
+
+static const char *const detail_names[3] = {"full", "reduced", "low"};
+static int detail_chosen = -1;   // detail_most's answer once it is made
+
+// The texture detail in effect, for a fatal error's summary line. No lock, any thread.
+const char *vk_texture_detail_name(void) {
+    int most = __atomic_load_n(&detail_chosen, __ATOMIC_RELAXED);
+    return most < 0 ? "not chosen yet (no texture made)" : detail_names[most];
 }
 
 static int detail_most(void) {   // the most levels a texture is made without: 0 full, 1 reduced, 2 low
-    static const char *const names[3] = {"full", "reduced", "low"};
     static int most = -1;
     if (most >= 0) return most;
     const char *v = cfg_value("NX2NAVI_TEXTURE_DETAIL");
@@ -773,8 +1008,11 @@ static int detail_most(void) {   // the most levels a texture is made without: 0
             rt_log("vk: texture detail: full (texture_detail = %s; the device reports no video memory budget)", v);
         else
             rt_log("vk: texture detail: %s, chosen for a video memory budget of %lld MiB (texture_detail = %s; full from "
-                   "%d MiB, low under %d MiB)", names[most], (long long)detail_budget_mb, v, DETAIL_FULL_MB, DETAIL_LOW_MB);
+                   "%d MiB, low under %d MiB%s)", detail_names[most],(long long)detail_budget_mb, v, DETAIL_FULL_MB, DETAIL_LOW_MB,
+                   vk_astc_mode() != VK_ASTC_NATIVE && !vk_astc_bc() && detail_budget_mb < DETAIL_RGBA8_MB
+                       ? "; one step lower because ASTC textures stay uncompressed here" : "");
     }
+    __atomic_store_n(&detail_chosen, most, __ATOMIC_RELAXED);
     return most;
 }
 
@@ -789,6 +1027,47 @@ static uint32_t detail_skip(const tex_t *t, const TexKey *k, const TexVkFormat *
     for (const struct Tex *p = nvn_hm_get(&by_addr, &k->addr); p; p = p->next_at)
         if (!p->released && alias_has_gpu_content(p)) return 0;
     return most >= 2 && levels >= 4 && w >= DETAIL_LOW_MIN && h >= DETAIL_LOW_MIN ? 2 : 1;
+}
+
+// A texture whose content the CPU provides (tex_mirrored), up to SUBALLOC_MAX, takes memory from VMA's device blocks:
+// the driver prefers a dedicated allocation for most images, and vmaCreateImage follows that, so a scene load
+// (about 2700 new textures in one frame entering Kokiri Forest) made as many vkAllocateMemory calls, 43% of that
+// 680 ms frame. vmaAllocateMemory with the plain requirements sub-allocates instead, from the blocks the headroom
+// thread keeps ahead (vk_headroom.c). Render targets keep vmaCreateImage and the driver's preference (vma_image).
+// VK_NULL_HANDLE when the image does not take that memory.
+enum { SUBALLOC_MAX = 32 << 20 };
+static VkImage suballoc_image(VkCtx *c, const VkImageCreateInfo *ci, VmaAllocation *alloc) {
+    VkImage img;
+    if (vkCreateImage(c->device, ci, NULL, &img) != VK_SUCCESS) return VK_NULL_HANDLE;
+    // an image the driver requires (not only prefers) dedicated memory for keeps it: vma_image
+    VkMemoryDedicatedRequirements dr = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS};
+    VkMemoryRequirements2 mr2 = {.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, .pNext = &dr};
+    VkImageMemoryRequirementsInfo2 ri = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2, .image = img};
+    vkGetImageMemoryRequirements2(c->device, &ri, &mr2);
+    VkMemoryRequirements mr = mr2.memoryRequirements;
+    VmaAllocationCreateInfo ai = {.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT};
+    int ok = !dr.requiresDedicatedAllocation && mr.size <= SUBALLOC_MAX &&
+             vmaAllocateMemory(c->vma, &mr, &ai, alloc, NULL) == VK_SUCCESS;
+    if (ok && vmaBindImageMemory(c->vma, *alloc, img) != VK_SUCCESS) {
+        vmaFreeMemory(c->vma, *alloc);
+        ok = 0;
+    }
+    if (!ok) {
+        vkDestroyImage(c->device, img, NULL);
+        img = VK_NULL_HANDLE, *alloc = NULL;
+    }
+    return img;
+}
+
+// An image made with vmaCreateImage. One of DEDICATED_MIN or more gets memory of its own: freed inside one of VMA's
+// 256 MiB blocks it left a hole the driver went on counting, with the rest of the block, against the budget and the
+// system's commit (0.5 to 1.8 GiB of such free space in a session at 5120x2160), until the block emptied; its own
+// memory goes back when it does.
+static VkResult vma_image(VkCtx *c, const VkImageCreateInfo *ci, const ImgKey *ik, VkImage *img, VmaAllocation *alloc) {
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    const VkMemoryRequirements *known = nvn_hm_get(&img_reqs, ik);
+    if ((known ? known->size : image_size(ci)) >= DEDICATED_MIN) ai.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+    return vmaCreateImage(c->vma, ci, &ai, img, alloc, NULL);
 }
 
 // defer_init: the caller records the image's first transition (init_image or alias_copy).
@@ -806,10 +1085,8 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
         log_limited(&n_unsupported, "texture format %#x: VkFormat %d lacks features %#x", d->format, (int)f.vk, (unsigned)f.need);
         return NULL;
     }
-    // NX2NAVI_ASTC_BC_PROBE (diagnostics only): measure what a data-driven alpha rule would compress
-    static int bc_probe = -1;   // read once: this runs for every texture created
-    if (bc_probe < 0) bc_probe = cfg_bool("NX2NAVI_ASTC_BC_PROBE");
-    if (f.astc_bw && bc_probe) astc_probe_alpha(t, &f);
+    // ASTC as BC1: a texture the CPU provides, not one that lies in pool memory, may turn BC1 at its first upload
+    int bc1_try = f.astc_bc == 1 && tex_mirrored(t) && !nvn_gpu_only(k->addr) && vk_astc_bc1();
     nvn_texlayout L;
     nvn_tex_layout(d, &L);
     uint32_t w = umax(d->width, 1), h = umax(d->height, 1), depth = 1, layers = 1;
@@ -919,37 +1196,13 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
                         (unsigned long long)k->addr, w, h, d->format);
         }
     }
-    // A texture whose content the CPU provides (tex_mirrored), up to SUBALLOC_MAX, takes memory from VMA's device blocks:
-    // the driver prefers a dedicated allocation for most images, and vmaCreateImage follows that, so a scene load
-    // (about 2700 new textures in one frame entering Kokiri Forest) made as many vkAllocateMemory calls, 43% of that
-    // 680 ms frame. vmaAllocateMemory with the plain requirements sub-allocates instead, from the blocks the headroom
-    // thread keeps ahead (vk_headroom.c). Render targets keep vmaCreateImage and the driver's preference.
-    enum { SUBALLOC_MAX = 32 << 20 };
-    if (!img && tex_mirrored(t) && samples == 1) {
-        if (vkCreateImage(c->device, &ci, NULL, &img) == VK_SUCCESS) {
-            // an image the driver requires (not only prefers) dedicated memory for keeps it: vmaCreateImage below
-            VkMemoryDedicatedRequirements dr = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS};
-            VkMemoryRequirements2 mr2 = {.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, .pNext = &dr};
-            VkImageMemoryRequirementsInfo2 ri = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2, .image = img};
-            vkGetImageMemoryRequirements2(c->device, &ri, &mr2);
-            VkMemoryRequirements mr = mr2.memoryRequirements;
-            VmaAllocationCreateInfo ai = {.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT};
-            int ok = !dr.requiresDedicatedAllocation && mr.size <= SUBALLOC_MAX &&
-                     vmaAllocateMemory(c->vma, &mr, &ai, &e->alloc, NULL) == VK_SUCCESS;
-            if (ok && vmaBindImageMemory(c->vma, e->alloc, img) != VK_SUCCESS) {
-                vmaFreeMemory(c->vma, e->alloc);
-                ok = 0;
-            }
-            if (!ok) {
-                vkDestroyImage(c->device, img, NULL);
-                img = VK_NULL_HANDLE, e->alloc = NULL;
-            }
-        } else {
-            img = VK_NULL_HANDLE;
-        }
-    }
+    if (!img && tex_mirrored(t) && samples == 1) img = suballoc_image(c, &ci, &e->alloc);
     int gpu_only = !tex_mirrored(t);
-    if (!img && gpu_only && tex_reuse_on()) {   // the image of a released entry with these parameters (reuse, above)
+    // an entry split fill is to fill gets a new image: start_at uploads into it in the upload batch (see "split fill")
+    int to_fill = gpu_only && split_wants(t, &f) && L.size <= SPLIT_FILL_MAX;
+    for (const Tex *p = to_fill ? nvn_hm_get(&by_addr, &k->addr) : NULL; p; p = p->next_at)
+        if (alias_has_gpu_content(p)) { to_fill = 0; break; }   // start_at copies that in instead
+    if (!img && gpu_only && !to_fill && tex_reuse_on()) {   // the image of a released entry with these parameters (reuse, above)
         // Not one released in this frame or the one before: Ocarina releases its render targets and registers them
         // again every frame, and DLSS's scene target (2560x1440 at a fixed address in Kokiri Forest) lost its image
         // to a moving target of the same size in between, and DLSS its history (vk_dlaa.c evaluate), several times a
@@ -972,20 +1225,14 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
             img = a->pub.image, e->alloc = a->alloc;
             vk_exec_image_gone(img);   // the views and records of the texture it was
             a->pub.image = VK_NULL_HANDLE, a->alloc = NULL;
-            destroy_tex(a);
-            e->reused = 1;
+            drop_tex(a, DROP_REUSED);
+            e->reused = 1, e->og_reimg = 1;
             n_reused++;
         }
     }
     if (!img) {
         if (gpu_only) n_reuse_new++;
-        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
-        // An image of DEDICATED_MIN or more gets memory of its own: freed inside one of VMA's 256 MiB blocks it left a hole
-        // the driver went on counting, with the rest of the block, against the budget and the system's commit (0.5 to 1.8
-        // GiB of such free space in a session at 5120x2160), until the block emptied; its own memory goes back when it does.
-        const VkMemoryRequirements *known = nvn_hm_get(&img_reqs, &e->ik);
-        if ((known ? known->size : image_size(&ci)) >= DEDICATED_MIN) ai.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
-        VkResult r = vmaCreateImage(c->vma, &ci, &ai, &img, &e->alloc, NULL);
+        VkResult r = vma_image(c, &ci, &e->ik, &img, &e->alloc);
         if (r != VK_SUCCESS) {
             log_limited(&n_failed, "image creation failed (%d): nvn fmt %#x %ux%ux%u target %d levels %u layers %u", (int)r,
                         d->format, w, h, depth, d->target, levels, layers);
@@ -998,6 +1245,7 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
         vmaGetAllocationInfo(c->vma, e->alloc, &own);
         e->bytes = own.size;
     }
+    e->bc1_try = (uint8_t)bc1_try;
     e->reusable = e->alloc && gpu_only;
     e->gw_frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     if (e->reusable && nvn_gpu_only(k->addr)) gwin_add(e);
@@ -1111,7 +1359,9 @@ static void rel_append(Tex *e) {
     if (e->reusable && tex_reuse_on()) ru_link(e);
 }
 
+static Tex *sweep_at;   // where sweep_released goes on
 static void rel_unlink(Tex *e) {
+    if (sweep_at == e) sweep_at = e->rel_next;
     ru_unlink(e);
     rel_bytes -= e->bytes;
     if (e->rel_prev) e->rel_prev->rel_next = e->rel_next;
@@ -1121,10 +1371,198 @@ static void rel_unlink(Tex *e) {
     e->rel_prev = e->rel_next = NULL;
 }
 
+// The entries the bindless texture pool's slots resolved to, for a submission's freshness check (make_fresh_snap once
+// per entry), which looked at every slot instead: 33,000 slots, 1.5 ms of the replay thread a submission in Kokiri
+// Forest. vk_exec_draw.c pool_fill notes a slot's entry after it resolved the slot; only entries whose content the CPU
+// provides are listed (the check does nothing for the others; one the GPU took over, gpu_owned, never uploads again
+// and leaves), and an entry stays listed until it is destroyed: the list holds every entry a slot resolves to, and
+// some that no slot does any more. Each keeps its storage range and the page generation of its last check here, so
+// that the check of an entry whose 2 MiB regions took no write since (vk_mem_unchanged_locked, one shared lock for the
+// whole list) touches neither the entry nor the lock: 5,600 entries took 0.77 ms a submission one by one. Texture lock
+// held.
+typedef struct { Tex *e; uint64_t addr, size; uint32_t since; int ok; } PEnt;   // ok: uploaded as of since
+static PEnt *pent;
+static int npent, cpent, *pq, cpq;
+static uint64_t n_pool_checks, n_pool_skips;
+// The region check's misses (vk_mem_unchanged_why_locked): not uploaded, a region without this epoch's snapshot yet, one
+// untracked, one written since, nothing to check; and the snapshot queries its own pass made (NX2NAVI_POOL_PRESNAP).
+static uint64_t n_pool_miss[5], n_presnap_q;
+static void make_fresh_snap(Tex *e);
+
+static void pool_unlist(Tex *e) {
+    if (!e->pidx) return;
+    int i = e->pidx - 1;
+    pent[i] = pent[--npent];
+    pent[i].e->pidx = i + 1;
+    e->pidx = 0;
+}
+
+// The entries the pool's slots hold: for each, how many slots' last fill resolved to it (vk_exec_draw.c pool_hold; a fill
+// that shared another slot's lookup counts for the entry that lookup found). The walk over every slot looked each slot
+// up in each submission, which left its entry's use stamp (touch): the idle clock reads it, and start_at's alias rule
+// reads the frame of an entry with GPU content. The check by list is no lookup, so it leaves the stamps from these
+// counts (pool_touch): in each submission for the GPU-owned entries, in turn for the others, each once in
+// POOL_TOUCH_DIV submissions (IDLE_ROUNDS is 240 of them). An entry keeps its place until it is destroyed and no slot
+// holds it any more: a destroyed one is refilled out of its slots by the bump of its bucket.
+#define POOL_TOUCH_DIV 64
+typedef struct { Tex *e; uint32_t refs; int next; uint8_t gown; } PRef;   // e NULL: destroyed, or free (refs 0, next)
+static PRef *pref;
+static int npref, cpref, pref_free;   // pref_free: 1 + the first free place
+static void touch(Tex *e);
+
+static uint32_t pool_ref(Tex *e) {
+    if (e->ph) return (uint32_t)e->ph;
+    int i;
+    if (pref_free) {
+        i = pref_free - 1, pref_free = pref[i].next;
+    } else {
+        if (npref == cpref) {
+            int n = cpref ? cpref * 2 : 1024;
+            PRef *q = realloc(pref, sizeof *q * (size_t)n);
+            if (!q) rt_fatal("vk: out of memory for the texture pool's entry counts");
+            pref = q, cpref = n;
+        }
+        i = npref++;
+    }
+    pref[i] = (PRef){e, 0, 0, e->pub.gpu_owned};
+    return (uint32_t)(e->ph = i + 1);
+}
+
+void vk_texture_pool_hold_locked(uint32_t old, uint32_t ent) {
+    if (ent) pref[ent - 1].refs++;
+    if (old && !--pref[old - 1].refs && !pref[old - 1].e) pref[old - 1].next = pref_free, pref_free = (int)old;
+}
+
+static void pool_forget(Tex *e) {   // destroy_tex
+    if (!e->ph) return;
+    PRef *q = &pref[e->ph - 1];
+    q->e = NULL;
+    if (!q->refs) q->next = pref_free, pref_free = e->ph;
+    e->ph = 0;
+}
+
+static void pool_touch(void) {
+    static int at;
+    for (int i = 0; i < npref; i++)
+        if (pref[i].gown && pref[i].refs && pref[i].e) touch(pref[i].e);
+    for (int k = (npref + POOL_TOUCH_DIV - 1) / POOL_TOUCH_DIV; k-- > 0;) {
+        if (at >= npref) at = 0;
+        const PRef *q = &pref[at++];
+        if (!q->gown && q->refs && q->e) touch(q->e);
+    }
+}
+
+// e becomes GPU-owned: the list's check does nothing for it any more, and its use stamp is left in each submission.
+static void pool_gpu_owned(Tex *e) {
+    pool_unlist(e);
+    if (e->ph) pref[e->ph - 1].gown = 1;
+}
+
+int vk_texture_pool_note_locked(int id, uint32_t *ent) {
+    *ent = 0;
+    if (id < 0 || id >= ntslots || !tslots[id].used) return 0;
+    // The caller's lookups left the slot resolved under its bucket's generation, unless it made none (a fill without a
+    // token or a kind): an entry cached under another generation may be destroyed, so the slot is looked up first.
+    if (tslots[id].ce && tslots[id].cgen != agen[sinfo[id] & 0xffff]) vk_texture_by_id_locked(id, NULL, NULL);
+    Tex *e = tslots[id].ce;
+    if (!e) return 0;
+    if (!e->pidx && from_storage(e) && !e->pub.gpu_owned) {
+        if (npent == cpent) {
+            int n = cpent ? cpent * 2 : 1024;
+            PEnt *p = realloc(pent, sizeof *p * (size_t)n);
+            int *q = realloc(pq, sizeof *q * (size_t)n);
+            if (!p || !q) rt_fatal("vk: out of memory for the texture pool's entry list");
+            pent = p, pq = q, cpent = cpq = n;
+        }
+        pent[npent++] = (PEnt){e, e->pub.addr, e->t.L.size, 0, 0};
+        e->pidx = npent;
+    }
+    *ent = pool_ref(e);
+    return 1;
+}
+
+// Released entries are left out: a slot resolves to none of those whose content the CPU provides (slot_resolve's stale
+// rule), and the game may be unmapping their storage.
+// NX2NAVI_POOL_PRESNAP=1 (default), 0, ab: the check takes the write-watch snapshot of an entry's regions that have
+// none in this submission yet before it looks at them (one exclusive hold of the generation table's lock for the list),
+// so an unchanged entry in such a region passes there. Without it 97 % of the 5,600 entries missed the region check for
+// want of a snapshot and went the long way, one entry and one lock at a time. With it 97 % pass, 3.5 snapshot queries
+// a submission: the check 0.50 to 0.19 ms a submission, the replay thread -0.37 ms against the control.
+static int pool_presnap(void) {
+    static int mode = -1;
+    if (mode < 0) mode = rt_knob("POOL_PRESNAP", "1");
+    return RT_KNOB_ON(mode);
+}
+
+// The submission being recorded checked the pool's entries by this list: for the idle clock it walked the pool
+// (vk_texture_new_submit).
+static int pool_by_list;
+
+int vk_texture_pool_fresh_locked(void) {
+    int nq = 0, ps = pool_presnap();
+    pool_by_list = 1;
+    if (ps) vk_mem_gen_lock();
+    else vk_mem_gen_lock_shared();
+    for (int i = 0; i < npent; i++) {
+        const PEnt *p = &pent[i];
+        if (p->ok) {
+            if (ps) n_presnap_q += vk_mem_snap_range_locked(p->addr, p->size, submit_epoch);
+            int why = vk_mem_unchanged_why_locked(p->addr, p->size, p->since, submit_epoch);
+            if (!why) continue;
+            n_pool_miss[why]++;
+        } else {
+            n_pool_miss[0]++;
+        }
+        pq[nq++] = i;
+    }
+    if (ps) vk_mem_gen_unlock();
+    else vk_mem_gen_unlock_shared();
+    n_pool_skips += (uint64_t)(npent - nq);
+    for (int k = nq; k-- > 0;) {   // from the end: an entry leaving swaps the last one into its place
+        int i = pq[k];
+        PEnt *p = &pent[i];
+        Tex *e = p->e;
+        if (e->pub.gpu_owned) {
+            pool_unlist(e);
+            continue;
+        }
+        if (e->released) continue;
+        if (!e->uploaded || e->checked != submit_epoch) {
+            make_fresh_snap(e);
+            e->checked = submit_epoch;
+            n_pool_checks++;
+        }
+        p->since = e->wgen, p->ok = e->uploaded;
+    }
+    pool_touch();
+    return npent;
+}
+
+// slot_resolve's last answer was none because of its stale rule (vk_texture_slot_retry_locked)
+static int resolve_stale;
+
+// NX2NAVI_TRACE=perf, since the last perf line: slots a finalize marked (its own texture object's), slots at the storage
+// with the same parameters registered with another texture object, which a finalize leaves current
+// (vk_texture_release), and lookups the stale rule answered with the stand-in (slot_resolve). _hm: of them, the
+// terrain's streamed heightmaps (R32F 260x260), whose stand-in draws a chunk of ground at height zero.
+static uint64_t n_fin_own, n_fin_other, n_fin_other_hm, n_stale, n_stale_hm;
+static int terrain_heightmap(const tex_t *t) {
+    return t->d.format == NVN_FORMAT_R32F && t->d.width == 260 && t->d.height == 260;
+}
+
+int vk_texture_slot_retry_locked(int id) {
+    if (id < 0 || id >= ntslots || !tslots[id].used || !tslots[id].t.mem) return -1;
+    resolve_stale = 0;
+    if (vk_texture_by_id_locked(id, NULL, NULL)) return 1;
+    return resolve_stale ? -1 : 0;
+}
+
 static void retire_remove(Tex *e);
 
 static void destroy_tex(Tex *e) {
     if (e->retiring) retire_remove(e);
+    pool_unlist(e);
+    pool_forget(e);
     own_remove(e);
     gwin_remove(e);
     n_site[0]++;
@@ -1150,14 +1588,226 @@ static void destroy_tex(Tex *e) {
     vk_defer_free(e);
 }
 
-// Released entries with another descriptor at the same address are replaced; past RELEASED_MAX released entries the
-// oldest one goes at each release (it comes back on demand, a mirrored one re-uploaded from its storage). NX2navi
+// ---- origins (NX2NAVI_TRACE=perf; a run without it tests the flag and counts the drops, nothing more)
+// A texture drawn without its content leaves nothing in the log: no call fails and the image exists. What can still be
+// told afterwards is where the entry came from, so each entry keeps how it was made and how its content started
+// (og_*, had), and the last DROPS_N destroyed entries keep their descriptor and the reason they went. An entry made
+// for a descriptor that is still in that ring says which drop it follows (origin_made), and the lines about one
+// address list what was dropped there (others_at). The users are marks_check, which names an entry a shader sampled
+// while nothing had ever put content into its image, and the lines of start_at.
+#define DROPS_N 4096
+typedef struct { uint64_t kh, addr, frame; uint32_t format, flags, w, h; uint8_t why, mirrored, released; } DropRec;
+static DropRec drops[DROPS_N];
+static uint64_t ndrops;
+static uint64_t n_drop_by[DROP_N];   // entries destroyed since the last perf line, by reason
+static const char *const drop_names[DROP_N] = {
+    "", "past RELEASED_MAX released entries", "past the released entries' size cap", "under commit pressure",
+    "under VRAM pressure", "idle, under VRAM pressure", "idle, under commit pressure", "unsampled (disuse)",
+    "overwritten at another address", "replaced by another descriptor at its address", "its image went to another texture",
+    "its storage went", "made whole again (texture detail)", "shutdown"};
+static const char *const start_names[START_N] = {
+    "started on its own", "filled from storage over a live entry", "content copied from a live entry",
+    "content copied from a released entry", "started empty over a live entry", "started empty over a released entry",
+    "content copied from the released CPU-written entry it replaced (split fill)", "filled from its storage (split fill)"};
+
+static uint64_t frames_now(void) { return __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED); }
+
+static uint64_t key_hash(const TexKey *k) {   // FNV-1a; make_key zeroes the key's padding
+    uint64_t h = 0xcbf29ce484222325ull;
+    const uint8_t *b = (const uint8_t *)k;
+    for (size_t i = 0; i < sizeof *k; i++) h = (h ^ b[i]) * 0x100000001b3ull;
+    return h;
+}
+
+// destroy_tex with the reason, which every caller gives.
+static void drop_tex(Tex *e, int why) {
+    n_drop_by[why]++;
+    if (rt_trace & RT_TRACE_PERF)
+        drops[ndrops++ % DROPS_N] = (DropRec){key_hash(&e->key), e->key.addr, frames_now(), (uint32_t)e->t.d.format,
+                                              (uint32_t)e->t.d.flags, e->t.d.width, e->t.d.height, (uint8_t)why,
+                                              e->pub.mirrored, e->released != 0};
+    destroy_tex(e);
+}
+
+// A new entry: the frame, and the drop of its descriptor's last entry when the ring still holds it.
+static void origin_made(Tex *e) {
+    e->og_frame = frames_now();
+    if (!(rt_trace & RT_TRACE_PERF)) return;
+    uint64_t kh = key_hash(&e->key), n = ndrops < DROPS_N ? ndrops : DROPS_N;
+    for (uint64_t i = 1; i <= n; i++) {   // newest first
+        const DropRec *r = &drops[(ndrops - i) % DROPS_N];
+        if (r->kh != kh || r->addr != e->key.addr) continue;
+        e->og_drop = r->why, e->og_drop_frame = r->frame;
+        return;
+    }
+}
+
+// "fmt 0x25 (vk 37) 256x256x1, 9 levels, 1 layers, target 1, samples 0, flags 0x1, pool flags 0x22"
+static int desc_text(char *out, size_t n, const Tex *e) {
+    const nvn_texdesc *d = &e->t.d;
+    return snprintf(out, n, "fmt %#x (vk %d) %ux%ux%u, %u levels, %u layers, target %d, samples %d, flags %#x, pool flags %#x",
+                    d->format, (int)e->f.vk, d->width, d->height, d->depth, e->pub.levels + e->pub.skip, e->pub.layers,
+                    d->target, d->samples, (unsigned)d->flags, (unsigned)e->t.pool_flags);
+}
+
+// "made at frame 100 again after a drop at frame 90 (under commit pressure); started empty over a released entry; ..."
+static int origin_text(char *out, size_t n, const Tex *e) {
+    int k = snprintf(out, n, "made at frame %llu", (unsigned long long)e->og_frame);
+    if (e->og_drop && k < (int)n)
+        k += snprintf(out + k, n - (size_t)k, " again after a drop at frame %llu (%s)", (unsigned long long)e->og_drop_frame,
+                      drop_names[e->og_drop]);
+    if (k < (int)n) k += snprintf(out + k, n - (size_t)k, "; %s", start_names[e->og_start]);
+    if (e->og_reimg && k < (int)n) k += snprintf(out + k, n - (size_t)k, "; with a released entry's image");
+    if (e->og_backs && k < (int)n)
+        k += snprintf(out + k, n - (size_t)k, "; taken back %u times, last at frame %llu", e->og_backs,
+                      (unsigned long long)e->og_back_frame);
+    return k < (int)n ? k : (int)n - 1;
+}
+
+// Whether nothing ever put content into e's image: an entry the CPU writes that was not uploaded, or one it does not
+// write, at an address the CPU can see, that the GPU never wrote and that got no copy, no texels and no split fill.
+static int no_content(const Tex *e) {
+    if (e->pub.gpu_owned) return 0;
+    if (e->pub.mirrored) return !e->uploaded;
+    return !e->had && !(e->sfill && e->uploaded) && e->key.addr && !nvn_gpu_only(e->key.addr);
+}
+
+// Lines per address for one kind of event: up to `most` each, in a table of the first SAID_N addresses that had one
+// (a later address always gets its line), so a session's limit is by address, not a count of lines.
+#define SAID_N 4096
+typedef struct { uint64_t addr[SAID_N]; uint16_t n[SAID_N]; } SaidAt;
+static int said_at(SaidAt *s, uint64_t addr, unsigned most) {
+    uint32_t i = (uint32_t)(addr * 0x9E3779B97F4A7C15ull >> 52);
+    for (int probe = 0; probe < 64; probe++, i = (i + 1) % SAID_N) {
+        if (s->addr[i] && s->addr[i] != addr) continue;
+        s->addr[i] = addr;
+        return s->n[i] < most ? (s->n[i]++, 1) : 0;
+    }
+    return 1;
+}
+
+// The other descriptors at e's address: every entry in the cache with its state, and what the ring knows was dropped
+// there, newest first. skip: an entry the caller describes itself (NULL: none).
+static int others_at(char *out, size_t n, const Tex *e, const Tex *skip) {
+    int k = 0, any = 0;
+    out[0] = 0;
+    for (const Tex *p = nvn_hm_get(&by_addr, &e->key.addr); p && k < (int)n - 1; p = p->next_at) {
+        if (p == e || p == skip) continue;
+        k += snprintf(out + k, n - (size_t)k, "%s[%s%s%s%s: fmt %#x flags %#x %ux%u, %s, %s]", any++ ? " " : "",
+                      p->released ? "released" : "live", p->superseded ? ", superseded" : "", p->retiring ? ", retiring" : "",
+                      p->pub.gpu_owned ? ", GPU-written" : "", p->t.d.format, (unsigned)p->t.d.flags, p->t.d.width,
+                      p->t.d.height, p->pub.mirrored ? (p->uploaded ? "CPU-written, uploaded" : "CPU-written, not uploaded")
+                                                     : (no_content(p) ? "not CPU-written, no content" : "not CPU-written"),
+                      start_names[p->og_start]);
+    }
+    uint64_t have = ndrops < DROPS_N ? ndrops : DROPS_N;
+    int listed = 0;
+    for (uint64_t i = 1; i <= have && listed < 4 && k < (int)n - 1; i++) {
+        const DropRec *r = &drops[(ndrops - i) % DROPS_N];
+        if (r->addr != e->key.addr) continue;
+        k += snprintf(out + k, n - (size_t)k, "%s[dropped at frame %llu (%s): fmt %#x flags %#x %ux%u, %s%s]", any++ ? " " : "",
+                      (unsigned long long)r->frame, drop_names[r->why], r->format, r->flags, r->w, r->h,
+                      r->mirrored ? "CPU-written" : "not CPU-written", r->released ? ", released then" : ", live then");
+        listed++;
+    }
+    if (!any) k = snprintf(out, n, "none");
+    return k < (int)n ? k : (int)n - 1;
+}
+
+// Released entries with another descriptor at the same address are replaced; past RELEASED_MAX released entries one
+// goes at each release (it comes back on demand, a mirrored one re-uploaded from its storage). NX2navi
 // finalizes and initializes transient textures every frame, so a released entry is mostly taken back within frames.
 // Dropping all of them at once when the count passed 4096 destroyed thousands of images in one frame: 333-422 ms
 // frames every 40-50 s on a GTX 1050 Ti, then the textures still in use were created and uploaded again.
+//
+// The one that goes is the oldest release that nothing sampled or drew into lately (samp_frame) or whose content is
+// gone (overwritten), not the oldest release as such. A released entry is not dead to the game (drop_stale, below, has the
+// reasons): a descriptor registered for it still resolves to it. Ocarina reads its scene picture in every frame through
+// a second descriptor at the picture's address (RGB9E5, 1920x1080, the input of its own upscaler) whose entry was
+// released once, a few seconds into the area, and was looked up from then on: it headed the list for the rest of
+// the session. One frame at the limit, as it was:
+//   1. the count of released entries passes RELEASED_MAX at a release, and the head of the list, that entry, is
+//      destroyed although the frame before sampled it;
+//   2. later in the frame the game's descriptor is looked up, finds no entry, and one is made again; its content is
+//      copied from the released scene target at its address (start_at);
+//   3. the frame comes out with the 3D scene black and the interface intact; the next one is whole again. Why the
+//      frame with the remade entry is black was not traced.
+// The count reaches the limit where released entries pile up: with the game's own upscaler in use (upscaler = fsr)
+// its render targets lie at new addresses in every frame, 2 to 13 new entries a frame, and the count went from 540
+// to 2,040 within 2,400 frames in Hyrule Field. Measured there (RTX 5090, 2026-11-11, Link running, 13,630 frames
+// kept of each run): 8 black frames in 5 of 7 runs. Where the remake was logged (3 runs, 4 black frames) each is the
+// frame after it, and where the drop was logged (2 runs) it is this sweep taking that entry as the count first
+// reaches the limit; in one of the two runs without a black frame that came after the frames kept. With the rule
+// below a run of 18,730 frames dropped 834 released entries past the limit from frame 11,600 on and showed no black
+// frame. A session with DLSS as the upscaler had the same black frame at Lon Lon Ranch while its log showed 2,032 to
+// 2,047 released entries, kept there by a low system commit; that it is the same drop is read from those counts, not
+// logged.
+// "Lately" is by sampling, not by lookups. The first form of this rule spared every entry a lookup still reached
+// (idle), and the texture pool's refresh looks up every registered slot in each submission that draws through the
+// pool: an entry whose descriptor the game merely leaves registered counts as looked up for good. With the game's own
+// upscaler in use its render targets move to new addresses in every frame and each leaves such an entry behind, 3 to
+// 7 a frame: over a town all 2,049 released entries were "looked up", the sweep fell back to the oldest lookup, which
+// among entries all stamped in the same submission is no order at all, and took entries still drawn: 200 to 450 a
+// window of 60 frames, with buildings black or wrongly lit for single frames. samp_frame is stamped when a marked
+// shader samples the entry's slot (vk_pool_marks_read) and by every lookup that is not the pool refresh (touch: a
+// draw's fixed binding, a render target, a copy), so a target the game draws into or reads is recent by it and one
+// it only keeps registered is not.
+// With this rule a player's session of 30,000 frames through eight areas kept the list at its limit, dropped
+// 50,182 entries past it, and showed none of those frames (2026-11-11, a hand test; no scripted run was made).
+// When every released entry was sampled within SWEEP_UNSAMPLED presents, the one sampled longest ago goes.
+//
+// That rule holds from RELEASED_HARD entries on. Between RELEASED_MAX and RELEASED_HARD only an entry that loses
+// nothing goes: one that comes back intact or an overwritten one, released STALE_FRAMES presents ago or earlier (a
+// younger one is mostly taken back within frames). An entry whose content exists only in its image can be used again
+// long after anything sampled it. In Kokiri Forest the count stays at RELEASED_MAX, and two render targets at one
+// address (a 40x24x64 volume and a 2240x1260 picture), released at the area's load and last sampled within seconds
+// of it, went as unsampled about two minutes later; the game used them again after that, they were made again empty,
+// and one frame came out with the scene black. On an 85 s route there (Link running, six runs a batch): a black
+// frame in 10 of 24 runs with the oldest release going; in 1 of 12 with the unsampled one going (the two targets went
+// in 7 of those runs and were made again empty in 4; the black frame is one in which the sweep took a row of render
+// targets); in 0 of 18 with such entries kept. Kept, the count reached 6,200 in the runs that pass the busiest part
+// of the route early and 2,300 to 2,500 in the others; frame times and the peak of the device memory in use were the
+// same in all three forms, the device memory at the end of a run 0.3 to 0.5 GiB higher with 6,200 kept.
+// A kept entry bound into pool memory owns no memory and goes with its pool (vk_texture_range_gone); the memory of
+// the others is bounded by NX2NAVI_TEX_RELEASED_MB (drop_stale).
+// Each call looks at up to SWEEP_LOOK entries from where the last one stopped (sweep_at; rel_unlink moves it off an
+// entry that leaves): with thousands of entries that stay, a walk from the head at every release would cross them all.
 #define RELEASED_MAX 2048
+#define RELEASED_HARD 16384
+#define SWEEP_LOOK 64
+#define SWEEP_UNSAMPLED PRESENTS(120)
+
+static int comes_back_intact(const Tex *e);
+
 static void sweep_released(void) {
-    while (nreleased > RELEASED_MAX && rel_head) destroy_tex(rel_head);
+    if (nreleased <= RELEASED_MAX) return;
+    {
+        uint64_t now = frames_now();
+        const uint64_t stale = PRESENTS(120);   // STALE_FRAMES, defined below
+        Tex *e = sweep_at ? sweep_at : rel_head;
+        for (int n = 0; n < SWEEP_LOOK && nreleased > RELEASED_MAX; n++) {
+            if (!e || now - e->rel_frame < stale) { e = rel_head; break; }   // the rest is younger: from the oldest again
+            Tex *next = e->rel_next;
+            if (comes_back_intact(e) || e->overwritten) drop_tex(e, DROP_MAX);
+            e = next;
+        }
+        sweep_at = e;
+    }
+    while (nreleased > RELEASED_HARD && rel_head) {
+        uint64_t now = frames_now();
+        Tex *gone = NULL, *lru = rel_head;
+        for (Tex *e = rel_head; e && !gone; e = e->rel_next) {   // in release order
+            if (e->overwritten || now - e->samp_frame >= SWEEP_UNSAMPLED) gone = e;
+            else if (e->samp_frame < lru->samp_frame) lru = e;
+        }
+        if (!gone) {
+            static volatile int32_t n_all_used;
+            log_limited(&n_all_used, "all %d released textures were sampled or drawn into lately: the one longest ago goes "
+                        "(%#llx fmt %#x %ux%u, last in frame %llu)", nreleased, (unsigned long long)lru->key.addr,
+                        lru->t.d.format, lru->t.d.width, lru->t.d.height, (unsigned long long)lru->samp_frame);
+        }
+        drop_tex(gone ? gone : lru, DROP_MAX);
+    }
 }
 
 // NX2NAVI_TEX_VRAM_PRESSURE (percent of the device-local budget, default VRAM_PRESSURE_DEFAULT; 0 = off): above it, each
@@ -1186,6 +1836,10 @@ static int comes_back_intact(const Tex *e) { return e->pub.mirrored && !e->pub.g
 // texture object, nothing samples it. The clock is look_round, which only a submission whose slot checks reached half
 // of the registered pool slots moves on (vk_texture_new_submit): counted in submissions, a pause screen or a fade that
 // draws nothing through the pool made the whole world's textures idle within seconds.
+// With NX2NAVI_POOL_FAST the refresh checks the entries by list instead (vk_texture_pool_fresh_locked), which is no
+// lookup. Such a submission counts for the clock all the same, and the entries the pool's slots hold get their stamp
+// from the count of those slots (pool_touch), each at least once in POOL_TOUCH_DIV submissions: an entry a slot names
+// never comes near IDLE_ROUNDS.
 #define IDLE_ROUNDS 240
 static uint32_t look_round = 1;     // submissions whose lookups walked the texture pool
 static uint32_t round_checks;       // slot checks of the submission being recorded (vk_texture_by_id_locked)
@@ -1198,9 +1852,11 @@ static void touch(Tex *e) {
 }
 
 void vk_texture_pool_ctx(int on) { pool_ctx = on; }
+
 static int idle(const Tex *e, uint64_t now);
 
-// NX2NAVI_TEX_RELEASED_MB (default a thirty-second of the installed memory, 512 MiB to 2 GiB; 0 = no limit) bounds the
+// NX2NAVI_TEX_RELEASED_MB (default a thirty-second of the installed memory, 512 MiB to 2 GiB, or more by the card's
+// budget, released_cap_bytes; 0 = no limit) bounds the
 // own memory of the released entries: RELEASED_MAX alone kept 5-7 GiB of released render targets and decoded textures
 // after an hour of play at a 2160p game resolution, device memory the driver also charges to the system's commit (the
 // process's private bytes reached 31 GiB). A sixteenth (1 to 4 GiB) still let them hold 1.3 GiB on a 32 GB PC whose
@@ -1211,8 +1867,9 @@ static int idle(const Tex *e, uint64_t now);
 // machine runs out of memory, and plat_commit_info reports the tighter of the two. Both drop only stale entries
 // (drop_stale), a few per check like the VRAM pressure.
 //
-// NX2NAVI_TEX_PROC_COMMIT_MB (default the installed memory, at least PROC_COMMIT_MIN_MB; 0 = off) counts the commit as
-// low too while this process's own commit is above it. The system's figure depends on the page file and on what else
+// NX2NAVI_TEX_PROC_COMMIT_MB (default the installed memory, at least PROC_COMMIT_MIN_MB; 0 = off) is a bound on this
+// process's own commit that is logged when passed; it counted the commit as low too until it was found that no texture
+// dropped could bring the process back under it (commit_is_low, at its end). The system's figure depends on the page file and on what else
 // runs: with a 64 GB limit it turned low at 59 GB in use, when this process alone held 42 GB on a PC with 32 GB of
 // memory, about half of it device memory, with the textures of five areas left behind. A process is not meant to need
 // more commit than the PC has memory: beyond that it lives on the page file, whatever its size. The bound holds until
@@ -1221,9 +1878,18 @@ static int idle(const Tex *e, uint64_t now);
 // figure decides there, as before. On Linux the process's figure is its resident anonymous memory, which cannot pass
 // the installed memory, so only a bound set below that holds there; a cgroup's limit and the machine's RAM act through
 // the system's figure.
+// Where a discrete GPU's memory counts against the commit (plat_commit_counts_vram: Windows), the bound compares the
+// commit less the device-local memory the driver reports in use (vk_mem_vram): that memory is on the card, not in RAM
+// or the page file, and the VRAM pressure and tex_disuse already bound it. Counted in, it held the bound all through
+// Hyrule Field on a 16 GB PC with a 16 GB card (RTX 5060 Ti): the process at 28.9 to 30.7 GB, 9 to 10 GB of it video
+// memory, while the system had 8 to 10 GB of its 49 GB limit free, and the ground flickered white as textures gave way.
+// So on such a PC the 42 GB process above, half of it device memory, no longer reaches this bound: the system's
+// figure and the VRAM pressure are what act there. The part of a card's memory the driver has moved into shared
+// system memory is subtracted too, which it should not be; the driver does not report it apart.
 #define COMMIT_LOW_KEEP ((uint64_t)256 << 20)
 #define PROC_COMMIT_MIN_MB 24576
 static uint64_t released_cap;   // bytes; 0 = not read yet, UINT64_MAX = no limit
+#define RELEASED_CAP_MAX_MB 8192
 static long long commit_free_mb = -2;   // -2: not read yet, -1: the default
 static long long proc_commit_mb;        // this process's bound in MB; 0 = none
 static int commit_low, commit_logs;     // commit_low: either of the two below at the last check
@@ -1234,15 +1900,32 @@ static uint64_t released_cap_bytes(void) {
     if (!released_cap) {
         const char *s = cfg_get("NX2NAVI_TEX_RELEASED_MB");
         long long mb;
+        int by_vram = 0;
         if (s && *s) mb = atoll(s);
         else {
             float used, total, proc;
             plat_mem_info(&used, &total, &proc);
             mb = total > 0 ? (long long)(total / 32) : 1024;
             mb = mb < 512 ? 512 : mb > 2048 ? 2048 : mb;
+            // By the card too: a quarter of its budget where the PC has an eighth of its memory to match, up to
+            // RELEASED_CAP_MAX_MB. The game lets go of the textures of what leaves the view and takes them back when
+            // it returns; walking through a village the released ones passed 1 GiB within two or three minutes, and
+            // from then on each release dropped an older one that was decoded and encoded again on its way back,
+            // hundreds a second, on a card with 30 GiB free. The two pressure rules still come first: released
+            // entries go before anything else above NX2NAVI_TEX_VRAM_PRESSURE of the budget, and the bound falls to
+            // COMMIT_LOW_KEEP while the commit is low.
+            uint64_t vused = 0, vbudget = 0;
+            int exact = 0;
+            if (vk_mem_vram(&vused, &vbudget, &exact) && total > 0) {
+                long long by_card = (long long)(vbudget >> 22), by_ram = (long long)(total / 8);   // a quarter, in MiB
+                long long more = by_card < by_ram ? by_card : by_ram;
+                if (more > RELEASED_CAP_MAX_MB) more = RELEASED_CAP_MAX_MB;
+                if (more > mb) mb = more, by_vram = 1;
+            }
         }
         released_cap = mb > 0 ? (uint64_t)mb << 20 : UINT64_MAX;
-        if (mb > 0) rt_log("vk: released textures keep at most %lld MiB of their own memory", mb);
+        if (mb > 0) rt_log("vk: released textures keep at most %lld MiB of their own memory%s (NX2NAVI_TEX_RELEASED_MB)", mb,
+                           by_vram ? ", a quarter of the video memory budget" : "");
         else rt_log("vk: released textures: no size limit");
     }
     return released_cap;
@@ -1264,8 +1947,9 @@ static int commit_is_low(void) {
         char note[2048];   // the platform layer's own lines go to stderr only, so the log file gets this through here
         if (plat_commit_note(note, sizeof note)) rt_log("platform: %s", note);
         if (proc_commit_mb)
-            rt_log("vk: textures give way as under low commit while this process's commit is above %lld MB "
-                   "(NX2NAVI_TEX_PROC_COMMIT_MB; 0 = off)", proc_commit_mb);
+            rt_log("vk: this process's commit%s is logged when it passes %lld MB (NX2NAVI_TEX_PROC_COMMIT_MB; 0 = off); "
+                   "textures give way only when the system's commit is low",
+                   plat_commit_counts_vram() ? ", less the video memory in use on a discrete card," : "", proc_commit_mb);
     }
     if (!commit_free_mb && !proc_commit_mb) return 0;
     double proc, used, limit;
@@ -1275,12 +1959,22 @@ static int commit_is_low(void) {
         double want = commit_free_mb > 0 ? (double)commit_free_mb : limit / 10 > 4096 ? limit / 10 : 4096;
         low = limit - used < want;
     }
-    int high = proc_commit_mb && proc > (double)(proc_high ? proc_commit_mb - proc_commit_mb / 32 : proc_commit_mb);
+    double dev = 0;   // device-local memory in use, MB: in the commit (plat_commit_counts_vram), not in RAM (see above)
+    VkCtx *c = vk_ctx();
+    uint64_t dev_used, dev_budget;
+    int exact;
+    if (proc_commit_mb && plat_commit_counts_vram() && c &&
+        c->props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU && vk_mem_vram(&dev_used, &dev_budget, &exact))
+        dev = dev_used / 1048576.0 < proc ? dev_used / 1048576.0 : proc;
+    int high = proc_commit_mb &&
+               proc - dev > (double)(proc_high ? proc_commit_mb - proc_commit_mb / 32 : proc_commit_mb);
     if (high != proc_high && commit_logs < 40) {
         commit_logs++;
-        rt_log("vk: this process's commit %s: %.0f MB, the bound is %lld MB (system: %.0f of %.0f MB in use); released "
-               "textures kept %d, %.0f MiB of own memory%s", high ? "high" : "no longer high", proc, proc_commit_mb,
-               used, limit, nreleased, rel_bytes / 1048576.0, high ? ": dropping the stale ones" : "");
+        rt_log("vk: this process's commit %s: %.0f MB less %.0f MB of video memory, the bound is %lld MB (system: %.0f "
+               "of %.0f MB in use); released textures kept %d, %.0f MiB of own memory%s", high ? "high" : "no longer high",
+               proc, dev, proc_commit_mb, used, limit, nreleased, rel_bytes / 1048576.0,
+               high ? ": the host's own memory, which dropping textures does not lower; textures give way only when the "
+                      "system's commit is low" : "");
     }
     proc_high = high;
     if (low != sys_low && commit_logs < 40) {   // a few lines, however often it flips
@@ -1288,9 +1982,25 @@ static int commit_is_low(void) {
         rt_log("vk: system commit %s: %.0f of %.0f MB in use (this process %.0f MB); released textures kept %d, %.0f MiB "
                "of own memory%s", low ? "low" : "no longer low", used, limit, proc, nreleased, rel_bytes / 1048576.0,
                low ? ": dropping the stale ones" : "");
+        // A page file Windows sizes grows only slowly and by little, so the limit stays near the installed memory plus
+        // what the page file held at the boot: on a 16 GB PC with a 16 GB card it ran low in Hyrule Field at 32 GB,
+        // and textures gave way (white or black ground). A fixed page file of 32 GB or more raised the limit to 49 GB.
+        static int hinted;
+        if (low && !hinted && plat_page_file_managed() == 1) {
+            hinted = 1;
+            rt_log("vk: the page file is sized by Windows, which grows it only slowly: a fixed page file whose initial "
+                   "size is at least 32 GB keeps the system's commit from running low (System > About > Advanced system "
+                   "settings > Performance Settings > Advanced > Virtual memory > Change: untick the automatic "
+                   "management, Custom size with an initial size of 32768 MB or more, Set, then restart Windows)");
+        }
     }
     sys_low = low;
-    return commit_low = low || high;
+    // Only the system's figure makes textures give way. The process's bound compares its commit less the video memory
+    // in use, and a texture dropped lowers both by the same amount: past the bound nothing a drop does could bring it
+    // back under, and textures went one after the other for as long as the rest of the process stayed large, the ground
+    // flickering white with the system's commit to spare (#434). What is above it is the host's own memory (the
+    // game's heap, pipelines, caches); the bound is logged, and the system's figure still acts when the commit runs low.
+    return commit_low = low;
 }
 
 int vk_texture_commit_low(void) { return __atomic_load_n(&commit_low, __ATOMIC_RELAXED); }
@@ -1323,7 +2033,7 @@ static uint64_t stale_after(const Tex *e) {
     return gap > GPU_STALE_FRAMES ? gap : GPU_STALE_FRAMES;
 }
 
-static int drop_stale(uint64_t keep, uint64_t *count) {   // returns the entries dropped: PRESSURE_STEP, more may follow
+static int drop_stale(uint64_t keep, uint64_t *count, int why) {   // returns the entries dropped: PRESSURE_STEP, more may follow
     uint64_t now = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     int dropped = 0;
     const uint64_t stale = STALE_FRAMES;
@@ -1333,7 +2043,7 @@ static int drop_stale(uint64_t keep, uint64_t *count) {   // returns the entries
             next = e->rel_next;
             if (!e->bytes || (!any && !comes_back_intact(e) && !e->overwritten)) continue;
             if (now - e->rel_frame < stale_after(e) || (!e->overwritten && !idle(e, now))) continue;
-            destroy_tex(e);
+            drop_tex(e, why);
             dropped++, (*count)++;
         }
     return dropped;
@@ -1347,7 +2057,7 @@ static void drop_overwritten(void) {
     for (Tex *e = rel_head, *next; e && now - e->rel_frame >= OVERWRITTEN_KEEP && dropped < PRESSURE_STEP; e = next) {
         next = e->rel_next;
         if (!e->overwritten || now - e->ow_frame < OVERWRITTEN_KEEP) continue;
-        destroy_tex(e);
+        drop_tex(e, DROP_OVERWRITTEN);
         dropped++, n_over_drops++;
     }
 }
@@ -1381,7 +2091,7 @@ void vk_texture_want_room(uint64_t bytes) {
                                                                  __ATOMIC_RELAXED)) {}
 }
 
-static uint64_t evict_idle(uint64_t want, uint64_t used, uint64_t budget) {   // tex_lock held; returns the bytes freed
+static uint64_t evict_idle(uint64_t want, uint64_t used, uint64_t budget, int why) {   // tex_lock held; returns the bytes freed
     if (vk_sync_fence_done() < evict_wait) return 0;
     Tex *v[EVICT_STEP];
     int nv = 0;
@@ -1399,7 +2109,7 @@ static uint64_t evict_idle(uint64_t want, uint64_t used, uint64_t budget) {   //
     }
     uint64_t freed = 0;
     int n = 0;
-    for (; n < nv && freed < want; n++) freed += v[n]->bytes, destroy_tex(v[n]);
+    for (; n < nv && freed < want; n++) freed += v[n]->bytes, drop_tex(v[n], why);
     if (!n) return 0;
     n_evict += (uint64_t)n, n_evict_bytes += freed;
     evict_wait = vk_sync_issued() + 2;
@@ -1450,7 +2160,12 @@ static uint64_t marks_peak;
 static uint32_t marks_live;
 static int resolve_held;            // slot_resolve left the slot out for a held key or a retired entry
 static uint64_t n_disuse, n_disuse_bytes, n_disuse_back;   // since the last perf line
+// since the last perf line: eviction candidates kept because another descriptor is registered at their address
+// (shared_address), and holds dropped by a mark that another entry at the address had taken (vk_pool_marks_read)
+static uint64_t n_disuse_shared, n_disuse_diverted;
 static uint64_t n_retire_cancel, n_retire_freed;           // since the last perf line
+static uint64_t n_retire_stalled;                          // retired textures taken back because they never came due
+#define RETIRE_PATIENCE PRESENTS(5 * 60)
 static int disuse_logs;
 static Tex **retiring;              // retired entries not destroyed yet
 static int nretiring, cretiring;
@@ -1462,6 +2177,11 @@ static void retire_cancel(Tex *e) {
     retiring_bytes -= e->bytes;
     if (holds.n) nvn_hm_del(&holds, &e->key);
     n_retire_cancel++, n_disuse_back++;
+    // In use as of now: while retired the pool refresh left it out, so it carries no use stamp of that time and
+    // counted as idle the moment it came back. A sweep over the budget (sweep_pressure calls retire_sweep and then
+    // evict_idle) could evict it in the same call that took it back.
+    e->use_round = look_round;
+    e->use_frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     tex_gen_bump(e->key.addr);
 }
 
@@ -1477,21 +2197,41 @@ static void retire_sweep(void) {
     static int keep = -1;
     if (keep < 0) keep = rt_knob("TEX_DISUSE", "1") == 2;
     uint64_t takes = vk_pool_takes(), done = vk_sync_fence_done();
+    uint64_t now = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     int k = 0;
     for (int i = 0; i < nretiring; i++) {
         Tex *e = retiring[i];
         if (!e->retiring) continue;   // taken back
         if (!e->retire_due && takes - e->retire_takes > VK_POOL_SETS) e->retire_due = vk_sync_issued();
+        // The takes that count are those of syncs that left no slot behind, and a PC that has no creation time over
+        // in most frames leaves some behind in nearly every sync: there a retired texture was never destroyed and its
+        // slots showed the stand-in for as long as that lasted, minutes in one report. One that is still not due
+        // after RETIRE_PATIENCE presents is taken back and counts as sampled now.
+        if (!e->retire_due && now - e->retire_frame > RETIRE_PATIENCE) {
+            retire_cancel(e);
+            e->samp_frame = now;
+            n_retire_stalled++;
+            continue;
+        }
         if (!keep && e->retire_due && done >= e->retire_due) {
             e->retiring = 0, retiring_bytes -= e->bytes;
             nvn_hm_put(&holds, &e->key, (void *)(uintptr_t)1);
             n_retire_freed++;
-            destroy_tex(e);
+            drop_tex(e, DROP_DISUSE);
             continue;
         }
         retiring[k++] = e;
     }
     nretiring = k;
+    static uint64_t stalled_logged;
+    static int stalled_logs;
+    if (n_retire_stalled != stalled_logged && stalled_logs < 8) {
+        stalled_logs++;
+        rt_log("vk: %llu textures evicted as unsampled were taken back: the texture pool had not been brought up to "
+               "date completely in %d s, so they could not be destroyed and their slots showed stand-ins",
+               (unsigned long long)(n_retire_stalled - stalled_logged), 5);
+        stalled_logged = n_retire_stalled;
+    }
 }
 
 // A lookup of key k that found no entry: 1 when the pool refresh asks for a held key (it gets the stand-in). Any other
@@ -1504,8 +2244,53 @@ static int held_out(const TexKey *k) {
     return 0;
 }
 
+// tex_lock held. Whether a registered slot at e's address names another descriptor than e's: the same bytes through
+// another swizzle or format, or a view the game draws through. Such a texture is not retired by disuse. Its slots
+// do not all come back by the marks: a slot of the other descriptor that followed e gets an image of its own once
+// e is gone, an empty one when the descriptor is not a CPU-written one, and from then on that image takes the
+// marks of every slot at the address, so the held key of e was never dropped and the slots that named e showed
+// the stand-in for good: the ground of Hyrule Field and of Lon Lon Ranch drawn flat and see-through after 6,663
+// textures went under low commit and 928 came back.
+static int slot_names_other(int32_t id, const Tex *e) {
+    const TexSlot *s = &tslots[id];
+    if (!s->used || s->finalized || (uintptr_t)s->t.mem != e->key.addr) return 0;
+    TexKey sk;
+    make_key(&s->t, &sk);
+    return memcmp(&sk, &e->key, sizeof sk) != 0;
+}
+
+static int shared_address(const Tex *e) {
+    if (!sinfo || !slot_next) return 0;
+    uint32_t b = agen_idx(e->key.addr);
+    for (int32_t id = bucket_head[b]; id >= 0; id = slot_next[id])
+        if (slot_names_other(id, e)) return 1;
+    for (int32_t g = bucket_ghead[b]; g >= 0; g = grp[g].gnext)
+        for (int32_t id = grp[g].pub.head; id >= 0; id = slot_next[id])
+            if (slot_names_other(id, e)) return 1;
+    return 0;
+}
+
+// NX2NAVI_TEX_DISUSE_EVICT (default 0; 1 = textures no shader sampled for a while are retired under pressure, as
+// before). Off since players' ground went flat and see-through after such evictions and stayed so (Hyrule Field, Lon
+// Lon Ranch; 1,441 retired on arriving in a village, 82 back): with the eviction off the same play kept its ground,
+// and neither of the two holes closed in the way back (shared_address, the hold drop in vk_pool_marks_read) acted
+// in the session that still lost it. What takes the retired texture's place for good is not known yet; a draw that
+// samples the stand-in once into a picture the game keeps would do it, and no mark can undo that. The shaders keep
+// their marks (NX2NAVI_TEX_DISUSE), so turning this on changes no pipeline. Released textures and the idle ones the
+// game no longer names still give way under pressure.
+static int disuse_evict_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = rt_knob("TEX_DISUSE_EVICT", "0") == 1;
+        rt_log("vk: textures no shader sampled for a while %s under pressure (NX2NAVI_TEX_DISUSE_EVICT)",
+               on ? "are retired" : "stay");
+    }
+    return on;
+}
+
 // tex_lock held; returns the bytes retired (freed a few submissions later), counting those still retiring as freed
 static uint64_t evict_disused(uint64_t want) {
+    if (!disuse_evict_on()) return 0;
     if (!want || !vk_pool_marks_enabled() || __atomic_load_n(&vk_pool_marks_missed, __ATOMIC_RELAXED) || marks_reads < 2 ||
         marks_live < 2 || vk_sync_fence_done() < evict_wait)
         return 0;
@@ -1525,6 +2310,14 @@ static uint64_t evict_disused(uint64_t want) {
         memmove(v + at + 1, v + at, sizeof *v * (size_t)(nv - 1 - at));
         v[at] = e;
     }
+    // A candidate whose address another descriptor shares stays (shared_address), and counts as sampled now, so the
+    // walk over its bucket is made once per disuse time and the next candidates get their turn.
+    int kept = 0;
+    for (int i = 0; i < nv; i++) {
+        if (shared_address(v[i])) v[i]->samp_frame = now, n_disuse_shared++;
+        else v[kept++] = v[i];
+    }
+    nv = kept;
     if (!nv) return 0;
     if (holds.n + (uint32_t)nv > HOLDS_MAX) {
         // keys of textures the game has let go of pile up: keep those a slot still holds out (cheld). Dropping them all
@@ -1551,7 +2344,8 @@ static uint64_t evict_disused(uint64_t want) {
             retiring = r, cretiring = c;
         }
         retiring[nretiring++] = e;
-        e->retiring = 1, e->retire_takes = takes, e->retire_due = 0;
+        e->retiring = 1, e->retire_takes = takes, e->retire_due = 0, e->retire_frame = now;
+        pool_unlist(e);   // no slot resolves to it in the pool refresh; taken back, the refill of its slots lists it again
         retiring_bytes += e->bytes;
         freed += e->bytes;
         tex_gen_bump(e->key.addr);
@@ -1567,9 +2361,79 @@ static uint64_t evict_disused(uint64_t want) {
     return retiring_bytes;
 }
 
+// The registered slots at e's address, for marks_check's line: how many, those of e's own descriptor ("f": finalized),
+// those whose last lookup gave e (a slot of another descriptor among them follows e), and the other descriptors' with
+// format and flags; up to 8 ids of each.
+static void slot_note(int32_t id, const Tex *e, int *n, int *n_own, int *n_show, int *n_other, char *own, char *show,
+                      char *other, size_t own_cap, size_t other_cap) {
+    const TexSlot *s = &tslots[id];
+    if (!s->used || (uintptr_t)s->t.mem != e->key.addr) return;
+    ++*n;
+    TexKey sk;
+    make_key(&s->t, &sk);
+    size_t at;
+    if (!memcmp(&sk, &e->key, sizeof sk)) {
+        if (++*n_own <= 8 && (at = strlen(own)) < own_cap - 1)
+            snprintf(own + at, own_cap - at, " %d%s", (int)id, s->finalized ? "f" : "");
+    } else if (++*n_other <= 8 && (at = strlen(other)) < other_cap - 1) {
+        snprintf(other + at, other_cap - at, " %d (fmt %#x flags %#x%s)", (int)id, s->t.d.format, (unsigned)s->t.d.flags,
+                 s->finalized ? ", finalized" : "");
+    }
+    if (s->ce == e && s->cgen == agen[sinfo[id] & 0xffff] && ++*n_show <= 8 && (at = strlen(show)) < own_cap - 1)
+        snprintf(show + at, own_cap - at, " %d", (int)id);
+}
+
+static void slots_text(char *out, size_t n, const Tex *e) {
+    char own[112] = "", show[112] = "", other[360] = "";
+    int total = 0, n_own = 0, n_show = 0, n_other = 0;
+    uint32_t b = agen_idx(e->key.addr);
+    for (int32_t id = bucket_head[b]; id >= 0; id = slot_next[id])
+        slot_note(id, e, &total, &n_own, &n_show, &n_other, own, show, other, sizeof own, sizeof other);
+    for (int32_t g = bucket_ghead[b]; g >= 0; g = grp[g].gnext)
+        for (int32_t id = grp[g].pub.head; id >= 0; id = slot_next[id])
+            slot_note(id, e, &total, &n_own, &n_show, &n_other, own, show, other, sizeof own, sizeof other);
+    snprintf(out, n, "%d registered; %d of this descriptor:%s; %d showing this entry:%s; %d of other descriptors:%s", total,
+             n_own, n_own ? own : " none", n_show, n_show ? show : " none", n_other, n_other ? other : " none");
+}
+
+// NX2NAVI_TRACE=perf, from vk_pool_marks_read: a shader sampled slot id, and nothing has ever put content into e, the
+// entry the slot shows or one credited with the mark (no_content): the picture drawn through it is an empty or
+// undefined image, which nothing else reports. One line per entry and up to MARK_LINES per address (said_at); the
+// marked slots that met such an entry are counted in the texture origins line whether or not a line was written.
+static uint64_t n_mark_empty, n_mark_none;   // since the last perf line: marked slots that met such an entry; that show none
+#define MARK_LINES 6
+#define MARK_LINES_ALL 20000
+static void marks_check(Tex *e, uint32_t id, uint64_t now, int followed) {
+    if (!no_content(e)) return;
+    // an entry the CPU writes is uploaded by its first check, which one just made (again) has not had yet
+    if (e->pub.mirrored && now - e->og_frame < 4) return;
+    n_mark_empty++;
+    if (e->said) return;
+    e->said = 1;
+    static SaidAt said;
+    static uint32_t total;
+    if (total >= MARK_LINES_ALL || !said_at(&said, e->key.addr, MARK_LINES)) return;
+    total++;
+    char d[224], og[320], state[160], slots[640], others[640];
+    desc_text(d, sizeof d, e);
+    origin_text(og, sizeof og, e);
+    slots_text(slots, sizeof slots, e);
+    others_at(others, sizeof others, e, NULL);
+    if (e->pub.mirrored)
+        snprintf(state, sizeof state, "CPU-written, not uploaded%s",
+                 e->up_retry ? " (an upload that had no memory waits for its next try)" : "");
+    else
+        snprintf(state, sizeof state, "not CPU-written (%s), never drawn into, copied into or filled", mirror_refused(&e->t));
+    rt_log("perf: frame %llu: sampled without content: texture %#llx (%llu bytes) [%s]: %s; %s; marked slot %u%s; slots "
+           "at the address: %s; other descriptors there: %s", (unsigned long long)now, (unsigned long long)e->key.addr,
+           (unsigned long long)e->t.L.size, d, state, og, id, followed ? " (of another descriptor, credited to this entry)" : "",
+           slots, others);
+}
+
 void vk_pool_marks_read(const uint32_t *marks, uint32_t n) {
     lock();
     uint64_t now = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    int trace = (rt_trace & RT_TRACE_PERF) != 0;
     if (n > (uint32_t)ntslots) n = (uint32_t)ntslots;
     uint32_t marked = 0;
     for (uint32_t id = 0; id < n; id++) {
@@ -1579,16 +2443,41 @@ void vk_pool_marks_read(const uint32_t *marks, uint32_t n) {
         if (s->ce && s->cgen == agen[sinfo[id] & 0xffff]) {   // what the slot resolves to now
             if (s->ce->retiring) retire_cancel(s->ce);   // not expected: retiring bumps the slot's generation
             s->ce->samp_frame = now;
+            if (trace) marks_check(s->ce, id, now, 0);
             continue;
         }
+        if (trace && !s->ce && s->cgen == agen[sinfo[id] & 0xffff]) n_mark_none++;   // its last lookup gave no entry
         TexKey k;
         make_key(&s->t, &k);
         Tex *e = nvn_hm_get(&by_key, &k);
-        if (e) {
+        if (e && !e->released) {
             if (e->retiring) retire_cancel(e);   // retired, and its stand-in was sampled: back as it is
             e->samp_frame = now;
-        } else if (holds.n && nvn_hm_del(&holds, &k)) {   // the stand-in was sampled: the next pool refresh makes it
+            if (trace) marks_check(e, id, now, 0);
+            continue;
+        }
+        // The slot has no entry of its own: it samples another descriptor's image at its address (slot_resolve follows
+        // one of the same target, as a second descriptor with another swizzle does). That image is what was sampled.
+        // With the mark given to the slot's own key alone, a texture sampled only through such slots was never noted
+        // as sampled while the slots' cached resolution was out of date, which it is at most reads in a bucket the
+        // game keeps changing: it was retired as unused after two minutes, and a mark on its stand-in could not take
+        // it back. While the pool's syncs kept leaving slots behind, a retired texture was never destroyed either
+        // (retire_sweep waits for complete takes), so its slots kept the stand-in: the ground of the field drawn
+        // without its textures and its height.
+        int followed = 0;
+        for (Tex *p = nvn_hm_get(&by_addr, &k.addr); p; p = p->next_at) {
+            if (p->released || p->key.d.target != k.d.target) continue;
+            if (p->retiring) retire_cancel(p);
+            p->samp_frame = now;
+            followed = 1;
+            if (trace) marks_check(p, id, now, 1);
+        }
+        // The slot's own key may be held although an entry at its address took the mark: the slot shows the stand-in
+        // then (slot_resolve follows fewer entries than the loop above credits), and only this drop makes its texture
+        // again. Left to the case where the loop found nothing, such a slot kept the stand-in for good.
+        if (holds.n && nvn_hm_del(&holds, &k)) {   // the stand-in was sampled: the next pool refresh makes it
             n_disuse_back++;
+            n_disuse_diverted += followed != 0;
             s->cheld = 0;
             s->cwant = 1;   // on screen as a stand-in: made at the next refresh, whatever the frame's creation time
             tex_gen_bump(k.addr);
@@ -1627,7 +2516,7 @@ static void commit_evict(void) {   // tex_lock held, the commit is low and the r
     }
     uint64_t used = 0, budget = 0;
     vk_mem_vram_live(&used, &budget);
-    uint64_t freed = evict_idle(COMMIT_EVICT_STEP, used, budget);
+    uint64_t freed = evict_idle(COMMIT_EVICT_STEP, used, budget, DROP_IDLE_COMMIT);
     if (freed < COMMIT_EVICT_STEP) evict_disused(COMMIT_EVICT_STEP - freed);
 }
 
@@ -1667,23 +2556,30 @@ static void sweep_pressure(void) {   // tex_lock held
         }
     }
     if (over) {
-        uint64_t freed = 0;
-        for (Tex *e = rel_head, *next; e && dropped < PRESSURE_STEP; e = next) {
+        // Released entries that come back intact, by the rule drop_stale keeps: released STALE_FRAMES ago and reached by
+        // no lookup since (idle). The game releases and takes back hundreds of textures a frame in towns, and the
+        // release list is mostly those: dropped, each was made and uploaded again within frames and freed nothing.
+        // With the budget taken as 7.5 GiB (NX2NAVI_VRAM_BUDGET_MB), teleports from Hyrule Field through Kakariko
+        // Village, the Graveyard, Death Mountain Trail and Kokiri Forest dropped 82,288 under the pressure and the card
+        // stayed over its budget throughout; with this rule 34,699 went, a fifth fewer textures were made again, the
+        // render thread waited a third less on textures, and 4 draws met a texture gone where 11 had.
+        uint64_t freed = 0, now = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+        for (Tex *e = rel_head, *next; e && dropped < PRESSURE_STEP && now - e->rel_frame >= STALE_FRAMES; e = next) {
             next = e->rel_next;
-            if (!comes_back_intact(e)) continue;
+            if (!comes_back_intact(e) || !idle(e, now)) continue;
             freed += e->bytes;
-            destroy_tex(e);
+            drop_tex(e, DROP_VRAM);
             dropped++, n_pressure_drops++;
         }
-        if (tex_evict && freed < over) freed += evict_idle(over - freed, used, budget);
+        if (tex_evict && freed < over) freed += evict_idle(over - freed, used, budget, DROP_IDLE_VRAM);
         if (tex_evict && freed < over) evict_disused(over - freed);
     }
     int low = commit_is_low(), more = 0;   // more: the released entries have stale ones left for the next check
     if (rel_head) {
         drop_overwritten();
         uint64_t cap = released_cap_bytes();
-        if (rel_bytes > cap) drop_stale(cap, &n_cap_drops);
-        if (rel_bytes > COMMIT_LOW_KEEP && low) more = drop_stale(COMMIT_LOW_KEEP, &n_commit_drops) == PRESSURE_STEP;
+        if (rel_bytes > cap) drop_stale(cap, &n_cap_drops, DROP_CAP);
+        if (rel_bytes > COMMIT_LOW_KEEP && low) more = drop_stale(COMMIT_LOW_KEEP, &n_commit_drops, DROP_COMMIT) == PRESSURE_STEP;
     }
     if (low && !more) commit_evict();
 }
@@ -1880,8 +2776,89 @@ static int astc_arena(void) {
 // Copies the whole storage into the image (every level and layer the image has). An image made without its top levels
 // (texture detail, VkTexImage.skip) has the game's level lv + skip at its level lv: the loops below run over the image's
 // levels and read the storage at the game's.
+// How long an upload whose decode had no memory waits for its next try (upload, up_wait): half a second of frames. A
+// try costs the copy of the texture's blocks into staging memory, so not every frame.
+#define UP_RETRY_FRAMES 30
+static uint64_t n_up_retry;
+uint64_t vk_texture_upload_retries(void) { return __atomic_load_n(&n_up_retry, __ATOMIC_RELAXED); }
+
+// 1 while a texture that is not uploaded waits for its next try (e->up_retry; 0 for one never tried).
+static int up_wait(const Tex *e) {
+    return e->up_retry && __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) < e->up_retry;
+}
+
+// ASTC as BC1: e gets an image of the other format, made with the same parameters, in place of its own: BC1 (bc 2) for
+// the opaque content of its first upload, BC3 (bc 1) for content with alpha about to go into its BC1 image. The old
+// image and its views go once the GPU is past the submission being recorded, as a destroyed texture's do (destroy_tex),
+// so commands recorded with it keep it; the new one starts as a new image (init_image) in the upload batch, which runs
+// before the part being recorded (in cb, the batch upload has open, or its own), and the slots that resolve to e look
+// it up again (tex_gen_bump). 0 when no image could be made; e keeps its own.
+static int astc_reformat(Tex *e, VkCommandBuffer cb, int bc) {
+    static volatile int32_t n_failed;
+    VkCtx *c = vk_ctx();
+    const ImgKey *k = &e->ik;
+    int s = e->f.astc_srgb;
+    VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = k->flags,
+                            .imageType = (VkImageType)k->type,
+                            .format = bc == 2 ? (s ? VK_FORMAT_BC1_RGB_SRGB_BLOCK : VK_FORMAT_BC1_RGB_UNORM_BLOCK)
+                                              : (s ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK),
+                            .extent = {k->w, k->h, k->d}, .mipLevels = k->levels, .arrayLayers = k->layers,
+                            .samples = (VkSampleCountFlagBits)k->samples, .tiling = VK_IMAGE_TILING_OPTIMAL,
+                            .usage = k->usage, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+    ImgKey nk;
+    img_key_of(&ci, &nk);
+    VmaAllocation a = NULL;
+    VkImage img = suballoc_image(c, &ci, &a);
+    if (!img && vma_image(c, &ci, &nk, &img, &a) != VK_SUCCESS) {
+        log_limited(&n_failed, "ASTC texture %#llx (%ux%u): no %s image could be made", (unsigned long long)e->pub.addr,
+                    e->t.d.width, e->t.d.height, bc == 2 ? "BC1" : "BC3");
+        return 0;
+    }
+    vk_exec_image_gone(e->pub.image);
+    vk_defer_image(e->pub.image, e->alloc);
+    vk_exec_image_gone(img);   // views cached under the handle of a destroyed image (create_tex)
+    int relink = e->ru_on;
+    if (relink) ru_unlink(e);
+    if (e->released) rel_bytes -= e->bytes;
+    if (e->retiring) retiring_bytes -= e->bytes;
+    VmaAllocationInfo own;
+    vmaGetAllocationInfo(c->vma, a, &own);
+    e->bytes = own.size;
+    if (e->released) rel_bytes += e->bytes;
+    if (e->retiring) retiring_bytes += e->bytes;
+    e->pub.image = img, e->alloc = a, e->reused = 0;
+    e->pub.format = e->f.vk = ci.format;
+    e->f.astc_bc = (uint8_t)bc;
+    e->ik = nk;
+    if (relink) ru_link(e);
+    if (cb) {
+        init_image(e, cb);
+    } else {
+        init_image(e, vk_upload_begin());
+        vk_upload_end();
+    }
+    tex_gen_bump(e->key.addr);
+    if (bc == 2) n_bc1_made++, n_bc1_made_bytes += e->bytes;
+    else n_bc1_widened++;
+    return 1;
+}
+
+// The upload's copy of size bytes of ASTC storage into staging, with the opaque check of its blocks: 1 when every block
+// is opaque and *decoded stays within ASTC_OPAQUE_DECODES. A large texture's copy and check run on the ASTC decode
+// workers (tex_astc_mt.c astc_blocks_opaque_mt), a small one's here.
+static uint64_t n_bc1_up_checks, n_bc1_up_bytes;
+static int astc_copy_opaque(const Tex *e, uint8_t *dst, const uint8_t *src, uint64_t size, uint32_t *decoded) {
+    uint64_t nb = size / 16;
+    int ok = astc_blocks_opaque_mt(src, nb, e->f.astc_bw, e->f.astc_bh, e->f.astc_srgb != 0, ASTC_OPAQUE_DECODES,
+                                   decoded, dst);
+    if (size % 16) memcpy(dst + 16 * nb, src + 16 * nb, size % 16);
+    n_bc1_up_checks++, n_bc1_up_bytes += size;
+    return ok;
+}
+
 static void upload(Tex *e) {
     static volatile int32_t n_bad, n_undecoded, n_split;
+    int no_mem = 0;   // a part's ASTC decode had no memory: the texture is uploaded again later
     const tex_t *t = &e->t;
     const nvn_texdesc *d = &t->d;
     int bw, bh, bpb = nvn_fmt_bpb(d->format, &bw, &bh);
@@ -1896,7 +2873,15 @@ static void upload(Tex *e) {
         return;
     }
     e->chash_ok = e->t.L.size <= CHASH_MAX;   // the hash of what this upload copies (make_fresh_snap compares it)
-    if (e->chash_ok) e->chash = content_hash((const void *)(uintptr_t)e->pub.addr, e->t.L.size);
+    if (e->chash_ok) {
+        // read with the storage held mapped, as the copies below: the game unmaps a texture's memory on its own thread
+        if (mem_read_hold(e->pub.addr, e->t.L.size)) {
+            e->chash = content_hash((const void *)(uintptr_t)e->pub.addr, e->t.L.size);
+            mem_read_release();
+        } else {
+            e->chash_ok = 0;
+        }
+    }
     static __thread char ctx[160];   // what this thread copies, for a crash report
     snprintf(ctx, sizeof ctx, "texture upload %#llx (%llu bytes, fmt %#x %ux%u)", (unsigned long long)e->pub.addr,
              (unsigned long long)e->t.L.size, d->format, d->width, d->height);
@@ -1928,6 +2913,26 @@ static void upload(Tex *e) {
     int checked = 0, parts = 1;
     // The GPU decoder reads the blocks in place (astc_bl_regions); the check mode compares against tight blocks.
     int gdsw = agpu && !acheck && !one_d && astc_bl_regions(e, levels, layers, bw, bh, ar);
+    // ASTC as BC1: a BC1 image takes opaque content only, and a BC3 one that may turn BC1 (bc1_try) does at its
+    // first upload when the content is opaque (astc_reformat). The blocks the GPU decoder takes as they lie (gdsw) are
+    // checked as they are copied; the others are checked here first. Without memory for a BC3 image the upload waits as
+    // one without memory for its decode does (no_mem); without memory for a BC1 one the texture stays BC3.
+    int bc1 = e->f.astc_bc == 2, try1 = e->bc1_try && e->f.astc_bc == 1 && !e->n_up, opq = 1;
+    uint32_t bc1_dec = 0;
+    e->bc1_try = 0;
+    if ((bc1 || try1) && !gdsw) {
+        opq = astc_opaque(t, e->pub.addr, &e->f);
+        if (bc1 && !opq && !astc_reformat(e, VK_NULL_HANDLE, 1)) {
+            e->uploaded = 0;
+            e->up_retry = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + UP_RETRY_FRAMES;
+            __atomic_add_fetch(&n_up_retry, 1, __ATOMIC_RELAXED);
+            free(ar), free(rg);
+            return;
+        }
+        if (try1 && opq) astc_reformat(e, VK_NULL_HANDLE, 2);
+        bc1 = try1 = 0;
+    }
+    int check = bc1 || try1;
     // A CPU decode or copy stages at most UPLOAD_PART bytes per staging buffer (a region larger than that alone) and
     // records one copy per buffer; every part stays in the same upload batch, submitted as before. The GPU decoder
     // takes the raw blocks of every region from one buffer.
@@ -1966,15 +2971,19 @@ static void upload(Tex *e) {
             static volatile int32_t n_gone;
             log_limited(&n_gone, "texture %#llx (%llu bytes): storage released during the upload; uploaded as zeros",
                         (unsigned long long)e->pub.addr, (unsigned long long)e->t.L.size);
+            // the image holds zeros, not the bytes hashed above: the same bytes mapped back there upload again
+            e->chash_ok = 0;
         }
         if (gdsw && !sk) {
-            if (held) memcpy(stg, t->mem, size);
+            if (held && check) opq = astc_copy_opaque(e, stg, t->mem, size, &bc1_dec);
+            else if (held) memcpy(stg, t->mem, size);
             else memset(stg, 0, size);
         } else if (gdsw) {
             VkDeviceSize at = 0;
             for (k = 0; k < n; k++) {   // astc_bl_regions checked that each lies inside the storage
                 VkDeviceSize nb = vk_astc_region_bytes(&ar[k], (uint32_t)bw, (uint32_t)bh);
-                if (held) memcpy(stg + at, t->mem + ar[k].src, nb);
+                if (held && check) opq &= astc_copy_opaque(e, stg + at, t->mem + ar[k].src, nb, &bc1_dec);
+                else if (held) memcpy(stg + at, t->mem + ar[k].src, nb);
                 else memset(stg + at, 0, nb);
                 ar[k].src = at, at += nb;
             }
@@ -2031,13 +3040,23 @@ static void upload(Tex *e) {
         if (agpu) {
             for (k = 0; k < n; k++) ar[k].src += soff;   // a range of the arena (astc_arena); 0 in a buffer of its own
             uint64_t a0 = perf_begin();
-            checked = vk_astc_record(cb, sb, size, ar, (int)n, e->f.astc_bw, e->f.astc_bh, e->f.astc_srgb, e->f.astc_bc,
+            // content with alpha for a BC1 image: a BC3 one first, or no decode for now (-1); opaque content at a BC3
+            // image's first upload: a BC1 one (it stays BC3 when none can be made)
+            int widen_failed = 0;
+            if (bc1 && !opq) widen_failed = !astc_reformat(e, cb, 1);
+            else if (try1 && opq) astc_reformat(e, cb, 2);
+            checked = widen_failed ? -1
+                    : vk_astc_record(cb, sb, size, ar, (int)n, e->f.astc_bw, e->f.astc_bh, e->f.astc_srgb, e->f.astc_bc,
                                      e->pub.image, e->pub.aspect, rbuf);
             perf_end(PERF_ASTC, a0);
             vk_texstat_time(VK_TS_ASTC, a0);
-            if (!checked)
-                log_limited(&n_undecoded, "ASTC texture %#llx (fmt %#x %ux%u) not decoded on the GPU: left as it was",
-                            (unsigned long long)e->pub.addr, d->format, d->width, d->height);
+            if (checked <= 0) {
+                log_limited(&n_undecoded, "ASTC texture %#llx (fmt %#x %ux%u) not decoded on the GPU: left as it was%s",
+                            (unsigned long long)e->pub.addr, d->format, d->width, d->height,
+                            checked < 0 ? " and tried again later (no memory for the decode)" : "");
+                e->chash_ok = 0;   // the image does not hold the bytes hashed above: the next write uploads, equal or not
+                no_mem |= checked < 0;
+            }
         } else {
             for (k = k0; k < k1; k++) rg[k].bufferOffset += soff;
             vkCmdCopyBufferToImage(cb, sb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, k1 - k0, rg + k0);
@@ -2051,7 +3070,7 @@ static void upload(Tex *e) {
                     parts);
     if (acheck) {   // waits for the GPU
         vk_upload_flush(1);
-        if (checked) {
+        if (checked > 0) {
             vmaInvalidateAllocation(vk_ctx()->vma, ralloc, 0, VK_WHOLE_SIZE);
             astc_check(e, raw_copy, ar, (int)n, rmap);
         }
@@ -2063,6 +3082,7 @@ static void upload(Tex *e) {
     uint64_t dt = kern_now_ns() - u0;
     if (e->uploaded) {
         n_reuploads++, perf_count(PERF_CNT_TEX_REUP);
+        n_split_refill += e->sfill != 0;
         ru_n++, ru_bytes += src_bytes, ru_ns += dt;
         if (e->wt_n) {
             ru_wt_n++, ru_wt_bytes += src_bytes, ru_wt_ns += dt;
@@ -2077,6 +3097,19 @@ static void upload(Tex *e) {
     e->wt_n = 0;
     e->uploaded = 1;
     e->n_up++;
+
+    // The decode had no memory (vk_astc_record: its scratch buffer failed while the video memory was used up), so the
+    // image does not hold this content: a new image holds nothing, an older one what it held before. Counted as
+    // uploaded, it stayed that way until the game next wrote the storage, which for most textures is never. It counts
+    // as not uploaded instead, and make_fresh and make_fresh_snap upload it again UP_RETRY_FRAMES frames on, when
+    // the evictions under memory pressure have had time to make room; again and again until one succeeds.
+    if (no_mem) {
+        e->uploaded = 0;
+        e->up_retry = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + UP_RETRY_FRAMES;
+        __atomic_add_fetch(&n_up_retry, 1, __ATOMIC_RELAXED);
+    } else {
+        e->up_retry = 0;
+    }
     perf_end(PERF_TEX, p0);
     vk_texstat_time(VK_TS_UPLOAD, u0);
     vk_texstat_add(VK_TS_UPLOAD, 0, src_bytes);
@@ -2117,16 +3150,22 @@ static int same_content(const Tex *e) {
     static int on = -1;   // NX2NAVI_TEX_SAME=0: every write to the pages uploads again (diagnosis)
     if (on < 0) { const char *v = cfg_get("NX2NAVI_TEX_SAME"); on = !(v && !strcmp(v, "0")); }
     if (!on || !e->chash_ok || e->wt_n || e->t.L.size > CHASH_MAX) return 0;
-    if (content_hash((const void *)(uintptr_t)e->pub.addr, e->t.L.size) != e->chash) return 0;
+    if (!mem_read_hold(e->pub.addr, e->t.L.size)) return 0;   // unmapped since: not the same; the upload deals with it
+    uint64_t h = content_hash((const void *)(uintptr_t)e->pub.addr, e->t.L.size);
+    mem_read_release();
+    if (h != e->chash) return 0;
     ru_same_n++, ru_same_bytes += e->t.L.size;
     return 1;
 }
 
-// A mirrored texture is uploaded on first use and again when its storage pages carry a newer write generation.
+// A mirrored texture is uploaded on first use and again when its storage pages carry a newer write generation. So is
+// one split fill fills (from_storage), while it is not released: the game may be unmapping a released one's storage,
+// and nothing keeps a slot from resolving to it as the stale rule does for a CPU-written one (slot_resolve).
 static void make_fresh(Tex *e) {
-    if (!e->pub.mirrored || e->pub.gpu_owned) return;
+    if (!from_storage(e) || e->pub.gpu_owned || (e->sfill && e->released)) return;
     uint64_t size = e->t.L.size;
     if (!e->uploaded) {
+        if (up_wait(e)) return;
         vk_mem_changed(e->pub.addr, size, 0, &e->wgen);   // resets the write bits before the storage is read
         upload(e);
         return;
@@ -2142,7 +3181,8 @@ static void make_fresh(Tex *e) {
 // vk_mem_changed_snap) instead of a system call per texture. A write the snapshot of the texture's region missed (made
 // after it, during this replay) keeps its write-watch bit and is caught by the next submission's snapshot.
 static void make_fresh_snap(Tex *e) {
-    if (!e->pub.mirrored || e->pub.gpu_owned) return;
+    if (!from_storage(e) || e->pub.gpu_owned || (e->sfill && e->released)) return;
+    if (!e->uploaded && up_wait(e)) return;
     uint32_t now;
     n_checks++;
     int ch = vk_mem_changed_snap(e->pub.addr, e->t.L.size, e->uploaded ? e->wgen : 0, submit_epoch, &now);
@@ -2156,7 +3196,7 @@ static void make_fresh_snap(Tex *e) {
 // Bytes per block and block size of the image's VkFormat (ASTC decodes to RGBA8, RGB expands to RGBA); 0 when the
 // VkFormat substitutes another one of unknown size.
 static int img_block(const Tex *e, int *bw, int *bh) {
-    if (e->f.astc_bc) { *bw = *bh = 4; return 16; }
+    if (e->f.astc_bc) { *bw = *bh = 4; return e->f.astc_bc == 2 ? 8 : 16; }   // BC1 or BC3
     if (e->f.astc_bw) { *bw = *bh = 1; return 4; }
     int b = nvn_fmt_bpb(e->t.d.format, bw, bh);
     if (e->f.expand_rgb) { *bw = *bh = 1; return b / 3 * 4; }
@@ -2275,6 +3315,67 @@ static void create_failed(const TexKey *k) {
     failed_hold[i].k = *k, failed_hold[i].until_ns = plat_now_ns() + 2000000000ull;
 }
 
+// NX2NAVI_TRACE=perf: a line for each event of the two kinds that can leave a descriptor showing an image without
+// content, up to START_LINES per address and kind (said_at).
+//  - over: e, which the CPU writes, was made over the live entry `over` and is filled from its storage. `over` stays
+//    as it is, and a slot that names its descriptor goes on showing it, whatever it holds.
+//  - gone: e, which the CPU does not write, was made at an address the CPU can see, and the released CPU-written entry
+//    there was destroyed (gone: its description, gone_rel: the frame of its release). Nothing uploads e; a slot of e's
+//    descriptor that showed the destroyed entry's image (slot_resolve follows it while it is live) shows e's from now on.
+// flag: e was taken back (over); how e started (gone): 0 empty, 1 with a copy of another entry's content, 2 with a
+// copy of the destroyed entry's, 3 filled from its storage (the last two: split fill).
+static uint64_t n_cpu_empty[3];   // since the last perf line: entries the CPU does not write, at an address it can see,
+                                  // that started without content: on their own, over a released entry, over a live one
+#define START_LINES 8
+#define START_LINES_ALL 20000
+static void start_line(const Tex *e, const Tex *over, const char *gone, uint64_t gone_rel, int flag) {
+    static SaidAt said[2];
+    static uint32_t total[2];
+    int kind = over ? 0 : 1;
+    if (total[kind] >= START_LINES_ALL || !said_at(&said[kind], e->key.addr, START_LINES)) return;
+    total[kind]++;
+    char d[224], o[224], og[320];
+    desc_text(d, sizeof d, e);
+    if (over) {
+        const char *why = mirror_refused(&over->t);
+        desc_text(o, sizeof o, over);
+        origin_text(og, sizeof og, over);
+        rt_log("perf: frame %llu: texture %#llx filled from storage over a live entry%s: new [%s]; live [%s], %s%s%s, %s",
+               (unsigned long long)frames_now(), (unsigned long long)e->key.addr, flag ? " (taken back)" : "", d, o,
+               why ? "not CPU-written: " : "CPU-written", why ? why : "", no_content(over) ? ", no content" : "", og);
+    } else {
+        static const char *const how[4] = {"started empty", "got another entry's content", "got the destroyed entry's content",
+                                           "was filled from its storage"};
+        rt_log("perf: frame %llu: texture %#llx, not CPU-written (%s), %s after the released CPU-written entry at its "
+               "address was destroyed: new [%s]; destroyed [%s], released at frame %llu",
+               (unsigned long long)frames_now(), (unsigned long long)e->key.addr, mirror_refused(&e->t), how[flag & 3], d,
+               gone, (unsigned long long)gone_rel);
+    }
+}
+
+// Split fill from the storage: e, new and through its first transition, gets its storage's bytes in the upload batch
+// (make_fresh, as a CPU-written texture's first use) and is marked to follow them or not (Tex.sfill). 0 when e is left
+// as it is: storage over SPLIT_FILL_MAX, an image taken from a released entry (see "split fill"), storage not mapped,
+// or an upload that had no memory, which make_fresh tries again later.
+static int split_fill(Tex *e) {
+    if (e->t.L.size > SPLIT_FILL_MAX) return n_split_big++, 0;
+    if (e->reused) return n_split_reused++, 0;
+    if (!mem_readable(e->pub.addr, e->t.L.size)) return 0;
+    uint64_t t0 = kern_now_ns();
+    e->sfill = (uint8_t)split_mode;
+    make_fresh(e);
+    if (!e->uploaded) return 0;
+    n_split_fill++, split_total[1]++, n_split_bytes += e->t.L.size, n_split_ns += kern_now_ns() - t0;
+    e->had |= HAD_FILL;
+    return 1;
+}
+
+static int depth_alias_log(void) {   // NX2NAVI_DEPTH_ALIAS_LOG=1: start_at logs each new depth entry over a live texture
+    static int on = -1;
+    if (on < 0) on = rt_knob("DEPTH_ALIAS_LOG", "0");
+    return on;
+}
+
 // The start of e's content at its address, for a new entry and for a superseded one taken back (taken_back): another
 // descriptor's released entry there is superseded, and a live one holding GPU-written content is the alias source,
 // preferring the one that differs only in swizzle (same_but_swizzle). A superseded entry is kept for its own
@@ -2290,7 +3391,16 @@ static void create_failed(const TexKey *k) {
 // it there (a black frame with FSR 3.1 and its frame generation, two presents long).
 static void start_at(Tex *e, const TexKey *k, int taken_back) {
     int alias = 0;
+    int trace = (rt_trace & RT_TRACE_PERF) != 0;
+    int gone = 0, rel_other = 0;   // released entries at the address: CPU-written ones destroyed here, others superseded
+    char gone_desc[224] = "";      // trace: the last destroyed one, described while it existed
+    uint64_t gone_rel = 0;
     Tex *src = NULL, *rsrc = NULL;
+    // split fill: e is to start with its storage's bytes; msrc: the released CPU-written entry whose image holds them
+    // (destroyed after the copy), msrc_gpu: it holds what the GPU wrote instead, msrc_gen: the storage's generation
+    int fill = !taken_back && tex_alias && split_wants(&e->t, &e->f), msrc_gpu = 0;
+    uint32_t msrc_gen = 0;
+    Tex *msrc = NULL;
     const char *why = "no live texture with GPU content";   // for the log of an alias left empty
     const Tex *other = NULL;
     int newer = 0;          // taken back: a texture at this address holds GPU content written since e's release
@@ -2301,10 +3411,27 @@ static void start_at(Tex *e, const TexKey *k, int taken_back) {
         if (taken_back && p->use_frame >= e->rel_frame && alias_has_gpu_content(p)) newer = 1;
         if (p->released) {
             if (p->pub.mirrored) {
-                destroy_tex(p);
+                if (trace) {
+                    int n = desc_text(gone_desc, sizeof gone_desc, p);
+                    if (n > 0 && n < (int)sizeof gone_desc)
+                        snprintf(gone_desc + n, sizeof gone_desc - (size_t)n, ", %s", p->pub.gpu_owned ? "GPU-written"
+                                 : p->uploaded ? "uploaded" : "not uploaded");
+                    gone_rel = p->rel_frame;
+                }
+                gone++;
+                const char *no;
+                uint32_t gen = 0;
+                int gpu = alias_has_gpu_content(p);
+                if (fill && !msrc && (gpu || (p->uploaded && !p->pub.gpu_owned &&
+                                              !vk_mem_changed(p->pub.addr, p->t.L.size, p->wgen, &gen))) &&
+                    alias_compatible(e, p, &no)) {
+                    msrc = p, msrc_gpu = gpu, msrc_gen = gen;
+                    continue;
+                }
+                drop_tex(p, DROP_REPLACED);
                 continue;
             }
-            p->superseded = 1;
+            p->superseded = 1, rel_other = 1;
             const char *unused;
             if (tex_alias && alias_has_gpu_content(p) && alias_compatible(e, p, &unused) &&
                 (!rsrc || p->use_frame > rsrc->use_frame))
@@ -2322,6 +3449,21 @@ static void start_at(Tex *e, const TexKey *k, int taken_back) {
     int from_released = !src && rsrc && !live_content;
     if (from_released) src = rsrc;
     if (alias) perf_count(PERF_CNT_TEX_ALIAS);
+    if (alias && (e->f.depth || e->f.stencil) && depth_alias_log()) {
+        // each new depth or stencil entry over a live texture, with the frame and whether the two are bound into pool
+        // memory (the same allocation: they share bytes), to line up with a dark frame
+        static int n_dlog;
+        if (n_dlog++ < 20000)
+            rt_log("vk: depth alias: frame %llu %#llx %ux%ux%u fmt %#x%s%s over %ux%ux%u fmt %#x%s%s%s: %s",
+                   (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), (unsigned long long)k->addr,
+                   e->pub.width, e->pub.height, e->pub.layers, e->t.d.format, e->bound_to ? " bound" : " own memory",
+                   taken_back ? " (taken back)" : "", other->pub.width, other->pub.height, other->pub.layers,
+                   other->t.d.format, other->f.depth ? " depth" : "", other->bound_to ? " bound" : " own memory",
+                   e->bound_to && e->bound_to == other->bound_to ? ", same allocation" : "",
+                   taken_back && !newer && !e->pub.mirrored ? "kept its own"
+                   : e->reused || taken_back ? "cleared at the replay's position (reused)"
+                   : depth_init_inline() ? "cleared at the replay's position" : "cleared in the upload batch");
+    }
     if (taken_back && !newer && !e->pub.mirrored) {   // its image still holds its content
         n_alias_kept++;
         return;
@@ -2330,20 +3472,45 @@ static void start_at(Tex *e, const TexKey *k, int taken_back) {
         if (taken_back) init_new(e);
         return;
     }
-    if (src && alias_copy(e, src)) {
+    // split fill only where nothing live holds content the storage lacks: that content is what e should show
+    if (src || live_content) fill = 0;
+    int copied = src && alias_copy(e, src), filled = 0;
+    if (fill && msrc && alias_copy(e, msrc)) {   // from the released entry this one replaces
+        copied = filled = 1;
+        n_split_copy++, split_total[0]++;
+        e->og_start = START_COPY_GONE;
+        e->had |= HAD_COPY;
+        if (!msrc_gpu && e->t.L.size <= SPLIT_FILL_MAX) {   // the storage's bytes as of msrc_gen: followed from there
+            e->sfill = (uint8_t)split_mode, e->uploaded = 1, e->wgen = msrc_gen;
+            e->chash_ok = 0;
+        }
+    }
+    if (msrc) drop_tex(msrc, DROP_REPLACED);
+    if (filled) {   // nothing more: e is not CPU-written
+    } else if (copied) {
         n_alias_copied++;
         if (from_released) n_alias_released++;
+        e->og_start = from_released ? START_COPY_RELEASED : START_COPY_LIVE;
+        e->had |= HAD_COPY;
         if (e->pub.mirrored) {   // the content is src's GPU render, newer than the storage bytes
             vk_mem_changed(e->pub.addr, e->t.L.size, 0, &e->wgen);
             e->uploaded = 1;
+            pool_gpu_owned(e);
             e->pub.gpu_owned = 1;
         }
         e->chash_ok = 0;
     } else {
         init_new(e);
+        if (fill) filled = split_fill(e);
+        e->og_start = filled ? START_FILL : alias ? (e->pub.mirrored ? START_UPLOAD_LIVE : START_EMPTY_LIVE)
+                    : (gone || rel_other) && !e->pub.mirrored ? START_EMPTY_RELEASED : START_NEW;
+        // an entry the CPU does not write, at an address the CPU can see, that starts without content
+        if (!filled && !e->pub.mirrored && !nvn_gpu_only(k->addr)) n_cpu_empty[alias ? 2 : gone || rel_other ? 1 : 0]++;
         if (alias) {
-            if (e->pub.mirrored) n_alias_upload++;
-            else {
+            if (e->pub.mirrored) {
+                n_alias_upload++;
+                if (trace) start_line(e, other, NULL, 0, taken_back);
+            } else if (!filled) {
                 n_alias_uninit++;
                 static int logged;
                 // what an empty start over live memory was, to tell a black frame's cause; depth buffers start empty
@@ -2360,6 +3527,8 @@ static void start_at(Tex *e, const TexKey *k, int taken_back) {
             }
         }
     }
+    if (trace && gone && !e->pub.mirrored && !nvn_gpu_only(k->addr))
+        start_line(e, NULL, gone_desc, gone_rel, e->og_start == START_COPY_GONE ? 2 : filled ? 3 : copied);
 }
 
 static Tex *entry_of(const tex_t *t) {
@@ -2378,6 +3547,7 @@ static Tex *entry_of(const tex_t *t) {
             rt_log("vk: texture aliases: %s", tex_alias ? "a new image takes the live image's content" : "a new image starts empty");
         }
         if (!(e = create_tex(t, &k, tex_alias))) return create_failed(&k), NULL;
+        origin_made(e);
         perf_count(PERF_CNT_TEX_NEW);
         start_at(e, &k, 0);
         e->next_at = nvn_hm_get(&by_addr, &k.addr);
@@ -2394,6 +3564,7 @@ static Tex *entry_of(const tex_t *t) {
         if (gap > e->back_gap) e->back_gap = gap > UINT32_MAX ? UINT32_MAX : (uint32_t)gap;
         e->released = 0, nreleased--, rel_unlink(e), n_site[2]++, tex_gen_flip(e, e->superseded || e->overwritten);
         e->overwritten = 0;
+        e->og_backs++, e->og_back_frame = e->samp_frame;
         if (e->superseded) {   // its image may still be in use: the first barrier waits for all earlier work
             e->superseded = 0, e->reused = 1;
             n_restarts++;
@@ -2491,6 +3662,7 @@ void vk_texture_gpu_written(const tex_t *t) {
             e->scan_frame = now + 1;
             overwrite_others(e, now);
         }
+        pool_gpu_owned(e);
         e->pub.gpu_owned = 1;
         e->chash_ok = 0;   // the image now holds the GPU's content: matching storage bytes no longer mean "unchanged"
         if (e->pub.skip) {   // texture detail leaves out what the GPU can write (detail_skip); said if it ever does
@@ -2532,6 +3704,11 @@ void vk_texture_release(const tex_t *t) {
     // Staleness belongs to the registered descriptor, not the cached image: a released Tex can be destroyed before the
     // slot looks again (eviction, the released cap, start_at for a mirrored one). A registered texture may also be
     // finalized before its image is created.
+    // Only the slots this texture object registered (its initialization serial): a slot registered with another
+    // texture initialized at the same storage with the same parameters names that one, which is still live. Ocarina
+    // streams terrain heightmaps (R32F 260x260) through a fixed set of storage and initializes and registers the next
+    // chunk's texture there before it finalizes the previous one; finalizing the new registration left the slot stale,
+    // the draws sampled the zero stand-in, and the chunk was drawn at height zero, tens of metres below the ground.
     int changed = 0;
     if (sinfo)
         for (int id = bucket_head[agen_idx(k.addr)]; id >= 0; id = slot_next[id]) {
@@ -2539,7 +3716,13 @@ void vk_texture_release(const tex_t *t) {
             if (s->finalized || (uintptr_t)s->t.mem != k.addr) continue;
             TexKey sk;
             make_key(&s->t, &sk);
-            if (!memcmp(&sk, &k, sizeof k)) s->finalized = 1, s->ce = NULL, changed = 1;
+            if (memcmp(&sk, &k, sizeof k)) continue;
+            if (s->t.serial != t->serial) {   // another texture object's registration: it stays current
+                n_fin_other++, n_fin_other_hm += terrain_heightmap(&s->t);
+                continue;
+            }
+            s->finalized = 1, s->ce = NULL, changed = 1;
+            n_fin_own++;
         }
     if (e && !e->released) {
         mark_released(e);
@@ -2558,7 +3741,7 @@ void vk_texture_range_gone(uint64_t lo, uint64_t size, VmaAllocation alloc) {
         Tex *e = by_key.vals[i];
         if (e && ((e->key.addr >= lo && e->key.addr - lo < size) || (alloc && e->bound_to == alloc))) list[n++] = e;
     }
-    for (int i = 0; i < n; i++) destroy_tex(list[i]);
+    for (int i = 0; i < n; i++) drop_tex(list[i], DROP_RANGE);
     free(list);
     unlock();
 }
@@ -2578,10 +3761,11 @@ void vk_texture_register(int id, const tex_t *t, const view_t *v) {
     if (!sinfo) {
         uint64_t *p = calloc(1 << 20, sizeof *p);
         slot_next = malloc(sizeof *slot_next << 20), slot_prev = malloc(sizeof *slot_prev << 20);
+        slot_grp = malloc(sizeof *slot_grp << 20);
         slot_bucket = calloc(1 << 20, sizeof *slot_bucket);
-        if (!p || !slot_next || !slot_prev || !slot_bucket) rt_fatal("vk: out of memory for texture slot tokens");
-        for (int i = 0; i < (1 << 20); i++) slot_prev[i] = -2, slot_next[i] = -1;
-        for (int i = 0; i < AGEN_N; i++) bucket_head[i] = -1;
+        if (!p || !slot_next || !slot_prev || !slot_grp || !slot_bucket) rt_fatal("vk: out of memory for texture slot tokens");
+        for (int i = 0; i < (1 << 20); i++) slot_prev[i] = -2, slot_next[i] = -1, slot_grp[i] = -1;
+        for (int i = 0; i < AGEN_N; i++) bucket_head[i] = -1, bucket_ghead[i] = -1;
         __atomic_store_n(&sinfo, p, __ATOMIC_RELEASE);
     }
     TexSlot *s = &tslots[id];
@@ -2607,7 +3791,6 @@ void vk_texture_register(int id, const tex_t *t, const view_t *v) {
     slots_gen++;
     if (!++reg_serial) reg_serial = 1;
     __atomic_store_n(&sinfo[id], (uint64_t)reg_serial << 16 | agen_idx((uintptr_t)t->mem), __ATOMIC_RELEASE);
-    slot_rebucket(id, agen_idx((uintptr_t)t->mem));
     dirty_push((uint32_t)id);
     s->has_view = v != NULL;
     if (v) s->v = *v;
@@ -2623,6 +3806,7 @@ void vk_texture_register(int id, const tex_t *t, const view_t *v) {
         for (size_t i = 0; i < sizeof s->v; i++) h = (h ^ b[i]) * 0x100000001b3ull;
         s->khash = (h ^ s->has_view) | 1;
     }
+    slot_place(id, agen_idx((uintptr_t)t->mem), s->khash);
     unlock();
 }
 
@@ -2687,14 +3871,20 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
         // after its released image was evicted; registering the descriptor again makes it current.
         if (!e && any) e = any;
         else if (!e && !cpu_slot) e = own && own->superseded ? NULL : own;   // a superseded one: entry_of takes it back
-        else if (!e && cpu_slot && s->finalized) stale = 1;
+        else if (!e && cpu_slot && s->finalized) stale = 1, n_stale++, n_stale_hm += terrain_heightmap(&s->t);
     }
+    resolve_stale = stale;
     if (!e && s->t.mem && !stale) {
         // evicted by disuse: the pool refresh keeps the stand-in, without spending the creation budget on it
         if (pool_ctx && holds.n && nvn_hm_get(&holds, &k)) resolve_held = 1;
         else if (create_budget < 0) e = entry_of(&s->t);
+        // Unmapped storage first: such a slot has nothing to make, now or later. Asked after the budget, every stale
+        // slot a refresh met with the budget at 0 was noted as left: in a busy frame (its creation time spent) that
+        // was about a thousand slots at once, which vk_exec_draw.c pool_sync_entries took for an area load, several
+        // times a second in some places, and each time lifted the count budget and the frame's creation time.
+        else if (!mem_readable((uint64_t)(uintptr_t)s->t.mem, s->t.L.size)) e = NULL;
         else if (!create_budget && !(s->cwant && want_take())) create_deferred = 1;
-        else if (mem_readable((uint64_t)(uintptr_t)s->t.mem, s->t.L.size)) {
+        else {
             e = entry_of(&s->t);
             if (create_budget > 0) create_budget--;
         }
@@ -2752,7 +3942,27 @@ void vk_texture_bucket_stats(char *out, size_t n) {
              (unsigned long long)n_site[2], (unsigned long long)n_site[3], (unsigned long long)n_undone,
              (unsigned long long)hot, occ[top[0]], occ[top[1]], occ[top[2]], occ[top[3]],
              bump_count[top[0]], bump_count[top[1]], bump_count[top[2]], bump_count[top[3]]);
-    n_bumps = n_undone = 0;
+    size_t used = strlen(out);
+    if (used < n)
+        snprintf(out + used, n - used, "; pool freshness check: %llu entries checked, %llu passed by their regions (missed: "
+                 "%llu not uploaded, %llu a region without a snapshot yet, %llu untracked, %llu written since, %llu "
+                 "nothing to check; %llu snapshot queries of NX2NAVI_POOL_PRESNAP)",
+                 (unsigned long long)n_pool_checks, (unsigned long long)n_pool_skips,
+                 (unsigned long long)n_pool_miss[0], (unsigned long long)n_pool_miss[1],
+                 (unsigned long long)n_pool_miss[2], (unsigned long long)n_pool_miss[3],
+                 (unsigned long long)n_pool_miss[4], (unsigned long long)n_presnap_q);
+    used = strlen(out);
+    if (used < n)
+        snprintf(out + used, n - used, "; %d slot groups holding %llu slots", ngrp_live, (unsigned long long)n_grouped);
+    int held = 0, gown = 0;
+    for (int i = 0; i < npref; i++)
+        if (pref[i].refs && pref[i].e) held++, gown += pref[i].gown;
+    used = strlen(out);
+    if (used < n)
+        snprintf(out + used, n - used, "; pool slots hold %d entries, %d of them GPU-owned (stamped in each submission "
+                 "checked by list)", held, gown);
+    n_bumps = n_undone = n_pool_checks = n_pool_skips = n_presnap_q = 0;
+    memset(n_pool_miss, 0, sizeof n_pool_miss);
     memset(n_site, 0, sizeof n_site);
     memset(bump_count, 0, sizeof bump_count);
     unlock();
@@ -2795,8 +4005,9 @@ const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view) {
         s->cheld = (uint8_t)(!s->ce && resolve_held);
     }
     Tex *e = s->ce;
-    // a draw binding: the texture is in use, whether or not the pool walk checked it first in this submission
-    if (e && !pool_ctx) e->samp_frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    // a draw binding: the texture is in use, whether or not the pool's refresh checked it first in this submission
+    // (by list that check is no lookup, vk_texture_pool_fresh_locked, so the stamp of the use is left here too)
+    if (e && !pool_ctx) touch(e);
     // Bindings of one submit share one check, answered from the submit's write-watch snapshot (guest writes during a
     // replay race the GPU read on hardware too). After one check an entry is either uploaded or never uploads (not
     // mirrored, GPU-owned or no CPU layout), so a slot that checked its entry in this submit has nothing left to do. A
@@ -2831,7 +4042,7 @@ const VkTexImage *vk_texture_exact_by_id_locked(int id, view_t *view, int *has_v
         log_limited(&n_logged, "texture detail: texture %#llx (fmt %#x %ux%u, %u levels) is read by texel position or its "
                     "size is asked for: made whole again (%llu so far)", (unsigned long long)e->pub.addr, e->t.d.format,
                     e->t.d.width, e->t.d.height, e->pub.levels + e->pub.skip, (unsigned long long)n_exact);
-        destroy_tex(e);
+        drop_tex(e, DROP_EXACT);
     }
     return vk_texture_by_id_locked(id, view, has_view);
 }
@@ -2853,8 +4064,9 @@ uint32_t vk_texture_epoch(void) { return __atomic_load_n(&submit_epoch, __ATOMIC
 
 void vk_texture_new_submit(void) {
     lock();
-    if (round_checks && (uint64_t)round_checks * 2 >= pool_slots) look_round++;   // the last one walked the pool
-    round_checks = 0;
+    // the last one walked the pool, or checked its entries by list
+    if (pool_by_list || (round_checks && (uint64_t)round_checks * 2 >= pool_slots)) look_round++;
+    round_checks = 0, pool_by_list = 0;
     if (!++submit_epoch) submit_epoch = 1;
     rate_tick();
     sweep_pressure();
@@ -2867,6 +4079,16 @@ void vk_texture_new_submit(void) {
                (unsigned long long)f * 60, (unsigned long long)n_alias_copied, (unsigned long long)n_alias_released,
                (unsigned long long)n_alias_upload, (unsigned long long)n_alias_uninit, (unsigned long long)n_alias_kept);
         n_alias_copied = n_alias_upload = n_alias_uninit = n_alias_kept = n_alias_released = 0;
+        if (n_dinit_inline || n_dinit_upload)
+            rt_log("perf: frame %llu: new depth images started at the replay's position %llu (%llu ended an open pass), "
+                   "in the upload batch %llu", (unsigned long long)f * 60, (unsigned long long)n_dinit_inline,
+                   (unsigned long long)n_dinit_inpass, (unsigned long long)n_dinit_upload);
+        n_dinit_inline = n_dinit_inpass = n_dinit_upload = 0;
+        if (n_disuse_shared || n_disuse_diverted)
+            rt_log("perf: frame %llu: unsampled textures kept because another descriptor shares their address %llu; "
+                   "holds dropped by a mark that another entry at the address had taken %llu",
+                   (unsigned long long)f * 60, (unsigned long long)n_disuse_shared, (unsigned long long)n_disuse_diverted);
+        n_disuse_shared = n_disuse_diverted = 0;
         rt_log("perf: frame %llu: texture re-uploads %llu (%.1f MiB, %.2f ms), after WriteTexels %llu (%.1f MiB, %.2f ms); "
                "skipped with unchanged bytes %llu (%.1f MiB)",
                (unsigned long long)f * 60, (unsigned long long)ru_n, ru_bytes / 1048576.0, ru_ns / 1e6,
@@ -2896,6 +4118,30 @@ void vk_texture_new_submit(void) {
         n_cap_drops = n_pressure_drops = n_commit_drops = n_commit_past = n_evict = n_evict_bytes = 0;
         n_disuse = n_disuse_bytes = n_disuse_back = n_retire_freed = n_retire_cancel = 0;
         n_reused = n_reuse_new = n_bind_skips = n_restarts = n_overwritten = n_over_drops = 0;
+        rt_log("perf: frame %llu: texture origins: released entries dropped past RELEASED_MAX %llu, replaced by another "
+               "descriptor at their address %llu; entries the CPU does not write made without content at an address it "
+               "can see: on their own %llu, over a released entry %llu, over a live one %llu; marked slots that met an "
+               "entry without content %llu, that show no entry %llu",
+               (unsigned long long)f * 60, (unsigned long long)n_drop_by[DROP_MAX], (unsigned long long)n_drop_by[DROP_REPLACED],
+               (unsigned long long)n_cpu_empty[0], (unsigned long long)n_cpu_empty[1], (unsigned long long)n_cpu_empty[2],
+               (unsigned long long)n_mark_empty, (unsigned long long)n_mark_none);
+        memset(n_drop_by, 0, sizeof n_drop_by), memset(n_cpu_empty, 0, sizeof n_cpu_empty);
+        n_mark_empty = n_mark_none = 0;
+        rt_log("perf: frame %llu: texture finalizes: slots marked %llu; slots of another live texture with the same "
+               "parameters at the storage, left current %llu (terrain heightmaps %llu); lookups the stale rule gave the "
+               "stand-in %llu (terrain heightmaps %llu)", (unsigned long long)f * 60, (unsigned long long)n_fin_own,
+               (unsigned long long)n_fin_other, (unsigned long long)n_fin_other_hm, (unsigned long long)n_stale,
+               (unsigned long long)n_stale_hm);
+        n_fin_own = n_fin_other = n_fin_other_hm = n_stale = n_stale_hm = 0;
+        if (split_mode > 0)
+            rt_log("perf: frame %llu: split fill: entries the CPU does not write started with their storage's bytes: "
+                   "copied from the released entry they replaced %llu, filled from storage %llu (%.1f MiB, %.2f ms), "
+                   "filled again after a write %llu; left empty: image taken from a released entry %llu, storage over "
+                   "%llu MiB %llu", (unsigned long long)f * 60, (unsigned long long)n_split_copy,
+                   (unsigned long long)n_split_fill, n_split_bytes / 1048576.0, n_split_ns / 1e6,
+                   (unsigned long long)n_split_refill, (unsigned long long)n_split_reused,
+                   (unsigned long long)(SPLIT_FILL_MAX >> 20), (unsigned long long)n_split_big);
+        n_split_copy = n_split_fill = n_split_bytes = n_split_ns = n_split_refill = n_split_reused = n_split_big = 0;
     }
     unlock();
 }
@@ -3025,6 +4271,7 @@ static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t
     if (g->level < e->pub.skip) return 1;
     uint32_t il = g->level - e->pub.skip;
     if (il >= e->pub.levels) return 0;
+    e->had |= HAD_TEXELS, e->sfill = 0;   // its content is no longer the storage's (split fill)
     uint32_t w = (uint32_t)r->width, h = (uint32_t)r->height;
     int rgb = e->f.expand_rgb, astc = e->f.astc_bw != 0, agpu = astc && vk_astc_gpu();
     size_t texels = (size_t)w * h, ib = agpu ? 0 : astc ? 4 : rgb ? (size_t)g->bpb / 3 * 4 : 0;
@@ -3076,7 +4323,7 @@ static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t
         free(ar);
     }
     if (!agpu) vkCmdCopyBufferToImage(cb, sb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)g->nz, rg);
-    else if (!done) log_limited(&n_astc, "WriteTexels of ASTC texture %#llx not decoded on the GPU: left as it was",
+    else if (done <= 0) log_limited(&n_astc, "WriteTexels of ASTC texture %#llx not decoded on the GPU: left as it was",
                                 (unsigned long long)e->pub.addr);
     barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
     vk_upload_end();
@@ -3712,8 +4959,8 @@ void vk_texture_census(VkTexCensus *s) {
 // STALE_FRAMES presents (touch). Then the entries that share their storage address with another live entry (each
 // descriptor of the same storage gets an image of its own), the formats holding the most, and the largest entries.
 void vk_texture_census_log(uint64_t frame) {
-    enum { K_BC3, K_RGBA8, K_CPU, K_GPU, K_N };
-    static const char *const kn[K_N] = {"ASTC as BC3", "ASTC as RGBA8", "other CPU-written", "GPU-written"};
+    enum { K_BC1, K_BC3, K_RGBA8, K_CPU, K_GPU, K_N };
+    static const char *const kn[K_N] = {"ASTC as BC1", "ASTC as BC3", "ASTC as RGBA8", "other CPU-written", "GPU-written"};
     uint64_t n[K_N] = {0}, b[K_N] = {0}, in[K_N] = {0}, ib[K_N] = {0}, bound = 0, dup_n = 0, dup_b = 0;
     uint64_t sk_n[3] = {0}, sk_b[3] = {0};   // texture detail: entries made without 1 and 2 levels, and their memory
     struct { int fmt; uint64_t n, b; } fm[48];
@@ -3728,7 +4975,8 @@ void vk_texture_census_log(uint64_t frame) {
         const Tex *e = by_key.vals[i];
         if (!e || e->released) continue;
         if (!e->bytes) { bound += e->bound_to != NULL; continue; }
-        int k = !comes_back_intact(e) ? K_GPU : e->f.astc_bw ? (e->f.astc_bc ? K_BC3 : K_RGBA8) : K_CPU;
+        int k = !comes_back_intact(e) ? K_GPU
+              : e->f.astc_bw ? (e->f.astc_bc == 2 ? K_BC1 : e->f.astc_bc ? K_BC3 : K_RGBA8) : K_CPU;
         n[k]++, b[k] += e->bytes;
         if (e->pub.skip < 3) sk_n[e->pub.skip]++, sk_b[e->pub.skip] += e->bytes;
         if (idle(e, now)) in[k]++, ib[k] += e->bytes;
@@ -3784,6 +5032,12 @@ void vk_texture_census_log(uint64_t frame) {
                  "position or size)", (unsigned long long)sk_n[1], sk_b[1] / M, (unsigned long long)sk_n[2], sk_b[2] / M,
                  (unsigned long long)n_exact, gfx_shader_exact_seen());
     rt_log("%s", line);
+    if (vk_astc_bc1())
+        rt_log("mem: ASTC as BC1 so far: %llu textures made BC1 at their first upload (%.0f MiB, half of what BC3 takes), "
+               "%llu made BC3 again for content with alpha; checks in the uploads' copies %llu (%.0f MiB), of the storage "
+               "before an upload that untiles on the CPU %llu (%.0f MiB) in %.1f ms", (unsigned long long)n_bc1_made,
+               n_bc1_made_bytes / M, (unsigned long long)n_bc1_widened, (unsigned long long)n_bc1_up_checks,
+               n_bc1_up_bytes / M, (unsigned long long)n_bc1_checks, n_bc1_check_bytes / M, n_bc1_check_ns / 1e6);
     for (int x = 0; x < nfm; x++)   // by bytes, largest first
         for (int y = x + 1; y < nfm; y++)
             if (fm[y].b > fm[x].b) { typeof(fm[0]) t = fm[x]; fm[x] = fm[y], fm[y] = t; }
@@ -3818,7 +5072,7 @@ void vk_texture_shutdown(void) {
     int n = 0;
     for (uint32_t i = 0; i < by_key.cap; i++)
         if (by_key.vals[i]) list[n++] = by_key.vals[i];
-    for (int i = 0; i < n; i++) destroy_tex(list[i]);
+    for (int i = 0; i < n; i++) drop_tex(list[i], DROP_SHUTDOWN);
     free(list);
     for (uint32_t i = 0; i < samplers.cap; i++)
         if (samplers.vals[i] && c) vkDestroySampler(c->device, (VkSampler)samplers.vals[i], NULL);
@@ -3835,4 +5089,24 @@ void vk_texture_shutdown(void) {
     rel_head = rel_tail = NULL, rel_bytes = 0;
     if (sinfo) memset(sinfo, 0, sizeof *sinfo << 20);   // no slot is registered: tokens 0
     unlock();
+}
+
+// NX2NAVI_TRACE=perf "mem: sizes" (perf.c): the texture cache's entries (the bytes are in the "mem: vram" line), the
+// released ones, those retired by disuse, the sampler cache, the image requirements cache, the disuse holds, the
+// reuse keys, and the pool's texture and sampler slots. Counters, and a walk of at most 4096 sampler slots.
+void vk_texture_sizes(PerfSizes *s) {
+    lock();
+    uint64_t imgs = by_key.n, rel = (uint64_t)nreleased, relb = rel_bytes, ret = (uint64_t)nretiring, retb = retiring_bytes,
+             smp = samplers.n, reqs = img_reqs.n, hold = holds.n, reuse_keys = reuse.n, tslot = pool_slots, sslot = 0;
+    for (int i = 0; i < nsslots; i++) sslot += sslots[i].used != 0;
+    unlock();
+    perf_size(s, "textures", imgs, 0, PERF_SIZE_NONE);
+    perf_size(s, "released textures", rel, 0, relb);
+    perf_size(s, "retiring textures", ret, 0, retb);
+    perf_size(s, "samplers", smp, 0, PERF_SIZE_NONE);
+    perf_size(s, "image requirements", reqs, 0, PERF_SIZE_NONE);
+    perf_size(s, "disuse holds", hold, HOLDS_MAX, PERF_SIZE_NONE);
+    perf_size(s, "reuse keys", reuse_keys, 0, PERF_SIZE_NONE);
+    perf_size(s, "texture pool slots", tslot, VK_POOL_TEX, PERF_SIZE_NONE);
+    perf_size(s, "sampler slots", sslot, VK_POOL_SAMP, PERF_SIZE_NONE);
 }

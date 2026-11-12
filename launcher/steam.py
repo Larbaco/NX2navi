@@ -325,5 +325,5 @@ def add(layout, game_dir, dump='', log=print, restart=True):
             subprocess.Popen([str(exe_steam)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, creationflags=0x00000008, close_fds=True)   # detached
     if was_running and restart:
-        return f'Added to Steam as {NAME}. Steam is starting again with it in the library.'
-    return f'Added to Steam as {NAME}. It is in the library the next time Steam starts.'
+        return 'Added to Steam.'
+    return 'Added. It shows up the next time you open Steam.'

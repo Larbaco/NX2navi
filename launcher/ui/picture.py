@@ -1,11 +1,13 @@
 """The player's own background picture (Customize Launcher): read a picture file into a numpy array, fit it to the
-window's shape and keep that copy in data/background.npy, so the launcher shows it without the file it came from.
+shape of the window below its title band and keep that copy in data/background.npy, so the launcher shows it without
+the file it came from. Fitting cuts the picture to that shape around its middle and scales it evenly: it is never
+stretched.
 
 Pillow reads the file where the launcher's Python has it (a release's does: tools/requirements-launcher.txt), turned
 the way its EXIF data says. Without Pillow (a checkout's Python may lack it), GDI+ reads it on Windows (PNG, JPEG,
 BMP, GIF, TIFF) and Tk elsewhere (PNG, GIF; the pixels come over as a PPM file). The kept copy is 8-bit RGB at
-KEEP_W x KEEP_H, 1.6 times the window's logical size: enough for a display scaled to 200 %, and five megabytes on
-disk.
+KEEP_W x KEEP_H, 1.6 times the logical size of the window below the band: enough for a display scaled to 200 %,
+and four and a half megabytes on disk.
 """
 import ctypes
 import os
@@ -14,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
-KEEP_W, KEEP_H = 1600, 1024        # the window's 1000 x 640 times 1.6
+KEEP_W, KEEP_H = 1600, 928         # the window's 1000 x 580 below the title band, times 1.6
 MAX_SIDE, MAX_PIXELS = 16384, 120_000_000
 try:
     from PIL import Image, ImageOps
@@ -180,9 +182,9 @@ def resize(img, w, h):
     return top * (1 - fy) + bot * fy
 
 
-def cover(img, w, h):
-    """img cut to the shape w : h around its middle and resized to w x h, so it fills the window with nothing
-    stretched; uint8."""
+def cover(img, w, h, as_float=False):
+    """img cut to the shape w : h around its middle and resized to w x h, so it fills the room with nothing
+    stretched; uint8, or float32 in 0..255 with as_float."""
     H, W = img.shape[:2]
     if W * h > H * w:   # wider than the window: cut the sides
         cw = max(1, round(H * w / h))
@@ -193,6 +195,8 @@ def cover(img, w, h):
         y = (H - ch) // 2
         img = img[y:y + ch]
     out = resize(img, w, h)
+    if as_float:
+        return np.clip(out.astype(np.float32), 0, 255)
     return np.clip(np.rint(out), 0, 255).astype(np.uint8)
 
 
@@ -207,12 +211,22 @@ def keep(path, store, master=None):
     return fitted
 
 
+def kept_shape(store):
+    """(height, width) of the kept background, or None."""
+    try:
+        a = np.load(store, mmap_mode='r', allow_pickle=False)
+        return a.shape[:2] if a.ndim == 3 else None
+    except (OSError, ValueError):
+        return None
+
+
 def kept(store, w, h):
-    """The kept background at w x h as float32 in 0..1, or None when there is none (or it is not what keep wrote)."""
+    """The kept background at w x h as float32 in 0..1, cut to that shape when it has another (one kept by an older
+    launcher for the whole window), or None when there is none (or it is not what keep wrote)."""
     try:
         a = np.load(store, allow_pickle=False)
     except (OSError, ValueError):
         return None
     if a.dtype != np.uint8 or a.ndim != 3 or a.shape[2] != 3 or a.shape[0] < 8 or a.shape[1] < 8:
         return None
-    return np.clip(resize(a, w, h).astype(np.float32) / 255.0, 0, 1)
+    return cover(a, w, h, as_float=True) / 255.0

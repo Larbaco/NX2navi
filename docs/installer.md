@@ -148,7 +148,8 @@ llvm/                 llvm-mingw, x86_64-only subset (Apache-2.0 with LLVM excep
 runtime/              libnx2navirt.a, libnx2navirt-v2.a and the headers the generated code and modules.c/romfs.c/patches.c
                       include
 bin/                  nx2navi_xlate.exe, hactool.exe, SDL3.dll, libopus-0.dll, ninja.exe
-data/                 shader_list.tsv (MIT, THIRD_PARTY_NOTICES.md); pgo-<ver>.profdata + .json, the execution profile an
+data/                 shader_list.tsv (MIT, THIRD_PARTY_NOTICES.md); pipeline_list.bin when the release was made with
+                      one (building.md, step 6); pgo-<ver>.profdata + .json, the execution profile an
                       update's code and the runtime libraries compile with (building.md, "Profile-guided build")
 THIRD_PARTY_NOTICES.md
 nx2navi.ini.example, VERSION  the default ini; the release string (the repository's VERSION plus the commit)

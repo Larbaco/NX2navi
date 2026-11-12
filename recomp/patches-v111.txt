@@ -19,6 +19,8 @@ set res_fixed   NX2NAVI_PATCH_RES_FIXED   0
 set ostep       NX2NAVI_OCARINA_REALTIME  1
 set zstd        NX2NAVI_ZSTD_NATIVE       1
 set osolver     NX2NAVI_PHYSICS_STEPS     1
+set opickup     NX2NAVI_PICKUP_COUNT      1
+set freecam     NX2NAVI_PATCH_FREECAM     0
 
 # Real-time step: the framework's per-frame update (main+0x6e6be0) gives the time manager **[main+0x4c7e890] its
 # nominal frame through main+0x3b4e300 (+0x10 frames per update, +0x14 the inverse, +0x18 seconds, +0x1c the rate),
@@ -47,6 +49,30 @@ site osolver main 38aebf4 1e380001 1e280001   # fcvtzs w1, s0 -> fcvtps w1, s0 (
 site osolver main 38afd10 bd440d02 1e2a1002   # the same three words in the second copy
 site osolver main 38afd1c 1f010800 1f218800
 site osolver main 38afd20 1e380001 1e280001
+
+# Pick-up window count: the window that shows a pick-up above the character (its update is main+0xa67e50) moves the
+# number it shows (+0x360) to the new total (+0x35c) by trunc(frames per update * max(1, difference / 50)) a frame, and
+# closes only once the two are equal. Below one frame per update that is 0: above 60 fps, and at 60 while the step runs
+# a little under one frame, the count never ends, so the window stayed until the area was left, and for an amount over
+# 9 the counting sound was started again every frame and its closing sound never came. The increment is floored at 1
+# without the flags (clz is 32 only for 0, so increment += clz >> 5); at one and two frames per update it is what the
+# game computes. Above 60 fps a small amount then counts one a rendered frame, faster than at 60. w13 held the time
+# manager, last read at main+0xa682ec, and every path from the site reaches a call before it reads x13 again.
+site opickup main a68300 1e38000c 1e38000c 5ac0118d 53057dad 0b0d018c   # fcvtzs w12, s0; clz w13, w12; lsr w13, w13, #5; add w12, w12, w13
+
+# Mouse camera: the camera's stick input update (main+0x37c300) puts the right stick through a radial dead zone of
+# 0.005, scales the radius to one, clamps it and raises it to StickExponent (2, the default of
+# game__component__PlayerCameraParam); then come the reset timer at +0x5e0 (the stick reads zero while it runs), the X/Y
+# inversion (w21 bits 1 and 2) and the idle test (flags +0x530 bit 4: the processed stick under 10%). At 37c45c s1 and
+# s0 hold the processed x and y for the stores at +0x538 and +0x53c: the host callback performs the displaced store of
+# s1 and adds the raw mouse counts to both (runtime/mouse_direct.c camera_input_oot), so the mouse never becomes a stick
+# value and meets no dead zone or curve. At 37c4f0, the displaced ldp d9, d8, [sp, #0x10] before the update's last
+# `str w8, [x20, #0x530]`, w8 holds the flags: a second callback clears the idle bit for an update the mouse moved in
+# (camera_activity_oot). x30 is the function's own saved one at both sites. The callbacks' addresses are page +0xfd0
+# and +0xfc0; the page is main+0x4ea0000 on this build.
+set mouse_direct NX2NAVI_MOUSE_DIRECT_PATCH 1
+site mouse_direct main 37c45c bd053a81 952c92dd   # str s1, [x20, #0x538] -> bl page+0xfd0
+site mouse_direct main 37c4f0 6d4123e9 952c92b4   # ldp d9, d8, [sp, #0x10] -> bl page+0xfc0
 
 # Game image: the graphics setup (main+0x1202ce0) fills the renderer's configuration with the size of the picture the
 # game presents, 2560x1440 at every console mode (config +0x14, copied to renderer +0x9c, which main+0x346be50 reads
@@ -122,3 +148,11 @@ site zstd main e910c  9400089d 9536dfb9   # bl ZSTD_decompressMultiFrame -> page
 site zstd main bf72e0 97d3d028 950aa744   # bl ZSTD_decompressMultiFrame -> page+0xff0
 site zstd main f50164 97c66c87 94fd43a3   # bl ZSTD_decompressMultiFrame -> page+0xff0
 site zstd main f5c2c  94000015 9536acd5   # bl the stream feed -> page+0xf80
+
+# The debug menu's free camera (runtime/debug_tools.c dbg_freecam_host; switched on by the menu, never by a setting). The
+# camera update (main+0x4c48c0) chooses the frame's position and target (doubles) and up vector between the camera's
+# own and an override; every path of that choice joins at main+0x4c4e50 with them in d0-d2, d3-d5 and s7, s16, s6,
+# before they are stored into the look-at camera and its matrix is made. That instruction goes to the host function
+# on the patch page (+0xf70), which puts the free camera's vectors into those registers and does the instruction's
+# own work.
+site freecam main 4c4e50 1e624011 95277048   # fcvt s17, d0 -> bl page+0xf70

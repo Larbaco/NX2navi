@@ -49,7 +49,7 @@ enum {
     R_SetRasterizerDiscardEnable, R_SetScissorWithCount, R_SetStencilCompareMask, R_SetStencilOp, R_SetStencilReference,
     R_SetStencilTestEnable, R_SetStencilWriteMask, R_SetViewportWithCount, R_WriteTimestamp, R_WriteTimestamp2,
     R_PushTpl, R_Push, R_VertexInput, R_Bool, R_PolygonMode, R_BlendEnable, R_BlendEquation, R_WriteMask, R_EndCb,
-    R_PassMark, R_DrawMesh, R_DrawMeshInd, R_ShadingRate,
+    R_PassMark, R_DrawMesh, R_DrawMeshInd, R_ShadingRate, R_DrawIndirect,
 };
 
 static uint64_t now_ns(void) { return plat_now_ns(); }
@@ -346,6 +346,9 @@ FIXED(DrawIndexed, (VkCommandBuffer cb, uint32_t n, uint32_t i, uint32_t f, int3
       uint32_t n, i, f; int32_t v; uint32_t fi)
 #define PACK_DrawIndexedIndirect *a = (A_DrawIndexedIndirect){b, o, n, s}
 FIXED(DrawIndexedIndirect, (VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, uint32_t n, uint32_t s), (cb, b, o, n, s),
+      VkBuffer b; VkDeviceSize o; uint32_t n, s)
+#define PACK_DrawIndirect *a = (A_DrawIndirect){b, o, n, s}
+FIXED(DrawIndirect, (VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, uint32_t n, uint32_t s), (cb, b, o, n, s),
       VkBuffer b; VkDeviceSize o; uint32_t n, s)
 #define PACK_EndQuery *a = (A_EndQuery){p, q}
 FIXED(EndQuery, (VkCommandBuffer cb, VkQueryPool p, uint32_t q), (cb, p, q), VkQueryPool p; uint32_t q)
@@ -705,6 +708,7 @@ static void exec_packet(uint32_t op, void *p) {
     F(Draw, a->n, a->i, a->f, a->fi)
     F(DrawIndexed, a->n, a->i, a->f, a->v, a->fi)
     F(DrawIndexedIndirect, a->b, a->o, a->n, a->s)
+    F(DrawIndirect, a->b, a->o, a->n, a->s)
     F(EndQuery, a->p, a->q)
     F(FillBuffer, a->b, a->o, a->n, a->v)
     F(ResetQueryPool, a->p, a->f, a->n)

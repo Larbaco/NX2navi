@@ -141,6 +141,17 @@ def register_font(path):
         return False
 
 
+def unregister_font(path):
+    '''Give up a font file register_font added, so the file can be written again: Windows keeps a registered font
+    file open, and writing it then fails with "Permission denied".'''
+    if os.name != 'nt':
+        return
+    try:
+        ctypes.windll.gdi32.RemoveFontResourceExW(ctypes.c_wchar_p(str(path)), 0x10, None)   # FR_PRIVATE
+    except (AttributeError, OSError):
+        pass
+
+
 def open_path(path):
     path = str(path)
     if os.name == 'nt':

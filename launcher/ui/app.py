@@ -10,6 +10,7 @@ flat cells and the orange choices are canvas items. Screens:
     first_run   the dump, the install folder, three choices and Begin Installation
     home        Play, Updates, the game folder, Saves, Rebuild the Game, Customize Launcher, Settings
     customize   the colour scheme, the player's own background picture, animations and sounds; Add to Steam
+    color       the Custom scheme's colour picker: a colour square, a hue bar and the hex code
     saves       Export Save (a zip for a bug report or another player), Import a Save (such a zip), a save folder
     job         the steps of an install, update or rebuild, with their progress, and Cancel; after a failure Try Again
                 and Copy Report
@@ -24,6 +25,7 @@ rows, a new screen slides in, sparks drift over the backdrop and Navi bobs in th
 plays the game's own decide and cancel sounds, read from the player's game, for a choice and for going back.
 """
 import argparse
+import colorsys
 import math
 import os
 import random
@@ -41,6 +43,7 @@ from . import art, picture, sound
 
 W, H = 1000, 640
 BAND = (0, 1000, 56)            # x0, x1, height: the whole top of the window, which is also its title bar
+PIC_TOP = 60                    # the player's background picture starts under the band and its two lines
 TITLE_BUTTONS = (('min', 908, 954), ('close', 954, 1000))   # x ranges on the band
 PANEL = (112, 60, 580)          # x0, top, x1
 ROWS = (140, 552, 96)           # x0, x1, top
@@ -50,7 +53,16 @@ DESC = (614, 336)               # x, width
 P = art.PALETTE                 # the colour scheme in use: art.set_theme changes it in place
 FRAME_MS = 15                   # between two steps of the animations; they move by the time that really passed
 SPARKS = 22                     # the dust drifting over the backdrop
-DEPTH = {'first_run': 0, 'home': 0, 'job': 1, 'saves': 1, 'settings': 1, 'customize': 1, 'uninstall': 2}
+DEPTH = {'first_run': 0, 'home': 0, 'job': 1, 'saves': 1, 'settings': 1, 'customize': 1, 'uninstall': 2,
+         'color': 2}
+# the Custom scheme's picker (draw_picker), logical pixels: its box (x, top, width, height), the colour square and
+# the hue bar (x0, y0, x1, y1)
+PICKER_BOX = (614, 100, 336, 452)
+SQUARE = (667, 160, 897, 390)
+BAR = (667, 408, 897, 430)
+CUSTOM_LABELS = {'background': 'Background Color', 'panel': 'Panel Color', 'buttons': 'Button Color'}
+CUSTOM_DESC = {'background': 'The color behind the menus.', 'panel': 'The color of the panels and the top bar.',
+               'buttons': 'The color of the buttons.'}
 DIMS = (0, 20, 40, 60, 80)      # Background Dimming, in percent
 SOUND_LEVELS = (('off', 'Off'), ('low', 'Low'), ('medium', 'Medium'), ('high', 'High'))
 
@@ -127,6 +139,31 @@ def exit_code_text(code):
     return f'{shown} ({meaning})' if meaning else shown
 
 
+FATAL_TAIL = 256 << 10   # bytes of the game's log last_fatal reads from its end
+FATAL_SHOWN = 240        # characters of a FATAL line the home screen shows; the launcher's log has all of it
+
+
+def last_fatal(game_dir):
+    """The last FATAL line of the game's latest run, without its "FATAL: ", or ''. The game writes one before it
+    exits with 70 (runtime/dispatch.c rt_fatal) or 71 (runtime/main.c crash_handler) into logs/nx2navi.log, which
+    each run starts anew (runtime/main.c log_open). A line this launcher added for an earlier run's end
+    (note_exit_in_log) ends the search: what stands before it is not this run's."""
+    if not game_dir:
+        return ''
+    try:
+        with open(Path(game_dir) / 'logs' / 'nx2navi.log', 'rb') as f:
+            f.seek(max(0, f.seek(0, 2) - FATAL_TAIL))
+            lines = f.read().decode('utf-8', 'replace').splitlines()
+    except OSError:
+        return ''
+    for line in reversed(lines):
+        if line.startswith('[launcher] the game ended'):
+            return ''
+        if line.startswith('FATAL: '):
+            return line[len('FATAL: '):].strip()
+    return ''
+
+
 def note_exit_in_log(game_dir, text):
     """Adds the exit code to the end of the game's log, so a log a player sends shows how the run ended even when the
     process died before it could write a line itself."""
@@ -138,6 +175,39 @@ def note_exit_in_log(game_dir, text):
             f.write(f'[launcher] the game ended with code {text} at {time.strftime("%Y-%m-%d %H:%M:%S")}\n')
     except OSError:
         pass
+
+
+def partial_image_gb(game_dir):
+    """The size of what an install that was cut short left of the RomFS image (romfs/romfs.bin.part, up to 26 GB).
+    The next install writes the image anew (tools/make_game.py step_romfs), so that space is the install's to use:
+    the first-run screen counts it as free."""
+    try:
+        return (Path(game_dir) / 'romfs' / 'romfs.bin.part').stat().st_size / 1e9
+    except OSError:
+        return 0.0
+
+
+def drop_partial_image(game_dir):
+    """Removes that file (partial_image_gb), so that it does not count against the free space an install asks
+    for."""
+    try:
+        (Path(game_dir) / 'romfs' / 'romfs.bin.part').unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+# Seconds after an update check before the Updates row or F5 starts another. Each check is a request to GitHub,
+# which allows 60 an hour for an address: a player who selected the row 25 times in 90 seconds used the allowance
+# up, and every check of the next hour was refused.
+FORCED_CHECK_PAUSE = 60
+
+# How long an update's rebuild takes, for the Updates row. No single figure holds: a version that changed little
+# compiles a few files and links, minutes; one that changed the lifter translates and compiles the game's code again,
+# and one that changed what the shaders are built with builds all of them into the graphics driver's cache again
+# (tools/make_game.py warm_driver_cache). Players' updates took 24, 34 and 45 minutes where the text said "a few
+# minutes".
+UPDATE_TAKES = ('That takes a few minutes when little changed, and half an hour or more when the game\'s code or '
+                'its shaders are built again.')
 
 
 def drive_of(path):
@@ -172,6 +242,10 @@ class App:
         self.export_message = ''   # the last Export Save result, shown in its description
         self.steam_message = ''   # the last Add to Steam result, shown in its description
         self.steam_busy = False   # Add to Steam is making the pictures or writing Steam's files
+        self.pick = None   # the colour picker: {'slot', 'h', 's', 'v'} (HSV in 0..1) of the colour being picked
+        self.pick_drag = None   # 'square' or 'bar' while the mouse drags on the picker
+        self.hex_entry = None   # the box the hex code is typed into
+        self.look_after = None   # the redraw a picked colour waits for (look_soon)
         self.dumps = None
         self.dump_search = None
         self.uninstall_game = False
@@ -184,7 +258,7 @@ class App:
         self.ico = None
         # the look: the colour scheme, the player's background picture at the window's size (None: the scheme's own
         # backdrop), the sounds (none while the selftest draws the screens)
-        art.set_theme(self.settings.get('theme'))
+        art.set_theme(self.settings.get('theme'), self.custom_colors())
         self.bg_store = self.layout.data / 'background.npy'
         self.picture = None
         self.sounds = sound.Sounds(self.layout.cache, 'off' if args.selftest else self.settings.get('sounds'), ctx.log)
@@ -317,6 +391,11 @@ class App:
             got = heard = {}
             try:
                 if fonts:
+                    # The cached files are registered (load_fonts) and were not usable, or this would not run:
+                    # registered, Windows keeps them open, and decoding them again failed with "Permission denied"
+                    # at every start, so a cache file that had gone bad was never replaced.
+                    for path, _family in gamefiles.cached_fonts(self.layout).values():
+                        winsys.unregister_font(path)
                     got = gamefiles.extract_fonts(self.layout, game_dir, dump)
             except Exception as e:
                 self.ctx.log(f'fonts: {e}')
@@ -351,10 +430,19 @@ class App:
         return bool(self.settings.get('animations')) and not self.args.selftest
 
     def load_picture(self):
-        """The player's background at the window's size, when one is set and its kept copy is readable."""
+        """The player's background at the size of the window below the title band, when one is set and its kept copy
+        is readable. A copy an older launcher kept for the whole window is made again from the picture when the file
+        is still there, so no more of it is cut off than the new shape needs."""
         self.picture = None
-        if self.settings.get('background'):
-            self.picture = picture.kept(self.bg_store, self.X(W), self.X(H))
+        src = self.settings.get('background')
+        if src:
+            if picture.kept_shape(self.bg_store) not in (None, (picture.KEEP_H, picture.KEEP_W)) \
+                    and Path(src).is_file():
+                try:
+                    picture.keep(src, self.bg_store, self.root)
+                except (picture.PictureError, OSError, MemoryError, ValueError) as e:
+                    self.ctx.log(f'background: {src}: {e!r}; the copy kept before stays')
+            self.picture = picture.kept(self.bg_store, self.X(W), self.X(H) - self.X(PIC_TOP))
             if self.picture is None:
                 self.ctx.log(f'background: {self.bg_store} is missing or unreadable; the colour scheme\'s backdrop')
 
@@ -367,7 +455,8 @@ class App:
         c.delete('static')
         dim = max(0, min(100, self.settings.get('background_dim', 40))) / 100.0
         c.create_image(0, 0, anchor='nw', tags='static',
-                       image=self.sprite('backdrop', lambda: art.backdrop(self.X(W), self.X(H), s, self.picture, dim)))
+                       image=self.sprite('backdrop', lambda: art.backdrop(self.X(W), self.X(H), s, self.picture, dim,
+                                                                          self.X(PIC_TOP))))
         self.make_sparks()   # over the backdrop, under the panel and the band
         bx0, bx1, bh = BAND
         px0, ptop, px1 = PANEL
@@ -418,7 +507,7 @@ class App:
 
     def apply_look(self):
         """Draw everything again after the colour scheme, the background or Animations changed."""
-        art.set_theme(self.settings.get('theme'))
+        art.set_theme(self.settings.get('theme'), self.custom_colors())
         self.sprites.clear()
         self.root.configure(background=P['window'])
         self.canvas.configure(background=P['window'])
@@ -460,7 +549,7 @@ class App:
         self.canvas.bind('<Motion>', self.on_motion)
         self.canvas.bind('<Button-1>', self.on_click)
         self.canvas.bind('<B1-Motion>', self.on_drag)
-        self.canvas.bind('<ButtonRelease-1>', lambda e: setattr(self, 'drag', None))
+        self.canvas.bind('<ButtonRelease-1>', self.on_release)
         self.canvas.bind('<Leave>', lambda e: self.set_tb_hover(None))
         r.bind('<Alt-F4>', lambda e: self.on_close())
         r.protocol('WM_DELETE_WINDOW', self.on_close)
@@ -531,9 +620,11 @@ class App:
         return next((i for i, r in enumerate(self.rows_home()) if r.label == label), None)
 
     def back(self):
-        if self.screen in ('settings', 'uninstall', 'saves', 'customize', 'job'):
+        if self.screen in ('settings', 'uninstall', 'saves', 'customize', 'job', 'color'):
             self.sounds.play('back')
-        if self.screen == 'settings':
+        if self.screen == 'color':
+            self.pick_done()
+        elif self.screen == 'settings':
             self.show('home', self.home_row('Settings'))
         elif self.screen == 'uninstall':
             self.show('settings')
@@ -560,6 +651,9 @@ class App:
             self.draw_title_buttons()
 
     def on_drag(self, e):
+        if self.pick_drag:
+            self.picker_at(e.x, e.y, self.pick_drag)
+            return
         if self.drag:   # moving the window without the system's help (Linux)
             dx, dy = self.drag
             self.root.geometry(f'+{e.x_root - dx}+{e.y_root - dy}')
@@ -597,6 +691,11 @@ class App:
             if not winsys.start_drag(self.root):
                 self.drag = (e.x_root - self.root.winfo_x(), e.y_root - self.root.winfo_y())
             return
+        if self.screen == 'color':
+            part = self.picker_at(e.x, e.y)
+            if part:
+                self.pick_drag = part
+                return
         i = self.hit(e.x, e.y)
         if i is None:
             return
@@ -621,6 +720,12 @@ class App:
             r.actions[r.pick][1]()
         else:
             self.activate()
+
+    def on_release(self, e):
+        self.drag = None
+        if self.pick_drag:
+            self.pick_drag = None
+            self.pick_changed(final=True)
 
     def on_close(self):
         if self.job and self.job.result is None:
@@ -648,9 +753,11 @@ class App:
         elif a.continue_update is not None and not a.rolled_back:
             # after a rollback the stub passes the failed version's --continue-update on to this one: the game was
             # never rebuilt for the new version, so there is nothing to finish, and home tells why the version is back
-            self.run_job(jobs.ContinueUpdateJob(self.ctx, gd if gd and build.built_version(gd) else '',
+            self.run_job(jobs.ContinueUpdateJob(self.ctx, gd if build.installed(gd) else '',
                                                 a.continue_update, self.settings.get('dump')), 'home')
-        elif gd and build.built_version(gd):
+        elif build.installed(gd):
+            # also a game whose last update stopped in the compile (build.installed): home, where Play starts the
+            # build from before the update and Rebuild the Game finishes it, not the first-run screen and its dump
             self.show('home')
             self.after_update_notice()
             if self.install_staged('a staged update waited for the launcher to start'):
@@ -671,6 +778,7 @@ class App:
             # another screen slides into place: from the right when it lies deeper, from the left on the way back
             deeper = DEPTH.get(screen, 1) >= DEPTH.get(self.screen, 0)
             self.slide = float(self.X(44) if deeper else -self.X(44))
+        self.close_hex()
         self.screen = screen
         self.rows = getattr(self, 'rows_' + screen)()
         idx = self.focusables()
@@ -723,12 +831,12 @@ class App:
             dump_desc = ('Choose your own dump of Ocarina of Time with the 1.1.1 update, as one .nup file. None was '
                          'found in Downloads, Desktop or Documents.',)
         gd = self.game_dir()
-        need = 30
-        free = free_gb(gd)
+        need = 34
+        free = free_gb(gd) + partial_image_gb(gd)   # Begin Installation removes the partial image (begin_install)
         folder_desc = (f'The game is built into this folder. {free:.0f} GB free on {drive_of(gd)}; the game needs '
                        f'about {need} GB. Select this row to choose another folder.',)
         ready = bool(dump)
-        begin_desc = (f'Build Ocarina of Time on this PC from your own dump. It takes 10 to 25 minutes, once, and '
+        begin_desc = (f'Build Ocarina of Time on this PC from your own dump. It takes 20 to 45 minutes, once, and '
                       f'downloads 170 MB of build tools. The game needs about {need} GB on {drive_of(gd)} '
                       f'({free:.0f} GB free).',) if ready else \
             ('Choose your dump first: select Game Dump above.',)
@@ -821,8 +929,9 @@ class App:
             self.choose_dump()
             return
         gd = self.game_dir()
-        if free_gb(gd) < 31 and not (Path(gd) / 'romfs' / 'romfs.bin').is_file():
-            self.message = f'{drive_of(gd)} has {free_gb(gd):.0f} GB free; the game needs about 30 GB.'
+        drop_partial_image(gd)   # before the free space is measured
+        if free_gb(gd) < 34 and not (Path(gd) / 'romfs' / 'romfs.bin').is_file():
+            self.message = f'{drive_of(gd)} has {free_gb(gd):.0f} GB free; the game needs about 34 GB.'
             self.render()
             return
         self.settings['game_dir'] = gd
@@ -865,11 +974,17 @@ class App:
             upd = Row('value', 'Updates', f'Version {mine}', 'normal', big=True, icon='refresh',
                       on=lambda: self.check_now(force=True),
                       desc=(f'You have NX2navi {mine}. Select this row to look for a new version.',))
-        rebuild_value = f'Built with {versions.display(built)}' if built else 'Not built'
+        # an update that stopped in the compile left no finished build on record, but the exe of the build before it
+        unfinished = not built and build.installed(gd)
+        rebuild_value = (f'Built with {versions.display(built)}' if built else
+                         'Not Finished' if unfinished else 'Not built')
         rebuild_style = 'normal' if versions.display(built) == mine else 'salmon'
         play_desc = ('Start Ocarina of Time. The launcher steps aside while you play and comes back when you quit.',)
         if built and versions.display(built) != mine:
             play_desc += (f'The game was built with {versions.display(built)}. Rebuild the Game brings it to {mine}.',)
+        elif unfinished:
+            play_desc += (f'The last rebuild of the game did not finish, so Play starts the build from before it. '
+                          f'Rebuild the Game finishes it and brings the game to {mine}; your dump is not needed.',)
         if staged and self.settings.get('auto_install'):
             play_desc += (f'NX2navi {staged["version"]} is downloaded and installs after you quit the game.',)
         if self.message:
@@ -901,6 +1016,10 @@ class App:
         def scheme(d):
             self.settings['theme'] = names[(names.index(art.theme) + d) % len(names)]
             self.settings.save()
+            # the rows again: Background Color and Button Color are there only while the scheme is Custom; the
+            # cursor stays on Color Scheme, the first row
+            art.set_theme(self.settings['theme'], self.custom_colors())
+            self.rows = self.rows_customize()
             self.apply_look()
 
         def dim(d):
@@ -932,7 +1051,13 @@ class App:
         rows = [
             Row('enum', 'Color Scheme', get=lambda: art.THEMES[art.theme]['label'],
                 left=lambda: scheme(-1), right=lambda: scheme(1),
-                desc=('The launcher\'s colours.',)),
+                desc=('The launcher\'s colours. Custom lets you pick your own.',)),
+        ]
+        if art.theme == 'custom':
+            rows += [Row('value', CUSTOM_LABELS[slot], art.CUSTOM[slot], 'swatch',
+                         on=lambda sl=slot: self.open_picker(sl), desc=(CUSTOM_DESC[slot],))
+                     for slot in art.CUSTOM_SLOTS]
+        rows += [
             Row('value', 'Background', Path(self.settings['background']).name if custom else 'Choose a Picture',
                 'arrow', on=self.choose_background, desc=bg_desc),
         ]
@@ -962,14 +1087,210 @@ class App:
         ]
         return rows
 
+    # ---- the Custom scheme's colour picker
+
+    def custom_colors(self):
+        return {slot: self.settings.get('custom_' + slot, '') for slot in art.CUSTOM_SLOTS}
+
+    def open_picker(self, slot):
+        h = art.CUSTOM.get(slot) or art.CUSTOM_DEFAULT[slot]
+        hh, ss, vv = colorsys.rgb_to_hsv(*(int(h[i:i + 2], 16) / 255.0 for i in (1, 3, 5)))
+        self.pick = {'slot': slot, 'h': hh, 's': ss, 'v': vv}
+        self.show('color', 0)
+
+    def pick_hex(self):
+        p = self.pick
+        return art.hexcode(*colorsys.hsv_to_rgb(p['h'], p['s'], p['v']))
+
+    def pick_step(self, key, d):
+        """Hue by 5 degrees along the hue bar, saturation and brightness by 5 % (the arrows and the gamepad)."""
+        p = self.pick
+        if key == 'h':
+            p['h'] = (round(p['h'] * 72) + d) % 72 / 72.0
+        else:
+            p[key] = max(0.0, min(1.0, (round(p[key] * 20) + d) / 20.0))
+        self.pick_changed(final=True)
+
+    def pick_changed(self, final):
+        """The picked colour into the settings and onto the screen: the picker at once, the launcher's colours a
+        moment later (look_soon), so dragging over the square stays smooth. final: saved to launcher.json."""
+        if not self.pick:
+            return
+        self.settings['custom_' + self.pick['slot']] = self.pick_hex()
+        if final:
+            self.settings.save()
+        if self.screen == 'color':
+            self.rows = self.rows_color()
+            self.render()
+        self.look_soon(0 if final else 120)
+
+    def look_soon(self, ms):
+        if self.look_after:
+            self.root.after_cancel(self.look_after)
+        self.look_after = self.root.after(ms, self.look_now)
+
+    def look_now(self):
+        self.look_after = None
+        self.apply_look()
+
+    def pick_reset(self):
+        slot = self.pick['slot']
+        self.settings['custom_' + slot] = ''
+        self.settings.save()
+        art.CUSTOM[slot] = art.CUSTOM_DEFAULT[slot]
+        self.open_picker(slot)
+        self.focus = next(i for i, r in enumerate(self.rows) if r.label == 'Reset')
+        self.apply_look()
+
+    def pick_done(self):
+        slot = self.pick['slot'] if self.pick else 'background'
+        if self.look_after:
+            self.root.after_cancel(self.look_after)
+            self.look_after = None
+            self.apply_look()
+        rows = self.rows_customize()
+        self.show('customize', next((i for i, r in enumerate(rows) if r.label == CUSTOM_LABELS[slot]), 0))
+
+    def rows_color(self):
+        p = self.pick
+        return [
+            Row('enum', 'Hue', get=lambda: f'{round(p["h"] * 360) % 360}°',
+                left=lambda: self.pick_step('h', -1), right=lambda: self.pick_step('h', 1)),
+            Row('enum', 'Saturation', get=lambda: f'{round(p["s"] * 100)} %',
+                left=lambda: self.pick_step('s', -1), right=lambda: self.pick_step('s', 1)),
+            Row('enum', 'Brightness', get=lambda: f'{round(p["v"] * 100)} %',
+                left=lambda: self.pick_step('v', -1), right=lambda: self.pick_step('v', 1)),
+            Row('value', 'Hex Code', self.pick_hex().upper(), 'arrow', on=self.type_hex),
+            Row('divider'),
+            Row('value', 'Reset', '', 'arrow', on=self.pick_reset),
+            Row('divider'),
+            Row('action', 'Done', on=self.pick_done, height=40),
+        ]
+
+    def picker_at(self, x, y, part=None):
+        """The colour under the mouse at (x, y) on the square or the bar into the picker; which of the two it was
+        (part: the one being dragged, which takes the mouse also outside it), or None."""
+        X, p = self.X, self.pick
+
+        def inside(box, m=0):
+            x0, y0, x1, y1 = box
+            return X(x0) - X(m) <= x <= X(x1) + X(m) and X(y0) - X(m) <= y <= X(y1) + X(m)
+
+        def frac(v, a, b):
+            return max(0.0, min(1.0, (v - X(a)) / max(1, X(b) - X(a))))
+        sx0, sy0, sx1, sy1 = SQUARE
+        bx0, _, bx1, _ = BAR
+        if part == 'square' or (part is None and inside(SQUARE, 4)):
+            p['s'] = frac(x, sx0, sx1)
+            p['v'] = 1 - frac(y, sy0, sy1)
+            part = 'square'
+        elif part == 'bar' or (part is None and inside(BAR, 8)):
+            p['h'] = min(frac(x, bx0, bx1), 0.9999)
+            part = 'bar'
+        else:
+            return None
+        self.pick_changed(final=False)
+        return part
+
+    def type_hex(self):
+        """A box over the Hex Code row to type a colour into, like #3A7BD5; Enter takes it, Esc leaves it."""
+        r = self.focused()
+        if self.hex_entry or not r or not r.value_rect:
+            return
+        x0, y0, x1, y1 = r.value_rect
+        X = self.X
+        e = tk.Entry(self.canvas, font=self.f['label'], bg=P['value'], fg=P['value_text'],
+                     insertbackground=P['value_text'], selectbackground=P['orange'], selectforeground=P['on_text'],
+                     relief='flat', justify='center', highlightthickness=1, highlightcolor=P['orange'],
+                     highlightbackground=P['value_border'])
+        e.insert(0, self.pick_hex().upper())
+        e.select_range(0, 'end')
+        self.hex_entry = e
+        self.canvas.create_window(x0 + X(3), y0 + X(3), anchor='nw', window=e, width=x1 - x0 - X(6),
+                                  height=y1 - y0 - X(6), tags='hexentry')
+        e.focus_set()
+
+        def take(ev):
+            self.hex_typed(e.get())
+            return 'break'
+
+        def leave(ev):
+            self.close_hex()
+            return 'break'
+        for key in ('<Return>', '<KP_Enter>'):
+            e.bind(key, take)
+        e.bind('<Escape>', leave)
+        for key in ('<Up>', '<Down>', '<space>'):
+            e.bind(key, lambda ev: 'break')
+        e.bind('<FocusOut>', lambda ev: self.close_hex())
+
+    @staticmethod
+    def parse_hex(text):
+        """(r, g, b) in 0..255 of a typed hex code (#3A7BD5, 3A7BD5 or #37D), or None."""
+        t = text.strip().lstrip('#').lower()
+        if len(t) == 3:
+            t = ''.join(ch * 2 for ch in t)
+        return tuple(int(t[i:i + 2], 16) for i in (0, 2, 4)) if art.HEX.match('#' + t) else None
+
+    def hex_typed(self, text):
+        got = self.parse_hex(text)
+        if got is None:
+            self.sounds.play('back')
+            self.hex_entry.select_range(0, 'end')
+            return
+        self.sounds.play('select')
+        hh, ss, vv = colorsys.rgb_to_hsv(*(v / 255.0 for v in got))
+        self.pick.update(h=hh, s=ss, v=vv)
+        self.close_hex()
+        self.pick_changed(final=True)
+
+    def close_hex(self):
+        if self.hex_entry:
+            e, self.hex_entry = self.hex_entry, None
+            self.canvas.delete('hexentry')
+            e.destroy()
+            try:
+                self.root.focus_force()
+            except tk.TclError:
+                pass
+
+    def draw_picker(self):
+        """The colour picker in the description box's place: the slot's name, the colour square of the picked hue
+        with a ring on the picked colour, the hue bar, and the colour itself with its hex code."""
+        c, X, s, p = self.canvas, self.X, self.s, self.pick
+        bx, by, bw, bh = PICKER_BOX
+        key = ('desc', X(bw), X(bh) // 4)
+        if key not in self.sprites:
+            img, pad = art.desc_box(X(bw), X(bh), s, self.see_through())
+            self.sprites[key] = (art.photo(self.root, img), pad)
+        pic, pad = self.sprites[key]
+        c.create_image(X(bx) - pad, X(by) - pad, anchor='nw', image=pic, tags='dyn')
+        self.text(X(bx + 26), X(by + 34), CUSTOM_LABELS[p['slot']], self.f['heading'], P['text_bright'])
+        sx0, sy0, sx1, sy1 = SQUARE
+        sw, sh = X(sx1) - X(sx0), X(sy1) - X(sy0)
+        hue = round(p['h'], 3)
+        square = self.sprite(('square', sw, sh, hue), lambda: art.color_square(sw, sh, hue))
+        c.create_rectangle(X(sx0) - 1, X(sy0) - 1, X(sx0) + sw, X(sy0) + sh, outline=P['value_border'], tags='dyn')
+        c.create_image(X(sx0), X(sy0), anchor='nw', image=square, tags='dyn')
+        size = X(18)
+        mark = self.sprite(('mark', size), lambda: art.picker_mark(size, s))
+        c.create_image(X(sx0) + round(p['s'] * sw), X(sy0) + round((1 - p['v']) * sh), image=mark, tags='dyn')
+        bx0, by0, bx1, by1 = BAR
+        bw_, bh_ = X(bx1) - X(bx0), X(by1) - X(by0)
+        bar = self.sprite(('hues', bw_, bh_), lambda: art.hue_bar(bw_, bh_))
+        c.create_rectangle(X(bx0) - 1, X(by0) - 1, X(bx0) + bw_, X(by0) + bh_, outline=P['value_border'], tags='dyn')
+        c.create_image(X(bx0), X(by0), anchor='nw', image=bar, tags='dyn')
+        c.create_image(X(bx0) + round(p['h'] * bw_), X(by0) + bh_ // 2, image=mark, tags='dyn')
+        hexc = self.pick_hex()
+        c.create_rectangle(X(bx0), X(452), X(bx0 + 64), X(500), fill=hexc, outline=P['value_border'], tags='dyn')
+        self.text(X(bx0 + 80), X(476), hexc.upper(), self.f['label'], P['text_bright'])
+        self.text(X(bx + 26), X(526), 'Click or drag the square and the bar.', self.f['small'], P['muted'])
+
     def steam_row(self):
         """Add to Steam: the game in the Steam library, started from there without the launcher (launcher/steam.py)."""
         found = steam.find_steam()
-        desc = ('Add Ocarina of Time to your Steam library as The Legend of Zelda Ocarina of Time, with Navi as its '
-                'icon and the title screen\'s moonlit field and logo as its pictures, all taken from your game. '
-                'Playing it from Steam starts the game straight away.',
-                'Steam closes while the shortcut is written and starts again with it. Select the row again after an '
-                'update of the game to refresh it.')
+        desc = ('Adds the game to your Steam library with its own icon and artwork, so you can start it from Steam.',
+                'Steam restarts while it is added.')
         if self.steam_message:
             desc = (self.steam_message,) + desc
         if self.steam_busy:
@@ -996,7 +1317,7 @@ class App:
             self.show('customize', self.focus)
             return
         self.steam_busy = True
-        self.steam_message = 'Making the pictures from your game and adding it to Steam…'
+        self.steam_message = 'Adding to Steam…'
         self.sounds.play('select')
         self.show('customize', self.focus)
         dump = self.settings.get('dump')
@@ -1111,7 +1432,8 @@ class App:
             Row('value', 'Export Save', out.name or str(out), on=self.export_save, desc=export_desc),
             Row('toggle', 'Add Log and Settings', on=report, get=lambda: bool(self.settings.get('export_with_log')),
                 desc=('On: the zip also holds the game\'s latest log (logs\\nx2navi.log) and its settings '
-                      '(nx2navi.ini), which show what happened and with which settings. Keep it on for a bug report.',
+                      '(nx2navi.ini), which show what happened and with which settings. Keep it on for a bug report: '
+                      'while the game has no save yet, Export Save then writes these two alone.',
                       'Off: the save alone, to give to another player.')),
             Row('value', 'Export To', str(out), on=self.choose_export_dir,
                 desc=(f'Export Save writes into {out}.', 'Select this row to choose another folder.')),
@@ -1149,6 +1471,9 @@ class App:
             else:
                 extra = ' with the game\'s log and settings' if r['extras'] else ''
                 self.export_message = f'Exported {r["files"]} files{extra} to {r["path"]}.'
+                if not r['files']:   # a game that stopped before its first save: the report files alone
+                    self.export_message = (f'The game has no save yet: exported its log and settings alone to '
+                                           f'{r["path"]}.')
                 try:
                     winsys.reveal(r['path'])
                 except OSError:
@@ -1202,8 +1527,8 @@ class App:
         nv, mine = versions.display(r.version), versions.display(self.layout.version)
         notes = feed.plain_notes(r.notes, 6)
         return {'title': f'Version {nv} Is Ready',
-                'text': [f'You have {mine}. Updating downloads the new version and rebuilds the game in a few '
-                         f'minutes. Your saves and settings stay as they are.'],
+                'text': [f'You have {mine}. Updating downloads the new version and rebuilds the game. {UPDATE_TAKES} '
+                         f'Your saves and settings stay as they are.'],
                 'divider': bool(notes), 'subtitle': "What's New" if notes else '', 'bullets': notes}
 
     def staged_desc(self, m):
@@ -1217,7 +1542,7 @@ class App:
             text = f'You have {mine}. Version {nv} is downloaded. Select this row to install it.'
         return {'title': f'Version {nv} Is Ready', 'text': [text],
                 'divider': bool(notes), 'subtitle': "What's New" if notes else '', 'bullets': notes,
-                'note': 'Installing restarts the launcher and rebuilds the game in a few minutes. Your saves and '
+                'note': f'Installing restarts the launcher and rebuilds the game. {UPDATE_TAKES} Your saves and '
                         'settings stay as they are.'}
 
     def staging_desc(self):
@@ -1244,6 +1569,11 @@ class App:
         if self.check and self.check.result is None:
             return
         if not force and time.time() - self.settings.get('last_check', 0) < 600 and self.release:
+            return
+        if force and time.time() - self.check_started < FORCED_CHECK_PAUSE:
+            self.message = 'NX2navi looked for updates less than a minute ago.'
+            if self.screen == 'home':
+                self.show('home', self.focus)
             return
         self.check_error = ''
         self.check_started = time.time()
@@ -1305,8 +1635,17 @@ class App:
         self.root.lift()
         if code not in (0, None):
             text = exit_code_text(code)
-            self.ctx.log(f'the game ended with code {text}')
-            self.message = f'The game ended with code {text}. Its log is logs\\nx2navi.log in the game folder.'
+            # 70 and 71 follow a FATAL line of the game's own, which names the error: the player gets that line
+            # and the launcher's log too, where the exit code alone said only that there was one
+            fatal = last_fatal(self.game_dir()) if code & 0xFFFFFFFF in (70, 71) else ''
+            if fatal:
+                shown = fatal if len(fatal) <= FATAL_SHOWN else fatal[:FATAL_SHOWN].rstrip() + '…'
+                self.ctx.log(f'the game ended with code {code & 0xFFFFFFFF}; its log says: FATAL: {fatal}')
+                self.message = (f'The game ended with a fatal error (code {code & 0xFFFFFFFF}): {shown}. Its log is '
+                                'logs\\nx2navi.log in the game folder.')
+            else:
+                self.ctx.log(f'the game ended with code {text}')
+                self.message = f'The game ended with code {text}. Its log is logs\\nx2navi.log in the game folder.'
             note_exit_in_log(self.game_dir(), text)
         if self.install_staged('the game exited'):
             return
@@ -1396,7 +1735,7 @@ class App:
             self.toggle('Hide Launcher While Playing', 'hide_while_playing',
                         'Hide this window while the game runs; it comes back when you quit the game.'),
             self.toggle('Keep Build Cache', 'keep_cache',
-                        'Keep the translated code and compiled files (about 5 GB) in the game folder, so an update '
+                        'Keep the translated code and compiled files (about 1.5 GB) in the game folder, so an update '
                         'compiles only what changed. Off: they are deleted after each build.'),
             self.channel_row(),
             *([self.discord_row(gd)] if gd and Path(gd).is_dir() else []),
@@ -1583,6 +1922,9 @@ class App:
                 self.message = 'The game is rebuilt and up to date.' if j.kind == 'rebuild' else \
                     f'NX2navi is now {versions.display(self.layout.version)}.'
                 self.release = None
+            note = getattr(j, 'note', '')   # what the file check found (jobs.Job.note_scan)
+            if note and j.after is None:
+                self.message = f'{self.message} {note}'.strip()
             self.reload_fonts_if_new()
             self.show(self.job_return)
             if j.kind == 'install' and self.settings.get('auto_check'):
@@ -1593,7 +1935,7 @@ class App:
             self.show('job')
 
     def drop_build_cache(self):
-        """Keep Build Cache off: delete the lifted C and the objects (about 5 GB) but keep state.json, which an
+        """Keep Build Cache off: delete the lifted C and the objects (about 1.5 GB) but keep state.json, which an
         update needs to rebuild without the dump; the next build then lifts and compiles everything again."""
         gd = self.settings.get('game_dir')
         if not gd:
@@ -1728,7 +2070,10 @@ class App:
             y += h + self.row_gap
         self.draw_status()
         self.draw_cursor()
-        self.draw_desc()
+        if self.screen == 'color' and self.pick:
+            self.draw_picker()
+        else:
+            self.draw_desc()
         self.slide_applied = int(self.slide)
         if self.slide_applied:   # drawn in place, then put where the slide has got to (step_slide)
             c.move('dyn', self.slide_applied, 0)
@@ -1866,6 +2211,16 @@ class App:
             self.canvas.create_text(sx, cy, text=r.value, font=vfont, fill=P['on_text'], anchor='w', tags='dyn')
             img = self.sprite(('chev', cw, ch, False, 'on'), lambda: art.chevron(cw, ch, P['on_text']))
             c.create_image(sx + label_w + X(10), cy, anchor='w', image=img, tags='dyn')
+        elif r.style == 'swatch':   # a colour of the Custom scheme: a patch of it and its hex code
+            cw, ch = X(9), X(12)
+            img = self.sprite(('chev', cw, ch, False, 'dim'), lambda: art.chevron(cw, ch, P['chevron_dim']))
+            c.create_image(x1 - X(16), cy, anchor='e', image=img, tags='dyn')
+            tw = vfont.measure(r.value.upper())
+            sw = X(26)
+            sx = (vx0 + x1 - X(16) - cw - X(10)) // 2 - (sw + X(10) + tw) // 2
+            c.create_rectangle(sx, cy - X(9), sx + sw, cy + X(9), fill=r.value, outline=P['value_border'], tags='dyn')
+            c.create_text(sx + sw + X(10), cy, text=r.value.upper(), font=vfont, fill=P['value_text'], anchor='w',
+                          tags='dyn')
         elif r.style == 'arrow':
             cw, ch = X(9), X(12)
             img = self.sprite(('chev', cw, ch, False, 'dim'), lambda: art.chevron(cw, ch, P['chevron_dim']))

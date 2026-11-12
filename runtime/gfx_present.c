@@ -17,6 +17,7 @@
 
 #include "audren.h"
 #include "cfg.h"
+#include "coop.h"
 #include "flight.h"
 #include "fs.h"
 #include "gfx.h"
@@ -82,9 +83,13 @@ void gfx_window_closed(void) {
     int restart = plat_cas32(&g_restart, 0, 0) != 0;
     rt_log("gfx: window closed; %s", restart ? "restarting" : "exiting");
     cfg_save();   // a menu change saves 400 ms later on the render thread (option_rows.cpp); closing sooner kept the old file
+    // The window closed while the boot still built its pipelines: not the driver crash the marker is there to catch.
+    // Left in place, the next start took it for one and every later start skipped the prebuild (vk_pipeline.c pm_skipped).
+    vk_pipeline_prewarm_marker_clear();
     vk_pipeline_save();
     prof_write();   // plat_exit runs no atexit handlers
     rtss_limit_restore();   // RivaTuner Statistics Server's profile as it was
+    coop_shutdown();   // LEAVE and BYE to the room, before the process ends
     fs_save_flush();   // last: the game's threads still run until plat_exit, and a Commit after this one is refused
     if (restart) {
         cfg_setenv("NX2NAVI_REEXEC", NULL);   // the new process counts its own address-space retries (memory.c)
@@ -314,7 +319,7 @@ static void flip_locked(void) {
     VkResult r = vk_dlssg_active() ? vk_dlssg_present(vk_ctx()->gfx_queue, &pi)
                : vk_fg_active()    ? vk_fg_present(&pi) : vkQueuePresentKHR(vk_ctx()->gfx_queue, &pi);
     vk_queue_unlock();
-    vk_device_fault_report(r);
+    vk_device_lost_check(r, "the present");
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) plat_xchg32(&g_dirty, 1);
 }
 
@@ -632,7 +637,13 @@ int vk_present_captured(const uint8_t **px, int *w, int *h, VkFormat *fmt) {
     return ok;
 }
 
-// The captured swapchain image as a PNG (the menu's test hook), RGBA with opaque alpha.
+static float g_pic[4];   // gfx_picture_rect
+static volatile int32_t g_pic_ok;
+
+// The captured swapchain image as a PNG (the menu's test hook), RGBA with opaque alpha. From an HDR10 swapchain the
+// log also gets the luminance in nits of the picture's rectangle (vk_hdr_luminance_stats: the black floor of a dark
+// scene, for one), and <path>.pq10 keeps the raw pixels: "PQ10", width, height, 1 when A2R10G10B10 (u32 each), then
+// the pixels as the swapchain holds them.
 static void save_capture(const char *path) {
     size_t n = (size_t)g_cap_w * (size_t)g_cap_h * 4;
     uint8_t *px = malloc(n);
@@ -648,15 +659,36 @@ static void save_capture(const char *path) {
     rt_write_png(path, px, (uint32_t)g_cap_w, (uint32_t)g_cap_h);
     free(px);
     rt_log("gfx: menu test shot %s (%dx%d)", path, g_cap_w, g_cap_h);
+    if (!g_sc_hdr) return;
+    int a2r = g_sc_fmt == VK_FORMAT_A2R10G10B10_UNORM_PACK32;
+    int rect[4] = {0, 0, g_cap_w, g_cap_h};
+    if (__atomic_load_n(&g_pic_ok, __ATOMIC_ACQUIRE)) {
+        rect[0] = (int)(g_pic[0] * (float)g_cap_w + 0.5f), rect[1] = (int)(g_pic[1] * (float)g_cap_h + 0.5f);
+        rect[2] = (int)(g_pic[2] * (float)g_cap_w + 0.5f), rect[3] = (int)(g_pic[3] * (float)g_cap_h + 0.5f);
+        if (rect[2] <= 0 || rect[3] <= 0 || rect[0] + rect[2] > g_cap_w || rect[1] + rect[3] > g_cap_h)
+            rect[0] = rect[1] = 0, rect[2] = g_cap_w, rect[3] = g_cap_h;
+    }
+    float st[7];
+    vk_hdr_luminance_stats(g_cap_ptr, g_cap_w, rect, a2r, st);
+    rt_log("gfx: shot %s, HDR10 luminance of the picture (%dx%d at %d,%d) in nits: darkest %.5f, 0.1%% %.5f, 1%% %.5f, "
+           "median %.3f, 99%% %.1f, brightest %.1f; %.2f%% of pixels under 0.01", path, rect[2], rect[3], rect[0], rect[1],
+           st[0], st[1], st[2], st[3], st[4], st[5], 100.0f * st[6]);
+    char raw[1200];
+    snprintf(raw, sizeof raw, "%s.pq10", path);
+    FILE *f = fopen(raw, "wb");
+    if (f) {
+        uint32_t head[4] = {0x30315150u /* "PQ10" */, (uint32_t)g_cap_w, (uint32_t)g_cap_h, (uint32_t)a2r};
+        fwrite(head, sizeof head, 1, f);
+        fwrite(g_cap_ptr, 4, (size_t)g_cap_w * (size_t)g_cap_h, f);
+        fclose(f);
+    }
 }
 
 // The rectangle {x, y, w, h} of a dw x dh swapchain image the cw x ch picture goes into: the whole image with
 // NX2NAVI_ASPECT=stretch, else (fit, the default) the largest one of the picture's own aspect ratio, centred (a 16:9 picture
 // on the Steam Deck's 1280x800 screen gets bars of 40 rows above and below; a 16:9 picture in a 21:9 window, bars at the
 // sides).
-// Where the last present put the picture, as fractions of the swapchain (x, y, w, h): menu_cursor.c's pointer
-static float g_pic[4];
-static volatile int32_t g_pic_ok;
+// Where the last present put the picture, as fractions of the swapchain (x, y, w, h; g_pic): menu_cursor.c's pointer
 int gfx_picture_rect(float out[4]) {
     if (!__atomic_load_n(&g_pic_ok, __ATOMIC_ACQUIRE)) return 0;
     memcpy(out, g_pic, sizeof g_pic);
@@ -991,7 +1023,7 @@ static void ng_present(VkSwapchainKHR sc, uint32_t idx) {
     vk_queue_lock();
     VkResult r = vkQueuePresentKHR(vk_ctx()->gfx_queue, &pi);
     vk_queue_unlock();
-    vk_device_fault_report(r);
+    vk_device_lost_check(r, "the present of a generated frame");
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) plat_xchg32(&g_dirty, 1);
     __atomic_add_fetch(&ng.presents, 1, __ATOMIC_RELAXED);
 }
@@ -1056,7 +1088,7 @@ static int ng_show(VkImage img, int set, int slot, uint64_t n) {
     vk_queue_lock();
     r = vkQueueSubmit2(c->gfx_queue, 1, &si, VK_NULL_HANDLE);
     vk_queue_unlock();
-    if (r != VK_SUCCESS) { vk_device_fault_report(r); return 0; }
+    if (r != VK_SUCCESS) { vk_device_lost_check(r, "the submit of a generated frame"); return 0; }
     ng_present(ng.job.sc, j);
     return 1;
 }
@@ -1326,6 +1358,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         static VkFormat last = VK_FORMAT_UNDEFINED;
         if (src && fmt != last) last = fmt, rt_log("gfx: the game presents %dx%d images of format %d", w, h, (int)fmt);
     }
+    if (vk_device_is_lost()) return;   // the run is ending (vk_device.c vk_device_lost_check): nothing touches the device
     gfx_window_start();
     VkCtx *c = vk_ctx();
     plat_rmutex_lock(&g_pl);
@@ -1354,8 +1387,8 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
           : vk_fg_active()    ? vk_fg_acquire(g_sc, 1000000000ull, g_acquire[slot], &idx)
                               : vkAcquireNextImageKHR(c->device, g_sc, 1000000000ull, g_acquire[slot], VK_NULL_HANDLE, &idx);
     }
-    vk_device_fault_report(r);
-    // lost, not ready: skip the frame. Acquires that keep timing out (1 s each) mean a swapchain nothing will free an
+    vk_device_lost_check(r, "the acquire of a swapchain image");
+    // not ready: skip the frame. Acquires that keep timing out (1 s each) mean a swapchain nothing will free an
     // image of again: three in a row rebuild it, where the picture used to stop for good.
     static uint32_t n_timeouts;
     if (r == VK_TIMEOUT || r == VK_NOT_READY) {
@@ -1549,7 +1582,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         g_flip_idx = idx;
         if (!defer) flip_locked();
     } else {
-        vk_device_fault_report(r);
+        vk_device_lost_check(r, "the present's submit");
         rt_log("gfx: present submit failed (%d)", (int)r);
         // The fence was reset after the acquire and the acquire's semaphore is signalled: left so, this slot's fence
         // wait would time out (5 s) at every later present and the picture stop for good. An empty batch takes the
@@ -1589,6 +1622,7 @@ void vk_present_blit(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int
 void gfx_present_boot(void) { present_image(VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED, VK_FORMAT_UNDEFINED, 1920, 1080, NULL, 0); }
 
 void vk_present_flip(void) {
+    if (vk_device_is_lost()) return;
     plat_rmutex_lock(&g_pl);
     flip_locked();
     plat_rmutex_unlock(&g_pl);

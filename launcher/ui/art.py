@@ -7,7 +7,9 @@ shape is a picture; flat rectangles and text stay canvas items.
 
 Colours follow the game's options menu (docs/launcher.md, "Look"). Sizes are in logical pixels times the display
 scale s. PALETTE holds the colours of the colour scheme in use: set_theme fills it from THEMES, each scheme the
-first one with its woods, accents, backdrop and glow turned to other hues.
+first one with its woods, accents, backdrop and glow turned to other hues. The Custom scheme takes three colours the
+player picks on a colour square (color_square, hue_bar): one for the backdrop, one for the panels and the title band,
+one for the buttons.
 """
 import base64
 import colorsys
@@ -75,8 +77,27 @@ THEMES = {
                'scene': (222, 0.55, 1.0, 0.05), 'glow': (48, 1.0, 1.0, 0.5), 'text': (48, 0.45, 1.02, 0)},
     'shadow': {'label': 'Shadow', 'wood': (268, 0.55, 0.78, 0), 'accent': (286, 0.75, 1.0, 0),
                'scene': (272, 0.9, 0.8, 0.2), 'glow': (280, 1.0, 1.0, 0.2), 'text': (270, 0.5, 1.0, 0)},
+    'custom': {'label': 'Custom'},
 }
 DEFAULT_THEME = 'forest'
+
+# The Custom scheme: each colour the player picks takes the place of one colour of the first scheme (ref), and the
+# rest of that colour's part of the window follows it, lighter and darker as in the first scheme (follow). Each part:
+# (ref, the colours that follow it, the text on it, which turns dark when the picked colour is light). The buttons are
+# the rows' label cells, their value cells and the orange choices in them; the panel is the list panel, the
+# description box, the dividers and the title band. The colours start as the first scheme's.
+CUSTOM_SLOTS = {
+    'background': ('tint_mid', GROUPS['scene'], ()),
+    'panel': ('panel', ('panel', 'desc', 'desc_border', 'line', 'dot', 'filigree', 'button_hover', 'wood_0', 'wood_1',
+                        'wood_2', 'wood_3', 'band_line_dark', 'band_line_light', 'band_shadow', 'frame'),
+              ('desc_text', 'muted', 'band_text', 'status', 'log_text')),
+    'buttons': ('label_mid', ('label_top', 'label_mid', 'label_bottom', 'label_border', 'ring', 'value', 'value_border',
+                              'text_shadow') + GROUPS['accent'],
+                ('text', 'text_bright', 'value_text', 'on_text', 'icon_frame', 'icon_fill', 'chevron_dim')),
+}
+CUSTOM_DEFAULT = {slot: BASE[ref] for slot, (ref, _, _) in CUSTOM_SLOTS.items()}
+CUSTOM = dict(CUSTOM_DEFAULT)
+HEX = re.compile(r'^#[0-9a-f]{6}$')
 
 
 def recolor(hexcolor, hue, sat=1.0, light=1.0, add=0.0):
@@ -91,8 +112,61 @@ def recolor(hexcolor, hue, sat=1.0, light=1.0, add=0.0):
     return '#%02x%02x%02x' % tuple(int(round(v * 255)) for v in (r, g, b))
 
 
+def hls(hexcolor):
+    h = hexcolor.lstrip('#')
+    return colorsys.rgb_to_hls(*(int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4)))
+
+
+def hexcode(r, g, b):
+    """#rrggbb of r, g, b in 0..1."""
+    return '#%02x%02x%02x' % tuple(int(round(max(0.0, min(1.0, v)) * 255)) for v in (r, g, b))
+
+
+def follow(hexcolor, ref, chosen):
+    """hexcolor moved as ref moves to chosen: chosen's hue, and its lightness and saturation shifted the way ref's
+    shift, so ref becomes chosen exactly and the colours lighter or darker than ref stay so."""
+    _, l, s = hls(hexcolor)
+    _, rl, rs = hls(ref)
+    ch, cl, cs = hls(chosen)
+
+    def move(v, r, c):
+        if c <= r:
+            return v * c / r if r > 0 else c
+        return v + (1 - v) * (c - r) / (1 - r) if r < 1 else c
+    return hexcode(*colorsys.hls_to_rgb(ch, max(0.0, min(1.0, move(l, rl, cl))), max(0.0, min(1.0, move(s, rs, cs)))))
+
+
+def luminance(hexcolor):
+    h = hexcolor.lstrip('#')
+    r, g, b = (int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def custom_palette(colors):
+    """The Custom scheme's colours from {slot: '#rrggbb'} (CUSTOM_SLOTS); a slot left out or not a colour keeps the
+    first scheme's. Text on a light button or panel turns dark, so it stays readable, and its shadow light."""
+    pal = dict(BASE)
+    for slot, (ref, keys, text) in CUSTOM_SLOTS.items():
+        c = str((colors or {}).get(slot) or '').lower()
+        if not HEX.match(c) or c == BASE[ref]:   # the first scheme's own colour: its colours as written
+            continue
+        for k in keys:
+            pal[k] = follow(BASE[k], BASE[ref], c)
+        if text and luminance(c) > 0.5:
+            h = hls(c)[0] * 360
+            for k in text:
+                pal[k] = recolor(BASE[k], h, 0.5, 0.3 if k == 'chevron_dim' else 0.18)
+            shadow = 'text_shadow' if slot == 'buttons' else 'band_shadow'
+            pal[shadow] = follow(BASE['label_top'], BASE[ref], c)
+        if slot == 'buttons' and luminance(pal['orange']) > 0.65:   # the choices come out lighter than the cells
+            pal['on_text'] = recolor(BASE['on_text'], hls(c)[0] * 360, 0.5, 0.18)
+    return pal
+
+
 def theme_palette(name):
     """The colours of scheme name (an unknown name: the first scheme's)."""
+    if name == 'custom':
+        return custom_palette(CUSTOM)
     t = THEMES.get(name) or THEMES[DEFAULT_THEME]
     pal = dict(BASE)
     for group, keys in GROUPS.items():
@@ -107,9 +181,14 @@ PALETTE = dict(BASE)
 theme = DEFAULT_THEME
 
 
-def set_theme(name):
-    """Fills PALETTE (in place: the window holds a reference) with scheme name's colours; the name in effect."""
+def set_theme(name, custom=None):
+    """Fills PALETTE (in place: the window holds a reference) with scheme name's colours; the name in effect.
+    custom: the Custom scheme's colours, {slot: '#rrggbb'} (CUSTOM_SLOTS)."""
     global theme
+    if custom is not None:
+        CUSTOM.clear()
+        CUSTOM.update(CUSTOM_DEFAULT)
+        CUSTOM.update({k: v.lower() for k, v in custom.items() if k in CUSTOM_SLOTS and HEX.match(str(v).lower())})
     theme = name if name in THEMES else DEFAULT_THEME
     PALETTE.clear()
     PALETTE.update(theme_palette(theme))
@@ -462,17 +541,19 @@ FILIGREE_PATHS = (
 
 # ---------------------------------------------------------------- the window's pieces
 
-def backdrop(W, H, s, picture=None, dim=0.4):
+def backdrop(W, H, s, picture=None, dim=0.4, top=0):
     """The whole window behind the panels: a dim misty field under a see-through tint of the colour scheme, darker at
-    the sides. picture: the player's own background instead of the field, an H x W x 3 array in 0..1 (the window's
-    size), darkened by dim (0 as it is .. 1 the scheme's darkest colour) so the text over it stays readable."""
+    the sides. picture: the player's own background instead of the field, an array of H - top rows and W columns in
+    0..1 put below the title band (top: where the band ends), darkened by dim (0 as it is .. 1 the scheme's darkest
+    colour) so the text over it stays readable."""
     P = PALETTE
     img = new(H, W, P['window'], 1.0)
     pad = int(45 * s)
     vig = kept(('vignette', W, H, s), lambda: 1 - box_blur(np.pad(rect_mask(H, W, 0, 0, W, H), pad,
                                                                    constant_values=0), 45 * s)[pad:-pad, pad:-pad])
     if picture is not None:
-        img[..., :3] = picture[:H, :W]
+        part = picture[:H - top, :W]
+        img[top:top + part.shape[0], :part.shape[1], :3] = part
         paint(img, np.ones((H, W), dtype=np.float32), P['tint_edge'], max(0.0, min(1.0, dim)))
         paint(img, np.clip(vig * 1.6, 0, 1), P['vignette'], 0.45)
         return img
@@ -492,6 +573,54 @@ def backdrop(W, H, s, picture=None, dim=0.4):
     over(img, hgradient_rgba(H, W, [(0, P['tint_edge'], 0.96), (0.14, P['tint_side'], 0.82), (0.5, P['tint_mid'], 0.72),
                                     (0.86, P['tint_side'], 0.82), (1, P['tint_edge'], 0.96)]))
     paint(img, np.clip(vig * 1.6, 0, 1), P['vignette'], 0.6)
+    return img
+
+
+def hsv_rgb(h, s, v):
+    """HSV to RGB on arrays (or numbers) in 0..1; an H... x 3 array."""
+    h, s, v = (np.asarray(a, dtype=np.float32) for a in (h, s, v))
+    h6 = (h % 1.0) * 6
+    c = v * s
+    x = c * (1 - np.abs(h6 % 2 - 1))
+    z = np.zeros_like(c)
+    k = np.floor(h6).astype(int) % 6
+    r = np.choose(k, [c, x, z, z, x, c])
+    g = np.choose(k, [x, c, c, x, z, z])
+    b = np.choose(k, [z, z, x, c, c, x])
+    m = v - c
+    return np.stack([r + m, g + m, b + m], axis=-1)
+
+
+def color_square(w, h, hue):
+    """The colour square of the Custom scheme's picker for one hue (0..1): saturation from grey on the left to the
+    full colour on the right, brightness from black at the bottom to full at the top."""
+    sat = (np.arange(w, dtype=np.float32) + 0.5) / w
+    val = 1 - (np.arange(h, dtype=np.float32) + 0.5) / h
+    img = new(h, w)
+    img[..., :3] = hsv_rgb(np.full((h, w), hue), np.broadcast_to(sat, (h, w)), np.broadcast_to(val[:, None], (h, w)))
+    img[..., 3] = 1
+    return img
+
+
+def hue_bar(w, h):
+    """The picker's hue bar: every hue from red on the left through yellow, green, cyan, blue and magenta to red."""
+    hue = (np.arange(w, dtype=np.float32) + 0.5) / w
+    img = new(h, w)
+    img[..., :3] = hsv_rgb(np.broadcast_to(hue, (h, w)), np.ones((h, w)), np.ones((h, w)))
+    img[..., 3] = 1
+    return img
+
+
+def picker_mark(size, s):
+    """The ring that shows the picked colour on the square and the bar: white with a dark edge inside and out."""
+    t = (np.arange(size, dtype=np.float32) + 0.5) - size / 2
+    d = np.hypot(t[None, :], t[:, None])
+    r = size / 2 - 1.5 * s
+    img = new(size, size, '#000000')
+    dark = np.clip(1.6 * s - np.abs(d - r) + 0.5, 0, 1) * 0.7
+    white = np.clip(0.9 * s - np.abs(d - r) + 0.5, 0, 1)
+    img[..., 3] = np.maximum(dark, white)
+    img[..., :3] = np.where(white[..., None] > dark[..., None] * 0.5, 1.0, 0.0)
     return img
 
 

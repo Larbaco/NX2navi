@@ -17,15 +17,20 @@
 //     --probe-loader    load and relocate the modules, check them against the measured 1.2.1 values
 //     --probe-kernel, --probe-ipc, --probe-services, --probe-fs    host probes
 //     --probe-discord  the Rich Presence IPC exchange; skips without a Discord client; no game files
+//     --probe-coop      the co-op codec, two sessions through a relay on 127.0.0.1 (NX2NAVI_COOP_RELAY, else its own); no game files
 //     --probe-dpi       the process DPI awareness (per-monitor v2) and the primary monitor's size; no game files
 //     --probe-gfx-abi   NVN object layouts against nvn.h's reserved sizes; needs no game files
 //     --probe-nvn, --probe-nvn-tex, --probe-window, --probe-shader, --probe-vkmem, --probe-vkexec    graphics probes
 //     --probe-prewarm   the boot's pipeline stages from the caches next to the executable, the memory each leaves and
 //                       what a compute pipeline's first dispatch costs; skips without recorded shaders, runs no game
+//     --probe-ffx-cache one FSR 3.1 upscaling context and where its pipelines came from (the pipeline caches kept
+//                       across runs); skips without amd_fidelityfx_vk.dll, runs no game
 //     --probe-astc      the compute ASTC decoder against astc_decode_ldr; needs no game files
+//     --probe-meshfb    the mesh shader fallback: mesh programs drawn through VK_EXT_mesh_shader and through compute
+//                       passes, the pictures compared; needs no game files (mesh_fb_probe.c)
 //     --probe-zstd      host zstd streams (ov_zstd.c) on frames made here; needs no game files
 //     --probe-input     gamepad polls on a virtual gamepad, also while SDL's update takes long; needs no game files
-//     --probe-movie     host VP9 movie::Decoder on one RomFS movie; skips without game data
+//     --probe-movie     the host movie decoders on one RomFS movie (VP9 movie::Decoder, AV1 movie::VideoDecoder); skips without game data
 //     --boot            run the game to the first NVN call
 //     --seconds S       run the game (implies --boot's start-up) until the world clock (game time since the loaded
 //                       save's first frame) passed S seconds, then exit 0 at that present
@@ -35,12 +40,15 @@
 // Also here: the runtime services the generated code calls besides rt_dispatch and rt_svc (rt_brk, rt_udf,
 // rt_ticks, the function profiler hook), logging, SHA-256, and the crash reporter (a vectored exception handler that
 // names the lifted function, the guest registers and the guest frame-pointer chain).
+#include <ctype.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "cfg.h"
+#include "coop.h"
+#include "coop_game.h"
 #include "host.h"
 #include "logq.h"
 #include "prof.h"
@@ -168,13 +176,13 @@ static void parse_trace(void) {
     static const struct { const char *name; unsigned bit; } names[] = {
         {"svc", RT_TRACE_SVC}, {"host", RT_TRACE_HOSTCALL}, {"ipc", RT_TRACE_IPC}, {"fs", RT_TRACE_FS},
         {"gfx", RT_TRACE_GFX}, {"perf", RT_TRACE_PERF}, {"sched", RT_TRACE_SCHED}, {"audio", RT_TRACE_AUDIO},
-        {"present", RT_TRACE_PRESENT}, {"all", ~0u}};
+        {"present", RT_TRACE_PRESENT}, {"coop", RT_TRACE_COOP}, {"all", ~0u}};
     for (const char *p = e; *p;) {
         size_t n = strcspn(p, ",");
         int known = 0;
         for (unsigned i = 0; i < sizeof names / sizeof *names; i++)
             if (strlen(names[i].name) == n && !strncmp(p, names[i].name, n)) rt_trace |= names[i].bit, known = 1;
-        if (!known && n) rt_log("NX2NAVI_TRACE: unknown item '%.*s' (svc, host, ipc, fs, gfx, perf, sched, audio, present, all)", (int)n, p);
+        if (!known && n) rt_log("NX2NAVI_TRACE: unknown item '%.*s' (svc, host, ipc, fs, gfx, perf, sched, audio, present, coop, all)", (int)n, p);
         p += n + (p[n] == ',');
     }
 }
@@ -256,6 +264,17 @@ static uint64_t lifted_function(uintptr_t rip) {
 
 static int readable(uint64_t a, uint64_t n) { return plat_mem_readable(a, n); }
 
+// A module another program put into the game's process: the Vulkan layer or the hook of a recorder, an overlay or a
+// capture tool, by the words such files carry in their names. A crash inside one is that program's: one report was an
+// access violation in a recorder's layer the moment the present mode changed and the swapchain was made again.
+static int foreign_hook(const char *module) {
+    char low[160];
+    size_t n = 0;
+    for (; module && module[n] && n < sizeof low - 1; n++) low[n] = (char)tolower((unsigned char)module[n]);
+    low[n] = 0;
+    return strstr(low, "vk_layer") || strstr(low, "hook") || strstr(low, "overlay");
+}
+
 static void crash_handler(const PlatCrash *x) {
     static volatile int32_t busy;
     if (plat_xchg32(&busy, 1)) plat_exit(71);
@@ -269,6 +288,9 @@ static void crash_handler(const PlatCrash *x) {
         rt_logf(", %s address %#llx", x->access == 1 ? "writing" : x->access == 8 ? "executing" : "reading",
                 (unsigned long long)x->addr);
     rt_log_raw("\n", 1);
+    if (foreign_hook(x->module))
+        rt_logf("  %s is not part of the game: a recording, overlay or capture program put it into the game. Close that "
+                "program or turn off its Vulkan capture, then start the game again\n", x->module);
     uint64_t f = x->module ? 0 : lifted_function(rip);
     if (f) rt_logf("  in lifted function f_%llx = %s\n", (unsigned long long)f, ldr_describe(f, d, sizeof d));
     // abort and invalid parameter: where the host code called it; a fault in another module: the host calls that led
@@ -296,7 +318,9 @@ static void crash_handler(const PlatCrash *x) {
     } else {
         rt_logf("  not on a guest thread\n");
     }
+    rt_fatal_notes();   // the card, its driver and the memory settings in effect (vk_device.c fatal_note)
     kern_free_cores_note();
+    fs_save_crash_wait();   // a save the game already reported as done finishes first (bounded; fs_host.c)
     rtss_limit_restore();   // after the report: RivaTuner Statistics Server's profile as it was
     fflush(stderr);
     prof_sampler_write();   // NX2NAVI_PROFILE: what was sampled until the crash (it gives up after 2 s if the sampler hangs)
@@ -513,8 +537,8 @@ static int usage(const char *argv0) {
     fprintf(stderr, "usage: %s [--exefs DIR] [--romfs DIR] [--profile DIR] [--audio-device VALUE] [--monitor VALUE] [--list-audio-devices | --list-monitors | --selftest | --probe-loader | "
                     "--probe-cfg | --probe-dpi | --probe-mods | --probe-kernel | --probe-ipc | --probe-services | --probe-fs | --probe-gfx-abi | "
                     "--probe-nvn | --probe-nvn-tex | --probe-window | --probe-shader | --probe-vkmem | "
-                    "--probe-vkexec | --probe-astc | --probe-zstd | --probe-input | --probe-movie | --probe-crash-call | --probe-crash-null | --probe-discord | "
-                    "--prepare-shaders | --warm-shaders | --probe-prewarm | --boot |--seconds S [--shot PNG]]\n", argv0);
+                    "--probe-vkexec | --probe-meshfb | --probe-astc | --probe-zstd | --probe-input | --probe-movie | --probe-crash-call | --probe-crash-null | --probe-discord | --probe-coop | "
+                    "--prepare-shaders | --warm-shaders | --prepare-pipelines | --probe-prewarm | --probe-buildgate | --probe-ffx-cache | --probe-memneed | --probe-devlost | --boot |--seconds S [--shot PNG]]\n", argv0);
     return 2;
 }
 
@@ -571,7 +595,8 @@ int main(int argc, char **argv) {
     // threads, so narrowing them to one die would only make the preparation take longer.
     int prepare = 0;
     for (int i = 1; i < argc; i++)
-        if (!strcmp(argv[i], "--prepare-shaders") || !strcmp(argv[i], "--warm-shaders")) prepare = 1;
+        if (!strcmp(argv[i], "--prepare-shaders") || !strcmp(argv[i], "--warm-shaders") ||
+            !strcmp(argv[i], "--prepare-pipelines")) prepare = 1;
     if (!prepare) perf_cpu_start();
     {   // NX2NAVI_POWER_FULL=0 leaves Windows' power throttling of an unfocused window in place (A/B runs)
         const char *pf = cfg_get("NX2NAVI_POWER_FULL");
@@ -628,9 +653,12 @@ int main(int argc, char **argv) {
     if (cfg.seconds && mode) return usage(argv[0]);
     log_open(!mode);
     if (!mode) {
+        mem_start_note(0);   // memory.c: a warning when the machine has less memory free than the game takes
         cfg.boot = cfg.seconds > 0;   // --seconds starts the game like --boot, with its checkpoints
         vk_driver_cache_env();   // before the threads below and rt_boot's, any of which may load the Vulkan driver
         discord_init();   // the Rich Presence thread (discord_rpc.c); it reads nx2navi.ini itself and idles while off
+        coop_init();      // the co-op thread (coop.c); the same, idle while the COOP setting is off
+        coop_game_init(); // progress sync's hooks on that thread and the game's frames (coop_game.c)
         rt_boot();
         return 0;
     }
@@ -646,6 +674,7 @@ int main(int argc, char **argv) {
 #endif
     if (!strcmp(mode, "--probe-mods")) return probe_mods();
     if (!strcmp(mode, "--probe-discord")) return probe_discord();
+    if (!strcmp(mode, "--probe-coop")) return probe_coop();
     if (!strcmp(mode, "--probe-kernel")) return probe_kernel();
     if (!strcmp(mode, "--probe-ipc")) return probe_ipc();
     if (!strcmp(mode, "--probe-services")) return probe_services();
@@ -657,14 +686,23 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "--probe-shader")) return probe_shader();
     if (!strcmp(mode, "--probe-vkmem")) return probe_vkmem();
     if (!strcmp(mode, "--probe-vkexec")) return probe_vkexec();
+    if (!strcmp(mode, "--probe-meshfb")) return probe_meshfb();
     if (!strcmp(mode, "--probe-astc")) return probe_astc();
     if (!strcmp(mode, "--probe-zstd")) return probe_zstd();
     if (!strcmp(mode, "--probe-input")) return probe_gamepad();
     if (!strcmp(mode, "--probe-vkdevice")) return probe_vkdevice();
-    if (!strcmp(mode, "--probe-movie")) return probe_movie();
+    if (!strcmp(mode, "--probe-devlost")) return vk_sync_probe_devlost();
+    if (!strcmp(mode, "--probe-movie")) {   // the AV1 decoder tells the graphics back end of each frame it writes: none here
+        cfg.gpu = "null";
+        return probe_movie();
+    }
     if (!strcmp(mode, "--prepare-shaders")) return vk_pipeline_prepare_shaders();
     if (!strcmp(mode, "--warm-shaders")) return vk_pipeline_warm_shaders();
+    if (!strcmp(mode, "--prepare-pipelines")) return vk_pipeline_prepare_pipelines();
     if (!strcmp(mode, "--probe-prewarm")) return vk_pipeline_probe_prewarm();
-    if (!strcmp(mode, "--boot")) { cfg.boot = 1; rt_boot(); return 0; }
+    if (!strcmp(mode, "--probe-buildgate")) return vk_pipeline_probe_buildgate();
+    if (!strcmp(mode, "--probe-ffx-cache")) return vk_ffx_probe_cache();
+    if (!strcmp(mode, "--probe-memneed")) { mem_start_note(1); return 0; }
+    if (!strcmp(mode, "--boot")) { mem_start_note(0); cfg.boot = 1; rt_boot(); return 0; }
     return usage(argv[0]);
 }

@@ -71,6 +71,11 @@ int probe_cfg(void) {
     CHECK(cfg_get("NX2NAVI_CLOTH_REALTIME") == NULL, "absent key is NULL");
     CHECK(cfg_get("NX2NAVI_comment") == NULL, "comment is not a key");
     CHECK(EQ(cfg_get("NX2NAVI_NO_SUCH_SETTING"), "1"), "unknown key is still readable");
+    {
+        int n = -1;
+        const char *u = cfg_unknown_keys(&n);
+        CHECK(n == 2 && EQ(u, "no_such_setting, last"), "the keys that are no settings: listed lower-case, in the file's order");
+    }
     cfg_setenv("NX2NAVI_FPS60", "1");
     CHECK(EQ(cfg_get("NX2NAVI_FPS60"), "1"), "environment overrides the file");
     cfg_setenv("NX2NAVI_FPS60", NULL);
@@ -78,6 +83,80 @@ int probe_cfg(void) {
     plat_file_delete(path);
     CHECK(cfg_load(path) == 0, "missing file is not an error");
     CHECK(cfg_get("NX2NAVI_FPS60") == NULL, "missing file leaves no keys");
+    {
+        int n = -1;
+        CHECK(EQ(cfg_unknown_keys(&n), "") && n == 0, "a missing file leaves no unknown keys either");
+    }
+
+    // A player's file as a report showed it: settings the menu wrote, and three lines added by hand that are no
+    // settings of this version (the player took the first for the fix of a crash). The three are named as such, a
+    // repeated one once, a key of other characters is counted without being listed, and the menu's save keeps every
+    // line it does not change byte for byte, the three included: only the changed, the reset and the new key move.
+#define PLAYER_HEAD \
+        "[display]\n" \
+        "async_compute = 1\n" \
+        "fullscreen = 1\n" \
+        "window_size = 1920x1080\n" \
+        "gpu_index = 0\n" \
+        "perf_overlay = fps\n" \
+        "vk_present = mailbox\n" \
+        "upscaler = bilinear\n" \
+        "dlaa = 1\n" \
+        "framegen = off\n" \
+        "taa = fsr3\n" \
+        "hdr = 0\n" \
+        "aspect = fit\n" \
+        "game_res = 1800\n"
+#define PLAYER_MID \
+        "aniso = 2\n" \
+        "assume_focus = 1\n" \
+        "texture_detail = auto\n" \
+        "\n" \
+        "[input]\n" \
+        "bind_a = key:default, pad:south\n" \
+        "bind_b = key:default, pad:east\n" \
+        "\n" \
+        "[language]\n" \
+        "operation_mode = docked\n" \
+        "\n" \
+        "[performance]\n" \
+        "wb_lazy = 0\n" \
+        "vram_safe_mode = 1\n" \
+        "exception_handler = 1\n" \
+        "ASYNC_COMPUTE = 1\n" \
+        "f\xC3\xBCr sp\xC3\xA4ter = 1\n" \
+        "\n" \
+        "[frame rate]\n"
+    static const char player[] = PLAYER_HEAD "sharpness = 80\n" PLAYER_MID "fps_limit = 120\n";
+    static const char player_saved[] = PLAYER_HEAD PLAYER_MID "fps_limit = 60\n\n[audio]\nvolume = 55\n";
+#undef PLAYER_HEAD
+#undef PLAYER_MID
+    cfg_setenv("NX2NAVI_FPS_LIMIT", NULL);
+    cfg_setenv("NX2NAVI_VOLUME", NULL);
+    cfg_setenv("NX2NAVI_SHARPNESS", NULL);
+    cfg_setenv("NX2NAVI_WB_LAZY", NULL);
+    CHECK(plat_file_write(path, player, sizeof player - 1), "write the player's ini");
+    CHECK(cfg_load(path) == 1, "load the player's ini");
+    {
+        int n = -1;
+        const char *u = cfg_unknown_keys(&n);
+        CHECK(n == 4 && EQ(u, "async_compute, vram_safe_mode, exception_handler"),
+              "the player's three lines are named as no settings; a repeat counts once, a key of other characters is only counted");
+        CHECK(EQ(cfg_get("NX2NAVI_WB_LAZY"), "0") && cfg_is_set("NX2NAVI_WB_LAZY"), "wb_lazy = 0 is a setting, and set");
+        CHECK(!cfg_is_set("NX2NAVI_VK_NAN_PRESERVE"), "a key the file lacks is not set");
+        static const char *const reset[] = {"SHARPNESS"};
+        cfg_set("NX2NAVI_FPS_LIMIT", "60");
+        cfg_set("NX2NAVI_VOLUME", "55");
+        CHECK(cfg_reset(reset, 1) == 1 && cfg_save_to(path) == 1, "the menu changes, adds and resets a key and saves");
+        uint64_t pn = 0;
+        uint8_t *p = plat_file_read(path, &pn);
+        CHECK(p && pn == sizeof player_saved - 1 && !memcmp(p, player_saved, pn),
+              "the save keeps every other line byte for byte, the lines that are no settings included");
+        if (p && (pn != sizeof player_saved - 1 || memcmp(p, player_saved, pn))) fprintf(stderr, "---- saved:\n%s\n----\n", p);
+        free(p);
+    }
+    plat_file_delete(path);
+    CHECK(cfg_load(path) == 0, "the player's ini is gone again");
 
     // cfg_set / cfg_save: only changed lines move, comments stay, a missing key goes under its section
     static const char before[] =
@@ -330,18 +409,22 @@ int probe_cfg(void) {
     CHECK(st[0] == -32767 && st[1] == 0, "keys: left arrow is right stick left");
     input_map_stick(dn, 0, st);
     CHECK(st[0] == 0 && st[1] == 0, "keys: arrows leave the left stick alone");
-    input_mouse_stick(30, 0, 1.0 / 60, 1, st);
+    input_mouse_stick(30, 0, 1.0 / 60, 1, 1, st);
     CHECK(st[0] == 32767 * 1800 / 3000 && st[1] == 0, "mouse: 30 counts in 1/60 s is 60% right");
-    input_mouse_stick(0, -10, 1.0 / 60, 1, st);
+    input_mouse_stick(0, -10, 1.0 / 60, 1, 1, st);
     CHECK(st[0] == 0 && st[1] > 0, "mouse: moving up is stick up");
-    input_mouse_stick(30, 0, 1.0 / 30, 1, st);
+    input_mouse_stick(30, 0, 1.0 / 30, 1, 1, st);
     CHECK(st[0] == 32767 * 900 / 3000, "mouse: the same counts over twice the time are half the deflection");
-    input_mouse_stick(15, 0, 1.0 / 60, 2, st);
+    input_mouse_stick(15, 0, 1.0 / 60, 2, 1, st);
     CHECK(st[0] == 32767 * 1800 / 3000, "mouse: doubling sensitivity halves the counts needed (15 counts at 2 = 30 at 1)");
-    input_mouse_stick(1000, 1000, 1.0 / 60, 1, st);
+    input_mouse_stick(1000, 1000, 1.0 / 60, 1, 1, st);
     CHECK((int64_t)st[0] * st[0] + (int64_t)st[1] * st[1] <= 32768ll * 32768, "mouse: clamped to the unit circle");
-    input_mouse_stick(30, 0, 1.0 / 60, 0, st);
+    input_mouse_stick(30, 0, 1.0 / 60, 0, 1, st);
     CHECK(st[0] == 0 && st[1] == 0, "mouse: sensitivity 0 is off");
+    input_mouse_stick(30, 0, 1.0 / 60, 1, 1.5f, st);
+    CHECK(st[0] == 13107 && st[1] == 0, "mouse: a camera speed of 1.5 divides the deflection, so the turn per count stays");
+    input_mouse_stick(1000, 0, 1.0 / 60, 1, 1.5f, st);
+    CHECK(st[0] == 32767 && st[1] == 0, "mouse: a fast flick reaches full tilt at a camera speed of 1.5 too");
     input_pad_stick(3000, -2000, 0.15f, st);
     CHECK(st[0] == 0 && st[1] == 0, "pad stick: an 11% drift inside a 15% dead zone reads centred");
     input_pad_stick(4000, -3000, 0, st);

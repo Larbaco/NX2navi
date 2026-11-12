@@ -21,6 +21,22 @@ The log names the layout in effect (`input: gamepad layout ...`) and each gamepa
 (`input: gamepad "...": first press`); the menu shows the layout under *Automatic*. The game's prompts show the Switch
 letters unless *Button prompts* says otherwise (below).
 
+The action prompt (top right) shows the four face buttons as a diamond. The game draws it in the Switch places (A right,
+B bottom, X top, Y left), which `nintendo` keeps. Under `xbox`, `playstation` and `auto` the diamond follows such a
+pad instead (A bottom, B right, X left, Y top), whatever *Button prompts* is.
+
+The game reads the diamond once at start, before a gamepad is open:
+
+- `auto` gets the Xbox diamond, so a Switch Pro Controller under `auto` sees A at the bottom although its A is on the
+  right. Pick `nintendo` for that pad.
+- A change of layout shows after a restart; until then *Button prompts* says *prompts change after restart*.
+- A RomFS mod that changes the action prompt keeps its own diamond. A mod that replaces the same archive for other
+  reasons gets the diamond moved on top of its changes.
+
+The log says what happened in a line that starts with `action prompt:`. How the layout is changed:
+`runtime/action_prompt.c` (`DoCommand_00` in `UI/Layout2Archive/Common.Product.100.Nin_Ounce_NVN2.blarc.zs`, served
+from `<profile>/action-prompt/`).
+
 ## Button prompts
 
 `NX2NAVI_PROMPTS` (`prompts`, the *Button prompts* row on the Controls tab) picks the buttons the game's prompts show: `nintendo` (default, the game's own), `xbox`, `playstation`, `steamdeck` or `pc` (*Keyboard and mouse*). It changes three things the game draws:
@@ -108,13 +124,17 @@ bind_Y = pad:north, key:mouse_l
 
 ## Mouse camera
 
-Mouse motion (raw input) becomes right-stick deflection. Each presented frame takes the counts moved since the last frame, divides by the frame time and sets the deflection to `counts per second * NX2NAVI_MOUSE_SENS / 3000` of full, held for that frame, so the turn rate does not depend on the frame rate. This is not mouselook: the game's stick curve and dead zone still apply, so very slow movements do nothing and a fast flick saturates. The mouse deflection competes with the gamepad and arrow keys by the larger-deflection rule.
+Mouse motion (raw input) becomes right-stick deflection. Each presented frame takes the counts moved since the last frame, divides by the frame time and sets the deflection to `counts per second * NX2NAVI_MOUSE_SENS / 3000` of full, held for that frame, so the turn rate does not depend on the frame rate. This is not mouselook: the game's stick curve and dead zone still apply, so very slow movements do nothing and a fast flick saturates. With a camera speed other than 1 (`NX2NAVI_STICK_SENS`) the deflection is divided by that factor before it is limited to full tilt: the turn for a given movement stays the same, and the fastest turn a flick reaches is the game's top speed with the factor in it. The mouse deflection competes with the gamepad and arrow keys by the larger-deflection rule.
 
-`NX2NAVI_MOUSE_SENS` (0 to 10, default 1; higher turns faster, 0 turns the mouse camera and the cursor capture off). While the window is the foreground window the cursor is hidden and confined to the client area. It is released on focus loss, minimise, while F11 changes the window, during a size or move loop and while a text entry is open. Esc releases it by hand: the cursor shows, the mouse camera and mouse buttons stop, and the window can be moved, minimised or closed. A mouse click inside the client area captures it again; that click does not reach the game. Activating the window by a click on its title bar or border does not capture, so it can be dragged or closed right away; Alt+Tab or a click in the client area captures as before. `NX2NAVI_INPUT=none` disables the capture too.
+`NX2NAVI_MOUSE_MODE` (`mouse_mode`, the *Mouse camera* row on the Controls tab, live) chooses that right-stick deflection (`stick`) or mouselook (`direct`, the default). In `direct` the camera's input update (`main+0x37c300`) takes the raw counts itself, after the game's stick dead zone, clamp and response curve (`recomp/patches-v111.txt`, set `mouse_direct`; `runtime/mouse_direct.c` `camera_input_oot`). The camera turns by how far the mouse moved, the same on both axes: about 0.08 degrees a count at `NX2NAVI_MOUSE_SENS` 1, at any frame rate and any `NX2NAVI_STICK_SENS`, with no dead zone and no top speed. The game's own camera sensitivity (its Options) scales the mouse as it scales the stick. A gamepad's right stick and the arrow keys still go through the game's response and add to the mouse. While the game takes no camera input (it switched camera input off, or the pause after a camera reset runs) the mouse is the right stick as above. `NX2NAVI_MOUSE_DIRECT_PATCH=0` turns the patch set off, and the mouse is the right stick whatever the mode. `NX2NAVI_MOUSE_TRACE=1` logs each camera input update (the stick, the counts taken and what they added) and, with `dlaa` on (DLAA, DLSS or FSR 3.1, which read the game's camera), the camera's direction in each frame, for measuring the turn per count.
+
+`NX2NAVI_MOUSE_SENS` (the *Mouse camera sensitivity* row, live; 0 to 10, default 1; higher turns faster, 0 turns the mouse camera and the cursor capture off, the row goes down to 0.05). While the window is the foreground window the cursor is hidden and confined to the client area. It is released on focus loss, minimise, while F11 changes the window, during a size or move loop and while a text entry is open. Esc releases it by hand: the cursor shows, the mouse camera and mouse buttons stop, and the window can be moved, minimised or closed. A mouse click inside the client area captures it again; that click does not reach the game. Activating the window by a click on its title bar or border does not capture, so it can be dragged or closed right away; Alt+Tab or a click in the client area captures as before. `NX2NAVI_INPUT=none` disables the capture too.
 
 `NX2NAVI_STICK_DEADZONE` (0 to 50, default 8) is the gamepad stick dead zone in percent of full deflection, the same for both sticks. It is round: a stick inside the circle reads centred, and the rest of its travel is scaled to start at 0 at the edge, so full deflection still reaches full. Raise it for a stick that drifts. The game's own dead zone applies after it. `NX2NAVI_LSTICK_DEADZONE` and `NX2NAVI_RSTICK_DEADZONE` (the *Left/Right stick dead zone* rows under *Analog sticks* on the Controls tab) set one stick each and fall back to `NX2NAVI_STICK_DEADZONE` while unset, so a worn stick can get a larger zone than the other. With a gamepad connected each row shows its stick's deflection now, before the dead zone (*stick now*): let go of the stick and set the row a few percent above the value it rests at.
 
 The stick direction bits (`StickLLeft` to `StickRDown`) are derived from the sticks at 50% deflection. With no gamepad connected the log says `input: no gamepad`.
+
+Keys tilt a stick all the way, so on the keyboard alone Link always runs. `NX2NAVI_WALK_KEY` (`walk_key`, the *Walk key* row under *Analog sticks* on the Controls tab) names a key that, while held, scales the stick values the keys give (movement and camera keys) to `NX2NAVI_WALK_SCALE` of full (`walk_scale`, the *Walk scale* row; 0.2 to 0.9, default 0.51), so Link walks. The value is a key name of the `bind_` lines, or `none` (the default: off). The row offers Shift, Alt, Ctrl, Tab and Caps Lock and names the button a chosen key also presses: with the default bindings Shift is A, Ctrl is B and Tab is Plus, while Alt and Caps Lock are free. The gamepad's sticks and the mouse camera are not scaled. The default is just above half because half of a key's full value falls one short of the 50% the direction bits need. Both settings apply at once while the game runs.
 
 ## Nintendo Switch 2 controllers
 

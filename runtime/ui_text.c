@@ -46,6 +46,7 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_ON] = "On", [UI_MENU_OFF] = "Off", [UI_MENU_AUTO] = "Automatic", [UI_MENU_DEFAULT_MARK] = "default",
     [UI_MENU_AFTER_RESTART] = "after restart", [UI_MENU_SET_BY_ENV] = "set by environment variable",
     [UI_MENU_SAVE_FAILED] = "could not save settings",
+    [UI_MENU_INI_UNKNOWN] = "nx2navi.ini: not settings of this version, ignored: %s",
     [UI_MENU_VERSION] = "NX2navi %s, game %s",
 
     [UI_MENU_FULLSCREEN] = "Fullscreen", [UI_MENU_FULLSCREEN_DESC] = "Play in fullscreen. F11 switches it.",
@@ -115,33 +116,6 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_HDR_GAME_DESC] = "Brightness of white in the game, in nits.",
     [UI_MENU_HDR_UI] = "HUD and menu brightness",
     [UI_MENU_HDR_UI_DESC] = "Brightness of the HUD and this menu, in nits.",
-    [UI_MENU_HDR_HUE] = "Hue correction",
-    [UI_MENU_HDR_HUE_DESC] = "How much bright colours keep the hue they have before the tone mapper; 0 lets them shift "
-                             "as the curve takes them.",
-    [UI_MENU_HDR_GAMMA] = "Gamma correction",
-    [UI_MENU_HDR_GAMMA_DESC] = "Shows the picture as a 2.2 or BT.1886 (2.4) display would, as the game was made to be "
-                               "seen; Off keeps the sRGB curve, with lighter shadows.",
-    [UI_MENU_HDR_TONEMAP] = "Tone mapper",
-    [UI_MENU_HDR_TONEMAP_DESC] = "Vanilla: the game's own curve at SDR brightness. RenoDRT: the game's look carried up "
-                                 "to your display's peak.",
-    [UI_MENU_HDR_EXPOSURE] = "Exposure",
-    [UI_MENU_HDR_EXPOSURE_DESC] = "Brightness of the whole picture before the tone mapper; 100 % leaves it unchanged.",
-    [UI_MENU_HDR_HIGHLIGHTS] = "Highlights",
-    [UI_MENU_HDR_HIGHLIGHTS_DESC] = "Brightness of the bright parts; 50 leaves them unchanged.",
-    [UI_MENU_HDR_SHADOWS] = "Shadows",
-    [UI_MENU_HDR_SHADOWS_DESC] = "Brightness of the dark parts; 50 leaves them unchanged.",
-    [UI_MENU_HDR_CONTRAST] = "Contrast",
-    [UI_MENU_HDR_CONTRAST_DESC] = "Contrast around mid grey; 50 leaves it unchanged.",
-    [UI_MENU_HDR_SATURATION] = "Saturation",
-    [UI_MENU_HDR_SATURATION_DESC] = "Strength of all colours; 50 leaves it unchanged.",
-    [UI_MENU_HDR_HIGHLIGHT_SAT] = "Highlight saturation",
-    [UI_MENU_HDR_HIGHLIGHT_SAT_DESC] = "Strength of the colours of the brightest parts; 50 leaves it unchanged.",
-    [UI_MENU_HDR_BLOWOUT] = "Blowout",
-    [UI_MENU_HDR_BLOWOUT_DESC] = "Turns the brightest parts towards white; 0 keeps their colour.",
-    [UI_MENU_HDR_FLARE] = "Flare",
-    [UI_MENU_HDR_FLARE_DESC] = "Lifts the darkest parts as a little stray light would; 0 keeps black black.",
-    [UI_MENU_HDR_GRADE] = "Colour grading",
-    [UI_MENU_HDR_GRADE_DESC] = "How much of the game's own colour grading the HDR picture keeps; 0 is the scene without it.",
     [UI_MENU_SHADOW_SCALE] = "Shadow resolution",
     [UI_MENU_SHADOW_SCALE_DESC] = "Sharper shadows. Higher costs more GPU power.",
     [UI_MENU_PCSS] = "Soft shadows",
@@ -179,7 +153,7 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_FXAA_DESC] = "The game's own FXAA edge smoothing. It blurs fine detail a little; with DLAA on it is not needed.",
 
     [UI_MENU_FPS_LIMIT] = "Frame rate limit",
-    [UI_MENU_FPS_LIMIT_DESC] = "The highest frame rate the game runs at.",
+    [UI_MENU_FPS_LIMIT_DESC] = "The highest frame rate the game draws at. Frame generation adds its frames on top.",
     [UI_MENU_FPS_30] = "30 FPS", [UI_MENU_FPS_40] = "40 FPS", [UI_MENU_FPS_45] = "45 FPS",
     [UI_MENU_FPS_60] = "60 FPS", [UI_MENU_FPS_90] = "90 FPS", [UI_MENU_FPS_120] = "120 FPS", [UI_MENU_FPS_144] = "144 FPS",
     // the monitor's refresh rate; printf format with the rate in Hz when it is known
@@ -289,7 +263,7 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_STICK_DEADZONE_DESC] = "How far a stick must move to register. Raise it if a stick drifts.",
     [UI_MENU_STICK_DEADZONE_NOW] = "stick now: %.0f %%",
     [UI_MENU_MOUSE_MODE] = "Mouse camera",
-    [UI_MENU_MOUSE_MODE_DESC] = "Direct: the camera turns by how far the mouse moves, as in a PC game, with no stick dead zone or curve (game 1.4.3; other versions use stick emulation). Stick emulation: the mouse acts as the right stick.",
+    [UI_MENU_MOUSE_MODE_DESC] = "Direct: the camera turns by how far the mouse moves, as in a PC game, with no stick dead zone or curve (games 1.1.1 and 1.4.3; other versions use stick emulation). Stick emulation: the mouse acts as the right stick.",
     [UI_MENU_MOUSE_STICK] = "Stick emulation",
     [UI_MENU_MOUSE_DIRECT] = "Direct",
     [UI_MENU_MENU_CURSOR] = "Mouse in the game's menus",
@@ -545,6 +519,146 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_SAVE_E_NEWER] = "%s was made by a newer NX2navi: update NX2navi first.",
     [UI_MENU_SAVE_E_DAMAGED] = "%s is damaged: download it again.",
     [UI_MENU_SAVE_E_UNSAFE] = "%s was refused: it holds files outside a save, links, or far more than a save.",
+    [UI_MENU_TAB_COOP] = "Co-op",
+    [UI_MENU_COOP_ON] = "Co-op",
+    [UI_MENU_COOP_ON_DESC] = "Play with friends, each in their own game and save: a room on a relay shares story progress "
+                             "between them by its rules (docs/coop.md). Off: the game uses no network at all. Make a room "
+                             "and Join a room turn it on.",
+    [UI_MENU_COOP_NAME] = "Your name",
+    [UI_MENU_COOP_NAME_DESC] = "The name the other players in a room see; the relay sees it too. At most 24 bytes. Empty: "
+                               "Player- and four random digits.",
+    [UI_MENU_COOP_AUTO] = "automatic",
+    [UI_MENU_COOP_SERVER] = "Relay address",
+    [UI_MENU_COOP_SERVER_DESC] = "The relay that connects the players' games: host, host:port or [IPv6]:port (port 24680 "
+                                 "when none is given). Whoever runs it (python tools/coop_relay.py) gives its address to "
+                                 "the others. The log and the system info do not show it.",
+    [UI_MENU_COOP_NONE] = "none",
+    [UI_MENU_COOP_MAKE] = "Make a room",
+    [UI_MENU_COOP_MAKE_DESC] = "Makes a room with a new secret of 18 characters, which you pass on to the players you "
+                               "invite (by voice or a private message). A room you make shares by the rules below, and you "
+                               "can change them while you play.",
+    [UI_MENU_COOP_JOIN] = "Join a room",
+    [UI_MENU_COOP_JOIN_DESC] = "Joins the room whose secret another player gave you. Nothing from the room reaches your "
+                               "save until you have seen who is in it and what it shares, and accepted it here.",
+    [UI_MENU_COOP_NEED_SERVER] = "set the relay address first",
+    [UI_MENU_COOP_SECRET] = "Room secret",
+    [UI_MENU_COOP_SECRET_HINT] = "18 characters, as XXXXXX-XXXXXX-XXXXXX: any case, with or without dashes.",
+    [UI_MENU_COOP_SECRET_BAD] = "This is not a room secret: it has 18 characters of 23456789BCDFGHJKMNPRSTVWXYZ.",
+    [UI_MENU_COOP_PASTE] = "Paste", [UI_MENU_COOP_PASTE_EMPTY] = "The clipboard has no text.",
+    [UI_MENU_COOP_OK] = "OK", [UI_MENU_COOP_STOP] = "Stop",
+    [UI_MENU_COOP_STOP_DESC] = "Stops trying to reach the room.",
+    [UI_MENU_COOP_CONNECTING] = "Connecting: %s",
+    [UI_MENU_COOP_RECONNECTING] = "The relay went silent; getting back into the room: %s",
+    [UI_MENU_COOP_LEFT] = "Not in a room: %s",
+    [UI_MENU_COOP_NO_ROOM] = "No open room on the relay has this secret: check it, or ask its maker whether the room is "
+                             "still open.",
+    [UI_MENU_COOP_NOT_STARTED] = "Co-op did not start; the log says why.",
+    [UI_MENU_COOP_PLAYERS] = "Players", [UI_MENU_COOP_YOU] = "you", [UI_MENU_COOP_MAKER] = "made the room",
+    [UI_MENU_COOP_HEARD] = "heard %u s ago", [UI_MENU_COOP_NOT_HEARD] = "not heard from yet", [UI_MENU_COOP_AWAY] = "away",
+    [UI_MENU_COOP_MEMBER_DESC] = "A player in the room. Heard: when a message of theirs last arrived sealed with the "
+                                 "room's secret; a player not heard from yet has not shown that they know it.",
+    [UI_MENU_COOP_REMOVE] = "Remove",
+    [UI_MENU_COOP_REMOVE_DESC] = "As the room's maker you can remove a player by their key: every game drops that key and "
+                                 "gives back what it took from the pools, and the relay drops the player and refuses them "
+                                 "again. Someone who knows the secret can come back under a new key, and everyone then gets "
+                                 "a new offer to accept or not; to be sure, make a new room.",
+    [UI_MENU_COOP_REMOVE_CONFIRM] = "Remove %s from the room?",
+    [UI_MENU_COOP_SECRET_DESC] = "Anyone who has the secret can join the room: pass it on only to the players you invite, "
+                                 "by voice or a private message. It shows only when you ask; hide it before you share your "
+                                 "screen. The relay never learns it.",
+    [UI_MENU_COOP_SHOW] = "press to show", [UI_MENU_COOP_HIDE] = "press to hide",
+    [UI_MENU_COOP_COPY] = "Copy the secret",
+    [UI_MENU_COOP_COPY_DESC] = "Puts the room's secret on the clipboard, to paste into a private message.",
+    [UI_MENU_COOP_OFFER] = "This room waits for your answer",
+    [UI_MENU_COOP_OFFER_WHO] = "In the room: %s.", [UI_MENU_COOP_OFFER_NOBODY] = "nobody else yet",
+    [UI_MENU_COOP_OFFER_SHARED] = "Shared by everyone: %s.", [UI_MENU_COOP_OFFER_POOLED] = "In one pool for everyone: %s.",
+    [UI_MENU_COOP_OFFER_NOTHING] = "The rules share nothing.",
+    [UI_MENU_COOP_OFFER_COPY] = "Nothing from the room reaches your save before you accept. Then your whole save (every "
+                                "slot) is first copied to coop-backup/<date and time> in the profile folder, and only after "
+                                "that does the room's progress arrive.",
+    [UI_MENU_COOP_OFFER_TRUST] = "A player in the room can do in your world what the rules share (open a chest, spend a "
+                                 "pooled key), and the game cannot undo it: accept only players you trust with your save.",
+    [UI_MENU_COOP_ANSWER] = "Accept or not",
+    [UI_MENU_COOP_ANSWER_DESC] = "Shows the offer with Accept and Not now. A new player or other rules make a new offer, "
+                                 "which waits for your answer again.",
+    [UI_MENU_COOP_ACCEPT_CONFIRM] = "Accept this room?", [UI_MENU_COOP_ACCEPT] = "Accept", [UI_MENU_COOP_NOT_NOW] = "Not now",
+    [UI_MENU_COOP_ACCEPTED] = "Accepted: the room's progress reaches your save. Your save as it was is in coop-backup in "
+                              "the profile folder.",
+    [UI_MENU_COOP_COPY_FAILED] = "Accepted, but your save could not be copied, so nothing from the room is applied; the "
+                                 "log says why.",
+    [UI_MENU_COOP_RULES_ROOM] = "The room's rules", [UI_MENU_COOP_RULES_MINE] = "Rules of a room you make",
+    [UI_MENU_COOP_RULES_UNKNOWN] = "The room's rules have not arrived yet.",
+    [UI_MENU_COOP_RULES_CHANGE] = "A change is a new offer: the others take nothing more from the room until they accept it.",
+    [UI_MENU_COOP_RULES_SET_BY] = "set by the room's maker", [UI_MENU_COOP_RULE_FOLLOWS] = "follows Progress",
+    [UI_MENU_COOP_R_PROGRESS] = "Progress", [UI_MENU_COOP_R_ITEMS] = "Items", [UI_MENU_COOP_R_SONGS] = "Songs",
+    [UI_MENU_COOP_R_QUEST] = "Quest items", [UI_MENU_COOP_R_KEYS] = "Small keys", [UI_MENU_COOP_R_RUPEES] = "Rupees",
+    [UI_MENU_COOP_R_AMMO] = "Ammunition",
+    [UI_MENU_COOP_R_PROGRESS_DESC] = "Story, world and dungeon flags: events, talks, chests, doors, switches, bosses, map "
+                                     "and compass. Shared: what one player does happens in every world. Own: each world "
+                                     "keeps its own, and small keys are then own too.",
+    [UI_MENU_COOP_R_ITEMS_DESC] = "Equipment, key items, bottles owned, wallet, bag and quiver sizes, magic meter size; of "
+                                  "a count, the highest wins. Own is possible only with Progress own: in a shared world a "
+                                  "chest one player opened is empty for the others.",
+    [UI_MENU_COOP_R_SONGS_DESC] = "The songs learned. Own is possible only with Progress own.",
+    [UI_MENU_COOP_R_QUEST_DESC] = "Medallions, spiritual stones, the Stone of Agony and the Gerudo card. Own is possible "
+                                  "only with Progress own.",
+    [UI_MENU_COOP_R_KEYS_DESC] = "Small keys, per dungeon. Pool: a key anyone picks up goes into the dungeon's pool and a "
+                                 "door anyone opens takes one out. Own with Progress own.",
+    [UI_MENU_COOP_R_RUPEES_DESC] = "Pool: one purse that every player adds to and spends from. Own: each keeps their own.",
+    [UI_MENU_COOP_R_AMMO_DESC] = "Bombs, bombchus, arrows, deku nuts, seeds and sticks, magic beans. Pool: one count that "
+                                 "every player adds to and spends from.",
+    [UI_MENU_COOP_SHARED] = "shared", [UI_MENU_COOP_OWN] = "own", [UI_MENU_COOP_POOL] = "pool",
+    [UI_MENU_COOP_LEAVE] = "Leave the room",
+    [UI_MENU_COOP_LEAVE_DESC] = "Leaves the room. What the room gave your save stays in it.",
+    [UI_MENU_COOP_LEAVE_CONFIRM] = "Leave the room? What it gave your save stays.",
+    [UI_MENU_COOP_LEAVE_MAKER] = "You made this room: while you are away nobody can change its rules or remove a player, "
+                                 "and if nobody else is in it, it closes.",
+    [UI_MENU_COOP_STAY] = "Stay",
+    [UI_MENU_COOP_TOAST_JOINED] = "%s joined the room", [UI_MENU_COOP_TOAST_LEFT] = "%s left the room",
+    [UI_MENU_COOP_TOAST_OFFER] = "The co-op room waits for your answer in the menu's Co-op tab",
+    [UI_MENU_COOP_LOST] = "The relay lost the room; the game is getting back into it.",
+    [UI_MENU_COOP_JOIN_LIMIT] = "The relay takes no more joins from your network for now; the game tries again in a minute.",
+    [UI_MENU_COOP_NOT_IDENTIFIED] = "not identified", [UI_MENU_COOP_REMOVED] = "removed by the maker",
+    [UI_MENU_COOP_KEY] = "key %s",
+    [UI_MENU_COOP_OFFER_KEY] = "The rules are signed by key %s.",
+    [UI_MENU_COOP_OFFER_COMPARE] = "Before you accept, ask the room's maker to read you their key, by voice or chat, and "
+                                   "compare it with this one.",
+    [UI_MENU_COOP_MY_KEY] = "Your key, which signs this room's rules: %s. Read it to the others, by voice or chat, so that "
+                            "they can compare it before they accept.",
+    [UI_MENU_COOP_UNIDENTIFIED] = "Players in the room who are not identified: %d (they have not said who they are, or two "
+                                  "keys say they are the same player). Nobody can accept the room while they are in it: the "
+                                  "maker can remove them, or everyone moves to a new room.",
+    [UI_MENU_COOP_DISAGREE] = "The players carry rules signed by different keys: ask the room's maker which key is theirs "
+                              "before you accept.",
+    [UI_MENU_COOP_NEW_SAVE] = "Another save is played in this room: it gets the room's progress, which holds what the last "
+                              "save brought.",
+    [UI_MENU_COOP_WARNINGS] = "Before you join a room with strangers",
+    [UI_MENU_COOP_WARN_SAVE] = "1. Keep a save you can go back to. Anyone you accept can set story flags in your save, and so "
+                               "can anyone they accepted; a player in your pools can empty a dungeon's small keys. No "
+                               "removal takes a flag back: the copy in coop-backup/first-<date and time> does.",
+    [UI_MENU_COOP_WARN_ROOM] = "2. Your acceptance is yours, the room is not. The players you accept pass on the flags of the "
+                               "players they accepted, and the maker alone decides who may use the pools. If anyone you do "
+                               "not know is in the room, do not accept: leave, and ask the maker for a new room.",
+    [UI_MENU_COOP_WARN_KEY] = "3. Check the maker's key, and keep yours to yourself. Compare the key that signs the rules "
+                              "with the maker's, never start the game with settings or a script someone hands you, and "
+                              "never hand out a copy of your profile folder.",
+    [UI_MENU_COOP_POOLS] = "Pools",
+    [UI_MENU_COOP_SPENT] = "took %lld keys, %lld rupees, %lld ammunition beyond what it brought",
+    [UI_MENU_COOP_NOT_IN_ROOM] = "not in the room",
+    [UI_MENU_COOP_SPENT_NONE] = "Nobody took more from the pools than they brought.",
+    [UI_MENU_COOP_SPENT_DESC] = "This key took more from the pools than it brought. A player who used keys others found is "
+                                "listed too; one nobody expected drained the pools. Removing the key gives back what it "
+                                "took, in every game, also after the player left. Remove it before a pool reset: a reset "
+                                "keeps what a player still in the room took.",
+    [UI_MENU_COOP_RESET] = "Reset the pools",
+    [UI_MENU_COOP_RESET_DESC] = "Every game joins the pools again with what it held for the players in the room. This "
+                                "recovers a pool that a player who left had emptied; flags stay as they are. A player who "
+                                "drained a pool and is still in the room keeps what they took: remove them first, then reset.",
+    [UI_MENU_COOP_RESET_CONFIRM] = "Reset the pools for everyone in the room?",
+    [UI_MENU_COOP_REMOVE_KEY_CONFIRM] = "Remove %s, key %s, from the room?",
+    [UI_MENU_COOP_NOT_ACCEPTED] = "Not accepted: the room changed or a player in it is not identified. Look at the offer "
+                                  "again.",
+    [UI_MENU_COOP_ACCEPTED_AS] = "a key you accepted as %s",
     [UI_BOOT_TITLE] = "Preparing shaders",
     [UI_BOOT_STARTING] = "Starting", [UI_BOOT_SHADERS] = "Shaders: %lld of %lld", [UI_BOOT_PIPELINES] = "Pipelines: %lld of %lld",
     [UI_MENU_UPSCALING] = "Upscaling",
@@ -553,7 +667,7 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_FRAMEGEN] = "Frame generation",
     [UI_MENU_FRAMEGEN_DESC] = "Adds generated frames for smoother motion. Needs DLSS or FSR 3.1.",
     [UI_MENU_FRAMEGEN_OFF] = "Off",
-    [UI_MENU_HDR_TONEMAPPED] = "RenoDX", [UI_MENU_HDR_NATIVE] = "Native (the game's)",
+    [UI_MENU_HDR_TONEMAPPED] = "RenoDX", [UI_MENU_HDR_NATIVE] = "Native",
     [UI_MENU_FRAMEGEN_NOTE] = "needs DLSS or FSR 3.1",
     [UI_MENU_FRAMEGEN_NEEDS] = "choose a DLSS or FSR 3.1 mode under Upscaling first",
     [UI_MENU_FRAMEGEN_NEEDS_FSR] = "choose an FSR 3.1 mode under Upscaling first",
@@ -575,16 +689,16 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_FG_MULT_DYNAMIC] = "Dynamic",
     [UI_MENU_FRAMEGEN_MULT_DESC] = "Frames on screen for each frame the game draws: 2x adds one generated frame, 3x "
                                    "two, 4x three. Higher is smoother but adds a little delay. The frame limit counts "
-                                   "the frames on screen, so the game draws the limit divided by this: set the limit "
-                                   "to your display's rate. 2x needs a GeForce RTX 40 GPU or newer, 3x and 4x an RTX "
-                                   "50.",
+                                   "the frames the game draws, so the screen shows the limit times this. 2x needs a "
+                                   "GeForce RTX 40 GPU or newer, 3x and 4x an RTX 50.",
     [UI_MENU_FRAMEGEN_MULT_RTX50] = "3x and 4x need an RTX 50 GPU",
     [UI_MENU_FRAMEGEN_MULT_UPTO] = "up to %dx on this GPU and driver",
     [UI_MENU_FRAMEGEN_MULT_OLD_DLL] = "2x only: update the DLSS frame generation files",
-    [UI_MENU_FRAMEGEN_OFF_GPU] = "in use: off, needs an RTX 40 GPU or newer",
+    [UI_MENU_FRAMEGEN_UNAVAILABLE] = "in use: off: it needs an RTX 40 or newer; if you have one, see dlssg in the log",
     [UI_MENU_FRAMEGEN_OFF_FILES] = "in use: off, its files are missing",
     [UI_MENU_GAME_RES] = "Resolution",
-    [UI_MENU_GAME_RES_DESC] = "Height of the game's picture. Higher is sharper but costs more GPU power.",
+    [UI_MENU_GAME_RES_DESC] = "Size of the game's picture; outside fullscreen the window takes it too. Higher is sharper "
+                              "but costs more GPU power.",
     [UI_MENU_GAME_RES_NATIVE] = "Native",
     [UI_MENU_CHEATS_REBUILD] = "Rebuild the game now",
     [UI_MENU_CHEATS_REBUILD_DESC] = "Some cheats change the game's code and are not built into it: they are new or "
@@ -610,6 +724,7 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_DEFAULT_MARK] = "по умолчанию",
     [UI_MENU_AFTER_RESTART] = "после перезапуска", [UI_MENU_SET_BY_ENV] = "задано переменной окружения",
     [UI_MENU_SAVE_FAILED] = "не удалось сохранить настройки",
+    [UI_MENU_INI_UNKNOWN] = "nx2navi.ini: не настройки этой версии, пропущены: %s",
     [UI_MENU_VERSION] = "NX2navi %s, игра %s",
 
     [UI_MENU_FULLSCREEN] = "Полный экран", [UI_MENU_FULLSCREEN_DESC] = "Игра на весь экран. F11 переключает.",
@@ -680,33 +795,6 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_HDR_GAME_DESC] = "Яркость белого в игре, в нитах.",
     [UI_MENU_HDR_UI] = "Яркость интерфейса и меню",
     [UI_MENU_HDR_UI_DESC] = "Яркость интерфейса и этого меню, в нитах.",
-    [UI_MENU_HDR_HUE] = "Коррекция оттенка",
-    [UI_MENU_HDR_HUE_DESC] = "Насколько яркие цвета сохраняют оттенок, который был до тональной кривой; при 0 они "
-                             "смещаются вместе с кривой.",
-    [UI_MENU_HDR_GAMMA] = "Коррекция гаммы",
-    [UI_MENU_HDR_GAMMA_DESC] = "Показывает картинку так, как её показал бы экран с гаммой 2.2 или BT.1886 (2.4), для "
-                               "которого игра делалась; «Выкл.» оставляет кривую sRGB с более светлыми тенями.",
-    [UI_MENU_HDR_TONEMAP] = "Тональная кривая",
-    [UI_MENU_HDR_TONEMAP_DESC] = "Vanilla: собственная кривая игры с яркостью SDR. RenoDRT: вид игры, доведённый до "
-                                 "пиковой яркости экрана.",
-    [UI_MENU_HDR_EXPOSURE] = "Экспозиция",
-    [UI_MENU_HDR_EXPOSURE_DESC] = "Яркость всей картинки до тональной кривой; 100 % оставляет её без изменений.",
-    [UI_MENU_HDR_HIGHLIGHTS] = "Света",
-    [UI_MENU_HDR_HIGHLIGHTS_DESC] = "Яркость светлых участков; 50 оставляет их без изменений.",
-    [UI_MENU_HDR_SHADOWS] = "Тени",
-    [UI_MENU_HDR_SHADOWS_DESC] = "Яркость тёмных участков; 50 оставляет их без изменений.",
-    [UI_MENU_HDR_CONTRAST] = "Контраст",
-    [UI_MENU_HDR_CONTRAST_DESC] = "Контраст вокруг среднего серого; 50 оставляет его без изменений.",
-    [UI_MENU_HDR_SATURATION] = "Насыщенность",
-    [UI_MENU_HDR_SATURATION_DESC] = "Сила всех цветов; 50 оставляет её без изменений.",
-    [UI_MENU_HDR_HIGHLIGHT_SAT] = "Насыщенность светов",
-    [UI_MENU_HDR_HIGHLIGHT_SAT_DESC] = "Сила цвета самых ярких участков; 50 оставляет её без изменений.",
-    [UI_MENU_HDR_BLOWOUT] = "Выгорание",
-    [UI_MENU_HDR_BLOWOUT_DESC] = "Уводит самые яркие участки к белому; 0 сохраняет их цвет.",
-    [UI_MENU_HDR_FLARE] = "Засветка",
-    [UI_MENU_HDR_FLARE_DESC] = "Приподнимает самые тёмные участки, как немного рассеянного света; 0 оставляет чёрное чёрным.",
-    [UI_MENU_HDR_GRADE] = "Цветокоррекция игры",
-    [UI_MENU_HDR_GRADE_DESC] = "Сколько собственной цветокоррекции игры сохраняет HDR-картинка; 0 — сцена без неё.",
     [UI_MENU_SHADOW_SCALE] = "Разрешение теней",
     [UI_MENU_SHADOW_SCALE_DESC] = "Более чёткие тени. Выше — больше нагрузка на видеокарту.",
     [UI_MENU_PCSS] = "Мягкие тени",
@@ -744,7 +832,7 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_FXAA_DESC] = "Собственное сглаживание FXAA. Слегка размывает мелкие детали; с DLAA оно не нужно.",
 
     [UI_MENU_FPS_LIMIT] = "Ограничение частоты кадров",
-    [UI_MENU_FPS_LIMIT_DESC] = "Максимальная частота кадров игры.",
+    [UI_MENU_FPS_LIMIT_DESC] = "Максимальная частота кадров, которые рисует игра. Генерация кадров добавляет свои сверх неё.",
     [UI_MENU_FPS_30] = "30 FPS", [UI_MENU_FPS_40] = "40 FPS", [UI_MENU_FPS_45] = "45 FPS",
     [UI_MENU_FPS_60] = "60 FPS", [UI_MENU_FPS_90] = "90 FPS", [UI_MENU_FPS_120] = "120 FPS", [UI_MENU_FPS_144] = "144 FPS",
     [UI_MENU_FPS_DISPLAY] = "Как у монитора", [UI_MENU_FPS_DISPLAY_HZ] = "Как у монитора (%.0f Гц)",
@@ -849,7 +937,7 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_STICK_DEADZONE_DESC] = "Насколько нужно сдвинуть стик, чтобы он сработал. Увеличьте при дрейфе.",
     [UI_MENU_STICK_DEADZONE_NOW] = "стик сейчас: %.0f %%",
     [UI_MENU_MOUSE_MODE] = "Управление мышью",
-    [UI_MENU_MOUSE_MODE_DESC] = "Прямое: камера поворачивается на столько, на сколько сдвинута мышь, как в играх для ПК, без мёртвой зоны и кривой стика (версия игры 1.4.3; на других версиях эмуляция стика). Эмуляция стика: мышь работает как правый стик.",
+    [UI_MENU_MOUSE_MODE_DESC] = "Прямое: камера поворачивается на столько, на сколько сдвинута мышь, как в играх для ПК, без мёртвой зоны и кривой стика (версии игры 1.1.1 и 1.4.3; на других версиях эмуляция стика). Эмуляция стика: мышь работает как правый стик.",
     [UI_MENU_MOUSE_STICK] = "Эмуляция стика",
     [UI_MENU_MOUSE_DIRECT] = "Прямое",
     [UI_MENU_MENU_CURSOR] = "Мышь в меню игры",
@@ -1110,6 +1198,149 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_SAVE_E_NEWER] = "%s создан более новой версией NX2navi: сначала обновите NX2navi.",
     [UI_MENU_SAVE_E_DAMAGED] = "%s повреждён: скачайте его заново.",
     [UI_MENU_SAVE_E_UNSAFE] = "%s отклонён: в нём файлы вне сохранения, ссылки или слишком много данных.",
+    [UI_MENU_TAB_COOP] = "Кооператив",
+    [UI_MENU_COOP_ON] = "Кооператив",
+    [UI_MENU_COOP_ON_DESC] = "Игра с друзьями, у каждого своя игра и своё сохранение: комната на ретрансляторе делит между "
+                             "ними прогресс сюжета по своим правилам (docs/coop.md). Выкл.: игра совсем не использует "
+                             "сеть. «Создать комнату» и «Войти в комнату» включают его.",
+    [UI_MENU_COOP_NAME] = "Ваше имя",
+    [UI_MENU_COOP_NAME_DESC] = "Имя, которое видят другие игроки в комнате; его видит и ретранслятор. Не больше 24 байт. "
+                               "Пусто: Player- и четыре случайные цифры.",
+    [UI_MENU_COOP_AUTO] = "автоматически",
+    [UI_MENU_COOP_SERVER] = "Адрес ретранслятора",
+    [UI_MENU_COOP_SERVER_DESC] = "Ретранслятор, который соединяет игры игроков: host, host:port или [IPv6]:port (порт "
+                                 "24680, если не указан). Тот, кто его запускает (python tools/coop_relay.py), сообщает "
+                                 "адрес остальным. Журнал и сведения о системе его не показывают.",
+    [UI_MENU_COOP_NONE] = "нет",
+    [UI_MENU_COOP_MAKE] = "Создать комнату",
+    [UI_MENU_COOP_MAKE_DESC] = "Создаёт комнату с новым секретом из 18 символов, который вы передаёте приглашённым игрокам "
+                               "(голосом или личным сообщением). Созданная вами комната делит прогресс по правилам ниже, и "
+                               "их можно менять во время игры.",
+    [UI_MENU_COOP_JOIN] = "Войти в комнату",
+    [UI_MENU_COOP_JOIN_DESC] = "Входит в комнату, секрет которой вам дал другой игрок. Ничего из комнаты не попадёт в ваше "
+                               "сохранение, пока вы не увидите, кто в ней и что она делит, и не примете её здесь.",
+    [UI_MENU_COOP_NEED_SERVER] = "сначала укажите адрес ретранслятора",
+    [UI_MENU_COOP_SECRET] = "Секрет комнаты",
+    [UI_MENU_COOP_SECRET_HINT] = "18 символов, вида XXXXXX-XXXXXX-XXXXXX: в любом регистре, с дефисами или без.",
+    [UI_MENU_COOP_SECRET_BAD] = "Это не секрет комнаты: в нём 18 символов из 23456789BCDFGHJKMNPRSTVWXYZ.",
+    [UI_MENU_COOP_PASTE] = "Вставить", [UI_MENU_COOP_PASTE_EMPTY] = "В буфере обмена нет текста.",
+    [UI_MENU_COOP_OK] = "ОК", [UI_MENU_COOP_STOP] = "Остановить",
+    [UI_MENU_COOP_STOP_DESC] = "Перестаёт пытаться попасть в комнату.",
+    [UI_MENU_COOP_CONNECTING] = "Подключение: %s",
+    [UI_MENU_COOP_RECONNECTING] = "Ретранслятор замолчал; возвращение в комнату: %s",
+    [UI_MENU_COOP_LEFT] = "Не в комнате: %s",
+    [UI_MENU_COOP_NO_ROOM] = "На ретрансляторе нет открытой комнаты с этим секретом: проверьте его или спросите создателя, "
+                             "открыта ли ещё комната.",
+    [UI_MENU_COOP_NOT_STARTED] = "Кооператив не запустился; причина в журнале.",
+    [UI_MENU_COOP_PLAYERS] = "Игроки", [UI_MENU_COOP_YOU] = "вы", [UI_MENU_COOP_MAKER] = "создатель комнаты",
+    [UI_MENU_COOP_HEARD] = "на связи %u с назад", [UI_MENU_COOP_NOT_HEARD] = "ещё не на связи", [UI_MENU_COOP_AWAY] = "отошёл",
+    [UI_MENU_COOP_MEMBER_DESC] = "Игрок в комнате. «На связи»: когда последний раз пришло его сообщение, запечатанное "
+                                 "секретом комнаты; игрок, который ещё не на связи, пока не показал, что знает секрет.",
+    [UI_MENU_COOP_REMOVE] = "Удалить",
+    [UI_MENU_COOP_REMOVE_DESC] = "Как создатель комнаты вы можете удалить игрока по его ключу: каждая игра отбрасывает этот "
+                                 "ключ и возвращает взятое им из запасов, а ретранслятор отключает игрока и больше не "
+                                 "пускает. Тот, кто знает секрет, может вернуться с новым ключом, и тогда все получат новое "
+                                 "предложение, которое можно принять или нет; для надёжности создайте новую комнату.",
+    [UI_MENU_COOP_REMOVE_CONFIRM] = "Удалить %s из комнаты?",
+    [UI_MENU_COOP_SECRET_DESC] = "Любой, у кого есть секрет, может войти в комнату: передавайте его только приглашённым "
+                                 "игрокам, голосом или личным сообщением. Он показывается, только когда вы попросите; "
+                                 "скройте его, прежде чем показывать экран другим. Ретранслятор его никогда не узнаёт.",
+    [UI_MENU_COOP_SHOW] = "нажмите, чтобы показать", [UI_MENU_COOP_HIDE] = "нажмите, чтобы скрыть",
+    [UI_MENU_COOP_COPY] = "Копировать секрет",
+    [UI_MENU_COOP_COPY_DESC] = "Помещает секрет комнаты в буфер обмена, чтобы вставить его в личное сообщение.",
+    [UI_MENU_COOP_OFFER] = "Комната ждёт вашего ответа",
+    [UI_MENU_COOP_OFFER_WHO] = "В комнате: %s.", [UI_MENU_COOP_OFFER_NOBODY] = "больше пока никого",
+    [UI_MENU_COOP_OFFER_SHARED] = "Общее для всех: %s.", [UI_MENU_COOP_OFFER_POOLED] = "Общий запас на всех: %s.",
+    [UI_MENU_COOP_OFFER_NOTHING] = "Правила ничего не делят.",
+    [UI_MENU_COOP_OFFER_COPY] = "Ничего из комнаты не попадёт в ваше сохранение, пока вы её не примете. Затем сначала всё "
+                                "ваше сохранение (все слоты) копируется в coop-backup/<дата и время> в папке профиля, и "
+                                "только после этого приходит прогресс комнаты.",
+    [UI_MENU_COOP_OFFER_TRUST] = "Игрок в комнате может делать в вашем мире то, что делят правила (открыть сундук, "
+                                 "потратить общий ключ), и игра не может это отменить: принимайте только тех, кому "
+                                 "доверяете своё сохранение.",
+    [UI_MENU_COOP_ANSWER] = "Принять или нет",
+    [UI_MENU_COOP_ANSWER_DESC] = "Показывает предложение с кнопками «Принять» и «Не сейчас». Новый игрок или другие правила "
+                                 "создают новое предложение, которое снова ждёт вашего ответа.",
+    [UI_MENU_COOP_ACCEPT_CONFIRM] = "Принять эту комнату?", [UI_MENU_COOP_ACCEPT] = "Принять",
+    [UI_MENU_COOP_NOT_NOW] = "Не сейчас",
+    [UI_MENU_COOP_ACCEPTED] = "Принято: прогресс комнаты попадает в ваше сохранение. Ваше прежнее сохранение лежит в "
+                              "coop-backup в папке профиля.",
+    [UI_MENU_COOP_COPY_FAILED] = "Принято, но сохранение не удалось скопировать, поэтому ничего из комнаты не применяется; "
+                                 "причина в журнале.",
+    [UI_MENU_COOP_RULES_ROOM] = "Правила комнаты", [UI_MENU_COOP_RULES_MINE] = "Правила комнаты, которую создадите вы",
+    [UI_MENU_COOP_RULES_UNKNOWN] = "Правила комнаты ещё не пришли.",
+    [UI_MENU_COOP_RULES_CHANGE] = "Изменение — это новое предложение: остальные ничего больше не берут из комнаты, пока не "
+                                  "примут его.",
+    [UI_MENU_COOP_RULES_SET_BY] = "задаёт создатель комнаты", [UI_MENU_COOP_RULE_FOLLOWS] = "следует за «Прогрессом»",
+    [UI_MENU_COOP_R_PROGRESS] = "Прогресс", [UI_MENU_COOP_R_ITEMS] = "Предметы", [UI_MENU_COOP_R_SONGS] = "Мелодии",
+    [UI_MENU_COOP_R_QUEST] = "Квестовые предметы", [UI_MENU_COOP_R_KEYS] = "Малые ключи", [UI_MENU_COOP_R_RUPEES] = "Рупии",
+    [UI_MENU_COOP_R_AMMO] = "Боеприпасы",
+    [UI_MENU_COOP_R_PROGRESS_DESC] = "Флаги сюжета, мира и подземелий: события, разговоры, сундуки, двери, переключатели, "
+                                     "боссы, карта и компас. Общее: то, что делает один игрок, происходит в каждом мире. "
+                                     "Своё: каждый мир хранит своё, и малые ключи тогда тоже свои.",
+    [UI_MENU_COOP_R_ITEMS_DESC] = "Снаряжение, ключевые предметы, имеющиеся бутылки, размеры кошелька, сумки и колчана, "
+                                  "размер шкалы магии; из количеств побеждает наибольшее. «Своё» возможно только при своём "
+                                  "«Прогрессе»: в общем мире сундук, открытый одним игроком, пуст для остальных.",
+    [UI_MENU_COOP_R_SONGS_DESC] = "Выученные мелодии. «Своё» возможно только при своём «Прогрессе».",
+    [UI_MENU_COOP_R_QUEST_DESC] = "Медальоны, духовные камни, Камень Агонии и карта Герудо. «Своё» возможно только при своём "
+                                  "«Прогрессе».",
+    [UI_MENU_COOP_R_KEYS_DESC] = "Малые ключи, по подземельям. Запас: ключ, подобранный кем угодно, идёт в запас "
+                                 "подземелья, а дверь, открытая кем угодно, забирает один. «Своё» при своём «Прогрессе».",
+    [UI_MENU_COOP_R_RUPEES_DESC] = "Запас: один кошелёк, который все игроки пополняют и тратят. Своё: у каждого свой.",
+    [UI_MENU_COOP_R_AMMO_DESC] = "Бомбы, бомбчу, стрелы, орехи деку, семена и палки, волшебные бобы. Запас: одно "
+                                 "количество, которое все игроки пополняют и тратят.",
+    [UI_MENU_COOP_SHARED] = "общее", [UI_MENU_COOP_OWN] = "своё", [UI_MENU_COOP_POOL] = "запас",
+    [UI_MENU_COOP_LEAVE] = "Покинуть комнату",
+    [UI_MENU_COOP_LEAVE_DESC] = "Выходит из комнаты. То, что комната дала вашему сохранению, остаётся в нём.",
+    [UI_MENU_COOP_LEAVE_CONFIRM] = "Покинуть комнату? То, что она дала вашему сохранению, останется.",
+    [UI_MENU_COOP_LEAVE_MAKER] = "Эту комнату создали вы: пока вас нет, никто не может менять её правила или удалять "
+                                 "игроков, а если в ней больше никого нет, она закроется.",
+    [UI_MENU_COOP_STAY] = "Остаться",
+    [UI_MENU_COOP_TOAST_JOINED] = "%s входит в комнату", [UI_MENU_COOP_TOAST_LEFT] = "%s покидает комнату",
+    [UI_MENU_COOP_TOAST_OFFER] = "Комната кооператива ждёт вашего ответа во вкладке «Кооператив» меню",
+    [UI_MENU_COOP_LOST] = "Ретранслятор потерял комнату; игра возвращается в неё.",
+    [UI_MENU_COOP_JOIN_LIMIT] = "Ретранслятор пока не принимает новых входов из вашей сети; игра попробует снова через минуту.",
+    [UI_MENU_COOP_NOT_IDENTIFIED] = "не назвался", [UI_MENU_COOP_REMOVED] = "удалён создателем",
+    [UI_MENU_COOP_KEY] = "ключ %s",
+    [UI_MENU_COOP_OFFER_KEY] = "Правила подписаны ключом %s.",
+    [UI_MENU_COOP_OFFER_COMPARE] = "Прежде чем принять, попросите создателя комнаты прочитать вам свой ключ голосом или в "
+                                   "чате и сравните его с этим.",
+    [UI_MENU_COOP_MY_KEY] = "Ваш ключ, которым подписаны правила этой комнаты: %s. Прочитайте его остальным голосом или в "
+                            "чате, чтобы они могли сравнить его, прежде чем принять.",
+    [UI_MENU_COOP_UNIDENTIFIED] = "Игроков в комнате, которые не опознаны: %d (не назвались, или два ключа называют себя одним "
+                                  "и тем же игроком). Пока они в ней, никто не может принять комнату: создатель может удалить "
+                                  "их, или все переходят в новую комнату.",
+    [UI_MENU_COOP_DISAGREE] = "У игроков правила, подписанные разными ключами: прежде чем принять, спросите создателя "
+                              "комнаты, какой ключ его.",
+    [UI_MENU_COOP_NEW_SAVE] = "В этой комнате играют другое сохранение: оно получает прогресс комнаты, в котором есть то, "
+                              "что принесло прошлое сохранение.",
+    [UI_MENU_COOP_WARNINGS] = "Прежде чем войти в комнату с незнакомцами",
+    [UI_MENU_COOP_WARN_SAVE] = "1. Держите сохранение, к которому можно вернуться. Любой, кого вы приняли, может ставить "
+                               "сюжетные флаги в вашем сохранении, как и любой, кого принял он; игрок в ваших запасах может "
+                               "опустошить малые ключи подземелья. Никакое удаление не возвращает флаг: это делает копия в "
+                               "coop-backup/first-<дата и время>.",
+    [UI_MENU_COOP_WARN_ROOM] = "2. Ваше согласие — ваше, комната — нет. Принятые вами игроки передают флаги тех, кого "
+                               "приняли они, а кто может пользоваться запасами, решает только создатель. Если в комнате "
+                               "есть кто-то незнакомый, не принимайте: выйдите и попросите у создателя новую комнату.",
+    [UI_MENU_COOP_WARN_KEY] = "3. Сверьте ключ создателя и не отдавайте свой. Сравните ключ, которым подписаны правила, с "
+                              "ключом создателя, никогда не запускайте игру с настройками или скриптом, которые вам дали, "
+                              "и никому не отдавайте копию папки профиля.",
+    [UI_MENU_COOP_POOLS] = "Запасы",
+    [UI_MENU_COOP_SPENT] = "взял сверх принесённого: ключей %lld, рупий %lld, боеприпасов %lld",
+    [UI_MENU_COOP_NOT_IN_ROOM] = "не в комнате",
+    [UI_MENU_COOP_SPENT_NONE] = "Никто не взял из запасов больше, чем принёс.",
+    [UI_MENU_COOP_SPENT_DESC] = "Этот ключ взял из запасов больше, чем принёс. Здесь и игрок, который пользовался ключами, "
+                                "найденными другими; тот, кого никто не ждал, опустошил запасы. Удаление ключа возвращает "
+                                "взятое во всех играх, и после ухода игрока тоже. Удалите ключ до сброса запасов: сброс "
+                                "оставляет взятое игроку, который ещё в комнате.",
+    [UI_MENU_COOP_RESET] = "Сбросить запасы",
+    [UI_MENU_COOP_RESET_DESC] = "Каждая игра заново входит в запасы с тем, что у неё было для игроков в комнате. Так "
+                                "восстанавливается запас, который опустошил ушедший игрок; флаги остаются как есть. Игрок, "
+                                "опустошивший запас и оставшийся в комнате, сохраняет взятое: сначала удалите его, потом сбросьте.",
+    [UI_MENU_COOP_RESET_CONFIRM] = "Сбросить запасы для всех в комнате?",
+    [UI_MENU_COOP_REMOVE_KEY_CONFIRM] = "Удалить %s (ключ %s) из комнаты?",
+    [UI_MENU_COOP_NOT_ACCEPTED] = "Не принято: комната изменилась или кто-то в ней не опознан. Посмотрите предложение ещё раз.",
+    [UI_MENU_COOP_ACCEPTED_AS] = "ключ, который вы приняли как %s",
     [UI_BOOT_TITLE] = "Подготовка шейдеров",
     [UI_BOOT_STARTING] = "Запуск", [UI_BOOT_SHADERS] = "Шейдеры: %lld из %lld", [UI_BOOT_PIPELINES] = "Конвейеры: %lld из %lld",
     [UI_MENU_CHEATS_REBUILD] = "Пересобрать игру сейчас",
@@ -1167,6 +1398,7 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_DEFAULT_MARK] = "padrão",
     [UI_MENU_AFTER_RESTART] = "após reiniciar", [UI_MENU_SET_BY_ENV] = "definido por variável de ambiente",
     [UI_MENU_SAVE_FAILED] = "não foi possível salvar as configurações",
+    [UI_MENU_INI_UNKNOWN] = "nx2navi.ini: não são configurações desta versão, ignoradas: %s",
     [UI_MENU_VERSION] = "NX2navi %s, jogo %s",
 
     [UI_MENU_FULLSCREEN] = "Tela cheia", [UI_MENU_FULLSCREEN_DESC] = "Jogar em tela cheia. F11 alterna.",
@@ -1202,7 +1434,7 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_SHARPNESS_NEEDS_FSR] = "só com AMD FSR 1",
 
     [UI_MENU_FPS_LIMIT] = "Limite de quadros",
-    [UI_MENU_FPS_LIMIT_DESC] = "A taxa de quadros máxima do jogo.",
+    [UI_MENU_FPS_LIMIT_DESC] = "A taxa máxima de quadros que o jogo desenha. A geração de quadros soma os dela por cima.",
     [UI_MENU_FPS_30] = "30 FPS", [UI_MENU_FPS_40] = "40 FPS", [UI_MENU_FPS_45] = "45 FPS",
     [UI_MENU_FPS_60] = "60 FPS", [UI_MENU_FPS_90] = "90 FPS", [UI_MENU_FPS_120] = "120 FPS", [UI_MENU_FPS_144] = "144 FPS",
     [UI_MENU_ASSUME_FOCUS] = "Continuar rodando fora de foco",
@@ -1511,7 +1743,7 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_PROMPTS_PLAYSTATION] = "PlayStation",
     [UI_MENU_PROMPTS_PC] = "Teclado e mouse",
     [UI_MENU_MOUSE_MODE] = "Câmera com o mouse",
-    [UI_MENU_MOUSE_MODE_DESC] = "Direta: a câmera gira o quanto o mouse se move, como num jogo de PC, sem zona morta nem curva do analógico (jogo 1.4.3; as outras versões usam a emulação do analógico). Emulação do analógico: o mouse age como o analógico direito.",
+    [UI_MENU_MOUSE_MODE_DESC] = "Direta: a câmera gira o quanto o mouse se move, como num jogo de PC, sem zona morta nem curva do analógico (jogos 1.1.1 e 1.4.3; as outras versões usam a emulação do analógico). Emulação do analógico: o mouse age como o analógico direito.",
     [UI_MENU_MOUSE_STICK] = "Emulação do analógico",
     [UI_MENU_MOUSE_DIRECT] = "Direta",
     [UI_MENU_MENU_CURSOR] = "Mouse nos menus do jogo",
@@ -1540,33 +1772,6 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_WALK_SCALE_DESC] = "A inclinação dos analógicos do teclado enquanto a tecla de andar está segura. Metade "
                                 "é andar, a inclinação total é correr.",
     [UI_MENU_OV_SCALE_DOWN] = "bilinear (nitidez FSR 0)",
-    [UI_MENU_HDR_HUE] = "Correção de matiz",
-    [UI_MENU_HDR_HUE_DESC] = "Quanto as cores brilhantes mantêm o matiz que tinham antes da curva de tons; 0 deixa que "
-                             "mudem com a curva.",
-    [UI_MENU_HDR_GAMMA] = "Correção de gama",
-    [UI_MENU_HDR_GAMMA_DESC] = "Mostra a imagem como uma tela de gama 2.2 ou BT.1886 (2.4) mostraria, como o jogo foi "
-                               "feito para ser visto; Desligado mantém a curva sRGB, com sombras mais claras.",
-    [UI_MENU_HDR_TONEMAP] = "Curva de tons",
-    [UI_MENU_HDR_TONEMAP_DESC] = "Vanilla: a curva do próprio jogo, com brilho SDR. RenoDRT: o visual do jogo levado até "
-                                 "o pico da sua tela.",
-    [UI_MENU_HDR_EXPOSURE] = "Exposição",
-    [UI_MENU_HDR_EXPOSURE_DESC] = "Brilho de toda a imagem antes da curva de tons; 100 % a deixa como está.",
-    [UI_MENU_HDR_HIGHLIGHTS] = "Realces",
-    [UI_MENU_HDR_HIGHLIGHTS_DESC] = "Brilho das partes claras; 50 as deixa como estão.",
-    [UI_MENU_HDR_SHADOWS] = "Sombras",
-    [UI_MENU_HDR_SHADOWS_DESC] = "Brilho das partes escuras; 50 as deixa como estão.",
-    [UI_MENU_HDR_CONTRAST] = "Contraste",
-    [UI_MENU_HDR_CONTRAST_DESC] = "Contraste em torno do cinza médio; 50 o deixa como está.",
-    [UI_MENU_HDR_SATURATION] = "Saturação",
-    [UI_MENU_HDR_SATURATION_DESC] = "Força de todas as cores; 50 a deixa como está.",
-    [UI_MENU_HDR_HIGHLIGHT_SAT] = "Saturação dos realces",
-    [UI_MENU_HDR_HIGHLIGHT_SAT_DESC] = "Força das cores das partes mais claras; 50 a deixa como está.",
-    [UI_MENU_HDR_BLOWOUT] = "Estouro",
-    [UI_MENU_HDR_BLOWOUT_DESC] = "Leva as partes mais claras para o branco; 0 mantém a cor delas.",
-    [UI_MENU_HDR_FLARE] = "Flare",
-    [UI_MENU_HDR_FLARE_DESC] = "Ergue as partes mais escuras como um pouco de luz difusa faria; 0 mantém o preto preto.",
-    [UI_MENU_HDR_GRADE] = "Gradação de cor",
-    [UI_MENU_HDR_GRADE_DESC] = "Quanto da gradação de cor do próprio jogo a imagem HDR mantém; 0 é a cena sem ela.",
     [UI_MENU_SHADOW_SCALE] = "Resolução das sombras",
     [UI_MENU_SHADOW_SCALE_DESC] = "Sombras mais nítidas. Mais alto exige mais da placa de vídeo.",
     [UI_MENU_SHADOW_RANGE] = "Alcance das cascatas de sombra",
@@ -1659,6 +1864,151 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_SAVE_E_NEWER] = "%s foi feito por um NX2navi mais novo: atualize o NX2navi primeiro.",
     [UI_MENU_SAVE_E_DAMAGED] = "%s está danificado: baixe-o de novo.",
     [UI_MENU_SAVE_E_UNSAFE] = "%s foi recusado: contém arquivos fora de um save, links ou dados demais.",
+    [UI_MENU_TAB_COOP] = "Cooperativo",
+    [UI_MENU_COOP_ON] = "Cooperativo",
+    [UI_MENU_COOP_ON_DESC] = "Jogue com amigos, cada um no seu próprio jogo e save: uma sala em um relay compartilha o "
+                             "progresso da história entre eles conforme as regras dela (docs/coop.md). Desligado: o jogo "
+                             "não usa a rede. Criar uma sala e Entrar em uma sala o ligam.",
+    [UI_MENU_COOP_NAME] = "Seu nome",
+    [UI_MENU_COOP_NAME_DESC] = "O nome que os outros jogadores da sala veem; o relay também o vê. No máximo 24 bytes. "
+                               "Vazio: Player- e quatro dígitos aleatórios.",
+    [UI_MENU_COOP_AUTO] = "automático",
+    [UI_MENU_COOP_SERVER] = "Endereço do relay",
+    [UI_MENU_COOP_SERVER_DESC] = "O relay que conecta os jogos dos jogadores: host, host:porta ou [IPv6]:porta (porta 24680 "
+                                 "se nenhuma for dada). Quem o executa (python tools/coop_relay.py) passa o endereço aos "
+                                 "outros. O log e as informações do sistema não o mostram.",
+    [UI_MENU_COOP_NONE] = "nenhum",
+    [UI_MENU_COOP_MAKE] = "Criar uma sala",
+    [UI_MENU_COOP_MAKE_DESC] = "Cria uma sala com um novo segredo de 18 caracteres, que você passa aos jogadores que "
+                               "convidar (por voz ou mensagem privada). Uma sala criada por você compartilha conforme as "
+                               "regras abaixo, e você pode mudá-las enquanto joga.",
+    [UI_MENU_COOP_JOIN] = "Entrar em uma sala",
+    [UI_MENU_COOP_JOIN_DESC] = "Entra na sala cujo segredo outro jogador lhe deu. Nada da sala chega ao seu save antes de "
+                               "você ver quem está nela e o que ela compartilha, e aceitá-la aqui.",
+    [UI_MENU_COOP_NEED_SERVER] = "defina antes o endereço do relay",
+    [UI_MENU_COOP_SECRET] = "Segredo da sala",
+    [UI_MENU_COOP_SECRET_HINT] = "18 caracteres, como XXXXXX-XXXXXX-XXXXXX: maiúsculas ou minúsculas, com ou sem hífens.",
+    [UI_MENU_COOP_SECRET_BAD] = "Isto não é um segredo de sala: ele tem 18 caracteres de 23456789BCDFGHJKMNPRSTVWXYZ.",
+    [UI_MENU_COOP_PASTE] = "Colar", [UI_MENU_COOP_PASTE_EMPTY] = "A área de transferência não tem texto.",
+    [UI_MENU_COOP_OK] = "OK", [UI_MENU_COOP_STOP] = "Parar",
+    [UI_MENU_COOP_STOP_DESC] = "Para de tentar chegar à sala.",
+    [UI_MENU_COOP_CONNECTING] = "Conectando: %s",
+    [UI_MENU_COOP_RECONNECTING] = "O relay ficou em silêncio; voltando para a sala: %s",
+    [UI_MENU_COOP_LEFT] = "Fora de uma sala: %s",
+    [UI_MENU_COOP_NO_ROOM] = "Nenhuma sala aberta no relay tem este segredo: confira-o ou pergunte a quem criou a sala se "
+                             "ela ainda está aberta.",
+    [UI_MENU_COOP_NOT_STARTED] = "O cooperativo não iniciou; o log diz por quê.",
+    [UI_MENU_COOP_PLAYERS] = "Jogadores", [UI_MENU_COOP_YOU] = "você", [UI_MENU_COOP_MAKER] = "criou a sala",
+    [UI_MENU_COOP_HEARD] = "ouvido há %u s", [UI_MENU_COOP_NOT_HEARD] = "ainda não ouvido", [UI_MENU_COOP_AWAY] = "ausente",
+    [UI_MENU_COOP_MEMBER_DESC] = "Um jogador da sala. Ouvido: quando chegou a última mensagem dele selada com o segredo da "
+                                 "sala; um jogador ainda não ouvido não mostrou que o conhece.",
+    [UI_MENU_COOP_REMOVE] = "Remover",
+    [UI_MENU_COOP_REMOVE_DESC] = "Como criador da sala, você pode remover um jogador pela chave dele: cada jogo descarta essa "
+                                 "chave e devolve o que ela pegou dos estoques, e o relay desconecta o jogador e o recusa de "
+                                 "novo. Quem conhece o segredo pode voltar com uma nova chave, e todos então recebem uma "
+                                 "nova oferta para aceitar ou não; para ter certeza, crie uma nova sala.",
+    [UI_MENU_COOP_REMOVE_CONFIRM] = "Remover %s da sala?",
+    [UI_MENU_COOP_SECRET_DESC] = "Qualquer pessoa com o segredo pode entrar na sala: passe-o só aos jogadores que convidar, "
+                                 "por voz ou mensagem privada. Ele só aparece quando você pede; esconda-o antes de "
+                                 "compartilhar a tela. O relay nunca o conhece.",
+    [UI_MENU_COOP_SHOW] = "pressione para mostrar", [UI_MENU_COOP_HIDE] = "pressione para esconder",
+    [UI_MENU_COOP_COPY] = "Copiar o segredo",
+    [UI_MENU_COOP_COPY_DESC] = "Coloca o segredo da sala na área de transferência, para colar em uma mensagem privada.",
+    [UI_MENU_COOP_OFFER] = "Esta sala aguarda sua resposta",
+    [UI_MENU_COOP_OFFER_WHO] = "Na sala: %s.", [UI_MENU_COOP_OFFER_NOBODY] = "ninguém mais ainda",
+    [UI_MENU_COOP_OFFER_SHARED] = "Compartilhado por todos: %s.",
+    [UI_MENU_COOP_OFFER_POOLED] = "Em um estoque comum para todos: %s.",
+    [UI_MENU_COOP_OFFER_NOTHING] = "As regras não compartilham nada.",
+    [UI_MENU_COOP_OFFER_COPY] = "Nada da sala chega ao seu save antes de você aceitar. Então todo o seu save (todos os "
+                                "slots) é primeiro copiado para coop-backup/<data e hora> na pasta do perfil, e só depois "
+                                "disso chega o progresso da sala.",
+    [UI_MENU_COOP_OFFER_TRUST] = "Um jogador da sala pode fazer no seu mundo o que as regras compartilham (abrir um baú, "
+                                 "gastar uma chave comum), e o jogo não pode desfazer: aceite só jogadores a quem você "
+                                 "confiaria o seu save.",
+    [UI_MENU_COOP_ANSWER] = "Aceitar ou não",
+    [UI_MENU_COOP_ANSWER_DESC] = "Mostra a oferta com Aceitar e Agora não. Um novo jogador ou outras regras criam uma nova "
+                                 "oferta, que aguarda sua resposta outra vez.",
+    [UI_MENU_COOP_ACCEPT_CONFIRM] = "Aceitar esta sala?", [UI_MENU_COOP_ACCEPT] = "Aceitar",
+    [UI_MENU_COOP_NOT_NOW] = "Agora não",
+    [UI_MENU_COOP_ACCEPTED] = "Aceita: o progresso da sala chega ao seu save. O seu save como era está em coop-backup na "
+                              "pasta do perfil.",
+    [UI_MENU_COOP_COPY_FAILED] = "Aceita, mas não foi possível copiar o seu save, então nada da sala é aplicado; o log diz "
+                                 "por quê.",
+    [UI_MENU_COOP_RULES_ROOM] = "Regras da sala", [UI_MENU_COOP_RULES_MINE] = "Regras de uma sala criada por você",
+    [UI_MENU_COOP_RULES_UNKNOWN] = "As regras da sala ainda não chegaram.",
+    [UI_MENU_COOP_RULES_CHANGE] = "Uma mudança é uma nova oferta: os outros não recebem mais nada da sala até aceitá-la.",
+    [UI_MENU_COOP_RULES_SET_BY] = "definido por quem criou a sala", [UI_MENU_COOP_RULE_FOLLOWS] = "segue o Progresso",
+    [UI_MENU_COOP_R_PROGRESS] = "Progresso", [UI_MENU_COOP_R_ITEMS] = "Itens", [UI_MENU_COOP_R_SONGS] = "Músicas",
+    [UI_MENU_COOP_R_QUEST] = "Itens de missão", [UI_MENU_COOP_R_KEYS] = "Chaves pequenas", [UI_MENU_COOP_R_RUPEES] = "Rupias",
+    [UI_MENU_COOP_R_AMMO] = "Munição",
+    [UI_MENU_COOP_R_PROGRESS_DESC] = "Flags da história, do mundo e das masmorras: eventos, conversas, baús, portas, "
+                                     "interruptores, chefes, mapa e bússola. Compartilhado: o que um jogador faz acontece "
+                                     "em todos os mundos. Próprio: cada mundo mantém o seu, e as chaves pequenas também "
+                                     "ficam próprias.",
+    [UI_MENU_COOP_R_ITEMS_DESC] = "Equipamento, itens-chave, garrafas obtidas, tamanhos da carteira, da bolsa e da aljava, "
+                                  "tamanho do medidor de magia; de uma quantidade, vence a maior. Próprio só é possível com "
+                                  "Progresso próprio: num mundo compartilhado, um baú que um jogador abriu fica vazio para "
+                                  "os outros.",
+    [UI_MENU_COOP_R_SONGS_DESC] = "As músicas aprendidas. Próprio só é possível com Progresso próprio.",
+    [UI_MENU_COOP_R_QUEST_DESC] = "Medalhões, pedras espirituais, a Pedra da Agonia e o cartão Gerudo. Próprio só é "
+                                  "possível com Progresso próprio.",
+    [UI_MENU_COOP_R_KEYS_DESC] = "Chaves pequenas, por masmorra. Estoque: uma chave que qualquer um pega vai para o estoque "
+                                 "da masmorra, e uma porta que qualquer um abre tira uma. Próprio com Progresso próprio.",
+    [UI_MENU_COOP_R_RUPEES_DESC] = "Estoque: uma carteira que todos os jogadores enchem e gastam. Próprio: cada um tem a sua.",
+    [UI_MENU_COOP_R_AMMO_DESC] = "Bombas, bombchus, flechas, nozes deku, sementes e galhos, feijões mágicos. Estoque: uma "
+                                 "quantidade que todos os jogadores enchem e gastam.",
+    [UI_MENU_COOP_SHARED] = "compartilhado", [UI_MENU_COOP_OWN] = "próprio", [UI_MENU_COOP_POOL] = "estoque",
+    [UI_MENU_COOP_LEAVE] = "Sair da sala",
+    [UI_MENU_COOP_LEAVE_DESC] = "Sai da sala. O que a sala deu ao seu save fica nele.",
+    [UI_MENU_COOP_LEAVE_CONFIRM] = "Sair da sala? O que ela deu ao seu save fica.",
+    [UI_MENU_COOP_LEAVE_MAKER] = "Você criou esta sala: enquanto estiver fora, ninguém pode mudar as regras nem remover um "
+                                 "jogador, e se não houver mais ninguém nela, ela fecha.",
+    [UI_MENU_COOP_STAY] = "Ficar",
+    [UI_MENU_COOP_TOAST_JOINED] = "%s entrou na sala", [UI_MENU_COOP_TOAST_LEFT] = "%s saiu da sala",
+    [UI_MENU_COOP_TOAST_OFFER] = "A sala cooperativa aguarda sua resposta na aba Cooperativo do menu",
+    [UI_MENU_COOP_LOST] = "O relay perdeu a sala; o jogo está voltando a ela.",
+    [UI_MENU_COOP_JOIN_LIMIT] = "O relay não aceita mais entradas da sua rede por enquanto; o jogo tenta de novo em um minuto.",
+    [UI_MENU_COOP_NOT_IDENTIFIED] = "não identificado", [UI_MENU_COOP_REMOVED] = "removido pelo criador",
+    [UI_MENU_COOP_KEY] = "chave %s",
+    [UI_MENU_COOP_OFFER_KEY] = "As regras são assinadas pela chave %s.",
+    [UI_MENU_COOP_OFFER_COMPARE] = "Antes de aceitar, peça ao criador da sala que leia a chave dele para você, por voz ou "
+                                   "chat, e compare-a com esta.",
+    [UI_MENU_COOP_MY_KEY] = "Sua chave, que assina as regras desta sala: %s. Leia-a para os outros, por voz ou chat, para "
+                            "que possam compará-la antes de aceitar.",
+    [UI_MENU_COOP_UNIDENTIFIED] = "Jogadores na sala que não estão identificados: %d (não disseram quem são, ou duas chaves "
+                                  "dizem ser o mesmo jogador). Ninguém pode aceitar a sala enquanto eles estiverem nela: o "
+                                  "criador pode removê-los, ou todos vão para uma nova sala.",
+    [UI_MENU_COOP_DISAGREE] = "Os jogadores trazem regras assinadas por chaves diferentes: pergunte ao criador da sala qual "
+                              "chave é a dele antes de aceitar.",
+    [UI_MENU_COOP_NEW_SAVE] = "Outro save é jogado nesta sala: ele recebe o progresso da sala, que inclui o que o último "
+                              "save trouxe.",
+    [UI_MENU_COOP_WARNINGS] = "Antes de entrar em uma sala com desconhecidos",
+    [UI_MENU_COOP_WARN_SAVE] = "1. Tenha um save para o qual possa voltar. Qualquer um que você aceitar pode definir flags da "
+                               "história no seu save, assim como quem essa pessoa aceitou; um jogador nos seus estoques pode "
+                               "esvaziar as chaves pequenas de uma masmorra. Nenhuma remoção desfaz uma flag: a cópia em "
+                               "coop-backup/first-<data e hora> desfaz.",
+    [UI_MENU_COOP_WARN_ROOM] = "2. Sua aceitação é sua, a sala não. Os jogadores que você aceita repassam as flags dos "
+                               "jogadores que eles aceitaram, e só o criador decide quem pode usar os estoques. Se houver "
+                               "alguém que você não conhece na sala, não aceite: saia e peça ao criador uma nova sala.",
+    [UI_MENU_COOP_WARN_KEY] = "3. Confira a chave do criador e guarde a sua. Compare a chave que assina as regras com a do "
+                              "criador, nunca inicie o jogo com configurações ou um script que alguém lhe passou, e nunca "
+                              "entregue uma cópia da sua pasta de perfil.",
+    [UI_MENU_COOP_POOLS] = "Estoques",
+    [UI_MENU_COOP_SPENT] = "pegou além do que trouxe: %lld chaves, %lld rupias, %lld munições",
+    [UI_MENU_COOP_NOT_IN_ROOM] = "fora da sala",
+    [UI_MENU_COOP_SPENT_NONE] = "Ninguém pegou dos estoques mais do que trouxe.",
+    [UI_MENU_COOP_SPENT_DESC] = "Esta chave pegou dos estoques mais do que trouxe. Um jogador que usou chaves que outros "
+                                "acharam também aparece; alguém que ninguém esperava esvaziou os estoques. Remover a chave "
+                                "devolve o que ela pegou, em todos os jogos, também depois que o jogador saiu. Remova-a antes "
+                                "de redefinir os estoques: a redefinição mantém o que pegou um jogador que ainda está na sala.",
+    [UI_MENU_COOP_RESET] = "Redefinir os estoques",
+    [UI_MENU_COOP_RESET_DESC] = "Cada jogo entra de novo nos estoques com o que tinha para os jogadores na sala. Isso "
+                                "recupera um estoque que um jogador que saiu esvaziou; as flags ficam como estão. Um jogador "
+                                "que esvaziou um estoque e ainda está na sala fica com o que pegou: remova-o primeiro, depois redefina.",
+    [UI_MENU_COOP_RESET_CONFIRM] = "Redefinir os estoques para todos na sala?",
+    [UI_MENU_COOP_REMOVE_KEY_CONFIRM] = "Remover %s, chave %s, da sala?",
+    [UI_MENU_COOP_NOT_ACCEPTED] = "Não aceito: a sala mudou ou alguém nela não está identificado. Veja a oferta de novo.",
+    [UI_MENU_COOP_ACCEPTED_AS] = "uma chave que você aceitou como %s",
     [UI_BOOT_TITLE] = "Preparando shaders",
     [UI_BOOT_STARTING] = "Iniciando", [UI_BOOT_SHADERS] = "Shaders: %lld de %lld", [UI_BOOT_PIPELINES] = "Pipelines: %lld de %lld",
     [UI_MENU_CHEATS_REBUILD] = "Recompilar o jogo agora",
@@ -1721,6 +2071,7 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_AFTER_RESTART] = "重启后生效",
     [UI_MENU_SET_BY_ENV] = "由环境变量设定",
     [UI_MENU_SAVE_FAILED] = "无法保存设置",
+    [UI_MENU_INI_UNKNOWN] = "nx2navi.ini：以下不是此版本的设置，已忽略：%s",
     [UI_MENU_VERSION] = "NX2navi %s，游戏 %s",
     [UI_MENU_FULLSCREEN] = "全屏",
     [UI_MENU_FULLSCREEN_DESC] = "全屏运行。按 F11 切换。",
@@ -1781,7 +2132,7 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_COLOR_GAMMA] = "伽马",
     [UI_MENU_COLOR_GAMMA_DESC] = "小于 1 提亮暗部与中间调，大于 1 压暗；1 表示不调整。",
     [UI_MENU_FPS_LIMIT] = "帧率上限",
-    [UI_MENU_FPS_LIMIT_DESC] = "游戏的最高帧率。",
+    [UI_MENU_FPS_LIMIT_DESC] = "游戏绘制的最高帧率。帧生成的帧在此之上另算。",
     [UI_MENU_FPS_30] = "30 FPS",
     [UI_MENU_FPS_40] = "40 FPS",
     [UI_MENU_FPS_45] = "45 FPS",
@@ -2171,7 +2522,7 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_PROMPTS_PLAYSTATION] = "PlayStation",
     [UI_MENU_PROMPTS_PC] = "键盘和鼠标",
     [UI_MENU_MOUSE_MODE] = "鼠标视角",
-    [UI_MENU_MOUSE_MODE_DESC] = "直接：镜头按鼠标移动的距离转动，与电脑游戏相同，没有摇杆死区和响应曲线（游戏 1.4.3；其他版本使用摇杆模拟）。摇杆模拟：鼠标相当于右摇杆。",
+    [UI_MENU_MOUSE_MODE_DESC] = "直接：镜头按鼠标移动的距离转动，与电脑游戏相同，没有摇杆死区和响应曲线（游戏 1.1.1 和 1.4.3；其他版本使用摇杆模拟）。摇杆模拟：鼠标相当于右摇杆。",
     [UI_MENU_MOUSE_STICK] = "摇杆模拟",
     [UI_MENU_MOUSE_DIRECT] = "直接",
     [UI_MENU_MENU_CURSOR] = "在游戏菜单中使用鼠标",
@@ -2198,30 +2549,6 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_WALK_SCALE] = "步行幅度",
     [UI_MENU_WALK_SCALE_DESC] = "按住步行键时键盘摇杆的推动幅度。一半为走路，推满为奔跑。",
     [UI_MENU_OV_SCALE_DOWN] = "双线性（FSR 锐度 0）",
-    [UI_MENU_HDR_HUE] = "色调校正",
-    [UI_MENU_HDR_HUE_DESC] = "明亮色彩保留色调映射前色调的程度；0 让它们随曲线偏移。",
-    [UI_MENU_HDR_GAMMA] = "伽马校正",
-    [UI_MENU_HDR_GAMMA_DESC] = "按游戏设计时的观看方式，以 2.2 或 BT.1886（2.4）显示器的效果呈现画面；关闭则保留 sRGB 曲线，暗部更亮。",
-    [UI_MENU_HDR_TONEMAP] = "色调映射",
-    [UI_MENU_HDR_TONEMAP_DESC] = "Vanilla：游戏自身的曲线，SDR 亮度。RenoDRT：把游戏的观感延伸到显示器的峰值亮度。",
-    [UI_MENU_HDR_EXPOSURE] = "曝光",
-    [UI_MENU_HDR_EXPOSURE_DESC] = "色调映射前整个画面的亮度；100 % 保持不变。",
-    [UI_MENU_HDR_HIGHLIGHTS] = "高光",
-    [UI_MENU_HDR_HIGHLIGHTS_DESC] = "明亮部分的亮度；50 保持不变。",
-    [UI_MENU_HDR_SHADOWS] = "阴影",
-    [UI_MENU_HDR_SHADOWS_DESC] = "暗部的亮度；50 保持不变。",
-    [UI_MENU_HDR_CONTRAST] = "对比度",
-    [UI_MENU_HDR_CONTRAST_DESC] = "中灰周围的对比度；50 保持不变。",
-    [UI_MENU_HDR_SATURATION] = "饱和度",
-    [UI_MENU_HDR_SATURATION_DESC] = "所有色彩的强度；50 保持不变。",
-    [UI_MENU_HDR_HIGHLIGHT_SAT] = "高光饱和度",
-    [UI_MENU_HDR_HIGHLIGHT_SAT_DESC] = "最亮部分的色彩强度；50 保持不变。",
-    [UI_MENU_HDR_BLOWOUT] = "过曝",
-    [UI_MENU_HDR_BLOWOUT_DESC] = "让最亮的部分趋向白色；0 保留其颜色。",
-    [UI_MENU_HDR_FLARE] = "眩光",
-    [UI_MENU_HDR_FLARE_DESC] = "像少量杂散光一样提亮最暗的部分；0 保持纯黑。",
-    [UI_MENU_HDR_GRADE] = "调色",
-    [UI_MENU_HDR_GRADE_DESC] = "HDR 画面保留游戏自身调色的程度；0 为不含调色的场景。",
     [UI_MENU_SHADOW_SCALE] = "阴影分辨率",
     [UI_MENU_SHADOW_SCALE_DESC] = "让阴影更清晰。越高越吃显卡。",
     [UI_MENU_SHADOW_RANGE] = "阴影级联范围",
@@ -2299,6 +2626,120 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_SAVE_E_NEWER] = "%s 由更新版本的 NX2navi 制作：请先更新 NX2navi。",
     [UI_MENU_SAVE_E_DAMAGED] = "%s 已损坏：请重新下载。",
     [UI_MENU_SAVE_E_UNSAFE] = "%s 被拒绝：其中含有存档以外的文件、链接或过多的数据。",
+    [UI_MENU_TAB_COOP] = "合作",
+    [UI_MENU_COOP_ON] = "合作",
+    [UI_MENU_COOP_ON_DESC] = "与朋友一起玩，各自运行自己的游戏和存档：中继服务器上的房间按其规则在玩家之间共享剧情进度"
+                             "（docs/coop.md）。关闭：游戏完全不使用网络。“创建房间”和“加入房间”会将其打开。",
+    [UI_MENU_COOP_NAME] = "你的名字",
+    [UI_MENU_COOP_NAME_DESC] = "房间中其他玩家看到的名字，中继服务器也能看到。最多 24 字节。留空：Player- 加四位随机数字。",
+    [UI_MENU_COOP_AUTO] = "自动",
+    [UI_MENU_COOP_SERVER] = "中继地址",
+    [UI_MENU_COOP_SERVER_DESC] = "连接各玩家游戏的中继服务器：host、host:port 或 [IPv6]:port（未指定时端口为 24680）。"
+                                 "运行它的人（python tools/coop_relay.py）把地址告诉其他人。日志和系统信息不会显示它。",
+    [UI_MENU_COOP_NONE] = "无",
+    [UI_MENU_COOP_MAKE] = "创建房间",
+    [UI_MENU_COOP_MAKE_DESC] = "创建一个带有新的 18 字符密钥的房间，由你告诉受邀的玩家（口头或私信）。你创建的房间按下方"
+                               "规则共享，游戏中也可以修改。",
+    [UI_MENU_COOP_JOIN] = "加入房间",
+    [UI_MENU_COOP_JOIN_DESC] = "加入其他玩家给你密钥的房间。在你看到房间里有谁、共享什么并在此接受之前，房间中的任何内容"
+                               "都不会进入你的存档。",
+    [UI_MENU_COOP_NEED_SERVER] = "请先设置中继地址",
+    [UI_MENU_COOP_SECRET] = "房间密钥",
+    [UI_MENU_COOP_SECRET_HINT] = "18 个字符，形如 XXXXXX-XXXXXX-XXXXXX：大小写均可，带不带连字符均可。",
+    [UI_MENU_COOP_SECRET_BAD] = "这不是房间密钥：密钥由 23456789BCDFGHJKMNPRSTVWXYZ 中的 18 个字符组成。",
+    [UI_MENU_COOP_PASTE] = "粘贴", [UI_MENU_COOP_PASTE_EMPTY] = "剪贴板中没有文字。",
+    [UI_MENU_COOP_OK] = "确定", [UI_MENU_COOP_STOP] = "停止",
+    [UI_MENU_COOP_STOP_DESC] = "不再尝试进入房间。",
+    [UI_MENU_COOP_CONNECTING] = "正在连接：%s",
+    [UI_MENU_COOP_RECONNECTING] = "中继没有响应，正在重新进入房间：%s",
+    [UI_MENU_COOP_LEFT] = "不在房间中：%s",
+    [UI_MENU_COOP_NO_ROOM] = "中继上没有使用此密钥的开放房间：请检查密钥，或询问房主房间是否仍开放。",
+    [UI_MENU_COOP_NOT_STARTED] = "合作未能启动，原因见日志。",
+    [UI_MENU_COOP_PLAYERS] = "玩家", [UI_MENU_COOP_YOU] = "你", [UI_MENU_COOP_MAKER] = "房主",
+    [UI_MENU_COOP_HEARD] = "%u 秒前有消息", [UI_MENU_COOP_NOT_HEARD] = "尚无消息", [UI_MENU_COOP_AWAY] = "离开",
+    [UI_MENU_COOP_MEMBER_DESC] = "房间中的玩家。消息：其最近一条用房间密钥封装的消息到达的时间；尚无消息的玩家还没有证明"
+                                 "自己知道密钥。",
+    [UI_MENU_COOP_REMOVE] = "移除",
+    [UI_MENU_COOP_REMOVE_DESC] = "作为房主，你可以按身份指纹移除玩家：每个游戏都会丢弃该身份并归还它从共用中取走的东西，"
+                                 "中继会断开该玩家并拒绝其再次进入。知道房间密钥的人可以换一个新身份回来，届时所有人都会"
+                                 "收到新的提议，可以接受或不接受；要确保安全，请创建新房间。",
+    [UI_MENU_COOP_REMOVE_CONFIRM] = "将 %s 移出房间？",
+    [UI_MENU_COOP_SECRET_DESC] = "任何拥有密钥的人都能加入房间：只通过口头或私信告诉受邀的玩家。只有在你要求时才显示；"
+                                 "分享屏幕前请将其隐藏。中继永远不会知道它。",
+    [UI_MENU_COOP_SHOW] = "按下以显示", [UI_MENU_COOP_HIDE] = "按下以隐藏",
+    [UI_MENU_COOP_COPY] = "复制密钥",
+    [UI_MENU_COOP_COPY_DESC] = "将房间密钥放入剪贴板，以便粘贴到私信中。",
+    [UI_MENU_COOP_OFFER] = "此房间正等待你的答复",
+    [UI_MENU_COOP_OFFER_WHO] = "房间中：%s。", [UI_MENU_COOP_OFFER_NOBODY] = "暂无其他人",
+    [UI_MENU_COOP_OFFER_SHARED] = "所有人共享：%s。", [UI_MENU_COOP_OFFER_POOLED] = "所有人共用一份：%s。",
+    [UI_MENU_COOP_OFFER_NOTHING] = "规则不共享任何内容。",
+    [UI_MENU_COOP_OFFER_COPY] = "接受之前，房间中的任何内容都不会进入你的存档。接受后，会先把你的整个存档（所有存档位）"
+                                "复制到配置文件夹中的 coop-backup/<日期和时间>，之后房间的进度才会到来。",
+    [UI_MENU_COOP_OFFER_TRUST] = "房间中的玩家可以在你的世界里做规则所共享的事（打开宝箱、花掉共用的钥匙），且游戏无法撤销："
+                                 "只接受你愿意托付存档的玩家。",
+    [UI_MENU_COOP_ANSWER] = "接受与否",
+    [UI_MENU_COOP_ANSWER_DESC] = "显示提议及“接受”和“暂不”。新玩家或其他规则会产生新的提议，再次等待你的答复。",
+    [UI_MENU_COOP_ACCEPT_CONFIRM] = "接受此房间？", [UI_MENU_COOP_ACCEPT] = "接受", [UI_MENU_COOP_NOT_NOW] = "暂不",
+    [UI_MENU_COOP_ACCEPTED] = "已接受：房间的进度会进入你的存档。你原来的存档在配置文件夹的 coop-backup 中。",
+    [UI_MENU_COOP_COPY_FAILED] = "已接受，但无法复制你的存档，因此不会应用房间中的任何内容；原因见日志。",
+    [UI_MENU_COOP_RULES_ROOM] = "房间规则", [UI_MENU_COOP_RULES_MINE] = "你创建的房间的规则",
+    [UI_MENU_COOP_RULES_UNKNOWN] = "房间规则尚未到达。",
+    [UI_MENU_COOP_RULES_CHANGE] = "修改即是新的提议：其他人在接受之前不会再从房间获取任何内容。",
+    [UI_MENU_COOP_RULES_SET_BY] = "由房主设定", [UI_MENU_COOP_RULE_FOLLOWS] = "随“进度”而定",
+    [UI_MENU_COOP_R_PROGRESS] = "进度", [UI_MENU_COOP_R_ITEMS] = "道具", [UI_MENU_COOP_R_SONGS] = "乐曲",
+    [UI_MENU_COOP_R_QUEST] = "任务道具", [UI_MENU_COOP_R_KEYS] = "小钥匙", [UI_MENU_COOP_R_RUPEES] = "卢比",
+    [UI_MENU_COOP_R_AMMO] = "弹药",
+    [UI_MENU_COOP_R_PROGRESS_DESC] = "剧情、世界和迷宫的标志：事件、对话、宝箱、门、开关、头目、地图和指南针。共享：一名玩家"
+                                     "做的事会在每个世界中发生。各自：每个世界保留自己的，此时小钥匙也各自独立。",
+    [UI_MENU_COOP_R_ITEMS_DESC] = "装备、关键道具、拥有的瓶子、钱包、袋子和箭筒的容量、魔力槽的大小；数量取最大值。只有在"
+                                  "“进度”为各自时才能设为各自：在共享的世界里，一名玩家打开的宝箱对其他人是空的。",
+    [UI_MENU_COOP_R_SONGS_DESC] = "学会的乐曲。只有在“进度”为各自时才能设为各自。",
+    [UI_MENU_COOP_R_QUEST_DESC] = "徽章、精灵石、痛苦之石和格鲁德会员证。只有在“进度”为各自时才能设为各自。",
+    [UI_MENU_COOP_R_KEYS_DESC] = "小钥匙，按迷宫计。共用：任何人捡到的钥匙进入该迷宫的共用数量，任何人开门都会用掉一把。"
+                                 "“进度”为各自时为各自。",
+    [UI_MENU_COOP_R_RUPEES_DESC] = "共用：所有玩家共同存入和花费的一个钱包。各自：每人有自己的。",
+    [UI_MENU_COOP_R_AMMO_DESC] = "炸弹、炸弹老鼠、箭、德库坚果、种子和木棒、魔豆。共用：所有玩家共同增加和消耗的一个数量。",
+    [UI_MENU_COOP_SHARED] = "共享", [UI_MENU_COOP_OWN] = "各自", [UI_MENU_COOP_POOL] = "共用",
+    [UI_MENU_COOP_LEAVE] = "离开房间",
+    [UI_MENU_COOP_LEAVE_DESC] = "离开房间。房间给你存档的内容会保留。",
+    [UI_MENU_COOP_LEAVE_CONFIRM] = "离开房间？它给你存档的内容会保留。",
+    [UI_MENU_COOP_LEAVE_MAKER] = "这个房间是你创建的：你不在时，没人能修改规则或移除玩家；如果房间里没有其他人，它会关闭。",
+    [UI_MENU_COOP_STAY] = "留下",
+    [UI_MENU_COOP_TOAST_JOINED] = "%s 加入了房间", [UI_MENU_COOP_TOAST_LEFT] = "%s 离开了房间",
+    [UI_MENU_COOP_TOAST_OFFER] = "合作房间正在菜单的“合作”页等待你的答复",
+    [UI_MENU_COOP_LOST] = "中继丢失了房间；游戏正在重新进入。",
+    [UI_MENU_COOP_JOIN_LIMIT] = "中继暂时不再接受来自你的网络的加入；游戏会在一分钟后重试。",
+    [UI_MENU_COOP_NOT_IDENTIFIED] = "未表明身份", [UI_MENU_COOP_REMOVED] = "已被房主移除",
+    [UI_MENU_COOP_KEY] = "身份指纹 %s",
+    [UI_MENU_COOP_OFFER_KEY] = "规则由身份指纹为 %s 的玩家签署。",
+    [UI_MENU_COOP_OFFER_COMPARE] = "接受之前，请房主通过语音或聊天把他的身份指纹读给你，并与这里的比对。",
+    [UI_MENU_COOP_MY_KEY] = "你的身份指纹（用于签署此房间的规则）：%s。请通过语音或聊天读给其他人，以便他们在接受前比对。",
+    [UI_MENU_COOP_UNIDENTIFIED] = "房间中未确认身份的玩家：%d（尚未表明身份，或有两个身份指纹自称是同一名玩家）。只要他们还在"
+                                  "房间里，任何人都无法接受此房间：房主可以移除他们，或者大家换到新房间。",
+    [UI_MENU_COOP_DISAGREE] = "玩家们携带的规则由不同的身份签署：接受之前，请向房主确认哪个身份指纹是他的。",
+    [UI_MENU_COOP_NEW_SAVE] = "此房间中正在玩另一个存档：它会得到房间的进度，其中包含上一个存档带来的内容。",
+    [UI_MENU_COOP_WARNINGS] = "与陌生人进入房间之前",
+    [UI_MENU_COOP_WARN_SAVE] = "1. 保留一个可以回退的存档。你接受的任何人都能在你的存档中设置剧情标记，他们接受的人也一样；"
+                               "共用中的玩家可以用光一个迷宫的小钥匙。移除玩家不会撤销标记：coop-backup/first-<日期和时间> "
+                               "中的副本才能。",
+    [UI_MENU_COOP_WARN_ROOM] = "2. 接受与否由你决定，房间却不由你决定。你接受的玩家会转交他们所接受的玩家的标记，而谁能使用"
+                               "共用只由房主决定。如果房间里有你不认识的人，不要接受：离开，并请房主开一个新房间。",
+    [UI_MENU_COOP_WARN_KEY] = "3. 核对房主的身份指纹，并保管好你自己的。把签署规则的身份指纹与房主的比对；绝不要用别人给你的"
+                              "设置或脚本启动游戏；绝不要交出你的配置文件夹的副本。",
+    [UI_MENU_COOP_POOLS] = "共用",
+    [UI_MENU_COOP_SPENT] = "超出所带来的部分取走了：%lld 把钥匙、%lld 卢比、%lld 份弹药",
+    [UI_MENU_COOP_NOT_IN_ROOM] = "不在房间中",
+    [UI_MENU_COOP_SPENT_NONE] = "没有人从共用中取走的比带来的多。",
+    [UI_MENU_COOP_SPENT_DESC] = "这个身份从共用中取走的比带来的多。用了别人找到的钥匙的玩家也会列在这里；没人预料到的那个人"
+                                "掏空了共用。移除这个身份会在所有游戏中归还它取走的东西，玩家离开后也是如此。请在重置共用之前"
+                                "移除它：重置时仍在房间中的玩家会保留已取走的东西。",
+    [UI_MENU_COOP_RESET] = "重置共用",
+    [UI_MENU_COOP_RESET_DESC] = "每个游戏都会带着它为房间中玩家保存的数量重新加入共用。这能恢复被已离开的玩家掏空的共用；"
+                                "标记保持不变。掏空了共用且仍在房间中的玩家会保留已取走的东西：先移除，再重置。",
+    [UI_MENU_COOP_RESET_CONFIRM] = "为房间中的所有人重置共用？",
+    [UI_MENU_COOP_REMOVE_KEY_CONFIRM] = "将 %s（身份指纹 %s）移出房间？",
+    [UI_MENU_COOP_NOT_ACCEPTED] = "未接受：房间已变化，或其中有玩家未确认身份。请重新查看提议。",
+    [UI_MENU_COOP_ACCEPTED_AS] = "你曾以“%s”之名接受的身份指纹",
     [UI_BOOT_TITLE] = "正在准备着色器",
     [UI_BOOT_STARTING] = "正在启动", [UI_BOOT_SHADERS] = "着色器：%lld / %lld", [UI_BOOT_PIPELINES] = "管线：%lld / %lld",
     [UI_MENU_CHEATS_REBUILD] = "立即重新构建游戏",

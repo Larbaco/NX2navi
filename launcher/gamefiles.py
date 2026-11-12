@@ -326,7 +326,9 @@ def extract_fonts(layout, game_dir='', dump=''):
         fam = font_family(otf) if otf else None
         if not otf or not fam:
             continue
-        (d / f'{role}.otf').write_bytes(otf)
+        p = d / f'{role}.otf'
+        if not (p.is_file() and p.read_bytes() == otf):   # a file this process registered as a font stays as it is
+            p.write_bytes(otf)
         (d / f'{role}.family').write_text(fam, encoding='utf-8')
         out[role] = (d / f'{role}.otf', fam)
     return out

@@ -48,10 +48,11 @@ const GfxShader *gfx_shader_get(int stage, const uint8_t *control, const uint8_t
 // NULL returned with *pending = 1 until it is ready. A failed translation stays failed (*pending = 0).
 const GfxShader *gfx_shader_get_async(int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size,
                                       const GfxShaderAnswers *a, int *pending);
-// As gfx_shader_get_async, but a shader queued for translation is moved to the front of the queue and waited for.
-// NULL when the translation failed.
+// As gfx_shader_get_async, but a shader queued for translation is moved to the front of the queue and waited for,
+// wait_ms at most (UINT32_MAX: until it is done). NULL when the translation failed, or with *pending = 1 when it was
+// still running at the end of the wait: it stays at the front of the queue.
 const GfxShader *gfx_shader_await(int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size,
-                                  const GfxShaderAnswers *a);
+                                  const GfxShaderAnswers *a, uint32_t wait_ms, int *pending);
 uint64_t gfx_shader_async_done(void);                      // translations finished by the background worker
 void gfx_shader_counts(uint64_t *keys, uint64_t *translated);   // distinct keys in memory, translations done (NX2NAVI_TRACE=perf)
 void gfx_shader_disk_counts(uint64_t *sync, uint64_t *sync_ns, uint64_t *bg);   // disk cache reads on the render
@@ -61,6 +62,9 @@ void gfx_shader_set_host(int float64, uint32_t sbuf_align, const uint32_t subgro
                          int bda);
 const uint8_t *gfx_shader_key(const GfxShader *s);          // the 32-byte cache key (stable while the translator is)
 const uint8_t *gfx_shader_input_id(const GfxShader *s);     // the 32-byte input id (stable across translators)
+// Where the translation in use came from: 0 the shader cache, under the current translator; 1 the shader cache, a
+// previous translator's (gfx_shader.c "Carry"); 2 translated in this process, so nothing was prepared from it.
+int gfx_shader_origin(const GfxShader *s);
 // By input id from memory or disk; xlate 1 also translates it from its stored inputs. NULL if absent.
 const GfxShader *gfx_shader_load_input(const uint8_t iid[32], int xlate);
 // Boot prewarm: out[i] = gfx_shader_load_input(iids[i], 1) on `threads` threads with up to `procs` translators, then
@@ -96,6 +100,7 @@ size_t gfx_shader_warm_list(GfxWarmEnt **out);              // malloc'd; recorde
 const GfxShader *gfx_shader_load_private(const uint8_t iid[32], int *owned);
 void gfx_shader_release_private(const GfxShader *s);
 const uint32_t *gfx_shader_spirv(const GfxShader *s, uint64_t *words);
+const char *gfx_shader_res_json(const GfxShader *s);        // the translator's .res.json text
 int gfx_shader_write_code(const GfxShader *s, const char *path);   // the guest program, from the stored inputs
 // A shader of the runtime's own (SPIR-V and a .res.json text as the translator writes them), outside the cache and
 // never freed; its key is the sha256 of both. NULL when the SPIR-V is malformed.

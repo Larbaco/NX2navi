@@ -71,7 +71,8 @@ static void check_write_watch(void) {
     CHECK(!mem_frozen(heap) && p[0x3000] == 7, "a write into a frozen region did not thaw it");
     n = mem_written_pages(heap, 0x200000, pages, 8);
     CHECK(n == 1 && pages[0] == heap + 0x3000, "write after a thaw: %llu pages reported (want 1)", (unsigned long long)n);
-    CHECK(mem_freeze(heap) == 1, "refreeze after a write thaw");
+    // written moments after its freeze: a region the game keeps writing, held thawed for a while (memory.c "Hot regions")
+    CHECK(mem_freeze(heap) == 0 && !mem_frozen(heap), "a region a write thawed right after its freeze was frozen again");
     mem_thaw(heap + 0x6000, 0x1000);
     CHECK(!mem_frozen(heap) && mem_freeze(heap) == 0, "mem_thaw did not thaw and hold the region");
     p[0x6000] = 8;

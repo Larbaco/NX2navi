@@ -44,6 +44,10 @@ _Static_assert(sizeof(nvn_mapping_t) == 0x28, "NVNmappingRequest stride");
 const pool_t *nvn_pool_find(uint64_t addr, uint64_t len);  // GPU-visible pool holding [addr, addr+len], NULL if none
 uint64_t nvn_prog_made_ns(uint64_t serial);                    // NX2NAVI_PROG_LEAD: when the program was made, 0 unknown
 uint64_t nvn_new_serial(void);                             // next tex_t / prog_t serial, from 1
+// NX2NAVI_TRACE=perf: a guest thread enters (enter 1) or leaves (0) QueueSubmitCommands (present 0) or
+// QueuePresentTexture (1) on queue q: the first call of each thread, kind and queue gets a line, and so does a call
+// that enters while another of these calls runs (nvn_api_core.c nvn_call_note).
+void nvn_call_note(int present, uintptr_t q, int enter);
 uint64_t nvn_fence_last(void);                             // fence value of the newest submit (0 before the first)
 int nvn_depth_minus_w(void);                               // 1 after DeviceSetDepthMode(NEAR_IS_MINUS_W), else 0
 extern int nvn_submits_in_frame;                           // nvnQueueSubmitCommands calls since the last present (NX2NAVI_SUBMIT_FINISH)

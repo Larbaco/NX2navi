@@ -23,6 +23,10 @@ void plat_mutex_lock(PlatMutex *m) { (void)m; }
 void plat_mutex_unlock(PlatMutex *m) { (void)m; }
 
 static int out_of_blocks_lines;
+void perf_size(PerfSizes *s, const char *name, uint64_t count, uint64_t limit, uint64_t bytes) {
+    (void)s, (void)name, (void)count, (void)limit, (void)bytes;   // vk_gpa_sizes is not called here
+}
+
 void rt_log(const char *fmt, ...) {
     char line[512];
     va_list ap;

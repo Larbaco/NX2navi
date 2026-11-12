@@ -82,8 +82,19 @@ static void note_gpu_write(VkExec *ex, uint64_t addr, uint64_t size) {
 
 typedef struct { volatile uint32_t *val; uint32_t mode, value; } EventWrite;
 
+// The side effects below that ran after a waiter on the executed timeline had gone on (vk_sync.c vk_sync_effect_late):
+// the game was already past the wait after its submit when these reached its memory.
+static volatile uint64_t late_events, late_counters, late_counts;
+
+void vk_exec_late_stats(uint64_t *events, uint64_t *counters, uint64_t *counts) {
+    *events = __atomic_exchange_n(&late_events, 0, __ATOMIC_RELAXED);
+    *counters = __atomic_exchange_n(&late_counters, 0, __ATOMIC_RELAXED);
+    *counts = __atomic_exchange_n(&late_counts, 0, __ATOMIC_RELAXED);
+}
+
 static void event_cb(void *arg) {
     EventWrite *e = arg;
+    if (vk_sync_effect_late()) __atomic_fetch_add(&late_events, 1, __ATOMIC_RELAXED);
     if (e->mode == NVN_EVENT_SIGNAL_MODE_ADD) __atomic_fetch_add(e->val, e->value, __ATOMIC_RELEASE);
     else __atomic_store_n(e->val, e->value, __ATOMIC_RELEASE);
     free(e);
@@ -104,6 +115,7 @@ typedef struct { uint64_t addr, seq; } CounterWrite;
 
 static void counter_cb(void *arg) {
     CounterWrite *w = arg;
+    if (vk_sync_effect_late()) __atomic_fetch_add(&late_counters, 1, __ATOMIC_RELAXED);
     write_counter(w->addr, 0);
     pending_written(w->addr, w->seq);
     free(w);
@@ -311,7 +323,7 @@ static void oq_read(VkDevice dev, uint32_t first, uint32_t n) {
     VkResult r = vkGetQueryPoolResults(dev, oq_pool, first, n, sizeof OQB.v[0] * 2 * n, OQB.v, 2 * sizeof OQB.v[0],
                                        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
     if (r != VK_SUCCESS && r != VK_NOT_READY) {
-        vk_device_fault_report(r);
+        vk_device_lost_check(r, "the read of occlusion query results");
         rt_fatal("vk: occlusion query results failed (%d)", (int)r);
     }
     OQB.first = first, OQB.n = n;
@@ -353,6 +365,7 @@ static void oq_cb(void *arg) {
         if (avail) sum += v;
         else {
             sum += 1;
+            vk_device_lost_poll();   // a query its submission never wrote: on a lost device the run ends here
             LOG_ONCE("vk: occlusion query slot %u not available after its fence, counted as visible", s->q[i]);
         }
     }
@@ -367,7 +380,10 @@ static void oq_cb(void *arg) {
     else {
         oq_count += sum;
         if (s->lost && !oq_count) oq_count = 1;
-        if (s->addr) write_counter(s->addr, oq_count), pending_written(s->addr, s->seq);
+        if (s->addr) {
+            if (vk_sync_effect_late()) __atomic_fetch_add(&late_counts, 1, __ATOMIC_RELAXED);
+            write_counter(s->addr, oq_count), pending_written(s->addr, s->seq);
+        }
     }
     free(s);
 }
@@ -380,7 +396,7 @@ static void oq_segment(VkExec *ex, uint64_t addr, int reset) {
     s->addr = addr, s->seq = report_seq, s->reset = reset, s->lost = oq_lost, s->n = oq_nseg;
     memcpy(s->q, oq_seg, sizeof *s->q * oq_nseg);
     oq_nseg = 0, oq_lost = 0;
-    vk_completion_add(ex->fence, oq_cb, s);
+    vk_completion_add_result(ex->fence, oq_cb, s);
 }
 
 static void reset_counter(VkExec *ex, const p_reset_counter *p) {
@@ -585,7 +601,7 @@ static void signal_event(VkExec *ex, const p_signal_event *p) {
     EventWrite *e = malloc(sizeof *e);
     if (!e) rt_fatal("vk: out of memory");
     *e = (EventWrite){p->val, p->mode, p->value};
-    vk_completion_add(ex->fence, event_cb, e);
+    vk_completion_add_result(ex->fence, event_cb, e);
 }
 
 static void report_counter(VkExec *ex, const p_report_counter *p) {
@@ -604,7 +620,7 @@ static void report_counter(VkExec *ex, const p_report_counter *p) {
         CounterWrite *a = malloc(sizeof *a);
         if (!a) rt_fatal("vk: out of memory");
         *a = (CounterWrite){p->addr, report_seq};
-        vk_completion_add(ex->fence, counter_cb, a);
+        vk_completion_add_result(ex->fence, counter_cb, a);
     }
     Pending *e = pending_slot(p->addr, 1);
     if (e) e->seq = report_seq, e->frame = cond_frame, e->unknown = samples, e->type = (int)p->type;

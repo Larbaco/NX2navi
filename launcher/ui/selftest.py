@@ -203,6 +203,15 @@ def states(app):
         app.show('home', 0)
         s['theme'] = was
 
+    def custom_picker():   # the Custom scheme with two picked colours, and its picker on the button colour
+        from . import art
+        was = {k: s.get(k) for k in ('theme', 'custom_background', 'custom_panel', 'custom_buttons')}
+        s.update(theme='custom', custom_background='#3a1d5c', custom_panel='#24324a', custom_buttons='#2f6fb0')
+        app.apply_look()
+        app.open_picker('buttons')
+        s.update(was)
+        art.set_theme(was['theme'], app.custom_colors())   # the next screen's colours; this one is drawn already
+
     def restore_scheme():
         app.apply_look()
         app.show('home', 0)
@@ -211,7 +220,8 @@ def states(app):
             ('4-update-ready', update_ready), ('5-updating', updating), ('6-settings', settings),
             ('7-build-failed', failed), ('8-uninstall', uninstall), ('9-import-saves', import_saves),
             ('10-shaders', shaders), ('11-update-staged', update_staged), ('12-export-save', export_save),
-            ('13-customize', customize), ('14-color-scheme', color_scheme), ('15-first-scheme', restore_scheme)]
+            ('13-customize', customize), ('14-color-scheme', color_scheme), ('15-custom-picker', custom_picker),
+            ('16-first-scheme', restore_scheme)]
 
 
 def run(app, shots):

@@ -13,6 +13,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "cfg_private.h"
 #include "folder_pick.h"
 #include "fs.h"
 #include "host.h"
@@ -118,6 +119,19 @@ static void add_file(Export *e, const char *name, const char *path) {
     free(data);
 }
 
+// nx2navi.ini for a bug report: as it is, except that the values of the private settings (cfg_private.h: a co-op
+// room's secret, the relay, the player's name) read "(set, not shown)". A report goes to people the player does not
+// know, and the secret lets anyone into the room.
+static void add_settings_file(Export *e, const char *name, const char *path) {
+    uint64_t n = 0;
+    uint8_t *data = plat_file_read(path, &n);
+    size_t sn = 0;
+    char *scrubbed = data ? cfg_ini_scrub((const char *)data, (size_t)n, &sn) : NULL;
+    if (scrubbed) sz_writer_add(&e->w, name, scrubbed, sn);
+    free(scrubbed);
+    free(data);
+}
+
 SaveShareResult save_share_export(const char *dir, int bug_report, char *path, size_t cap) {
     *path = 0;
     struct tm t;
@@ -137,7 +151,7 @@ SaveShareResult save_share_export(const char *dir, int bug_report, char *path, s
         add_file(&e, "bug-report/nx2navi.log", rt_log_path());
         if (exe_dir(base, sizeof base)) {
             snprintf(file, sizeof file, "%s/nx2navi.ini", base);
-            add_file(&e, "bug-report/nx2navi.ini", file);
+            add_settings_file(&e, "bug-report/nx2navi.ini", file);
         }
     }
     struct tm u;
