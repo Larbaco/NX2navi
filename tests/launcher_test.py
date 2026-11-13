@@ -5981,6 +5981,18 @@ class ModsTest(Tmp):
         cheat.write_text('[Moon jump]\n04000000 00000000 D65F03C0\n')
         self.assertEqual(self.mods.code_waiting(self.game), ['Cheats'])  # edited since
 
+    def test_code_cheats_take_mains_base_from_the_layout(self):
+        """recomp/layout.py alone decides the modules' bases: tools/cheats.py decodes main's pc-relative code at the
+        base the layout gives main, the first module of its order, and follows it when it changes."""
+        import importlib
+        import cheats
+        import layout
+        self.assertEqual(layout.ORDER[0], 'main')
+        self.assertEqual(cheats.BASE, layout.FIRST_BASE)
+        self.addCleanup(importlib.reload, cheats)
+        with mock.patch.object(layout, 'FIRST_BASE', 0x7100000000):
+            self.assertEqual(importlib.reload(cheats).BASE, 0x7100000000)
+
     def test_the_mods_code_is_in_the_lift_key_and_not_the_shaders_key(self):
         import make_game
         kit = self.tmp / 'kit'
