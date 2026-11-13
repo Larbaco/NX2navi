@@ -331,6 +331,10 @@ void plat_aligned_free(void *p);
 // ---- process
 _Noreturn void plat_exit(int code);       // ends the process at once: other threads stop, no atexit handlers run
 extern void (*plat_exit_hook)(void);      // called first by plat_exit when set (main.c: the queued log lines)
+// Ends the process at once with code, and nothing else: no exit hook, no stream flush, and no library's detach call
+// (ExitProcess and _Exit run every one). For the ends of a failed run (dispatch.c fatal_end, vk_device.c
+// lost_wait_exit), which have written their lines themselves and must not wait on a lock another thread holds.
+_Noreturn void plat_terminate(int code);
 int plat_setenv(const char *name, const char *value);    // value NULL removes it; 1 on success
 uint32_t plat_process_id(void);
 // CPU time of the process since it started (user and kernel), and wall time since it started, in ns; 0 when unknown.

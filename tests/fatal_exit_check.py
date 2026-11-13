@@ -1,0 +1,109 @@
+"""Build and run tests/fatal_exit_check.c: the end of a fatal error (runtime/dispatch.c fatal_end) with the platform
+layer linked. The process ends with its own code and its FATAL line, and without the libraries' detach calls that
+ExitProcess makes (a driver's detach that faulted there turned the end into a crash report with another code). Also
+checks statically that no runtime file outside the platform layer ends the process with _Exit, and that the fatal
+error's end and the lost device's (runtime/vk_device.c lost_wait_exit) end with plat_terminate. No game files, no GPU.
+
+Usage: fatal_exit_check.py
+"""
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+RT = ROOT / 'runtime'
+MSYS_BIN = Path(r'C:\msys64\ucrt64\bin')
+
+LAYOUT = '''// A stand-in for the generated layout.h (tests/fatal_exit_check.py).
+#pragma once
+#define MOD_MAIN_BASE 0x7000000000ull
+#define MOD_MAIN_SIZE 0x4ea0000ull
+'''
+
+
+def compiler():
+    if os.environ.get('CC'):
+        return os.environ['CC']
+    if os.name == 'nt' and (MSYS_BIN / 'clang.exe').exists():
+        return str(MSYS_BIN / 'clang.exe')
+    return shutil.which('clang') or 'clang'
+
+
+def function(source, signature):
+    start = source.index(signature)
+    brace = source.index('{', start)
+    depth, end = 1, brace + 1
+    while depth:
+        depth += (source[end] == '{') - (source[end] == '}')
+        end += 1
+    return source[start:end]
+
+
+def static_checks():
+    """_Exit is ExitProcess in the C runtime: the platform layer alone ends the process (plat_exit, plat_terminate)."""
+    bad = 0
+    for path in sorted(RT.rglob('*')):
+        rel = path.relative_to(RT).as_posix()
+        if path.suffix not in ('.c', '.cpp', '.h', '.inc') or rel.startswith(('platform/', 'third_party/')):
+            continue
+        code = re.sub(r'//[^\n]*', '', path.read_text(encoding='utf-8', errors='replace'))
+        for m in re.finditer(r'\b_Exit\s*\(', code):
+            print(f'FAIL: runtime/{rel}:{code.count(chr(10), 0, m.start()) + 1} ends the process with _Exit '
+                  '(ExitProcess: every library\'s detach runs); use plat_terminate or plat_exit')
+            bad += 1
+    for file, sig in (('dispatch.c', 'static void fatal_end(int code, const char *fmt, va_list ap) {'),
+                      ('vk_device.c', 'static void lost_wait_exit(void *arg)')):
+        body = re.sub(r'//[^\n]*', '', function((RT / file).read_text(encoding='utf-8'), sig))
+        if 'plat_terminate(' not in body:
+            print(f'FAIL: runtime/{file} {sig.split("(")[0].split()[-1]} does not end with plat_terminate')
+            bad += 1
+    print(f'static: no _Exit outside the platform layer, fatal_end and lost_wait_exit end with plat_terminate: '
+          f'{"FAILED" if bad else "ok"}', flush=True)
+    return bad
+
+
+CASES = [
+    # mode, exit code, lines that must be there, lines that must not
+    ('fatal', 70, ['FATAL: the test\'s fatal error 1'], ['detach:']),
+]
+
+
+def main():
+    bad = static_checks()
+    if os.name != 'nt':
+        print('fatal_exit_check: the program part runs on Windows only')
+        return 1 if bad else 0
+    work = ROOT / 'build' / 'test' / 'fatal_exit'
+    work.mkdir(parents=True, exist_ok=True)
+    (work / 'layout.h').write_text(LAYOUT)
+    exe = work / 'fatal_exit_check.exe'
+    env = dict(os.environ)
+    if MSYS_BIN.exists():
+        env['PATH'] = str(MSYS_BIN) + os.pathsep + env.get('PATH', '')
+    plat = [RT / 'platform' / 'win32.c', RT / 'platform' / 'common.c']
+    libs = ['-lbcrypt', '-lws2_32', '-lpsapi', '-lwinmm', '-ldbghelp', '-lshell32', '-lole32', '-luser32', '-ladvapi32']
+    subprocess.check_call([compiler(), '-O1', '-g', '-Wall', '-Wno-unused-function', '-fno-strict-aliasing',
+                           '-march=x86-64-v3', '-I', str(RT), '-I', str(work), str(ROOT / 'tests' / 'fatal_exit_check.c'),
+                           *map(str, plat), '-o', str(exe), '-lm', *libs], env=env)
+    for mode, code, want, unwanted in CASES:
+        p = subprocess.run([str(exe), mode], env=env, capture_output=True, text=True, errors='replace', timeout=120)
+        out = p.stdout + p.stderr
+        missing = [w for w in want if w not in out]
+        extra = [u for u in unwanted if u in out]
+        fatal_lines = out.count('FATAL:')
+        ok = p.returncode == code and not missing and not extra
+        print(f'{mode}: exit code {p.returncode} (want {code}), {fatal_lines} FATAL line(s)'
+              + (f', missing {missing}' if missing else '') + (f', unexpected {extra}' if extra else '')
+              + ('' if ok else ': FAIL'), flush=True)
+        if not ok:
+            print(out[-3000:])
+        bad += not ok
+    print(f'fatal_exit_check: {"FAILED" if bad else "ok"}')
+    return 1 if bad else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

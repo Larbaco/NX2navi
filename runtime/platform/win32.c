@@ -1380,6 +1380,11 @@ void plat_exit(int code) {
     ExitProcess((UINT)code);   // not reached
 }
 
+void plat_terminate(int code) {
+    TerminateProcess(GetCurrentProcess(), (UINT)code);
+    ExitProcess((UINT)code);   // not reached
+}
+
 // _putenv_s, not SetEnvironmentVariableA: getenv reads the C runtime's copy of the environment, which only the CRT's
 // own calls update. An empty value removes the variable.
 int plat_setenv(const char *name, const char *value) { return _putenv_s(name, value ? value : "") == 0; }

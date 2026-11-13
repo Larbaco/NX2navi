@@ -80,7 +80,10 @@ static void fatal_end(int code, const char *fmt, va_list ap) {
     rtss_limit_restore();
     fflush(stdout);
     fflush(stderr);
-    _Exit(code);
+    // Not _Exit: in the C runtime it is ExitProcess, which stops the other threads wherever they are and then runs every
+    // library's detach on this thread. A driver's detach that faults there turned a fatal error's end into a crash
+    // report with another code (platform/win32.c plat_exit names one such detach), and one that hangs held the process.
+    plat_terminate(code);
 }
 
 void rt_fatal(const char *fmt, ...) {

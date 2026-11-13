@@ -868,21 +868,28 @@ static void device_fault_report(void) {
 // the run, and nothing else touches the device meanwhile: the paths that would read vk_lost and return, and a thread
 // that gets the loss as a result of its own stops here for good.
 // LOST_EXIT_MS bounds the end. The first thread writes the report and waits for a save commit (fs_host.c
-// fs_save_crash_wait, 2 s at most); should it hang on a lock that a stopped thread holds, the watchdog ends the
-// process with the same code, and the lines already written are in the log (rt_fatal_code wrote them itself).
+// fs_save_crash_wait, 2 s at most); should it hang on a lock that a stopped thread holds, the watchdog (arg non-NULL)
+// says so in one line and ends the process with the same code, and the lines already written are in the log
+// (rt_fatal_code wrote them itself). The end is plat_terminate: ExitProcess would stop the watchdog too and then run
+// every library's detach, and a driver's detach that hangs on a lost device would hold the process for good. A thread
+// that stops here otherwise ends the process a little later, should the watchdog not have started.
 #define LOST_EXIT_MS 10000
 volatile int32_t vk_lost;
 
 static void lost_wait_exit(void *arg) {
-    (void)arg;
-    for (int t = 0; t < LOST_EXIT_MS; t += 50) plat_sleep_ms(50);
-    _Exit(RT_LOST_EXIT);
+    int watchdog = arg != NULL;
+    for (int t = 0; t < LOST_EXIT_MS + (watchdog ? 0 : 2000); t += 50) plat_sleep_ms(50);
+    if (watchdog) {
+        rt_log_sync();   // the queue's locks only tried (bounded): their holder may be the thread that hangs
+        rt_log("vk: the end of the run did not finish in %d s; ending it", LOST_EXIT_MS / 1000);
+    }
+    plat_terminate(RT_LOST_EXIT);
 }
 
 void vk_device_lost_check(VkResult r, const char *where) {
     if (r != VK_ERROR_DEVICE_LOST) return;
     if (plat_xchg32(&vk_lost, 1)) lost_wait_exit(NULL);   // another thread is ending the run: this one stops here
-    plat_thread_spawn(lost_wait_exit, NULL, "vk lost exit", 0);
+    plat_thread_spawn(lost_wait_exit, (void *)1, "vk lost exit", 0);
     device_fault_report();
     rt_fatal_code(RT_LOST_EXIT, "vk: the GPU device was lost (seen at: %s). The run ends here; the lines above name what "
                                 "the GPU was doing", where);

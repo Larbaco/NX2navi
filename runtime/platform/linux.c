@@ -1927,6 +1927,8 @@ void plat_exit(int code) {
     _exit(code);
 }
 
+void plat_terminate(int code) { _exit(code); }
+
 int plat_setenv(const char *name, const char *value) {
     return (value ? setenv(name, value, 1) : unsetenv(name)) == 0;
 }
