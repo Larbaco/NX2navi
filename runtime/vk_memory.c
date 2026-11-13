@@ -4322,9 +4322,12 @@ int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
     int rec = 0;
     lazy_part_check();   // before the merges are recorded: what the last part skipped and has to write back after all
     if (nsnl) {
-        // the merge reads the mirror the submission's shaders wrote and writes the imported buffers
+        // the merge reads the mirror the submission's shaders wrote and writes the imported buffers, which earlier
+        // commands may have written too: its writes are ordered after theirs as well (a write after a write needs the
+        // write access on both sides of the dependency)
         mbarrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
-                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                 VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
         vk_gpu_gap_note(VK_GAP_WB_MERGE, 0);
         int m = wb_merge_record(cb);
         if (!m) {   // no range list: copy them plainly
