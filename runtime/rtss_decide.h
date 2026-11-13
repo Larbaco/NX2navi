@@ -82,7 +82,6 @@ enum {
     RTSS_WHY_REFUSED,       // RTSS refused this limit
     RTSS_WHY_NEWER,         // the want changed while the poll ran: nothing decided, the next poll takes the new one
     RTSS_WHY_UNSET,         // no want yet
-    RTSS_WHY_CLOSED,        // the exit put the profile back (rtss_limit_restore)
 };
 
 // What the worker keeps between polls.
@@ -99,7 +98,6 @@ typedef struct {
 typedef struct {
     int64_t want;   // the want the poll read
     int current;    // the want is still that one when the poll decides
-    int closed;     // rtss_limit_restore ran
     int hooks;      // RTSS's hooks library: 1 loaded, 0 failed to load, -1 not tried (rtss_wants_hooks)
     RtssApp app;
 } RtssIn;
@@ -118,15 +116,15 @@ static inline int rtss_wants_hooks(const RtssState *s, const RtssIn *in) {
     return in->want >= 0 && !s->fail && in->app.running;
 }
 
-// The decision of one poll, in this order: a closed run or no want does nothing; a kept-out want puts back what this
-// run wrote (once the hooks are loaded); a failure lasts the run; RTSS not running leaves the profile for its return; a
-// library that did not load fails the run; a refused limit stays with the game; a new limit goes into the profile at
-// once, and RTSS holds it as soon as it lists the game. On an unchanged limit RTSS's own frame count is checked: more
-// than RTSS_CHECK_SLACK times the limit for RTSS_CHECK_POLLS polls in a row puts the profile back for the run.
+// The decision of one poll, in this order: no want does nothing; a kept-out want puts back what this run wrote (once
+// the hooks are loaded); a failure lasts the run; RTSS not running leaves the profile for its return; a library that
+// did not load fails the run; a refused limit stays with the game; a new limit goes into the profile at once, and RTSS
+// holds it as soon as it lists the game. On an unchanged limit RTSS's own frame count is checked: more than
+// RTSS_CHECK_SLACK times the limit for RTSS_CHECK_POLLS polls in a row puts the profile back for the run. After the
+// exit put the profile back (rtss_limit_restore) no poll decides: rtss_limit.c worker skips it under the lock.
 static inline RtssOut rtss_decide(RtssState *s, const RtssIn *in) {
     int64_t w = in->want;
     RtssOut o = {RTSS_DO_NOTHING, w, 0, RTSS_WHY_NOT_LISTED, 0};
-    if (in->closed) return o.why = RTSS_WHY_CLOSED, o;
     if (w == RTSS_UNSET) return o.why = RTSS_WHY_UNSET, o;
     if (w < 0) {
         if (in->hooks == 1 && s->changed) o.act = RTSS_DO_PUT_BACK;

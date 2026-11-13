@@ -160,15 +160,15 @@ static void run_init(Run *r) {
     r->running = r->listed = 1, r->t0 = 1000, r->t1 = 2000, r->frames = 60;
 }
 // One poll for want, as rtss_limit.c worker makes it: the hooks library loads on the first poll that wants it and stays.
-static RtssOut step_ex(Run *r, int64_t want, int current, int closed) {
-    RtssIn in = {.want = want, .current = current, .closed = closed};
+static RtssOut step_ex(Run *r, int64_t want, int current) {
+    RtssIn in = {.want = want, .current = current};
     in.app = (RtssApp){r->running, r->running && r->listed, r->t0, r->t1, r->frames};
     if (r->st.loaded) in.hooks = 1;
     else if (rtss_wants_hooks(&r->s, &in)) in.hooks = r->st.no_library ? 0 : (r->st.loaded = 1);
     else in.hooks = -1;
     return rtss_poll(&r->s, &in, &r->ops);
 }
-static RtssOut step(Run *r, int64_t want) { return step_ex(r, want, 1, 0); }
+static RtssOut step(Run *r, int64_t want) { return step_ex(r, want, 1); }
 
 // RTSS's injection delay: it runs but has not hooked the game for 30 polls. The limit goes into the profile at the
 // first poll, and RTSS holds the game once it lists it, with no second write.
@@ -289,7 +289,7 @@ static void frame_count(void) {
     r.frames = 144;
     step(&r, 60000);
     step(&r, 60000);
-    o = step_ex(&r, 60000, 0, 0);
+    o = step_ex(&r, 60000, 0);
     CHECK(o.why == RTSS_WHY_NEWER && !o.holds && o.act == RTSS_DO_NOTHING && r.s.over == 1, "a newer want: no count");
 }
 
@@ -337,17 +337,13 @@ static void movie(void) {
     CHECK(o.act == RTSS_DO_APPLY && o.holds && r.st.applies == 3, "144 written again at its end");
 }
 
-// No want yet, and a closed run: nothing at all. The hooks library that does not load fails the run.
-static void closed_and_library(void) {
+// No want yet: nothing at all. The hooks library that does not load fails the run. (A run whose exit put the profile
+// back makes no decision: rtss_limit.c worker skips the poll, which tests/rtss_worker_check.c's restore_* check.)
+static void unset_and_library(void) {
     Run r;
     run_init(&r);
     RtssOut o = step(&r, RTSS_UNSET);
     CHECK(o.why == RTSS_WHY_UNSET && o.act == RTSS_DO_NOTHING && !r.st.loaded, "no want");
-    step(&r, 60000);
-    o = step_ex(&r, 144000, 1, 1);
-    CHECK(o.why == RTSS_WHY_CLOSED && o.act == RTSS_DO_NOTHING && r.st.holds == 60000, "closed: nothing written");
-    o = step_ex(&r, RTSS_OUT_FRAMEGEN, 1, 1);
-    CHECK(o.act == RTSS_DO_NOTHING && !r.st.put_backs, "closed: nothing put back");
     run_init(&r);
     r.st.no_library = 1;
     o = step(&r, 60000);
@@ -396,7 +392,7 @@ int main(void) {
     kept_out();
     churn();
     movie();
-    closed_and_library();
+    unset_and_library();
     two();
     printf("rtss_limit_check: %s\n", fails ? "FAIL" : "ok");
     return fails != 0;
