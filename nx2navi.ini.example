@@ -782,6 +782,14 @@
 # Each step adds a little latency, and a display shows no more than its refresh rate. Changes while the game runs
 # take effect at once.
 # framegen_multiplier = 2
+# With framegen = dlss, Reflex holds fps_limit where each frame starts, before the controller is read, and the game's
+# own limiter keeps only its ceiling of 240 frames a second: a finished picture no longer waits for its turn, which
+# takes up to a frame of the game's off the delay from the controller to the screen. The game's own limiter takes the
+# limit back while a movie plays, while the window is minimised, and for the rest of the run when the frames show that
+# Reflex does not hold it; the log's "frame rate:" lines say which one holds it. 0 leaves the limit to the game's own
+# limiter, as before 0.10.2. Needs the nx2navi_dlssg.dll of 0.10.2 or later (an older one leaves the limit to the
+# game). Changes while the game runs take effect at once.
+# reflex_limit = 1
 # Low latency without frame generation: 0 off, 1 on, 2 on with boost (NVIDIA's: the GPU keeps a high clock; on AMD 2
 # is 1). The graphics driver holds each frame's start, so the game reads the controller as late as the picture allows
 # and no finished picture waits for its turn: NVIDIA's low-latency mode (VK_NV_low_latency2) or AMD's Anti-Lag

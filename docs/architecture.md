@@ -334,7 +334,7 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   (`frame_rate.c` `frame_step_ceiling_ns`). Since the SDK does not say whether the driver's interval counts the frames
   the game draws or every frame on screen, the frames are checked: about the multiplier periods apart switches Reflex
   to the period over the multiplier once, and the same again or frames too soon give the limit to the pacer for the
-  run.
+  run. `NX2NAVI_REFLEX_LIMIT=0` (live) leaves the limit to the pacer, as before Reflex's frame limit was used.
   The device gets the drivers' extensions only in a run that starts with the setting on (`vk_device.c`
   `create_device`): turning it on takes a restart, and with it off the device is made as it was before the mode.
 - ASTC textures are uploaded as they are where the device samples ASTC, and decoded by a compute shader everywhere

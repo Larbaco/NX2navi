@@ -24,11 +24,11 @@
 // game's own pacer then keeps only the game's ceiling (vk_dlssg_pace, nvn_api_obj.c nvnQueuePresentTexture): the pacer's
 // wait came after the picture was drawn, so the pad was read up to a period before the picture left, and Reflex's sleep
 // at the frame's start already waited for the GPU. The pacer keeps the limit while a movie plays, before the first host
-// present, while none went out for DLSSG_HOLD_IDLE_NS, with a DLL older than nx2sl_reflex2 or a limit Streamline
-// refused, and for the rest of the run once the frames show Reflex does not hold it (dlssg_pace.h). The guest thread
-// that presents decides and the present thread hands the limit to Streamline before its present (vk_dlssg_frame, under
-// the present lock, which keeps Streamline's options calls on one thread at a time); the pacer stands aside only once
-// Streamline took that limit.
+// present, while none went out for DLSSG_HOLD_IDLE_NS, with NX2NAVI_REFLEX_LIMIT=0 (live), a DLL older than
+// nx2sl_reflex2 or a limit Streamline refused, and for the rest of the run once the frames show Reflex does not hold it
+// (dlssg_pace.h). The guest thread that presents decides and the present thread hands the limit to Streamline before
+// its present (vk_dlssg_frame, under the present lock, which keeps Streamline's options calls on one thread at a time);
+// the pacer stands aside only once Streamline took that limit.
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -115,9 +115,15 @@ static void reflex_apply(uint32_t us) {
     __atomic_store_n(&S.limit_set, ok ? us : 0, __ATOMIC_RELEASE);
 }
 
-// Reflex may hold the frame limit: a DLL with nx2sl_reflex2 whose limit Streamline did not refuse.
+// Reflex may hold the frame limit: NX2NAVI_REFLEX_LIMIT (default 1, live; 0 leaves the limit to the game's own limiter,
+// as before Reflex's frame limit was used), and a DLL with nx2sl_reflex2 whose limit Streamline did not refuse. The
+// setting is parsed again when a setting changed (cfg_version). Only the presenting guest thread calls it.
 static int limit_allowed(void) {
-    return S.reflex2 && !__atomic_load_n(&S.limit_refused, __ATOMIC_ACQUIRE);
+    static unsigned seen;
+    static int read, on;
+    unsigned v = cfg_version();
+    if (!read || v != seen) on = cfg_bool("NX2NAVI_REFLEX_LIMIT"), seen = v, read = 1;
+    return on && S.reflex2 && !__atomic_load_n(&S.limit_refused, __ATOMIC_ACQUIRE);
 }
 
 // With any upscaler or none: vk_dlaa.c makes the inputs either way (vk_dlaa_frame says which, at the start and at each
@@ -380,7 +386,8 @@ int vk_dlssg_pace(uint64_t period_ns) {
     if (held) pace_say(1, want, NULL);
     else if (!want)   // (a limit Streamline has yet to take is no change: the present thread hands it over next)
         pace_say(0, 0, !allowed     ? (!S.reflex2 ? "nx2navi_dlssg.dll is older than Reflex's frame limit"
-                                                  : "Streamline refused the limit")
+                                       : __atomic_load_n(&S.limit_refused, __ATOMIC_ACQUIRE) ? "Streamline refused the limit"
+                                                                                             : "NX2NAVI_REFLEX_LIMIT=0")
                        : S.pace.bad ? "Reflex did not hold the limit"
                        : !period_ns ? "a movie plays, or no limit"
                        : hosted     ? "no host present for 200 ms"
