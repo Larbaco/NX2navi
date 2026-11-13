@@ -192,6 +192,19 @@ def static_checks():
     ok = None not in pos and pos[0] < pos[1]
     print(f'rt_exit_steps: RivaTuner\'s profile put back before the pipeline save: {"ok" if ok else "FAIL"}')
     bad += not ok
+    # the presents during the pipeline save do not undo that restore: rtss_limit_restore marks the run closed before
+    # anything else (an exit before RTSS was ever asked included), and rtss_limit_want returns on it before it changes
+    # the want or starts the worker (runtime/rtss_limit.c; tests/rtss_worker_check.c runs it against a fake RTSS)
+    rl = strip_comments((RT / 'rtss_limit.c').read_text(encoding='utf-8'))
+    restore = function(rl, 'void rtss_limit_restore(void) {')
+    want = function(rl, 'void rtss_limit_want(int64_t mhz) {')
+    restore, want = restore[restore.index('{') + 1:], want[want.index('{') + 1:]
+    closed, back = restore.find('&closed, 1)'), restore.find('return')
+    guard, ret, store = want.find('closed'), want.find('return'), want.find('&want,')
+    ok = 0 <= closed and (back < 0 or closed < back) and 0 <= guard < ret < store
+    print(f'rtss_limit.c: after rt_exit_steps\' restore a want changes nothing (closed set first, want returns on it): '
+          f'{"ok" if ok else "FAIL"}')
+    bad += not ok
     flush = strip_comments(function(perf, 'void perf_summary_flush(void)'))
     present = strip_comments(function(perf, 'void perf_present(uint64_t frame)'))
     e, f, s, l = (present.find(x) for x in ('ft_enter()', 'ft_frame(', 'session_report(', 'ft_leave()'))
