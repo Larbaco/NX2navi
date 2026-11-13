@@ -439,6 +439,12 @@ static VkPresentModeKHR pick_present_mode(VkPhysicalDevice pd) {
 
 const char *gfx_window_present_mode(void) { return __atomic_load_n(&g_present_got, __ATOMIC_ACQUIRE); }
 
+// kern_now_ns when the newest host present returned with its picture taken (flip_locked); 0 before the first. A
+// minimised window and a frame hold present nothing, so it ages: RTSS, which holds the frames inside the host present,
+// then holds none, and the game's pacer takes the limit back (rtss_decide.h rtss_pace_period).
+static uint64_t g_hosted_ns;
+uint64_t gfx_window_hosted_ns(void) { return __atomic_load_n(&g_hosted_ns, __ATOMIC_ACQUIRE); }
+
 // Queues the present of a blit vk_present_blit left waiting (g_pl held). A swapchain rebuild and the next blit flush it
 // first; the device release drops it.
 static void flip_locked(void) {
@@ -459,6 +465,7 @@ static void flip_locked(void) {
                : vk_fg_active()    ? vk_fg_present(&pi) : vkQueuePresentKHR(vk_ctx()->gfx_queue, &pi);
     vk_queue_unlock();
     vk_lowlat_present_end(&ll);
+    if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) __atomic_store_n(&g_hosted_ns, kern_now_ns(), __ATOMIC_RELEASE);
     vk_device_lost_check(r, "the present");
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) plat_xchg32(&g_dirty, 1);
 }

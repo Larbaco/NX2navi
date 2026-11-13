@@ -380,6 +380,19 @@ static void two(void) {
     CHECK(!rtss_two(60000, RTSS_FAIL_NOT_LIMITING, 1, 1), "RTSS seen not to hold the game: not counted");
 }
 
+// The period the game's pacer keeps beside RTSS: the ceiling while RTSS holds and host presents go out, the limit's own
+// otherwise; never 0.
+static void pace_period(void) {
+    const uint64_t p60 = 16666667, ceiling = 4166667, now = 50000000000ull;
+    CHECK(rtss_pace_period(1, now, now - 10000000, p60, ceiling) == ceiling, "holds, a host present 10 ms ago");
+    CHECK(rtss_pace_period(1, now, now - RTSS_HOLD_IDLE_NS + 1, p60, ceiling) == ceiling, "just under 200 ms");
+    CHECK(rtss_pace_period(1, now, now - RTSS_HOLD_IDLE_NS, p60, ceiling) == p60, "200 ms with no host present");
+    CHECK(rtss_pace_period(1, now, 0, p60, ceiling) == p60, "no host present yet");
+    CHECK(rtss_pace_period(0, now, now - 10000000, p60, ceiling) == p60, "RTSS does not hold");
+    CHECK(rtss_pace_period(1, now, now + 1000, p60, ceiling) == ceiling, "a host present stored after now was read");
+    CHECK(rtss_pace_period(1, now, now - 10000000, ceiling, ceiling) == ceiling, "a limit at the ceiling");
+}
+
 int main(void) {
     settings();
     reasons();
@@ -394,6 +407,7 @@ int main(void) {
     movie();
     unset_and_library();
     two();
+    pace_period();
     printf("rtss_limit_check: %s\n", fails ? "FAIL" : "ok");
     return fails != 0;
 }

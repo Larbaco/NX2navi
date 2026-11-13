@@ -26,6 +26,7 @@ void gfx_vsync_bind(uint64_t system_event);                // nn::vi vsync event
 uint64_t gfx_vsync_ticks(void);                            // ticks since start
 uint64_t gfx_vsync_time_ns(uint64_t tick);                 // kern_now_ns() time of a tick (pacing)
 double gfx_window_refresh_hz(void);                        // refresh rate of the window's monitor; 0 unknown
+uint64_t gfx_window_hosted_ns(void);                       // kern_now_ns() of the newest host present; 0 before one
 int gfx_window_focused(void);
 // gfx_present.c: who holds the present, queue and window-start locks, read without taking them (the hang watch)
 typedef struct { uint32_t present, present_depth, queue, queue_depth, start; } GfxLockHolders;

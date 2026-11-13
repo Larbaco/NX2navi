@@ -274,8 +274,10 @@ double frame_step_game_hz(void) {
     return !frame_free_running() && !step_word && hz > 60 ? 60 : hz > LIMIT_MAX_HZ ? LIMIT_MAX_HZ : hz;
 }
 
-// RivaTuner Statistics Server (rtss_limit.c) gets the same limit; while it limits this process the pacer holds no
-// frames, so the two never stack. NX2NAVI_RTSS=0 and frame generation (RTSS would count the generated frames) keep it
+// RivaTuner Statistics Server (rtss_limit.c) gets the same limit; while it limits this process the pacer holds the
+// frames only to LIMIT_FREE_MAX_HZ, the ceiling the game's code needs, so the two never stack, and it takes the limit
+// back once no picture went out for 200 ms (rtss_decide.h rtss_pace_period): a minimised window or a frame hold leaves
+// RTSS no present to hold. NX2NAVI_RTSS=0 and frame generation (RTSS would count the generated frames) keep it
 // out, and so does a driver's low latency while it is in effect (vk_lowlat.c): the driver holds the limit where the
 // frame starts, and RTSS would hold the finished picture, the wait that mode is there to remove. RTSS gets the reason
 // (RTSS_OUT_*), for the log and for its check of a limit set in RTSS itself.
@@ -328,8 +330,8 @@ uint64_t frame_step_cap_ns(void) {
     if (movie_hz) hz = movie_hz;
     paced_hz = hz;
     rtss_limit_want(rtss_out ? rtss_out : (int64_t)(hz * 1000 + 0.5));
-    if (rtss_limit_active()) return 0;
-    return (uint64_t)(1e9 / hz + 0.5);
+    return rtss_pace_period(rtss_limit_active(), kern_now_ns(), gfx_window_hosted_ns(), (uint64_t)(1e9 / hz + 0.5),
+                            (uint64_t)(1e9 / LIMIT_FREE_MAX_HZ + 0.5));
 }
 
 // The limit as it is set, for the performance overlay: the setting, the monitor's rate for "display", 60 at

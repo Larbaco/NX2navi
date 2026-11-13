@@ -211,6 +211,23 @@ static inline void rtss_why_text(char *out, size_t n, const RtssOut *o, int fail
     else snprintf(out, n, "RivaTuner Statistics Server has not hooked the game yet");
 }
 
+// ---- the game's pacer beside RTSS (frame_rate.c frame_step_cap_ns)
+#define RTSS_HOLD_IDLE_NS 200000000ull   // no host present for this long: RTSS holds nothing (vk_lowlat.c HOLD_IDLE_NS)
+
+// The period the pacer keeps (now_ns and hosted_ns are kern_now_ns times; hosted_ns of the newest host present,
+// gfx_present.c gfx_window_hosted_ns, 0 before the first). The limit's own period while RTSS does not hold the game,
+// before the first host present, and once no host present went out for RTSS_HOLD_IDLE_NS: a minimised window or a
+// frame hold (vk_backend.c frame_hold) gives RTSS nothing to hold, and a pacer that held nothing then let the quick menu
+// run at the 640-700 fps that read address 0 (frame_rate.c LIMIT_FREE_MAX_HZ). While RTSS holds, the ceiling's period
+// and never 0: the frames RTSS lets through come further apart than that, so pace() waits for none of them, and it
+// still holds the game's frames to the ceiling the game's code needs.
+static inline uint64_t rtss_pace_period(int holds, uint64_t now_ns, uint64_t hosted_ns, uint64_t period,
+                                        uint64_t ceiling) {
+    uint64_t idle = now_ns > hosted_ns ? now_ns - hosted_ns : 0;
+    if (!holds || !hosted_ns || idle >= RTSS_HOLD_IDLE_NS) return period;
+    return ceiling < period ? ceiling : period;
+}
+
 // ---- RTSS's own settings
 // RTSS's own [Framerate] settings for the game, as its profile file holds them (rtss_limit.c read_settings): a frame
 // rate limit (Limit over LimitDenominator), a frame time limit (LimitTime over LimitTimeDenominator) and scanline sync
