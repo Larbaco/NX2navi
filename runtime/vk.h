@@ -567,6 +567,8 @@ void vk_defer_view(VkImageView view);
 void vk_defer_free(void *p);
 int vk_exec_image_gone(VkImage image);   // texture lock held: the replay's views of image go with it; returns how many
 void vk_defer_buffer(VkBuffer buf, VmaAllocation alloc);
+// As vk_defer_buffer without waiting: 0 when another thread holds the upload lock, and nothing is deferred.
+int vk_defer_buffer_try(VkBuffer buf, VmaAllocation alloc);
 // ---- ASTC (vk_astc.c). NX2NAVI_ASTC = auto | gpu | native | cpu | check; see vk_astc.c.
 enum { VK_ASTC_CPU, VK_ASTC_GPU, VK_ASTC_NATIVE, VK_ASTC_CHECK };
 int vk_astc_mode(void);                 // decided once per device (logged); VK_ASTC_CPU before vk_init

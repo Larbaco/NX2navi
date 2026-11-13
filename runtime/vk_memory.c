@@ -6016,6 +6016,16 @@ void vk_defer_free(void *p) { if (p) defer(DEAD_HOST, (uint64_t)(uintptr_t)p, NU
 void vk_defer_buffer(VkBuffer buf, VmaAllocation alloc) {
     if (buf) defer(DEAD_BUFFER_VMA, (uint64_t)(uintptr_t)buf, alloc);
 }
+// For a caller that holds a lock the upload path takes inside cmd_lock: vk_astc.c vk_astc_scratch_trim holds the
+// decoder's lock, which vk_astc.c scratch_get takes under vk_upload_begin's cmd_lock, so waiting for cmd_lock there
+// would reverse that order. defer takes cmd_lock again, which the recursive lock allows.
+int vk_defer_buffer_try(VkBuffer buf, VmaAllocation alloc) {
+    plat_once(&cmd_once, cmd_init, NULL);
+    if (!plat_rmutex_trylock(&cmd_lock)) return 0;
+    if (buf) defer(DEAD_BUFFER_VMA, (uint64_t)(uintptr_t)buf, alloc);
+    plat_rmutex_unlock(&cmd_lock);
+    return 1;
+}
 
 void vk_mem_note_submit(uint64_t timeline_value) {
     plat_once(&cmd_once, cmd_init, NULL);

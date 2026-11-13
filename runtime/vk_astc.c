@@ -564,8 +564,11 @@ static VkBuffer scratch_get(VkCtx *c, VkCommandBuffer cb, VkDeviceSize need, int
 // SCRATCH_SHRINK_NS, without waiting for the next ASTC upload, which is when scratch_get makes it small again: in a
 // session of 2026-11-13 the decoder held 224 MiB for the 70 s after an area load and from a later load to the session's
 // end. Nothing is made here: the next request makes the usual scratch, as after scratch_get's own shrink. The buffer
-// is freed once the upload batches recorded so far completed (vk_defer_buffer), as there. Only tried: scratch_get holds
-// g_lock while VMA makes a buffer, up to 19 ms for a new block, and the present does not wait for that.
+// is freed once the upload batches recorded so far completed (vk_defer_buffer_try), as there. Both locks are only
+// tried. scratch_get holds g_lock while VMA makes a buffer, up to 19 ms for a new block. The upload path takes
+// cmd_lock first (vk_memory.c vk_upload_begin) and g_lock inside it (vk_astc_record, scratch_get), so waiting for
+// cmd_lock while holding g_lock would deadlock with an upload, and waiting at all would hold the present for as long
+// as an upload flush waits for its fences. When either lock is busy the trim gives way; the next present tries again.
 // NX2NAVI_ASTC_SCRATCH_TRIM=0: the grown scratch stays until the next upload, as in 0.10.1.
 void vk_astc_scratch_trim(void) {
     static int on = -1;
@@ -574,7 +577,10 @@ void vk_astc_scratch_trim(void) {
     if (__atomic_load_n(&S.size, __ATOMIC_RELAXED) <= SCRATCH_MIN || !plat_mutex_trylock(&g_lock)) return;
     VkCtx *c = vk_ctx();
     if (S.buf && c && S.dev == c->device && S.size > SCRATCH_MIN && kern_now_ns() - S.big_ns > SCRATCH_SHRINK_NS) {
-        vk_defer_buffer(S.buf, S.alloc);
+        if (!vk_defer_buffer_try(S.buf, S.alloc)) {
+            plat_mutex_unlock(&g_lock);
+            return;
+        }
         S.buf = VK_NULL_HANDLE, S.alloc = NULL, S.size = 0, S.cb = VK_NULL_HANDLE;
         n_scratch_trim++;
     }
