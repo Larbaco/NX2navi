@@ -2,11 +2,14 @@
 frames and the GPU move, while the window is not in front or minimized, or while the process ends; one report for a
 stall of the frames with the window in front, another after progress and a new stall, one for GPU submissions not
 done whatever the focus, none for an idle GPU, at most three a run. A report writes the log out with logq_flush and
-never with logq_sync, which would turn the log thread off. No game files, no GPU.
+never with logq_sync, which would turn the log thread off. Also checks statically that runtime/kernel.c logs the guest
+threads' waits (kern_wait_report, wait_watch) only after it released the kernel lock: a log call can wait for room in
+the log queue, and a stalled log thread would then hold every guest thread. No game files, no GPU.
 
 Usage: hang_watch_check.py
 """
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -30,7 +33,36 @@ def compiler():
     return shutil.which('clang') or 'clang'
 
 
+def function(source, signature):
+    start = source.index(signature)
+    brace = source.index('{', start)
+    depth, end = 1, brace + 1
+    while depth:
+        depth += (source[end] == '{') - (source[end] == '}')
+        end += 1
+    return source[start:end]
+
+
+def static_checks():
+    """kernel.c: no log call while G is held in the wait report's walk and its two callers."""
+    kernel = re.sub(r'//[^\n]*', '', (ROOT / 'runtime' / 'kernel.c').read_text(encoding='utf-8'))
+    bad = 0
+    walk = function(kernel, 'static int wait_pass(')
+    ok = 'rt_log' not in walk
+    print(f'static: kernel.c wait_pass formats its lines and logs none: {"ok" if ok else "FAIL"}', flush=True)
+    bad += not ok
+    for sig in ('void kern_wait_report(void)', 'static void wait_watch(void *arg)'):
+        body = function(kernel, sig)
+        held = body[body.index('wait_pass('):body.index('unlock()')]
+        ok = 'rt_log' not in held and 'wait_lines_log(' in body[body.index('unlock()'):]
+        print(f'static: kernel.c {sig.split("(")[0].split()[-1]} logs the waits after unlock: {"ok" if ok else "FAIL"}',
+              flush=True)
+        bad += not ok
+    return bad
+
+
 def main():
+    bad = static_checks()
     work = ROOT / 'build' / 'test' / 'hang_watch'
     work.mkdir(parents=True, exist_ok=True)
     (work / 'layout.h').write_text(LAYOUT)
@@ -46,7 +78,10 @@ def main():
     subprocess.check_call([compiler(), '-O1', '-g', '-Wall', '-Wno-unused-function', '-fno-strict-aliasing',
                            '-march=x86-64-v3', '-I', str(rt), '-I', str(work), str(ROOT / 'tests' / 'hang_watch_check.c'),
                            *map(str, plat), '-o', str(exe), '-lm', *libs], env=env)
-    return subprocess.run([str(exe)], env=env, timeout=120).returncode
+    rc = subprocess.run([str(exe)], env=env, timeout=120).returncode
+    if bad:
+        print('hang_watch_check: the static checks FAILED')
+    return 1 if bad or rc else 0
 
 
 if __name__ == '__main__':

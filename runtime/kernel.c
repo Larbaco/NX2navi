@@ -970,31 +970,45 @@ static void wait_watch_holder(char *out, size_t cap, const RtThread *h) {
 
 // One walk over the guest threads, G held: each one that has waited `limit` ns or longer for a lock or for another
 // thread's end gets a line, at most max of them. mark: a wait gets its line once (wait_watch); the hang watch's report
-// (kern_wait_report) lists every such wait as it stands. Returns the lines written.
-static int wait_pass(uint64_t limit, int max, int mark) {
+// (kern_wait_report) lists every such wait as it stands. The lines go into out, each ending in a newline, and the
+// caller logs them once G is released (wait_lines_log): a log call can wait for room in the log queue (logq.c), and a
+// log thread stuck in a write, one of the stalls the hang watch reports, would then hold G and every guest thread with
+// it. Returns the lines written.
+#define WAIT_LINE_CAP 384   // a line: its fixed words, two numbers and wait_watch_holder's 160 bytes
+static int wait_pass(uint64_t limit, int max, int mark, char *out, size_t cap) {
     int lines = 0;
+    size_t used = 0;
     uint64_t now = kern_now_ns();
+    out[0] = 0;
     for (RtThread *t = g_all; t && lines < max; t = t->all) {
         if (!t->blk_since || (mark && t->blk_told) || now - t->blk_since < limit) continue;
-        char who[160];
+        char who[160], line[WAIT_LINE_CAP];
+        int n;
         if (t->wkind == W_LOCK) {   // the lock word's owner field is the holder's handle
             wait_watch_holder(who, sizeof who, h_peek((uint32_t)t->wobj, O_THREAD));
-            rt_log("kernel: thread %#x (priority %d) has waited %.0f s for the lock at %#llx held by %s",
-                   t->handle, t->prio, (now - t->blk_since) / 1e9, (unsigned long long)t->waddr, who);
+            n = snprintf(line, sizeof line, "kernel: thread %#x (priority %d) has waited %.0f s for the lock at %#llx held "
+                         "by %s\n", t->handle, t->prio, (now - t->blk_since) / 1e9, (unsigned long long)t->waddr, who);
         } else if (t->wkind == W_SYNC && t->whs) {
             const RtThread *end = NULL;
             for (int i = 0; i < t->wn && !end; i++) end = h_peek(t->whs[i], O_THREAD);
             if (!end) continue;
             wait_watch_holder(who, sizeof who, end);
-            rt_log("kernel: thread %#x (priority %d) has waited %.0f s for the end of %s", t->handle, t->prio,
-                   (now - t->blk_since) / 1e9, who);
+            n = snprintf(line, sizeof line, "kernel: thread %#x (priority %d) has waited %.0f s for the end of %s\n",
+                         t->handle, t->prio, (now - t->blk_since) / 1e9, who);
         } else {
             continue;
         }
+        if (n <= 0 || (size_t)n >= sizeof line || used + (size_t)n >= cap) break;   // no room: a later pass has it
+        memcpy(out + used, line, (size_t)n + 1);
+        used += (size_t)n;
         if (mark) t->blk_told = 1;
         lines++;
     }
     return lines;
+}
+
+static void wait_lines_log(const char *p) {   // wait_pass's lines, G released
+    for (const char *e; *p && (e = strchr(p, '\n')); p = e + 1) rt_log("%.*s", (int)(e - p), p);
 }
 
 static void wait_watch(void *arg) {
@@ -1004,9 +1018,11 @@ static void wait_watch(void *arg) {
     int lines = 0;
     while (lines < WAIT_WATCH_LINES) {
         plat_wait_ns(2000000000ull);
+        char out[WAIT_WATCH_LINES * WAIT_LINE_CAP];
         lock();
-        lines += wait_pass(limit, WAIT_WATCH_LINES - lines, 1);
+        lines += wait_pass(limit, WAIT_WATCH_LINES - lines, 1, out, sizeof out);
         unlock();
+        wait_lines_log(out);
     }
     rt_log("kernel: %d long waits logged: no more", lines);
 }
@@ -1020,8 +1036,10 @@ void kern_wait_report(void) {
         rt_log("kernel: the thread lock stayed taken for 100 ms; the guest threads' waits are not listed");
         return;
     }
-    int lines = wait_pass(0, 16, 0);
+    char out[16 * WAIT_LINE_CAP];
+    int lines = wait_pass(0, 16, 0, out, sizeof out);
     unlock();
+    wait_lines_log(out);
     if (!lines) rt_log("kernel: no guest thread waits for a lock or for another thread's end");
 }
 
