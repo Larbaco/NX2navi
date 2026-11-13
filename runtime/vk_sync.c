@@ -670,6 +670,14 @@ static void ts_submitted(const VkCommandBufferSubmitInfo *cbi, uint32_t ncb) {
     ts_n_unsent = 0;
 }
 
+// The last timed parts, for the line of a frame whose render thread waited long for the GPU (vk_gpu_parts_log): with
+// calibrated timestamps, each part's submit, GPU start and end (plat_now_ns) and its kind (vk.h GTL_*). Written by the
+// completion thread alone, in submission order; a reader takes the newest PART_RING / 2 entries, which the writer does
+// not reach before it has read them unless the GPU ends that many parts meanwhile.
+#define PART_RING 512
+static struct { int64_t sub, sn, en; int kind; } part_ring[PART_RING];
+static volatile uint64_t part_n;
+
 static void ts_read_cb(void *arg) {   // completion thread, in submission order
     TsRead *t = arg;
     VkCtx *c = vk_ctx();
@@ -691,6 +699,10 @@ static void ts_read_cb(void *arg) {   // completion thread, in submission order
                 if (en > ts_last_end_ns) ts_last_end_ns = en;
                 int64_t q = (int64_t)ts_queue_ns[t->pair];
                 vk_gtl_note_ns(t->mirror, sub, q ? q : sub, sn, en);
+                uint64_t pn = __atomic_load_n(&part_n, __ATOMIC_RELAXED);
+                part_ring[pn % PART_RING].sub = sub, part_ring[pn % PART_RING].sn = sn;
+                part_ring[pn % PART_RING].en = en, part_ring[pn % PART_RING].kind = t->mirror;
+                __atomic_store_n(&part_n, pn + 1, __ATOMIC_RELEASE);
             }
             uint64_t from = s > ts_last_end ? s : ts_last_end;
             if (e > from) {
@@ -706,6 +718,46 @@ static void ts_read_cb(void *arg) {   // completion thread, in submission order
     } else plat_inc64(&ts_missed);
     __atomic_store_n(&ts_busy[t->pair], 0, __ATOMIC_RELEASE);
     free(t);
+}
+
+// NX2NAVI_TRACE=perf (perf.c): a frame whose render thread waited 20 ms or more for GPU fences gets, at the next
+// present, a line of the timed parts that ended in its interval [t0, t1]: how many, the GPU time they took, the
+// longest ones with their kind and the time they waited in the queue, and the longest gap between two. In a session of
+// 2026-11-13 frames of 60-96 ms followed each area load by 2 to 6 frames, the render thread waiting 59-86 ms for the
+// GPU, and no line said which work the GPU did then. Read from the ring the completion thread fills: nothing here
+// waits for the GPU.
+void vk_gpu_parts_log(uint64_t frame, uint64_t t0, uint64_t t1, double fence_ms) {
+    static uint32_t logged;
+    if (logged >= 400) return;
+    uint64_t n = __atomic_load_n(&part_n, __ATOMIC_ACQUIRE), from = n > PART_RING / 2 ? n - PART_RING / 2 : 0;
+    struct { int64_t ns, q; int kind; } top[6] = {{0}};
+    static const char *const kn[GTL_KINDS] = {"part", "mirror copies", "pre-pass", "uploads", "present"};
+    uint64_t parts = 0, busy = 0, gap = 0;
+    int64_t prev_end = 0;
+    for (uint64_t i = from; i < n; i++) {
+        const typeof(part_ring[0]) *p = &part_ring[i % PART_RING];
+        if (p->en < (int64_t)t0 || p->en > (int64_t)t1 || p->en < p->sn) continue;
+        int64_t ns = p->en - p->sn, q = p->sub && p->sn > p->sub ? p->sn - p->sub : 0;
+        parts++, busy += (uint64_t)ns;
+        if (prev_end && p->sn > prev_end && (uint64_t)(p->sn - prev_end) > gap) gap = (uint64_t)(p->sn - prev_end);
+        if (p->en > prev_end) prev_end = p->en;
+        for (int k = 0; k < 6; k++)
+            if (ns > top[k].ns) {
+                memmove(&top[k + 1], &top[k], sizeof top[0] * (size_t)(5 - k));
+                top[k].ns = ns, top[k].q = q, top[k].kind = p->kind;
+                break;
+            }
+    }
+    if (!parts) return;
+    logged++;
+    char line[700];
+    int o = snprintf(line, sizeof line, "perf: frame %llu: the GPU's timed parts that ended while the render thread waited "
+                     "%.1f ms for fences: %llu parts, %.1f ms of GPU time, the longest gap between two %.1f ms; the longest:",
+                     (unsigned long long)frame, fence_ms, (unsigned long long)parts, busy / 1e6, gap / 1e6);
+    for (int k = 0; k < 6 && top[k].ns && o < (int)sizeof line - 80; k++)
+        o += snprintf(line + o, sizeof line - (size_t)o, "%s %.1f ms (%s, %.1f ms in the queue)", k ? "," : "",
+                      top[k].ns / 1e6, top[k].kind >= 0 && top[k].kind < GTL_KINDS ? kn[top[k].kind] : "?", top[k].q / 1e6);
+    rt_log("%s", line);
 }
 
 // ---- frame timeline

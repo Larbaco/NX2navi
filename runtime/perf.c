@@ -592,6 +592,9 @@ static void ft_report(uint64_t now, const char *tag) {
 }
 
 __attribute__((weak)) void gfx_exit_log(void) {}
+__attribute__((weak)) void vk_gpu_parts_log(uint64_t frame, uint64_t t0, uint64_t t1, double fence_ms) {
+    (void)frame, (void)t0, (void)t1, (void)fence_ms;
+}
 __attribute__((weak)) void vk_mem_rank_log(const char *when) { (void)when; }
 
 // The session's reports when the window loses the focus in play: the frame-time summary of the period so far (which
@@ -946,6 +949,13 @@ void perf_present(uint64_t frame) {
     MarkSums fm;
     mark_frame(&fm);
     seg_frame(frame, now, last ? d : 0, &fm);
+    // A frame whose render thread waited 20 ms or more for GPU fences: at the next present, the GPU's timed parts that
+    // ended in its interval (vk_sync.c vk_gpu_parts_log), read then, so that the completion thread has read them.
+    static uint64_t parts_frame, parts_t0, parts_t1;
+    static double parts_fence;
+    if (parts_frame) vk_gpu_parts_log(parts_frame, parts_t0, parts_t1, parts_fence), parts_frame = 0;
+    if (last && frame_ns[PERF_FENCE] >= 20000000ull)
+        parts_frame = frame, parts_t0 = plat_now_ns() - d, parts_t1 = plat_now_ns(), parts_fence = frame_ns[PERF_FENCE] / 1e6;
     if (last) {
         sum += d;
         n++;

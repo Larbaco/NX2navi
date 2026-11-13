@@ -948,6 +948,9 @@ VkCommandBuffer vk_sync_cut(void);
 // sub_ns (plat_now_ns), its timestamps start and end (ticks of the graphics queue). vk_gtl_log: the gaps of the pieces
 // noted since the last call, over frames frames, in the log.
 enum { GTL_PART, GTL_MIRROR, GTL_PRE, GTL_UPLOAD, GTL_PRESENT, GTL_KINDS };
+// NX2NAVI_TRACE=perf: the timed GPU parts that ended in [t0, t1] (plat_now_ns), the interval of a frame whose render
+// thread waited fence_ms for fences (perf.c perf_present), in one line (vk_sync.c)
+void vk_gpu_parts_log(uint64_t frame, uint64_t t0, uint64_t t1, double fence_ms);
 void vk_gtl_note(int kind, uint64_t sub_ns, uint64_t start_tick, uint64_t end_tick);
 void vk_gtl_log(uint64_t frame, int frames);
 extern int vk_sub_in_frame;   // replay: the submission being recorded is the frame's n-th (0 the first; vk_backend.c)
