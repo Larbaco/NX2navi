@@ -1168,6 +1168,31 @@ static uint32_t *gen_chunk[GEN_CHUNKS];
 static uint32_t gen_now;                 // last generation handed out
 static PlatMutex gen_lock = PLAT_MUTEX_INIT;
 static uint64_t gen_pages[1024];
+
+// Generations are 32 bits, and nothing compares them across a wrap: past it a stamp from before reads as newer than
+// every later check, and a stamp of 0 as never stamped, so textures and pool mirrors the CPU writes can miss a write
+// and every check reads as a write. At about 181 a frame that comes after about 110 h of play at 60 fps, 27 h at 240.
+// Only trace=perf's "mem: sizes" counted them, so gen_next, which hands each one out, logs where the session stands at
+// 0xC0000000, 0xD0000000, 0xE0000000 and 0xF0000000, and the wrap itself (gen_mark): five lines at most.
+static void gen_mark(uint32_t g) {   // gen_lock held exclusively; the log takes no lock of this file
+    uint64_t frames = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    double secs = rt_guest_start_ns ? (double)(kern_now_ns() - rt_guest_start_ns) / 1e9 : 0, all = 4294967296.0;
+    if (!g) {
+        rt_log("mem: page generations ran out at frame %llu after %.1f h: from here on textures and pool mirrors the "
+               "CPU writes can show old content and every check uploads again; restart the game",
+               (unsigned long long)frames, secs / 3600);
+        return;
+    }
+    rt_log("mem: page generations: %u of 4294967295 handed out at frame %llu (%.0f a frame); at this rate they run out "
+           "in about %.1f h of play, after which textures and pool mirrors the CPU writes can miss a write and every "
+           "check reads as a write: restart the game before then", g, (unsigned long long)frames,
+           frames ? g / (double)frames : 0.0, secs > 0 ? (all - g) * secs / g / 3600 : 0.0);
+}
+static inline uint32_t gen_next(void) {   // gen_lock held exclusively
+    uint32_t g = ++gen_now;
+    if (__builtin_expect(!(g & 0x0fffffffu) && (g >= 0xc0000000u || !g), 0)) gen_mark(g);
+    return g;
+}
 // The newest generation stamped on any page of each 2 MiB region (the write-watch snapshot regions below): the mirror
 // sync skips regions with nothing newer than its pool's mirror.
 #define REG_SHIFT 21
@@ -1280,7 +1305,7 @@ void vk_guest_written(uint64_t addr, uint64_t size) {
     if (!size || nvn_gpu_only(addr)) return;
     uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;
     plat_mutex_lock(&gen_lock);
-    stamp_range(lo, hi, ++gen_now);
+    stamp_range(lo, hi, gen_next());
     plat_mutex_unlock(&gen_lock);
 }
 
@@ -1288,7 +1313,7 @@ int vk_mem_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now) 
     if (!size) { *now = since; return 0; }
     uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;
     plat_mutex_lock(&gen_lock);
-    uint32_t g = ++gen_now;
+    uint32_t g = gen_next();
     int tracked = 1, frozen = 1;
     for (uint64_t a = lo & ~((1ull << REG_SHIFT) - 1); a < hi && frozen; a += 1ull << REG_SHIFT) frozen = mem_frozen(a);
     while (!frozen) {
@@ -1334,7 +1359,7 @@ static uint64_t snap_regions(uint64_t r0, uint64_t r1, uint32_t epoch) {
         while (k + 1 <= r1 && snap_at[k + 1] != epoch && !mem_frozen((k + 1) << SNAP_SHIFT)) k++;
         uint64_t a = r << SNAP_SHIFT, b = (k + 1) << SNAP_SHIFT;
         int tracked = 1;
-        if (!g) g = ++gen_now;
+        if (!g) g = gen_next();
         for (;;) {
             uint64_t n = ww_query(a, b - a);
             if (n == UINT64_MAX) { tracked = 0; break; }
@@ -1973,7 +1998,7 @@ static void shadow_sync_pool(PoolRec *r, uint32_t epoch, int cpu) {
         s_queries += snap_regions(r0, r1, epoch);
         for (uint64_t k = r0; k <= r1 && tracked; k++) tracked = !snap_untracked[k];
     } else {   // outside the snapshot regions, or before the first guest submission: one query per unfrozen run
-        uint32_t g = ++gen_now;
+        uint32_t g = gen_next();
         for (uint64_t a = lo; a < hi;) {
             uint64_t b = (a | ((1ull << REG_SHIFT) - 1)) + 1;
             if (b > hi) b = hi;
@@ -2143,7 +2168,7 @@ static void table_wb_cb(void *arg) {
     s_tab_wb += moved, s_tab_wb_seen += seen, s_tab_wb_jobs++;
     if (nwrote) {
         plat_mutex_lock(&gen_lock);
-        uint32_t g = ++gen_now;
+        uint32_t g = gen_next();
         for (int i = 0; i < nwrote; i++) stamp_page_as(wrote[i], g, back);
         plat_mutex_unlock(&gen_lock);
     }
@@ -2159,7 +2184,7 @@ static void gpu_written(uint64_t addr, uint64_t size, int back) {
     uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;
     back = back && wb_no_reup();   // read before gen_lock: its first call logs
     plat_mutex_lock(&gen_lock);
-    uint32_t g = ++gen_now;
+    uint32_t g = gen_next();
     for (uint64_t a = lo; a < hi; a += 1ull << GEN_PAGE_SHIFT) stamp_page_as(a, g, back);
     plat_mutex_unlock(&gen_lock);
 }
@@ -2315,7 +2340,7 @@ void vk_mem_dirty_submit(void) {
         if (r->kind == POOL_IMPORT && r->bufbound) dlist[n++] = r;
     }
     plat_mutex_lock(&gen_lock);
-    uint32_t g = ++gen_now, since = dirty_gen;
+    uint32_t g = gen_next(), since = dirty_gen;
     dirty_gen = g;
     for (int i = 0; i < n;) {   // one query per run of pools (sorted by address)
         uint64_t lo = page_lo(dlist[i]), hi = page_hi(dlist[i]);
@@ -3503,7 +3528,7 @@ static void swb_run(uint64_t a, uint64_t b) {
     if (b <= a || !shadow_write_back(a, b - a) || nvn_gpu_only(a)) return;
     int back = wb_no_reup();
     plat_mutex_lock(&gen_lock);
-    uint32_t g = ++gen_now;
+    uint32_t g = gen_next();
     for (uint64_t x = a & ~0xfffull; x < b; x += 1ull << GEN_PAGE_SHIFT) stamp_page_as(x, g, back);
     plat_mutex_unlock(&gen_lock);
 }
@@ -4005,7 +4030,7 @@ static void freeze_pass(void) {
         int ok = mem_freeze(a);
         uint64_t t1 = qpc();
         slow_mem_call("freeze", a, 1ull << REG_SHIFT, 0, t1 - t0);
-        if (ok) query_stamp(a, a + (1ull << REG_SHIFT), ++gen_now);
+        if (ok) query_stamp(a, a + (1ull << REG_SHIFT), gen_next());
         else n_frz_refused++;
         if (!freeze_budget_ns) continue;
         frz_freeze_done(&frz, t1, t1 - t0, frz_quiet_ns);
