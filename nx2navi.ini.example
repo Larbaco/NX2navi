@@ -364,6 +364,9 @@
 # With astc = gpu: 1 keeps the decoder's scratch buffer from one upload batch to the next instead of making it again for
 # each, to shorten the hitches when an area loads (0 = one per batch).
 # astc_scratch_keep = 1
+# With astc_scratch_keep = 1: 1 gives back a scratch grown for a large texture 5 s after the last one needed it (up to
+# 192 MiB of video memory after an area load); 0 keeps it until the next ASTC upload, as in 0.10.1.
+# astc_scratch_trim = 1
 # With astc = gpu: 1 stages a texture's ASTC blocks in the shared staging ranges instead of a buffer of their own
 # (0 = a buffer each).
 # astc_arena = 1

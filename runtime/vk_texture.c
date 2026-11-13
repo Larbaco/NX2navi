@@ -3429,6 +3429,7 @@ static void compact_frame_time(uint64_t d);
 
 void vk_texstat_frame(uint64_t frame, uint64_t d) {
     if (compact_on()) compact_frame_time(d);
+    vk_astc_scratch_trim();
     if (ts_log_ms < 0) {
         ts_log_ms = cfg_int("NX2NAVI_TEXUP_LOG_MS");
         if (ts_log_ms < 0) ts_log_ms = 0;

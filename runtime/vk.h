@@ -598,6 +598,7 @@ void vk_texture_split_counts(uint64_t *copies, uint64_t *fills);
 VkDeviceSize vk_astc_region_bytes(const VkAstcRegion *r, uint32_t bw, uint32_t bh);   // source bytes the region reads
 void vk_astc_stats(uint64_t *dispatches, uint64_t *texels);   // since start
 uint64_t vk_astc_scratch_bytes(void);                          // the decoder's shared scratch now
+void vk_astc_scratch_trim(void);                               // each present: a grown scratch idle for 5 s goes
 // NX2NAVI_ASTC_TIME=1: GPU timestamps around each vk_astc_record's dispatches (logged per footprint and the largest one)
 void vk_astc_time_enable(int on);
 int vk_astc_time_get(uint32_t bw, uint32_t bh, uint64_t *texels, uint64_t *calls, double *us);   // totals so far
