@@ -1039,9 +1039,10 @@
 # flight_flash_diff = 24
 # flight_flash_cells = 3
 # Stutter map: the log gets a line for each hitch (a frame over 2.5 times the frames before it and at least 12 ms, or
-# over 25 ms) with the area, what the frame waited for and the pipelines and shaders its draws met missing, and every 10
-# minutes and at exit a map of the areas by their hitches and of the pipelines that cost the most. tools/stutter_map.py
-# reads it. 0: off. Read at start.
+# over 25 ms) with the area, what the frame waited for and the pipelines and shaders its draws met missing; a run of
+# consecutive long frames counts as one hitch with their summed time. Every 5 minutes of play, when the window loses
+# the focus in play and at exit, a map of the areas by their hitches and of the pipelines that cost the most.
+# tools/stutter_map.py reads it. 0: off. Read at start.
 # stutter_map = 0
 # GPU pass marks: after a GPU crash (device lost) the log names the render pass or dispatch the GPU had started and the
 # last one it finished. Unset: on AMD GPUs (VK_AMD_buffer_marker). 1: also on NVIDIA GPUs

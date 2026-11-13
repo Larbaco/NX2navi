@@ -652,6 +652,12 @@ A change to where the lazy write-back is on by default (`runtime/wb_lazy_choice.
 `vk_mem_lazy_decide`) passes `python tests\wb_lazy_check.py`, which builds the header alone and checks the choice and
 its reason by platform, by GPU driver and by what the player set. No game files, no GPU.
 
+A change to when the freezing of idle guest regions waits (`runtime/freeze_hold.h`, `runtime/vk_memory.c`
+`freeze_pass`) passes `python tests\freeze_hold_check.py`, which builds the header alone: the backoff after a slow
+freeze doubles while slow ones come within the quiet time, fast freezes between them included, stops at its cap and
+starts over after the quiet time (with a quiet time of 0, at the first fast freeze); and an area load holds the passes
+while the texture pool loads and for the hold after it or after the area's load. No GPU, no game files.
+
 A change to what writes `nx2navi.ini` outside the game (`launcher/gameini.py`, `installer/ini.py`, `tools/make_game.py`,
 `launcher/updater.py`) passes the settings-file tests of `tests\launcher_test.py` (`PlayerIniTest`, and the tests named
 `..._settings_file` of `BackgroundUpdateTest` and `MakeGameTest`): a player's file with lines that are no settings of
