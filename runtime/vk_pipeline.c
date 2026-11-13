@@ -165,6 +165,7 @@ typedef struct Pipe {
     uint8_t optimised;                 // graphics: its pipeline is the whole build that replaced a fast link (fast_retire)
     uint32_t used_min;                 // pipe_minute when a draw or dispatch last looked it up; 0 none in this run
     uint64_t t_miss;                   // graphics: when a draw first missed it (ns), 0 once it is usable (ready_note)
+    uint64_t rel_fence;                // taken out by pressure_release: destroyed once this value is done (release_drain)
     size_t key_size;
     uint8_t key[];
 } Pipe;
@@ -5035,12 +5036,14 @@ static void fast_retire(Pipe *p) {
 // each one's compiled code in video memory until it is destroyed. In a 4K session with DLSS and frame generation the
 // device-local memory outside the allocator was 4.2 GB with 6,300 graphics pipelines alive, 3,589 of them not drawn
 // once in that run. On a card short of video memory those are the cheapest thing to give back: no draw has recorded
-// them. So while the device-local memory in use is over NX2NAVI_TEX_VRAM_PRESSURE percent of the budget (vk_mem_vram_live,
-// which NX2NAVI_VRAM_BUDGET_MB caps for a test), the autosave thread takes up to RELEASE_BATCH graphics pipelines that
-// no draw has looked up in this run out of the table every RELEASE_EVERY_MS, and destroys them with their entries once
-// the GPU is past the submission being recorded and one more (as fast_retire). A draw that needs one later misses it as
-// it would a pipeline never built (pipe_miss): its stage libraries link it, or the look-ahead queued them
-// (vk_pipeline_hint), and its optimised build comes from the pipeline cache, which still holds it.
+// them. So while the device-local memory in use is over NX2NAVI_TEX_VRAM_PRESSURE percent of the budget
+// (vk_mem_vram_live, which NX2NAVI_VRAM_BUDGET_MB caps for a test), the autosave thread takes up to RELEASE_BATCH
+// graphics pipelines that no draw has looked up in this run out of the table every RELEASE_EVERY_MS, and destroys them
+// with their entries once the GPU is past the submission being recorded and one more (as fast_retire), at most
+// RELEASE_DRAIN a tick (release_drain). Not on the completion thread: a value counts as done only after its callbacks
+// ran (vk_sync.c completion_main), so a batch of destroys there held every fence wait of the drawing threads. A draw that
+// needs one later misses it as it would a pipeline never built (pipe_miss): its stage libraries link it, or the
+// look-ahead queued them (vk_pipeline_hint), and its optimised build comes from the pipeline cache, which still holds it.
 // Only entries no lookup reached go (used_min 0; pipe_minute is set before the first lookup, ensure_init), so no draw's
 // memo (vk_exec_draw.c, the PM context) nor any caller holds their VkPipeInfo. Not taken: mesh pipelines (without
 // stage libraries their build is long), entries building or with a link queued, failed ones, and compute pipelines.
@@ -5051,14 +5054,25 @@ static void fast_retire(Pipe *p) {
 // NX2NAVI_PIPE_RELEASE=0 keeps every pipeline for the run, as before 0.10.0.
 #define RELEASE_EVERY_MS 5000
 #define RELEASE_BATCH 256
+#define RELEASE_DRAIN 64   // destroyed per autosave tick (500 ms) at most: faster than RELEASE_BATCH per RELEASE_EVERY_MS
 static uint64_t rel_total, rel_batches;
 static uint64_t rel_used0;   // device-local use (MiB) when the last batch went; 0 none to report
+// Entries out of the table, linked through next in the order they went (so by rel_fence), until release_drain
+// destroys them. Only the autosave thread touches the list (pressure_release, release_drain): no lock.
+static Pipe *rel_head, *rel_tail;
 
-static void released_destroy_cb(void *arg) {   // the completion thread: the entry is out of the table since its batch
-    Pipe *p = arg;
-    if (p->info.pipeline) vkDestroyPipeline(P.device, p->info.pipeline, NULL);
-    free(p->bindings);
-    free(p);
+// The autosave thread, each tick: destroys the released entries whose fence the GPU is past. None after a device loss
+// (vk_device.c vk_device_lost_check): the device is not called any more.
+static void release_drain(void) {
+    if (!rel_head || vk_device_is_lost()) return;
+    uint64_t done = vk_sync_fence_done();
+    for (int i = 0; i < RELEASE_DRAIN && rel_head && rel_head->rel_fence <= done; i++) {
+        Pipe *p = rel_head;
+        if (!(rel_head = p->next)) rel_tail = NULL;
+        if (p->info.pipeline) vkDestroyPipeline(P.device, p->info.pipeline, NULL);
+        free(p->bindings);
+        free(p);
+    }
 }
 
 // Caller holds P.lock.
@@ -5102,7 +5116,12 @@ static void pressure_release(uint64_t now) {
     uint64_t at = vk_sync_issued() + 2;
     plat_mutex_unlock(&P.lock);
     if (!n) return;
-    for (int i = 0; i < n; i++) vk_completion_add(at, released_destroy_cb, gone[i]);
+    for (int i = 0; i < n; i++) {
+        gone[i]->rel_fence = at, gone[i]->next = NULL;
+        if (rel_tail) rel_tail->next = gone[i];
+        else rel_head = gone[i];
+        rel_tail = gone[i];
+    }
     rel_total += (uint64_t)n, rel_batches++;
     rel_used0 = used >> 20;
     if (rel_batches <= 16 || !(rel_batches & (rel_batches - 1)))
@@ -8944,6 +8963,7 @@ static void autosave_once(void) {
     if (!P.ready) return;
     uint64_t now = plat_now_ms();
     __atomic_store_n(&pipe_minute, minute_now(), __ATOMIC_RELAXED);
+    release_drain();         // the pipelines given back earlier that the GPU is done with
     pressure_release(now);   // while video memory is short: the pipelines no draw used go
     if (now - last_sizes >= SIZES_EVERY_MS && (P.cache || P.play)) last_sizes = now, cache_sizes_ask();
     if (now - last_keys >= 2000) {
