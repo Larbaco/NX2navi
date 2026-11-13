@@ -865,6 +865,7 @@ void vk_exec_pass_begin(VkExec *ex) {
     VkPassMark *m = ex->mark = rw_chunk ? NULL : vk_pass_mark_begin(ex->cb, VK_MARK_PASS, ex->fence);   // one ring
     if (m) {
         m->step = ex->mark_passes++;
+        m->mesh = m->mesh_ind = 0;
         m->w = ex->pass_w, m->h = ex->pass_h, m->d = ex->pass_layers;
         m->layer = ex->depth.image ? ex->depth.base_layer : 0;
         m->vw = m->vh = 0;
@@ -1855,8 +1856,10 @@ static void op_one(VkExec *ex, const op_hdr *h) {
 // 3 workers: on an RX 7900 XT with a Ryzen 7 5800X3D, Hyrule Field standing went from 41.2 to 50.4 fps (2026-11-12, one
 // batch), with the same pictures there and in Kokiri Forest, Kakariko, Goron City, a graveyard house and Gerudo
 // Valley; 5 or 7 workers measured the same as 3. Default 0 again after players' games crashed with 3 on by default
-// (0.9.1, 0.9.2): an RX 6700 XT lost its device after about 18,000 frames, its last mark a compute dispatch of the
-// replay's own, with an occlusion query slot found unavailable after its fence just before; the cause is not known.
+// (0.9.1, 0.9.2): an RX 6700 XT lost its device after about 18,000 frames, its last mark the game's own compute
+// dispatch (op_dispatch: 20x1x1 groups of cs d7566eb1, a depth probe) and nothing after it marked, since the group of
+// draws that followed was recorded by the workers, whose passes have no marks; an occlusion query slot was found
+// unavailable after its fence just before. An RX 6600 lost it the same way twice (0.9.2). The cause is not known.
 // A submission's draws come in runs between ops that have to stay in the replay's order on its own thread (dispatches,
 // copies, texture and buffer clears, events, the game's barriers, calls). Hyrule Field, standing (NX2NAVI_REPLAY_RUNS,
 // 2026-11-11): about 3,500 draws a frame in 82 runs, 96% of them in runs of 16 draws or more and 67% in runs of 256 or
@@ -2449,6 +2452,9 @@ static const op_hdr *group_start(VkExec *ex, const op_hdr *h, int depth) {
     uint64_t t0 = kern_now_ns();
     gfx_tl_note('g', 0, draws, (uint64_t)n);
     vk_exec_barrier(ex);         // the command buffer so far ends behind a full barrier, every image back in GENERAL
+    // the chunks' passes get no marks (vk_exec_pass_begin): a lost device's report names the group between the marks.
+    // After the barrier, whose end of an open pass ends that pass's mark and empties the note.
+    vk_gpu_gap_note(VK_GAP_GROUP, draws);
     g->upd = vk_exec_draw_group_begin(ex);
     // the front pass
     uint32_t per = (draws + (uint32_t)n - 1) / (uint32_t)n, cd = 0;

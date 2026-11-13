@@ -420,10 +420,15 @@ typedef struct {
 // One line for a fatal error's report (dispatch.h rt_fatal_note_add): the card, its driver, and the settings in effect
 // that change how the game's memory behaves. A report often arrives as the end of a log alone, or as a picture of it,
 // and the lines that say these things are at its start. No lock is taken: the failing thread may hold any.
+// How the game's task and mesh programs are drawn (create_device decides it): natively, through the mesh fallback, the
+// mesh emulation, or not at all. Every RX 6000 loss whose marks named a pass was in one that starts with a mesh draw.
+static const char *g_mesh_path = "not decided yet";
+
 static void fatal_note(void) {
     char mem[512];
     vk_mem_fatal_note(mem, sizeof mem);
-    rt_log("fatal: gpu %s; %s; texture detail %s", vk_caps_summary(), mem, vk_texture_detail_name());
+    rt_log("fatal: gpu %s; %s; texture detail %s; mesh draws %s", vk_caps_summary(), mem, vk_texture_detail_name(),
+           g_mesh_path);
 }
 
 static int create_device(void) {
@@ -607,6 +612,8 @@ static int create_device(void) {
         const char *mf = cfg_value("NX2NAVI_MESH_FALLBACK"), *me = cfg_value("NX2NAVI_MESH_EMULATION");
         int emu = !g_vk.has_mesh_shader && strcmp(me, "0");
         g_vk.mesh_fallback = !emu && (!strcmp(mf, "1") || (strcmp(mf, "0") && !g_vk.has_mesh_shader));
+        g_mesh_path = emu ? "emulated (mesh_emulation)" : g_vk.mesh_fallback ? "through the mesh fallback (compute passes)"
+                    : g_vk.has_mesh_shader ? "native (VK_EXT_mesh_shader)" : "skipped (no mesh shaders, mesh_fallback = 0)";
         if (emu) rt_log("vk: mesh shaders: emulated with compute (mesh_emulation = 1); mesh_fallback is not used");
         else if (g_vk.mesh_fallback)
             rt_log("vk: mesh fallback: task and mesh programs run as compute passes and are drawn from their buffers (%s)",

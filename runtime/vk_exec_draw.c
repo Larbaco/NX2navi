@@ -6068,6 +6068,8 @@ static void mfb_draw(VkExec *ex, uint32_t count, const VkMemSpan *ind) {
     int prim = c->mi.ipp == 1 ? NVN_DRAW_PRIMITIVE_POINTS : c->mi.ipp == 2 ? NVN_DRAW_PRIMITIVE_LINES : NVN_DRAW_PRIMITIVE_TRIANGLES;
     if (!prepare_draw_ex(ex, prim, 0x7fffffff, 0, 2)) return;
     vk_exec_frame.draws++;
+    if (ex->mark && ind) ex->mark->mesh_ind++;   // the pass's mesh draws (vk_crumbs.c describe_mark)
+    else if (ex->mark) ex->mark->mesh++;
     vkCmdDrawIndirect(ex->cb, rec, at + 32, 1, sizeof(VkDrawIndirectCommand));
     ex->recorded++;
 }
@@ -6117,6 +6119,7 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d) {
     if (!prepare_draw_ex(ex, NVN_DRAW_PRIMITIVE_TRIANGLES, 0x7fffffff, 0, 1)) return;
     if (d->first) warn_once(W_MESH, "a mesh draw from workgroup %u: drawn from workgroup 0", d->first);
     vk_exec_frame.draws++;
+    if (ex->mark) ex->mark->mesh++;   // the pass's mesh draws, for a lost device's report (vk_crumbs.c describe_mark)
     static uint32_t n_logged;
     if (n_logged < 8 && knob_log_mesh()) {
         n_logged++;
@@ -6325,6 +6328,7 @@ static void op_draw_mesh_ind(VkExec *ex, const p_draw_mesh_ind *d) {
     if (!mesh_ring_entry(ex, ex->cb, d, &ip, &at)) return warn_once(W_MESH, "the indirect mesh ring could not be created: skipped");
     if (!prepare_draw_ex(ex, NVN_DRAW_PRIMITIVE_TRIANGLES, 0x7fffffff, 0, 1)) return;
     vk_exec_frame.draws++;
+    if (ex->mark) ex->mark->mesh_ind++;   // the pass's mesh draws, for a lost device's report (vk_crumbs.c describe_mark)
     static uint32_t n_logged;
     if (n_logged < 8 && knob_log_mesh()) {
         n_logged++;

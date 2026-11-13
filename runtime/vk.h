@@ -174,6 +174,7 @@ typedef struct {
     uint32_t gp;                        // NX2NAVI_GPU_PASSES: the timestamp pair of this mark plus one; 0 none
     uint32_t layer;                     // NX2NAVI_GPU_PASSES: the first layer of the depth target (a shadow cascade)
     uint32_t gap;                       // bits of VK_GAP_*: what the replay recorded between the mark before and this one
+    uint16_t mesh, mesh_ind;            // a pass's mesh draws, with a count and with the GPU's (DrawMeshTasksIndirect)
 } VkPassMark;
 void vk_gpu_passes_frame(uint64_t frame);   // vk_crumbs.c, each present: NX2NAVI_GPU_PASSES, GPU time per pass and dispatch
 // NX2NAVI_GPU_PASSES also times what a part of a submission spends outside its passes and dispatches (vk_crumbs.c, "the
@@ -184,7 +185,9 @@ void vk_gpu_passes_frame(uint64_t frame);   // vk_crumbs.c, each present: NX2NAV
 enum {
     VK_GAP_COPY_B2B, VK_GAP_COPY_B2T, VK_GAP_COPY_T2B, VK_GAP_COPY_T2T, VK_GAP_CLEAR_BUF, VK_GAP_CLEAR_TEX,
     VK_GAP_CLEAR_TARGET, VK_GAP_UPSCALER, VK_GAP_WB_MERGE, VK_GAP_WB_COPY, VK_GAP_TWIN, VK_GAP_POOL_MARKS,
-    VK_GAP_MESH_RING, VK_GAP_BC_BACK, VK_GAP_N
+    VK_GAP_MESH_RING, VK_GAP_BC_BACK,
+    VK_GAP_GROUP,   // a group of draws the replay workers recorded (vk_exec.c group_start): passes without marks
+    VK_GAP_N
 };
 void vk_gpu_passes_part(VkCommandBuffer cb, int end);
 // Result points (NX2NAVI_GPU_PASSES): the submission whose parts follow (vk_sync.c), a result just recorded (VK_RES_*
