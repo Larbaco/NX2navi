@@ -125,13 +125,17 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   a crash, which skips the prebuild or the variants, or a start that was closed or stopped, which skips nothing.
   `NX2NAVI_PREWARM_WAIT_MS` caps the whole wait, after which the rest finishes in the background.
 - Translator updates: every cache key names the translator, so a new one has no translations. The cache carries the
-  previous translator's (`NX2NAVI_SHADER_CARRY`, `runtime/gfx_shader.c` "Carry"): `shader-cache/identities.txt`
-  lists the translators it holds translations of, and a shader the new translator has not translated yet uses the
-  previous one's for the whole session, so neither the start nor play waits for a translation the update caused.
-  After the boot prewarm a background pass on its own translator process at idle priority, which waits while the game
-  translates, translates every stored program again for the next start, then deletes the old translations (a pruned
-  copy of `shader-cache.pack` replaces the pack at the next start). A program the new translator refuses keeps its
-  old translation. `--prepare-shaders` still translates everything with the current translator.
+  previous translator's (`NX2NAVI_SHADER_CARRY`, `runtime/gfx_shader.c` "Carry"): `shader-cache/identities.txt` lists
+  the translators it holds translations of, and a shader the new translator has not translated yet uses the previous
+  one's for the whole session, so neither the start nor play waits for a translation the update caused. Except a
+  previous translation that indexes the texture pool with the earlier length (32768 entries, the 0.9.2 translator's),
+  which would read slot 32767 for every texture numbered from 32768 up (`runtime/gfx_shader.c` `carry_usable`): such a
+  shader is translated again, in the boot prewarm when the boot names it, otherwise at first use (its draws are skipped
+  meanwhile; a compute dispatch waits for the translation). A program the current translator fails keeps even such a
+  translation (`carry_last`). After the boot prewarm a background pass on its own translator process at idle priority,
+  which waits while the game translates, translates every stored program again for the next start, then deletes the old
+  translations (a pruned copy of `shader-cache.pack` replaces the pack at the next start). A program the new translator
+  refuses keeps its old translation. `--prepare-shaders` still translates everything with the current translator.
 - Shader disk reads in play: a draw's shader that is in the disk cache but not in memory is read on the render thread
   within a budget of 1/8 of the wall time (2 ms at once), and past it by three loader threads while its draws are
   skipped as for a translation (`runtime/gfx_shader.c` `load_budget`). Opening a loose file is what costs (5.6 ms a
