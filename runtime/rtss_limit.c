@@ -47,17 +47,12 @@ typedef void (*ProfileFn)(LPCSTR name);
 typedef BOOL (*PropertyFn)(LPCSTR property, LPBYTE data, DWORD size);
 typedef void (*UpdateFn)(void);
 
-#define RTSS_SIGNATURE 0x52545353u   // 'RTSS' as RTSS writes it: the memory holds valid data
 #define POLL_MS 500
-#define CHECK_POLLS 6     // polls in a row RTSS's own frame rate of the game may stay above the limit
-#define CHECK_SLACK 1.2   // above limit * this, RTSS is taken not to hold the game to it
-
-enum { FAIL_NONE, FAIL_LIBRARY, FAIL_READONLY, FAIL_NOT_LIMITING };
 
 static PlatMutex lock = PLAT_MUTEX_INIT;   // the hooks calls and the state below
 static _Atomic int64_t want = RTSS_UNSET;  // millihertz from the pacer: >0 a limit, 0 none; RTSS_OUT_* kept out
 static _Atomic int64_t active_for = RTSS_UNSET;   // the want RTSS holds the game to now; RTSS_UNSET none
-static _Atomic int failed;                 // FAIL_*: RTSS is out of it for the rest of the run
+static _Atomic int failed;                 // RTSS_FAIL_*: RTSS is out of it for the rest of the run (S.fail)
 static _Atomic int closed;                 // rtss_limit_restore ran: nothing reaches the profile any more
 static _Atomic int two;                    // kept out, and RTSS limits the game by a setting of its own (watch)
 static _Atomic int started;                // rtss_limit_want spawned the worker
@@ -68,45 +63,21 @@ static EnumProfilesFn enum_profiles;
 static ProfileFn load_profile, save_profile, delete_profile;
 static PropertyFn get_property, set_property;
 static UpdateFn update_profiles;
+static RtssState S = RTSS_STATE_INIT;   // the worker's decisions (rtss_decide.h), under lock
 static int has_denominator;   // this RTSS knows FramerateLimitDenominator
-static int64_t applied = -1;  // the millihertz the profile holds from this run; -1 untouched
-static int64_t refused = -1;  // a limit RTSS refused (out of its range): the game's own limiter keeps that one
-static int changed;           // the profile holds a value from this run: put the old one back on exit
 static int had_profile;       // the profile existed before this run changed it
 static DWORD old_limit, old_denominator = 1;
 
-// RTSS's shared memory: running (1), whether its application list holds this process, and the frame rate RTSS measured
-// for it over its last period (0 unknown). The header: signature, version, application entry size, offset of the
-// application array, its length. An entry: the process id, the executable path (MAX_PATH), flags, then the period's
-// start and end in ms and the frames in it.
-static int rtss_running(int *hooked, double *fps) {
-    *hooked = 0, *fps = 0;
+// RTSS's shared memory as rtss_parse reads it: whether RTSS runs, whether it lists this process, and its frame count.
+static void rtss_map(RtssApp *a) {
+    memset(a, 0, sizeof *a);
     HANDLE m = OpenFileMappingA(FILE_MAP_READ, FALSE, "RTSSSharedMemoryV2");
-    if (!m) return 0;
+    if (!m) return;
     const uint8_t *p = MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
-    int run = 0;
     MEMORY_BASIC_INFORMATION mi;
-    if (p && VirtualQuery(p, &mi, sizeof mi) && mi.RegionSize >= 20) {
-        DWORD h[5];
-        memcpy(h, p, sizeof h);
-        run = h[0] == RTSS_SIGNATURE && h[1] >= 0x20000;
-        DWORD pid = GetCurrentProcessId();
-        enum { PERIOD_AT = 4 + MAX_PATH + 4, ENTRY_MIN = PERIOD_AT + 12 };
-        for (DWORD i = 0; run && h[2] >= ENTRY_MIN && i < h[4] && i < 4096; i++) {
-            uint64_t at = (uint64_t)h[3] + (uint64_t)i * h[2];
-            if (at + ENTRY_MIN > mi.RegionSize) break;
-            DWORD id, t[3];
-            memcpy(&id, p + at, 4);
-            if (id != pid) continue;
-            *hooked = 1;
-            memcpy(t, p + at + PERIOD_AT, sizeof t);   // start, end, frames
-            if (t[1] > t[0]) *fps = 1000.0 * t[2] / (t[1] - t[0]);
-            break;
-        }
-    }
+    if (p && VirtualQuery(p, &mi, sizeof mi)) rtss_parse(p, mi.RegionSize, GetCurrentProcessId(), a);
     if (p) UnmapViewOfFile(p);
     CloseHandle(m);
-    return run;
 }
 
 static int load_hooks(void) {
@@ -176,10 +147,11 @@ static int write_limit(DWORD limit, DWORD denominator) {
     return l == limit && (!has_denominator || d == denominator) ? 1 : -1;
 }
 
-// 1: the profile holds mhz; 0: RTSS refused it (the profile then holds no limit of this run); -1: the profile cannot be
-// written.
-static int apply(int64_t mhz) {
-    if (!changed) {   // what to put back on exit
+// Writes mhz into the profile (rtss_poll's RtssOps.apply): RTSS_WROTE_*. first: the run's first write, which records
+// what to put back on exit; clear: on a refusal, clear the limit of this run the profile holds.
+static int apply(void *ctx, int64_t mhz, int first, int clear) {
+    (void)ctx;
+    if (first) {   // what to put back on exit
         had_profile = profile_exists();
         load_profile(profile);
         old_limit = 0, old_denominator = 1;
@@ -195,23 +167,23 @@ static int apply(int64_t mhz) {
     if (r < 0) {
         rt_log("frame rate: RivaTuner Statistics Server's profile %s did not keep the limit: its Profiles folder needs the "
                "game run as administrator", profile);
-        return -1;
+        return RTSS_WROTE_READONLY;
     }
-    if (!changed) {
+    if (first) {
         if (!had_profile)
             rt_log("frame rate: RivaTuner Statistics Server profile %s created; it goes away when the game closes", profile);
         else
             rt_log("frame rate: RivaTuner Statistics Server profile %s held a limit of %lu/%lu; it gets that back when the "
                    "game closes", profile, old_limit, old_denominator);
-        changed = 1;
     }
     if (r == 0) {   // RTSS must not keep an earlier limit of this run under the game's own one
         rt_log("frame rate: RivaTuner Statistics Server refused a limit of %.3f fps", mhz / 1000.0);
-        if (applied != 0 && write_limit(0, 1) > 0) applied = 0, update_profiles();
-        refused = mhz;
-        return 0;
+        if (clear && write_limit(0, 1) > 0) {
+            update_profiles();
+            return RTSS_WROTE_REFUSED_CLEARED;
+        }
+        return RTSS_WROTE_REFUSED;
     }
-    applied = mhz;
     update_profiles();
     if (!mhz) rt_log("frame rate: RivaTuner Statistics Server's profile %s has no limit (unlimited)", profile);
     else if ((int64_t)limit * 1000 == mhz * denominator)
@@ -219,13 +191,11 @@ static int apply(int64_t mhz) {
     else   // rounded to whole frames by an RTSS without FramerateLimitDenominator: the log says what RTSS holds
         rt_log("frame rate: RivaTuner Statistics Server's profile %s limits to %lu/%lu (%.3f fps; the game asked %.3f)",
                profile, limit, denominator, (double)limit / denominator, mhz / 1000.0);
-    return 1;
+    return RTSS_WROTE_HELD;
 }
 
+// The profile as it was before this run changed it (the caller checked S.changed, and marks it done).
 static void put_back(void) {
-    if (!changed) return;
-    changed = 0;
-    applied = -1;
     if (!had_profile) {
         delete_profile(profile);
         rt_log("frame rate: RivaTuner Statistics Server profile %s removed, as before the game started", profile);
@@ -238,6 +208,14 @@ static void put_back(void) {
     update_profiles();
 }
 
+static void put_back_op(void *ctx, const RtssOut *o) {   // rtss_poll's RtssOps.put_back
+    (void)ctx;
+    if (o->why == RTSS_WHY_FAILED)   // the frame count check gave up on RTSS
+        rt_log("frame rate: RivaTuner Statistics Server measures %.1f fps with its limit at %.3f fps", o->fps,
+               o->mhz / 1000.0);
+    put_back();
+}
+
 // Whether RTSS holds the game to the want w this poll read, and the log of which limiter is in use: the first decision,
 // then each change. The want may have changed since the poll read it: rtss_limit_active compares the two, so a stale
 // store never lets the game's limiter stand aside for a newer want.
@@ -248,12 +226,6 @@ static void set_active(int64_t w, int on, const char *why) {
     logged = on;
     if (on) rt_log("frame rate: RivaTuner Statistics Server does the limiting; the game's own limiter stands aside");
     else rt_log("frame rate: the game's own limiter (%s)", why);
-}
-
-static const char *fail_reason(int f) {
-    return f == FAIL_READONLY       ? "RivaTuner Statistics Server's profile cannot be changed"
-           : f == FAIL_NOT_LIMITING ? "RivaTuner Statistics Server does not hold the game to the limit"
-                                    : "RivaTuner Statistics Server's hooks library did not load";
 }
 
 // RTSS's own settings for the game, read from its profile file as RTSS keeps it: Profiles\<exe>.cfg, else
@@ -314,7 +286,7 @@ static void watch(int64_t w, int listed) {
         snprintf(said_settings, sizeof said_settings, "%s", all);
     }
     if (w < 0 && listed) {
-        on = rtss_settings_limit(&settings);
+        on = rtss_two(w, listed, rtss_settings_limit(&settings));
         rtss_settings_text(text, sizeof text, &settings, 0);
     }
     if (w >= 0) said = 0;   // a later kept-out want logs afresh
@@ -368,7 +340,8 @@ static void worker(void *arg) {
     (void)arg;
     if (!find_rtss()) return;
     atomic_store_explicit(&ready, 1, memory_order_release);   // rtss_limit_restore may read the names now
-    int was_running = -1, was_hooked = 0, over = 0;
+    int was_running = -1, was_listed = 0;
+    const RtssOps ops = {NULL, apply, put_back_op};
     for (;; plat_sleep_ms(POLL_MS)) {
         int64_t w = atomic_load(&want);
         if (w == RTSS_UNSET) continue;
@@ -377,49 +350,24 @@ static void worker(void *arg) {
             plat_mutex_unlock(&lock);
             continue;
         }
-        int hooked;
-        double fps;
-        int run = rtss_running(&hooked, &fps), f = atomic_load(&failed);
-        if (run != was_running || hooked != was_hooked) {
-            if (!run) rt_log("frame rate: RivaTuner Statistics Server is installed but not running");
-            else if (!hooked) rt_log("frame rate: RivaTuner Statistics Server runs; it has not hooked the game yet");
+        RtssIn in = {.want = w};
+        rtss_map(&in.app);
+        if (in.app.running != was_running || in.app.listed != was_listed) {
+            if (!in.app.running) rt_log("frame rate: RivaTuner Statistics Server is installed but not running");
+            else if (!in.app.listed) rt_log("frame rate: RivaTuner Statistics Server runs; it has not hooked the game yet");
             else rt_log("frame rate: RivaTuner Statistics Server has hooked the game");
-            was_running = run, was_hooked = hooked;
+            was_running = in.app.running, was_listed = in.app.listed;
         }
-        if (w < 0) {
-            if (dll) put_back();
-            char why[96];
-            snprintf(why, sizeof why, "RivaTuner Statistics Server kept out: %s", rtss_out_text(w));
-            set_active(w, 0, why);
-        } else if (f) {
-            set_active(w, 0, fail_reason(f));
-        } else if (!run) {
-            set_active(w, 0, "RivaTuner Statistics Server is not running");
-        } else if (!load_hooks()) {
-            atomic_store(&failed, FAIL_LIBRARY);
-            set_active(w, 0, fail_reason(FAIL_LIBRARY));
-        } else if (w == refused) {
-            set_active(w, 0, "RivaTuner Statistics Server refused this limit");
-        } else if (w != applied) {
-            int r = apply(w);
-            over = 0;
-            if (r < 0) atomic_store(&failed, FAIL_READONLY), set_active(w, 0, fail_reason(FAIL_READONLY));
-            else if (r == 0) set_active(w, 0, "RivaTuner Statistics Server refused this limit");
-            else set_active(w, hooked, "RivaTuner Statistics Server has not hooked the game yet");
-        } else if (atomic_load(&want) == w) {   // a newer want waits for the next poll: these frames are not its
-            set_active(w, hooked, "RivaTuner Statistics Server has not hooked the game yet");
-            // RTSS's own count of the game's frames while the game's limiter stands aside: well above the limit for
-            // three seconds means RTSS does not hold the game to it, and the game takes the limiting back for the run
-            if (!hooked || w == 0 || fps <= w / 1000.0 * CHECK_SLACK) over = 0;
-            else if (++over == CHECK_POLLS) {
-                rt_log("frame rate: RivaTuner Statistics Server measures %.1f fps with its limit at %.3f fps", fps,
-                       w / 1000.0);
-                atomic_store(&failed, FAIL_NOT_LIMITING);
-                put_back();
-                set_active(w, 0, fail_reason(FAIL_NOT_LIMITING));
-            }
+        in.hooks = dll ? 1 : rtss_wants_hooks(&S, &in) ? load_hooks() : -1;
+        in.current = atomic_load(&want) == w;
+        RtssOut o = rtss_poll(&S, &in, &ops);
+        atomic_store(&failed, S.fail);
+        if (o.why != RTSS_WHY_NEWER) {   // a newer want waits for the next poll
+            char why[128];
+            rtss_why_text(why, sizeof why, &o, S.fail);
+            set_active(w, o.holds, why);
         }
-        watch(w, run && hooked);
+        watch(w, in.app.listed);
         plat_mutex_unlock(&lock);
     }
 }
@@ -446,7 +394,7 @@ int rtss_limit_state(void) {
     if (atomic_load_explicit(&closed, memory_order_relaxed)) return 0;
     int f = atomic_load_explicit(&failed, memory_order_relaxed);
     int64_t w = atomic_load(&want);
-    if (w >= 0 && (f == FAIL_READONLY || f == FAIL_NOT_LIMITING)) return f == FAIL_READONLY ? 2 : 3;
+    if (w >= 0 && (f == RTSS_FAIL_READONLY || f == RTSS_FAIL_NOT_LIMITING)) return f == RTSS_FAIL_READONLY ? 2 : 3;
     if (w < 0 && w != RTSS_UNSET && atomic_load_explicit(&two, memory_order_relaxed)) return 4;
     return rtss_limit_active() && w > 0;
 }
@@ -461,7 +409,7 @@ void rtss_limit_restore(void) {
     // the exit may come from a crash on any thread: give up after a second rather than wait on a lock held there
     for (int i = 0; i < 100; i++) {
         if (plat_mutex_trylock(&lock)) {
-            if (dll) put_back();
+            if (dll && S.changed) put_back(), rtss_put_back_done(&S);
             plat_mutex_unlock(&lock);
             return;
         }

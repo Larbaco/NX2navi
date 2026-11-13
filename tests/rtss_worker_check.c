@@ -58,6 +58,8 @@ typedef struct {
 static Prof global = {1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1}, own, loaded;
 static int no_denominator;   // an RTSS that does not know FramerateLimitDenominator
 static int readonly;         // SaveProfile does not reach the file (no administrator rights)
+static DWORD refuse_over;    // RTSS refuses a limit above this many frames a second (0: none refused)
+static int no_library;       // LoadLibraryA fails
 static volatile LONG saves, deletes, updates, loads, created, removed;
 
 static void touch(Prof *p) { p->stamp++; }
@@ -86,6 +88,9 @@ static BOOL WINAPI f_get(LPCSTR prop, LPBYTE data, DWORD size) {
 }
 static BOOL WINAPI f_set(LPCSTR prop, LPBYTE data, DWORD size) {
     if (size != 4) return FALSE;
+    DWORD v;
+    memcpy(&v, data, 4);
+    if (!strcmp(prop, "FramerateLimit") && refuse_over && v / (loaded.denom ? loaded.denom : 1) > refuse_over) return FALSE;
     if (!strcmp(prop, "FramerateLimit")) return memcpy(&loaded.limit, data, 4), TRUE;
     if (!strcmp(prop, "FramerateLimitDenominator") && !no_denominator) return memcpy(&loaded.denom, data, 4), TRUE;
     return FALSE;
@@ -133,6 +138,7 @@ LSTATUS stub_RegGetValueA(HKEY k, LPCSTR sub, LPCSTR val, DWORD fl, LPDWORD ty, 
 HMODULE stub_LoadLibraryA(LPCSTR p) {
     (void)p;
     loads++;
+    if (no_library) return NULL;
     return (HMODULE)(uintptr_t)0x1000;
 }
 FARPROC stub_GetProcAddress(HMODULE m, LPCSTR n) {
@@ -524,6 +530,142 @@ static void settings_logged(void) {
     CHECK(count("settings for the game") == 2, "once per change (%d)", count("settings for the game"));
 }
 
+// The decisions as they stand, pinned against the real worker (rtss_limit_check.c pins the same in rtss_decide.h).
+
+// Profiles under Program Files without administrator rights: the save does not stick, and RTSS is out for the run.
+static void readonly_run(void) {
+    readonly = 1;
+    app_set(1, 0xA, 1000, 2000, 60);
+    ask(60000);
+    poll();
+    show("read-only profiles");
+    CHECK(rtss_limit_state() == 2 && !rtss_limit_active(), "the menu says RTSS needs administrator rights");
+    ask(144000);
+    poll();
+    poll();
+    CHECK(saves == 1, "no write after the failure (%ld saves)", saves);
+    CHECK(logged("RivaTuner Statistics Server's profile cannot be changed"), "logged");
+}
+
+// RTSS refuses a limit out of its range: the game keeps that one, the earlier limit of this run is cleared to none,
+// and a limit in range goes to RTSS again at once.
+static void refused_run(void) {
+    refuse_over = 200;
+    app_set(1, 0xA, 1000, 2000, 60);
+    ask(60000);
+    poll();
+    CHECK(own.limit == 60 && rtss_limit_active(), "60 taken");
+    ask(240000);
+    poll();
+    show("240 refused");
+    CHECK(own.exists && own.limit == 0, "the earlier limit of this run is cleared to none");
+    CHECK(!rtss_limit_active() && rtss_limit_state() == 0, "the game's limiter keeps 240");
+    long s0 = saves;
+    poll();
+    poll();
+    CHECK(saves == s0, "the refused limit is not written again");
+    ask(144000);
+    poll();
+    show("144 after the refusal");
+    CHECK(own.limit == 144 && rtss_limit_active(), "144 taken at once");
+    ask(240000);
+    poll();
+    CHECK(!rtss_limit_active(), "240 stays with the game");
+}
+
+// RTSS lists the game but lets it run well over the limit: after six polls in a row over 1.2 times the limit the
+// profile is put back and the game limits for the run. 1.15 times the limit is not caught (the rule as it stands),
+// and a period RTSS no longer moves still counts.
+static void over_run(void) {
+    app_set(1, 0xA, 1000, 2000, 144);
+    ask(60000);
+    for (int i = 0; i < 5; i++) poll();
+    CHECK(rtss_limit_active() && own.exists, "five polls over: RTSS still limits");
+    poll();
+    show("six polls at 144 fps with the limit at 60");
+    CHECK(rtss_limit_state() == 3 && !rtss_limit_active(), "the menu says RTSS does not limit the game");
+    CHECK(!own.exists, "the profile is put back");
+    CHECK(logged("RivaTuner Statistics Server measures 144.0 fps with its limit at 60.000 fps"), "logged");
+    ask(30000);
+    poll();
+    CHECK(saves == 1 && rtss_limit_state() == 3, "out for the run");
+}
+static void over_slack_run(void) {
+    app_set(1, 0xA, 1000, 2000, 69);
+    ask(60000);
+    for (int i = 0; i < 20; i++) poll();
+    show("20 polls at 69 fps with the limit at 60");
+    CHECK(rtss_limit_active() && rtss_limit_state() == 1, "1.15 times the limit is not caught");
+    app_set(1, 0xA, 1000, 2000, 73);
+    for (int i = 0; i < 6; i++) poll();
+    CHECK(rtss_limit_state() == 3, "1.22 times the limit is caught after six polls");
+}
+static void over_unlimited_run(void) {
+    app_set(1, 0xA, 1000, 2000, 700);
+    ask(0);
+    for (int i = 0; i < 10; i++) poll();
+    show("unlimited at 700 fps");
+    CHECK(rtss_limit_active() && rtss_limit_state() == 0, "no limit, nothing to check");
+}
+
+// RTSS quits while it limits and comes back: the profile stays for its return, no write either way.
+static void quit_run(void) {
+    app_set(1, 0xA, 1000, 2000, 60);
+    ask(60000);
+    poll();
+    running = 0;
+    poll();
+    show("RTSS quit");
+    CHECK(!rtss_limit_active() && own.exists && own.limit == 60, "the game limits; the profile stays");
+    running = 1;
+    poll();
+    show("RTSS back");
+    CHECK(rtss_limit_active() && saves == 1, "RTSS limits again with no new write");
+}
+
+// RTSS's hooks library does not load: the game limits for the run.
+static void library_run(void) {
+    no_library = 1;
+    app_set(1, 0xA, 1000, 2000, 60);
+    ask(60000);
+    poll();
+    ask(144000);
+    poll();
+    show("no hooks library");
+    CHECK(loads == 1 && !rtss_limit_active() && !saves, "one try, then the game's limiter for the run");
+    CHECK(logged("RivaTuner Statistics Server's hooks library did not load"), "logged");
+}
+
+// Low latency switching on and off at every poll (the want flips between a limit and kept out): each switch writes or
+// puts back the profile, as it stands.
+static void churn_run(void) {
+    app_set(1, 0xA, 1000, 2000, 60);
+    ask(60000);
+    poll();
+    for (int i = 0; i < 10; i++) {
+        ask(i & 1 ? 60000 : RTSS_OUT_LOWLAT);
+        poll();
+    }
+    show("ten polls with the want flipping");
+    CHECK(created == 6 && removed == 5, "%ld creations, %ld removals", created, removed);
+    CHECK(rtss_limit_active(), "RTSS limits after the last want of a limit");
+}
+
+// A movie at 60 under a limit of 144: the want follows the movie, and each start and end is a write.
+static void movie_run(void) {
+    app_set(1, 0xA, 1000, 2000, 144);
+    ask(144000);
+    poll();
+    long s0 = saves;
+    ask(60000);
+    poll();
+    CHECK(own.limit == 60 && rtss_limit_active(), "RTSS holds the movie's 60");
+    ask(144000);
+    poll();
+    show("after one movie");
+    CHECK(own.limit == 144 && saves - s0 == 2, "two writes for one movie");
+}
+
 static const struct { const char *name; void (*run)(void); } scenarios[] = {
     {"restore_race", restore_race},
     {"restore_player", restore_player},
@@ -539,6 +681,15 @@ static const struct { const char *name; void (*run)(void); } scenarios[] = {
     {"start_off_present", start_off_present},
     {"not_installed", not_installed},
     {"settings_logged", settings_logged},
+    {"readonly_run", readonly_run},
+    {"refused_run", refused_run},
+    {"over_run", over_run},
+    {"over_slack_run", over_slack_run},
+    {"over_unlimited_run", over_unlimited_run},
+    {"quit_run", quit_run},
+    {"library_run", library_run},
+    {"churn_run", churn_run},
+    {"movie_run", movie_run},
 };
 
 int main(int argc, char **argv) {

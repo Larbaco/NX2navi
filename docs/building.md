@@ -476,6 +476,17 @@ for all three, rounded up by `osolver` and at least 4 every update by `osolverfu
 game's words and the set's: the page's cut is 100 at 60 and 30 fps, and from 90 to 240 fps the set cuts a floor's
 velocity at the time scales where the game cuts it at 60 fps and nowhere else. No game files.
 
+A change to how the frame limit goes to RivaTuner Statistics Server (`runtime/rtss_limit.c`, `runtime/rtss_decide.h`)
+passes `python tests\rtss_limit_check.py`. It builds `rtss_decide.h` alone and checks its reader of RTSS's shared
+memory against a fake `RTSSSharedMemoryV2` (a bad header, short entries, an entry past the memory or past the 4096th
+find nothing) and the worker's decisions poll by poll against a fake profile: RTSS's injection delay, RTSS quitting and
+coming back, a read-only profile, a refused limit, the frame count rule, kept-out wants and their reasons, low latency
+switching at every poll, a movie, a closed run, a hooks library that does not load, and two limiters. On Windows it
+also builds the real `rtss_limit.c` against a fake RTSS (its registry key, hooks library, profile files and shared
+memory) and runs each scenario in a process of its own, among them a want after the exit's restore and one the worker
+read before it, a worker polling without pause while the want switches, and the registry and file calls a present
+must not make. No GPU, no RTSS, no game files.
+
 A change to how the mixer applies volumes (`runtime/audio_mixer.c` `accumulate_ramp`, the voice and splitter paths
 of `audio_mixer_render`) or to what it owes the device after a stall (`ring_pull`, `audio_mixer_owed`) passes
 `python tests\audio_mixer_check.py`, which builds `audio_mixer.c` with the rest of the runtime stubbed. It mixes
