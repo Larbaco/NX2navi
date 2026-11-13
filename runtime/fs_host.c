@@ -39,8 +39,8 @@ enum { M_FREE, M_SAVE, M_TEMP, M_CACHE, M_SAVE_RO };   // M_SAVE: the working co
 
 typedef struct { int kind; char name[32]; char root[1024]; } Mount;
 // h NULL = free; save: on a save-data mount; users: calls using h now (file_of .. file_release); closing: CloseFile
-// came while users > 0, and the last of them closes h
-typedef struct { PlatFile *h; int mode, save; int32_t users; int closing; } File;
+// came while users > 0, and the last of them closes h. users and closing are read without `lock` (file_release).
+typedef struct { PlatFile *h; int mode, save; int32_t users; int32_t closing; } File;
 typedef struct { char *name; int kind; uint64_t size; } Listed;
 typedef struct { Listed *e; int n, next, mode, used; } Dir;   // the directory's entries at open; used 0 = free
 
@@ -1151,14 +1151,16 @@ static uint32_t commit(const char *name) {
 // Commit first, save_touched), so a CloseFile on another thread could close it in the middle of a call. Windows hands
 // a closed HANDLE's value to the next file opened, so the call went on in another file: a save write could land in the
 // wrong one. Each call now counts itself in the slot from file_of to file_release. CloseFile closes at once when no
-// call is under way, and otherwise marks the slot; the last call out closes it. Nothing waits for another call, the
-// slot (and with it the guest's handle value) is not handed out again before the close, and a call that comes after
-// the CloseFile gets FS_R_INVALID_ARGUMENT, as a closed handle does.
+// call is under way, and otherwise marks the slot; the last call out closes it. Nothing waits for another call: a call
+// takes `lock` exclusive at its end only when it finds the slot marked, so the fsync loop a Commit runs under the
+// shared lock (commit) does not hold up the end of every read and write. The slot (and with it the guest's handle
+// value) is not handed out again before the close, and a call that comes after the CloseFile gets
+// FS_R_INVALID_ARGUMENT, as a closed handle does.
 static File *file_of(uint64_t h, PlatFile **fh, int *mode) {
     if (h < FILE_BASE || h >= FILE_BASE + NFILES) return NULL;
     plat_mutex_lock_shared(&lock);
     File *f = &files[h - FILE_BASE];
-    int ok = f->h && !f->closing;
+    int ok = f->h && !__atomic_load_n(&f->closing, __ATOMIC_RELAXED);   // stored only under the exclusive lock
     if (ok) {
         __atomic_add_fetch(&f->users, 1, __ATOMIC_ACQ_REL);   // shared holders count at once; close_file reads it exclusive
         if (fh) *fh = f->h;
@@ -1177,13 +1179,26 @@ static void file_closed(PlatFile *h, int save) {
     }
 }
 
-// The end of a call that file_of let in. The last call out of a slot CloseFile closed meanwhile closes the file.
+// Empties a slot, under the exclusive lock. users and closing are stored as atomics: the call that has just left the
+// slot may still read closing without the lock (file_release). open_file fills only h, mode and save.
+static void file_clear(File *f) {
+    f->h = NULL, f->mode = 0, f->save = 0;
+    __atomic_store_n(&f->users, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&f->closing, 0, __ATOMIC_RELAXED);
+}
+
+// The end of a call that file_of let in. The last call out of a slot CloseFile closed meanwhile closes the file. The
+// decrement and close_file's mark are a sequentially consistent pair: either this call sees closing, or close_file
+// sees users at 0 and closes the file itself. Only the first case takes the lock, and its check under the lock keeps
+// the close to one.
 static void file_release(File *f) {
-    if (__atomic_sub_fetch(&f->users, 1, __ATOMIC_ACQ_REL)) return;
+    if (__atomic_sub_fetch(&f->users, 1, __ATOMIC_SEQ_CST)) return;
+    if (!__atomic_load_n(&f->closing, __ATOMIC_SEQ_CST)) return;
     PlatFile *h = NULL;
     int save = 0;
     plat_mutex_lock(&lock);
-    if (f->h && f->closing && !__atomic_load_n(&f->users, __ATOMIC_ACQUIRE)) h = f->h, save = f->save, *f = (File){0};
+    if (f->h && __atomic_load_n(&f->closing, __ATOMIC_RELAXED) && !__atomic_load_n(&f->users, __ATOMIC_ACQUIRE))
+        h = f->h, save = f->save, file_clear(f);
     plat_mutex_unlock(&lock);
     if (h) file_closed(h, save);
 }
@@ -1215,8 +1230,8 @@ static uint32_t open_file(uint64_t *out, const char *path, int mode) {
     if (!f) return fs_result(err);
     plat_mutex_lock(&lock);
     for (int i = 0; i < NFILES; i++)
-        if (!files[i].h) {
-            files[i] = (File){.h = f, .mode = mode, .save = save_writer};
+        if (!files[i].h) {   // users and closing are 0 in a free slot (file_clear)
+            files[i].h = f, files[i].mode = mode, files[i].save = save_writer;
             *out = FILE_BASE + (uint64_t)i;
             plat_mutex_unlock(&lock);
             if (save_writer) {
@@ -1337,10 +1352,11 @@ static void close_file(uint64_t h) {
     PlatFile *close_now = NULL;
     int open = 0, save = 0;
     plat_mutex_lock(&lock);
-    if (f && f->h && !f->closing) {
+    if (f && f->h && !__atomic_load_n(&f->closing, __ATOMIC_RELAXED)) {
         open = 1;
-        if (__atomic_load_n(&f->users, __ATOMIC_ACQUIRE)) f->closing = 1;   // the last call under way closes it
-        else close_now = f->h, save = f->save, *f = (File){0};
+        // the mark first, then the count (file_release does the reverse): a call that is still under way closes it
+        __atomic_store_n(&f->closing, 1, __ATOMIC_SEQ_CST);
+        if (!__atomic_load_n(&f->users, __ATOMIC_SEQ_CST)) close_now = f->h, save = f->save, file_clear(f);
     }
     plat_mutex_unlock(&lock);
     if (!open) rt_fatal("fs: close of invalid file handle %#llx", (unsigned long long)h);

@@ -1,6 +1,8 @@
 """A save file's handle and a CloseFile on another thread (runtime/fs_host.c file_of, file_release, close_file): a
 call under way keeps its host file open, the close happens once when the last call is out, the guest's handle value
-is not handed out again before that, and a call after the close gets FS_R_INVALID_ARGUMENT. The host files here are
+is not handed out again before that, and a call after the close gets FS_R_INVALID_ARGUMENT. A call with no close
+pending takes no exclusive lock, so it ends while another thread holds the lock shared (a Commit's fsync loop). The
+host files here are
 stand-ins that hand a closed file's value to the next one opened, as Windows does with a HANDLE: a read that went on
 through a closed handle would read the other file. Builds fs_host.c's file functions into a test program. No game
 files.
@@ -46,7 +48,8 @@ HARNESS = r'''
 #include <string.h>
 typedef SRWLOCK PlatMutex;
 #define PLAT_MUTEX_INIT SRWLOCK_INIT
-static void plat_mutex_lock(PlatMutex *m) { AcquireSRWLockExclusive(m); }
+static volatile LONG exclusive_takes;   // exclusive acquisitions of fs_host.c's lock
+static void plat_mutex_lock(PlatMutex *m) { InterlockedIncrement(&exclusive_takes); AcquireSRWLockExclusive(m); }
 static void plat_mutex_unlock(PlatMutex *m) { ReleaseSRWLockExclusive(m); }
 static void plat_mutex_lock_shared(PlatMutex *m) { AcquireSRWLockShared(m); }
 static void plat_mutex_unlock_shared(PlatMutex *m) { ReleaseSRWLockShared(m); }
@@ -171,7 +174,25 @@ int main(void) {
     if (hc != ha) printf("FAIL: the closed slot was not free again (%#llx)\n", (unsigned long long)hc), fails++;
     close_file(hb), close_file(hc);
 
-    // 2. A reader loops over a file "a" while another thread closes it, opens "b" (which may take a closed handle's
+    // 2. Calls with no close pending take no exclusive lock: 1000 reads add none, and a read ends while another thread
+    //    holds the lock shared (fs_host.c commit's fsync loop runs so).
+    open_file(&ha, "a", FS_OPEN_READ);
+    LONG before = exclusive_takes;
+    int bad_reads = 0;
+    for (int i = 0; i < 1000; i++) bad_reads += read_file(&n, ha, 0, b, 4) != 0 || b[0] != 'a';
+    LONG taken = exclusive_takes - before;
+    AcquireSRWLockShared(&lock);
+    h_read = ha, got = 0;
+    t = CreateThread(NULL, 0, reader, NULL, 0, NULL);
+    int ended = WaitForSingleObject(t, 2000) == WAIT_OBJECT_0;
+    ReleaseSRWLockShared(&lock);
+    WaitForSingleObject(t, INFINITE);
+    printf("reads with no close pending: 1000 reads took the exclusive lock %ld time(s)%s, a read beside a shared holder "
+           "%s\n", (long)taken, taken ? " (FAIL)" : "", ended ? "ended" : "WAITED FOR IT (FAIL)");
+    if (taken || bad_reads || !ended || got != 'a') fails++;
+    close_file(ha);
+
+    // 3. A reader loops over a file "a" while another thread closes it, opens "b" (which may take a closed handle's
     //    value) and opens "a" again: no read returns b's bytes.
     open_file(&ha, "a", FS_OPEN_READ);
     current = ha;
@@ -205,7 +226,7 @@ def main():
         return 0
     file_t = re.search(r'typedef struct \{ PlatFile \*h;[^\n]*\} File;', source).group(0)
     parts = [HARNESS, file_t, 'static File files[NFILES];', 'static PlatMutex lock = PLAT_MUTEX_INIT;']
-    for sig in ('static File *file_of(', 'static void file_closed(', 'static void file_release(',
+    for sig in ('static File *file_of(', 'static void file_closed(', 'static void file_clear(', 'static void file_release(',
                 'static int64_t host_read_at(', 'static uint32_t open_file(', 'static uint32_t read_file(',
                 'static void close_file('):
         parts.append(function(sig))
