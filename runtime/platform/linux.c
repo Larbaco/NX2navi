@@ -1933,6 +1933,11 @@ void plat_exit(int code) {
 
 void plat_terminate(int code) { _exit(code); }
 
+// The note of an end the game did not ask for is the Windows executable's TLS callback (win32.c); nothing here.
+void plat_exit_note_setup(PlatAppend *log, void (*queued)(const char **p, size_t *n)) { (void)log, (void)queued; }
+void plat_exit_note_modules(void) {}
+void plat_exit_orderly(void) {}
+
 void plat_stack_guarantee(void) {}   // the crash report runs on the signal stack crash handling sets up
 
 int plat_setenv(const char *name, const char *value) {

@@ -140,6 +140,14 @@ static void console_closed(const char *what) {
     gfx_window_closed();
 }
 
+// The window lost the focus (gfx_present.c gfx_window_focus_changed): a process ended from outside soon after lost the
+// lines the log thread was still gathering, and both unexplained ends of 2026-11-13 came seconds after one. The log
+// thread writes them at once, and the module list for the note of an ExitProcess is brought up to date.
+void rt_log_focus_lost(void) {
+    logq_nudge();
+    plat_exit_note_modules();
+}
+
 void rt_log_raw(const char *p, size_t n) {
     if (__atomic_load_n(&g_log_state, __ATOMIC_ACQUIRE) == LOG_EARLY) {
         fwrite(p, 1, n, stderr);
@@ -211,6 +219,10 @@ static void log_open(int game) {
         g_log_bytes = n;
         __atomic_store_n(&g_log_state, LOG_FILE, __ATOMIC_RELEASE);
         rt_log("log: %s", g_log_path);
+    }
+    if (game && g_log_file) {   // an ExitProcess nobody of ours asked for leaves a line in the file (platform.h)
+        plat_exit_note_setup(g_log_file, logq_peek);
+        plat_exit_note_modules();
     }
     // A game run writes its log from the log thread (logq.c), whether the lines go to a log file or to stderr alone.
     const char *e = cfg_get("NX2NAVI_LOG_ASYNC");
@@ -690,6 +702,7 @@ int main(int argc, char **argv) {
     plat_stack_guarantee();   // a stack overflow on the main thread still gets its crash report (platform.h)
     mode_rc = main_run(argc, argv);
     __atomic_store_n(&mode_done, 1, __ATOMIC_RELEASE);   // from here on only the exit runs (mode_done, above)
+    plat_exit_orderly();   // the C runtime's exit ends the process with ExitProcess: no note of an end nobody asked for
     return mode_rc;
 }
 

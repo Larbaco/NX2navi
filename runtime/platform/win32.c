@@ -1270,6 +1270,7 @@ int plat_crash_filter_reassert(char *who, size_t n) {
 // A fresh process gets a fresh layout: Windows places DLLs, heaps and thread stacks at random addresses. The parent
 // waits and exits with the child's code.
 void plat_reexec(void) {
+    plat_exit_orderly();   // this process ends with ExitProcess below, on purpose
     fprintf(stderr, "[host] memory: a fixed region is taken; re-running the process\n");
     fflush(stdout);
     fflush(stderr);
@@ -1390,6 +1391,7 @@ int plat_stderr_write(const void *p, size_t n) {
 void (*plat_exit_hook)(void);
 
 void plat_exit(int code) {
+    plat_exit_orderly();
     if (plat_exit_hook) plat_exit_hook();
 #ifdef NX2NAVI_PGO_GEN
     __llvm_profile_dump();
@@ -1409,9 +1411,105 @@ void plat_exit(int code) {
 }
 
 void plat_terminate(int code) {
+    plat_exit_orderly();
     TerminateProcess(GetCurrentProcess(), (UINT)code);
     ExitProcess((UINT)code);   // not reached
 }
+
+// ---- an end the game did not ask for (plat_exit_note_setup)
+// Two runs of 2026-11-13 ended seconds after a focus loss with exit code 0, no crash event and no line of their own: an
+// ExitProcess by a module in the process, or a kill from outside, could not be told apart. ExitProcess stops every
+// other thread and then calls each module's detach, the executable's TLS callbacks included; TerminateProcess calls
+// none. The callback runs under the loader lock with the other threads gone, so any lock they held stays held: it
+// uses no C runtime (no formatting, allocation or streams: their locks), does not ask the loader (RtlPcToFileHeader
+// takes its module lock) and names addresses from the module list noted earlier. RtlCaptureStackBackTrace and
+// WriteFile take no lock of the process.
+#define EN_MODS 384
+typedef struct { uintptr_t base, size; char name[40]; } EnMod;
+static EnMod en_mods[2][EN_MODS];
+static int en_n[2];
+static volatile LONG en_cur = -1;   // the table the callback reads, -1 none yet
+static PlatMutex en_lock = PLAT_MUTEX_INIT;   // the writers of the tables (start, focus losses)
+static PlatAppend *volatile en_log;
+static void (*volatile en_queued)(const char **p, size_t *n);
+static volatile LONG en_orderly;
+
+void plat_exit_orderly(void) { InterlockedExchange(&en_orderly, 1); }
+
+void plat_exit_note_setup(PlatAppend *log, void (*queued)(const char **p, size_t *n)) {
+    en_queued = queued;
+    en_log = log;
+}
+
+void plat_exit_note_modules(void) {
+    HMODULE m[EN_MODS];
+    DWORD need = 0;
+    if (!EnumProcessModules(GetCurrentProcess(), m, sizeof m, &need)) return;
+    int n = (int)(need / sizeof m[0] < EN_MODS ? need / sizeof m[0] : EN_MODS), k = 0;
+    plat_mutex_lock(&en_lock);
+    int t = InterlockedCompareExchange(&en_cur, 0, 0) == 0 ? 1 : 0;   // the table the callback does not read
+    for (int i = 0; i < n; i++) {
+        MODULEINFO mi;
+        if (!GetModuleInformation(GetCurrentProcess(), m[i], &mi, sizeof mi)) continue;
+        EnMod *e = &en_mods[t][k++];
+        e->base = (uintptr_t)mi.lpBaseOfDll, e->size = mi.SizeOfImage;
+        if (!GetModuleBaseNameA(GetCurrentProcess(), m[i], e->name, sizeof e->name)) e->name[0] = 0;
+    }
+    en_n[t] = k;
+    InterlockedExchange(&en_cur, t);
+    plat_mutex_unlock(&en_lock);
+}
+
+static size_t en_put(char *o, size_t at, size_t cap, const char *s) {
+    while (*s && at < cap) o[at++] = *s++;
+    return at;
+}
+
+static size_t en_hex(char *o, size_t at, size_t cap, uintptr_t v) {
+    char d[18];
+    int n = 0;
+    do d[n++] = "0123456789abcdef"[v & 15], v >>= 4; while (v);
+    at = en_put(o, at, cap, "0x");
+    while (n && at < cap) o[at++] = d[--n];
+    return at;
+}
+
+// An executable gets DLL_PROCESS_DETACH only as the process ends (its reserved argument is NULL there all the same).
+static void NTAPI exit_note_tls(PVOID h, DWORD reason, PVOID reserved) {
+    (void)h, (void)reserved;
+    PlatAppend *log = en_log;
+    if (reason != DLL_PROCESS_DETACH || en_orderly || !log) return;
+    const char *q = NULL;
+    size_t qn = 0;
+    void (*queued)(const char **, size_t *) = en_queued;
+    if (queued) queued(&q, &qn);
+    if (q && qn) plat_append_write(log, q, qn);
+    char line[2048];
+    size_t at = en_put(line, 0, sizeof line - 1, "[host] exit: the process is ending through ExitProcess, not one of "
+                                                 "the game's own ends; the calls that led to it:");
+    void *f[32];
+    USHORT n = RtlCaptureStackBackTrace(1, 32, f, NULL);
+    LONG t = en_cur;
+    for (USHORT i = 0; i < n; i++) {
+        uintptr_t a = (uintptr_t)f[i];
+        const EnMod *m = NULL;
+        for (int k = 0; t >= 0 && k < en_n[t] && !m; k++)
+            if (a - en_mods[t][k].base < en_mods[t][k].size) m = &en_mods[t][k];
+        at = en_put(line, at, sizeof line - 1, " ");
+        if (m && m->name[0]) {
+            at = en_put(line, en_put(line, at, sizeof line - 1, m->name), sizeof line - 1, "+");
+            a -= m->base;
+        }
+        at = en_hex(line, at, sizeof line - 1, a);
+    }
+    line[at++] = '\n';
+    plat_append_write(log, line, at);
+}
+// The callback in the executable's TLS callback list (the .CRT$XL* sections), which the TLS directory the image has
+// for its thread-local variables points to; _tls_used is that directory.
+__attribute__((section(".CRT$XLB"), used)) PIMAGE_TLS_CALLBACK plat_exit_note_cb = exit_note_tls;
+extern const IMAGE_TLS_DIRECTORY _tls_used;
+__attribute__((used)) static const void *volatile exit_note_tls_dir = &_tls_used;
 
 // _putenv_s, not SetEnvironmentVariableA: getenv reads the C runtime's copy of the environment, which only the CRT's
 // own calls update. An empty value removes the variable.

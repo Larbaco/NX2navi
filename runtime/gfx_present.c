@@ -104,7 +104,10 @@ void gfx_window_focus_changed(int in) {
     plat_local_time(&t);
     rt_log("gfx: window %s the focus at %04d-%02d-%02d %02d:%02d:%02d local time", in ? "gained" : "lost",
            t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
-    if (!in) perf_focus_lost();   // the session's reports, in case the process is ended from outside next (perf.c)
+    if (!in) {   // the session's reports and the log now, should the process be ended from outside next
+        perf_focus_lost();     // perf.c
+        rt_log_focus_lost();   // main.c
+    }
 }
 
 // ---- the orderly end: the window's close (gfx_window_closed), the guest's ExitProcess (svc.c) and the end of a

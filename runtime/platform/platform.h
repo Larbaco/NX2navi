@@ -403,6 +403,16 @@ int plat_file_private(const char *path);                  // only this account m
 typedef struct PlatAppend PlatAppend;
 PlatAppend *plat_append_open(const char *path);           // creates or truncates path; NULL on failure
 int plat_append_write(PlatAppend *f, const void *data, size_t n);   // 1 when all n bytes landed
+// An end the game did not ask for: ExitProcess (or exit()) called by a library, or by the runtime outside plat_exit and
+// plat_terminate. Windows calls the executable's TLS callback for it, with every other thread already stopped, and the
+// callback then writes what the log queue held (queued(&p, &n): the bytes as they stand, no lock) and one line with
+// the return addresses that led to the end into log. Nothing for plat_exit, plat_terminate, TerminateProcess from
+// outside, or after plat_exit_orderly (main returning from a tool mode). plat_exit_note_modules notes the loaded
+// modules, whose names the line gives the addresses (the callback may not ask the loader): at start and at a focus
+// loss. Windows only; elsewhere they do nothing.
+void plat_exit_note_setup(PlatAppend *log, void (*queued)(const char **p, size_t *n));
+void plat_exit_note_modules(void);
+void plat_exit_orderly(void);
 // Calls cb(name, ctx) for each file in dir whose name ends in ext (".in"); name has no directory part. cb returns 0 to
 // stop. Returns 0 when dir cannot be listed.
 int plat_file_list(const char *dir, const char *ext, int (*cb)(const char *name, void *ctx), void *ctx);

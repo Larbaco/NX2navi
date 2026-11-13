@@ -326,6 +326,24 @@ int main(int argc, char **argv) {
     at = out_n;
     for (int i = 0; i < THREADS; i++) next[i] = 0;
 
+    // 9b. logq_nudge (a focus loss): the log thread writes what it gathers at once, not when the gathering time is up.
+    //     On a machine too busy to log and look within half that time the timing check is left out.
+    uint64_t n0 = plat_now_ns();
+    for (int i = 0; i < 10; i++) {
+        char line[64];
+        int n = snprintf(line, sizeof line, "t 4 %d \n", i);
+        logq_write(line, (size_t)n);
+    }
+    logq_nudge();
+    in_time = plat_now_ns() - n0 < LOGQ_GATHER_NS / 4;
+    for (int i = 0; i < 60000 && out_n == at; i++) plat_sleep_ms(1);
+    uint64_t nudged = plat_now_ns() - n0;
+    settle();
+    if (in_time) CHECK(nudged < LOGQ_GATHER_NS * 3 / 4, "the nudged batch came %.1f ms after its first line", nudged / 1e6);
+    CHECK(check_lines(at, next, &notes) == 10, "lines lost from a nudged batch");
+    at = out_n;
+    for (int i = 0; i < THREADS; i++) next[i] = 0;
+
     // 10. logq_sync: what is queued is written before it returns, and later lines are written by their own thread. The
     //     lines are logged together just before it, so the log thread is still gathering them (the clock says
     //     whether this thread was in time for that): the batch a fatal error, a crash or the end of the process finds

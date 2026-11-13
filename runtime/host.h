@@ -25,6 +25,7 @@ void rt_log_raw(const char *p, size_t n);
 const char *rt_log_path(void);                  // the log file, NULL when this run writes none
 void rt_log_sync(void);                         // writes the queued log lines now; later lines are written as they are made
 void rt_log_ending(void);                       // the process is ending: its lines reach the log file past its 64 MiB cap
+void rt_log_focus_lost(void);                   // main.c: the gathered lines written now, the module list noted again
 void hang_watch_start(void);                    // hang_watch.c: NX2NAVI_HANG_WATCH_S's thread, in a game run
 void kern_wait_report(void);                    // kernel.c: the guest threads' lock and thread-end waits, for a hang report
 void vk_sync_progress(uint64_t *issued, uint64_t *done);   // vk_sync.c: submissions issued and done, no lock or device call
