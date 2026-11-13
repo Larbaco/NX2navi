@@ -69,7 +69,10 @@ static int reserve_at(uint64_t at, uint64_t size, int watch) { return plat_mem_r
 // thaw_handler makes the region writable again before the write retries. A kernel write into guest memory (a file
 // read) fails on a read-only page instead of faulting, so file reads thaw their buffer first (mem_thaw), and so does
 // every commit, decommit and protection change here. A region stays thawed for FRZ_HOLD_MS after a mem_thaw: a file
-// read still in flight writes its buffer later. frz_lock is a leaf lock: nothing writes guest memory under it.
+// read still in flight writes its buffer later. Nothing writes guest memory under frz_lock. It is not a leaf: lz_lock
+// and vm_lock come inside it, a strict thaw's page calls run under it (thaw_pages_vm), and a fetch of lazily written
+// pages (lazy_gone_locked, lazy_piece_locked: vk_memory.c lazy_fetch) takes the queue lock and waits for the GPU under
+// it. So no holder of the queue lock may touch guest memory or take frz_lock.
 #define FRZ_SHIFT 21
 #define FRZ_SIZE (1ull << FRZ_SHIFT)
 #define FRZ_HOLD_MS 5000u
