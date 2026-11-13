@@ -118,7 +118,10 @@ static volatile uint32_t exit_tid;   // the thread that runs the orderly end, 0 
 
 int rt_exit_begin(void) {
     uint32_t me = plat_thread_id(), was = 0;
-    if (__atomic_compare_exchange_n(&exit_tid, &was, me, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return 1;
+    if (__atomic_compare_exchange_n(&exit_tid, &was, me, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        rt_log_ending();   // the end's lines reach the log file past its cap (main.c log_sink)
+        return 1;
+    }
     if (was == me) return 0;
     for (;;) plat_sleep_ms(1000);
 }

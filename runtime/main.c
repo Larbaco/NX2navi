@@ -62,8 +62,15 @@ unsigned rt_trace;
 // `2> file` keep their own file. Each start moves the earlier logs to nx2navi.1.log .. nx2navi.4.log. A file stops at 64 MiB
 // (NX2NAVI_TRACE can write that much). Lines from before log_open wait in a static buffer: mem_init runs first so that
 // nothing else lands in the guest address space, and an earlier open would put the CRT's heap there.
+// The end of the run still reaches a file past its cap: once the process is ending (rt_log_ending at the start of an
+// orderly end, gfx_present.c rt_exit_begin, and of the frame-time summary, perf.c perf_summary_flush; rt_log_sync at a
+// fatal error and in the crash report), up to LOG_END_RESERVE more bytes are written, counted on their own. A
+// trace = perf session reaches the cap in about 90 minutes, and every line after it, the exit summary, "frametime:
+// exit", the stutter map and FATAL lines included, went to stderr only, which a game started from the launcher or
+// Explorer does not keep.
 #define LOG_KEEP 5
 #define LOG_CAP (64ull << 20)
+#define LOG_END_RESERVE (4ull << 20)
 enum { LOG_EARLY, LOG_FILE, LOG_OFF };
 static int g_log_state;
 static PlatAppend *g_log_file;
@@ -76,6 +83,10 @@ static uint64_t g_log_bytes;
 // crash report.
 static PlatMutex g_err_lock = PLAT_MUTEX_INIT;
 static volatile int32_t g_log_final;
+static volatile int32_t g_log_ending;   // rt_log_ending ran: the process is ending
+static uint64_t g_log_tail;             // bytes of the end the file was given past LOG_CAP
+
+void rt_log_ending(void) { __atomic_store_n(&g_log_ending, 1, __ATOMIC_RELEASE); }
 
 // The log's destinations: the file first, then stderr. logq.c calls it: from the log thread in a game run, else from
 // the thread that logs. A write to stderr can block for as long as its reader likes: a console window holds every write
@@ -89,9 +100,21 @@ static void log_sink(const char *p, size_t n) {
         uint64_t at = __atomic_fetch_add(&g_log_bytes, n, __ATOMIC_RELAXED);
         if (at + n <= LOG_CAP) {
             plat_append_write(g_log_file, p, n);
-        } else if (at <= LOG_CAP) {   // the first write past the cap says so, once
-            static const char cut[] = "[host] log: the file reached 64 MiB, the rest of this run goes to stderr only\n";
-            plat_append_write(g_log_file, cut, sizeof cut - 1);
+        } else {
+            if (at <= LOG_CAP) {   // the first write past the cap says so, once
+                static const char cut[] = "[host] log: the file reached 64 MiB, the rest of this run goes to stderr only, "
+                                          "but for the lines of its end\n";
+                plat_append_write(g_log_file, cut, sizeof cut - 1);
+            }
+            if (__atomic_load_n(&g_log_ending, __ATOMIC_ACQUIRE) || __atomic_load_n(&g_log_final, __ATOMIC_ACQUIRE)) {
+                uint64_t t = __atomic_fetch_add(&g_log_tail, n, __ATOMIC_RELAXED);
+                if (!t) {
+                    static const char end[] = "[host] log: the end of the run follows; the lines between the cap and it "
+                                              "were not written to this file\n";
+                    plat_append_write(g_log_file, end, sizeof end - 1);
+                }
+                if (t + n <= LOG_END_RESERVE) plat_append_write(g_log_file, p, n);
+            }
         }
     }
     // without the file stderr is the log (run_game.py, `2> file`), and it is waited for

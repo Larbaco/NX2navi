@@ -65,6 +65,8 @@ static char seen[1024];
 STEP(fs_save_wait) STEP(rtss_limit_restore) STEP(input_rumble_hd_stop) STEP(vk_pipeline_prewarm_marker_clear)
 STEP(prof_write) STEP(vk_mem_exit_log) STEP(logq_flush) STEP(vk_pipeline_save_exit) STEP(fs_save_flush)
 static int cfg_save(void) { strcat(seen, "cfg_save "); return 1; }
+static int ending;
+static void rt_log_ending(void) { ending++; }
 '''
 
 MAIN = r'''
@@ -95,9 +97,9 @@ int main(int argc, char **argv) {
     int first = rt_exit_begin(), again = rt_exit_begin();
     HANDLE t = CreateThread(NULL, 0, second, NULL, 0, NULL);
     int parked = WaitForSingleObject(t, 300) == WAIT_TIMEOUT && second_back == -1;
-    printf("once: first caller %d, its own thread again %d, another thread %s\n", first, again,
-           parked ? "stays in rt_exit_begin" : "came back");
-    if (first != 1 || again != 0 || !parked) printf("FAIL: the end must run once\n"), fails++;
+    printf("once: first caller %d, its own thread again %d, another thread %s; the log told of the end %d time(s)\n",
+           first, again, parked ? "stays in rt_exit_begin" : "came back", ending);
+    if (first != 1 || again != 0 || !parked || ending != 1) printf("FAIL: the end must run once\n"), fails++;
 
     // an update under way: ft_stop waits for it; after ft_stop no update starts
     HANDLE p = CreateThread(NULL, 0, present, (void *)(intptr_t)20, 0, NULL);
@@ -156,8 +158,9 @@ def static_checks():
     flush = strip_comments(function(perf, 'void perf_summary_flush(void)'))
     present = strip_comments(function(perf, 'void perf_present(uint64_t frame)'))
     e, f, s, l = (present.find(x) for x in ('ft_enter()', 'ft_frame(', 'session_report(', 'ft_leave()'))
-    ok = flush[flush.index('{') + 1:].strip().startswith('ft_stop();') and 0 <= e < f < s < l
-    print(f'perf.c: perf_summary_flush starts with ft_stop, perf_present updates inside ft_enter/ft_leave: '
+    stop, report = flush.find('ft_stop();'), flush.find('ft_report(')
+    ok = 0 <= stop < report and 0 <= e < f < s < l
+    print(f'perf.c: perf_summary_flush calls ft_stop before ft_report, perf_present updates inside ft_enter/ft_leave: '
           f'{"ok" if ok else "FAIL"}')
     bad += not ok
     return bad
@@ -188,6 +191,7 @@ def main():
     want_all = ' '.join(STEPS) + ' '
     want_seconds = ' '.join(s for s in STEPS if s != 'cfg_save') + ' '
     rc = subprocess.run([str(exe), want_all, want_seconds], env=env, timeout=60).returncode
+    print(f'exit_order_check, the static checks and the program: {"FAILED" if bad or rc else "ok"}')
     return 1 if bad or rc else 0
 
 

@@ -764,6 +764,7 @@ static void session_report(uint64_t now) {
 __attribute__((weak)) void vk_texstat_frame(uint64_t frame, uint64_t d) { (void)frame, (void)d; }
 
 void perf_summary_flush(void) {   // at exit (prof_write)
+    rt_log_ending();   // the summary and the stutter map reach the log file past its cap (main.c log_sink)
     ft_stop();
     if (rt_trace & RT_TRACE_PERF) seg_close(__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), kern_now_ns(), 1);
     if (summary_t0) {
