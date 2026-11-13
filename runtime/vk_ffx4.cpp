@@ -207,7 +207,9 @@ const uint64_t UP_IDLE_NS = 90ull * 1000000000ull;
 
 void destroy_up(Up *u, const char *why) {
     rt_log("ffx4: the %ux%u context (render sizes up to %ux%u) destroyed: %s", u->ow, u->oh, u->mw, u->mh, why);
+    uint64_t t0 = perf_mark_begin();   // NX2NAVI_TRACE=perf: "upscaler releases"
     A.destroy(&u->ctx, nullptr);
+    perf_mark_end(PERF_M_UPREL, t0, 0);
     *u = Up();
 }
 
@@ -288,11 +290,10 @@ Up *context_for(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
     for (Up &u : U)
         if (u.ctx && u.ow == ow && u.oh == oh && u.drs == drs && (drs ? w <= u.mw && h <= u.mh : w == u.mw && h == u.mh))
             found = &u;
-    const VkCtx *c = vk_ctx();
     int waited = 0;
     for (Up &u : U)   // the contexts of this output size for another render size, once no command buffer holds them
         if (u.ctx && &u != found && u.ow == ow && u.oh == oh && up_tick - u.used >= UP_RECENT) {
-            if (!waited++) vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();   // their work may be in flight
+            if (!waited++) vk_upscaler_device_idle();   // their work may be in flight
             destroy_up(&u, "the render size changed");
         }
     if (found) {
@@ -308,7 +309,7 @@ Up *context_for(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
         if (up_tick - u.used >= UP_RECENT && (!lru || u.used < lru->used)) lru = &u;
     }
     if (!slot && lru) {
-        vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();   // its work may still be in flight
+        vk_upscaler_device_idle();   // its work may still be in flight
         destroy_up(lru, "its slot went to another output size");
         slot = lru;
     }
@@ -318,7 +319,7 @@ Up *context_for(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
     Up *u = create(slot, mw, mh, ow, oh, drs);
     if (!u) {
         int freed = 0;
-        vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();
+        vk_upscaler_device_idle();
         for (Up &o : U)
             if (o.ctx && up_tick - o.used >= UP_RECENT) destroy_up(&o, "room for a context whose creation failed"), freed++;
         freed += vk_ffx_trim_idle(UP_RECENT);

@@ -16,6 +16,9 @@ typedef struct {
 typedef struct { float fov_y, znear, zfar, meters; } VkFfxCamera;
 // vk_dlaa.c: the share (0..1) of the extra sharpening FSR 3.1 gets at a render width w of an output width ow
 float vk_dlaa_fsr3_boost(uint32_t w, uint32_t ow);
+// vk_dlaa.c: a wait for the device to be idle, the queue lock held, before an upscaler frees what the GPU may still
+// use (NX2NAVI_TRACE=perf: "upscaler device waits")
+void vk_upscaler_device_idle(void);
 
 int vk_ffx_load(void);   // 1 when the library is there with its entry points (loaded once)
 // Whether FSR 3.1 upscaling can run in this build, for the settings menu: after vk_ffx_load ran, what it found; before,

@@ -726,6 +726,22 @@ static int idle_free(void) {
     return m;
 }
 
+// The upscalers' waits for the device to be idle before they free what the GPU may still use (vk_dlaa.c, vk_ffx.cpp,
+// vk_ffx4.cpp), with the queue lock held: the present's flip, the completion thread's hold release and every upload
+// submit wait as long. NX2NAVI_TRACE=perf names them "upscaler device waits" on a slow frame's line.
+void vk_upscaler_device_idle(void) {
+    uint64_t t0 = perf_mark_begin();
+    vk_queue_lock(), vkDeviceWaitIdle(vk_ctx()->device), vk_queue_unlock();
+    perf_mark_end(PERF_M_UPWAIT, t0, 0);
+}
+
+// A DLSS feature's release, timed as "upscaler releases" (NX2NAVI_TRACE=perf).
+static void feat_release(NgxHandle *f) {
+    uint64_t t0 = perf_mark_begin();
+    N.release(f);
+    perf_mark_end(PERF_M_UPREL, t0, 0);
+}
+
 // The images and views of a size, then its feature. The device must be idle: free_size waits for it, vk_dlaa_release
 // has. Whatever was not made is skipped, so a half-made size goes the same way.
 static void destroy_size(struct Size *e) {
@@ -744,13 +760,13 @@ static void destroy_size(struct Size *e) {
         if (e->dist_view[i]) vkDestroyImageView(c->device, e->dist_view[i], NULL);
         if (e->dist[i]) vmaDestroyImage(c->vma, e->dist[i], e->dist_mem[i]);
     }
-    if (e->feat && N.release) N.release(e->feat), feat_released = 1;
+    if (e->feat && N.release) feat_release(e->feat), feat_released = 1;
     if (D.host == e) D.host = NULL;
     memset(e, 0, sizeof *e);
 }
 
 static void free_size(struct Size *e) {
-    vk_queue_lock(), vkDeviceWaitIdle(vk_ctx()->device), vk_queue_unlock();   // a third scene size: the evicted images may still be in flight
+    vk_upscaler_device_idle();   // a third scene size: the evicted images may still be in flight
     destroy_size(e);
 }
 
@@ -1420,7 +1436,7 @@ static void destroy_snap(struct Snap *s) {
 }
 
 static void free_snap(struct Snap *s) {
-    vk_queue_lock(), vkDeviceWaitIdle(vk_ctx()->device), vk_queue_unlock();   // a fourth size: the evicted images may still be in flight
+    vk_upscaler_device_idle();   // a fourth size: the evicted images may still be in flight
     destroy_snap(s);
 }
 
@@ -1871,8 +1887,8 @@ static void stale_sizes(const struct Size *cur, const struct Size *host) {
         } else if (s->feat && D.evals >= s->feat_used + SIZE_STALE) {
             rt_log("dlaa: the DLSS feature at %ux%u -> %ux%u went unused for %d frames while its size ran on another "
                    "size's: released", s->w, s->h, s->ow, s->oh, SIZE_STALE);
-            vk_queue_lock(), vkDeviceWaitIdle(vk_ctx()->device), vk_queue_unlock();
-            N.release(s->feat), s->feat = NULL, feat_released = 1;
+            vk_upscaler_device_idle();
+            feat_release(s->feat), s->feat = NULL, feat_released = 1;
         }
     }
 }
@@ -1886,8 +1902,8 @@ static void release_kept(const struct Size *making, int all) {
         struct Size *s = &D.sizes[i];
         if (s == making || !s->feat) continue;
         if (!all && (uint64_t)s->w * s->h <= (uint64_t)making->w * making->h) continue;
-        if (!n++) vk_queue_lock(), vkDeviceWaitIdle(vk_ctx()->device), vk_queue_unlock();
-        N.release(s->feat), s->feat = NULL;
+        if (!n++) vk_upscaler_device_idle();
+        feat_release(s->feat), s->feat = NULL;
         if (D.last == s) D.last = NULL;
         if (D.host == s) D.host = NULL;
     }
@@ -2292,8 +2308,6 @@ own_feature:
         // The feature is made for the size of its entry: this frame's own, or the larger one of the DLSS mode's, which
         // was released since (release_kept) and takes this frame's size as a sub-rectangle.
         const uint32_t fw = host->w, fh = host->h;
-        // NX2NAVI_TRACE=perf: the release of the kept features (a device idle wait) and the create, as one mark
-        uint64_t t0 = perf_mark_begin();
         if (idle_free() != 2) release_kept(host, feat_released);
         feat_released = 0;
         p_setu(p, "CreationNodeMask", 1);
@@ -2317,6 +2331,8 @@ own_feature:
         p_setu(p, "DLSS.Hint.Render.Preset.Balanced", (unsigned)pk);
         p_setu(p, "DLSS.Hint.Render.Preset.Performance", (unsigned)pm);
         p_setu(p, "DLSS.Hint.Render.Preset.UltraPerformance", (unsigned)pl);
+        // NX2NAVI_TRACE=perf: the create alone; the wait and the releases of release_kept have marks of their own
+        uint64_t t0 = perf_mark_begin();
         NgxResult r = N.create(cb, NGX_FEATURE_SUPERSAMPLING, p, &host->feat);
         perf_mark_end(PERF_M_NGX, t0, 0);
         if (!NGX_OK(r) || !host->feat) return dl_fail("DLSS feature creation", r);
@@ -2469,7 +2485,7 @@ static void hudless_from(VkCommandBuffer cb, VkImage src, uint32_t level, uint32
     if (vk_hdr_native()) return;
     VkFormat fmt = hdr ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
     if (D.hl && (D.hl_w != w || D.hl_h != h || D.hl_fmt != fmt)) {
-        vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();
+        vk_upscaler_device_idle();
         hl_destroy();
     }
     if (!D.hl) {
@@ -2592,7 +2608,7 @@ static int pb_images(VkCommandBuffer cb, uint32_t w, uint32_t h) {
     PB.used = D.presents;
     if (PB.scene && PB.w == w && PB.h == h) return 1;
     if (PB.scene || PB.comp) {
-        vk_queue_lock(), vkDeviceWaitIdle(vk_ctx()->device), vk_queue_unlock();
+        vk_upscaler_device_idle();
         pb_destroy();
     }
     VkImageUsageFlags u = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
@@ -2832,7 +2848,7 @@ static void retire_idle(void) {
     }
     if (!retire_off_at) retire_off_at = now ? now : 1;
     if (now < retire_off_at + RETIRE_PRESENTS || !up_holds()) return;
-    vk_queue_lock(), vkDeviceWaitIdle(vk_ctx()->device), vk_queue_unlock();
+    vk_upscaler_device_idle();
     for (int i = 0; i < SNAPS; i++) destroy_snap(&R.s[i]);
     vk_ffx_release_idle();
     if (D.failed) {   // as idle_release does for a size: frame generation is handed nothing of one from here on
@@ -3056,7 +3072,7 @@ static void idle_release(void) {
             if (s->feat) {
                 rt_log("dlaa: the DLSS feature at %ux%u went unused for %d presents with the upscaler off: released; "
                        "its size's motion images stay for frame generation", s->w, s->h, IDLE_FREE_PRESENTS);
-                N.release(s->feat), s->feat = NULL, feat_released = 1;
+                feat_release(s->feat), s->feat = NULL, feat_released = 1;
             }
             if (D.host == s) D.host = NULL;
             continue;

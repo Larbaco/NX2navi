@@ -141,7 +141,9 @@ const uint64_t UP_IDLE_NS = 90ull * 1000000000ull;
 
 void destroy_up(Up *u, const char *why) {
     rt_log("ffx: the FSR 3.1 context for %ux%u (render sizes up to %ux%u) destroyed: %s", u->ow, u->oh, u->mw, u->mh, why);
+    uint64_t t0 = perf_mark_begin();   // NX2NAVI_TRACE=perf: "upscaler releases"
     A.destroy(&u->ctx, nullptr);
+    perf_mark_end(PERF_M_UPREL, t0, 0);
     *u = Up();
 }
 
@@ -195,7 +197,7 @@ Up *context_for(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
     int waited = 0;
     for (Up &u : U)   // the contexts of this output size for another render size, once no command buffer holds them
         if (u.ctx && &u != found && u.ow == ow && u.oh == oh && up_tick - u.used >= UP_RECENT) {
-            if (!waited++) vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();   // their work may be in flight
+            if (!waited++) vk_upscaler_device_idle();   // their work may be in flight
             destroy_up(&u, "the render size changed");
         }
     if (found) {
@@ -211,7 +213,7 @@ Up *context_for(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
         if (up_tick - u.used >= UP_RECENT && (!lru || u.used < lru->used)) lru = &u;
     }
     if (!slot && lru) {
-        vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();   // its work may still be in flight
+        vk_upscaler_device_idle();   // its work may still be in flight
         destroy_up(lru, "its slot went to another output size");
         slot = lru;
     }
