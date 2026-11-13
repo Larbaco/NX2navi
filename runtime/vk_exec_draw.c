@@ -6042,7 +6042,7 @@ static void mfb_draw(VkExec *ex, uint32_t count, const VkMemSpan *ind) {
     if (!vs || !vk_meshfb_init()) { draw_skipped(ex, 1, SK_PIPE_FAILED); return; }
     uint32_t verts = c->mi.maxp * c->mi.ipp, slot_words = meshfb_slot_words(&c->mi);
     uint32_t most = vk_ctx()->props.limits.maxComputeWorkGroupCount[0];
-    if (count > most) count = most;   // a count the GPU wrote is not looked at here: the dispatch reads it as it is
+    if (count > most) count = most;   // a count the GPU wrote is cut on the GPU, below
     VkBuffer rec;
     int cmds;
     vk_exec_barrier(ex);   // ends the pass; the culling's record and the last draw's reads come before what follows
@@ -6050,6 +6050,12 @@ static void mfb_draw(VkExec *ex, uint32_t count, const VkMemSpan *ind) {
                                        verts, slot_words, &rec, &cmds);
     ex->recorded += (uint32_t)cmds;
     vk_exec_barrier(ex);
+    if (ind) {   // to what the buffers hold, before a dispatch reads it (meshfb_clamp.comp)
+        vk_meshfb_clamp(ex->cb, at, ts ? c->ti.payload_bytes / 4 : 0);
+        cx->B.pipe[1] = VK_NULL_HANDLE;   // the clamp bound its own
+        ex->recorded += 4;
+        vk_exec_barrier(ex);
+    }
     if (ts) {
         if (!mfb_dispatch(ex, c->cs_task, NVN_STAGE_TASK, rec, at)) { draw_skipped(ex, 1, SK_PIPE_FAILED); return; }
         vk_exec_barrier(ex);
