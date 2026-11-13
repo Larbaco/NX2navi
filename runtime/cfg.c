@@ -508,6 +508,8 @@ static char *norm_key(char *key) {
     return strncmp(key, PREFIX, PREFIX_LEN) ? key : key + PREFIX_LEN;
 }
 
+static int entry_line[CFG_MAX_KEYS];   // the file line each entry's value came from (cfg_load's check_values)
+
 static void add(char *key, char *value, int line) {
     key = norm_key(key);
     size_t vl = strlen(value);
@@ -522,10 +524,88 @@ static void add(char *key, char *value, int line) {
         if (!strcmp(entries[i].key, key)) {   // a repeated key: the later line wins
             free(entries[i].value);
             entries[i].value = strdup(value);
+            entry_line[i] = line;
             return;
         }
     if (n_entries == CFG_MAX_KEYS) return;
+    entry_line[n_entries] = line;
     entries[n_entries++] = (CfgEntry){strdup(key), strdup(value), 0, 0};
+}
+
+// ---- values outside their rows' sets, logged at load (the values are read as they are written)
+// Hand-edited files had values no consumer takes, and nothing said so: "pace_smooth = 0 ; off" keeps the comment in
+// the value, which cfg_bool reads as on; "fullscreen = false" is on too; "sharpness = 250" is past 0..100. Only the
+// sets that are the consumers' own are checked: 0|1, ranges lo..hi, and lists of words. A list with a number in it is
+// the menu's presets, and its consumer takes more (fps_limit any rate from 30 to 240, render_scale 25..400), so it is
+// left alone. A list of words names the menu's choices; a consumer may take more (dlss_preset any letter a..m), so the
+// line says no more than that. At most CHECK_LINES lines per load, then a count.
+#define CHECK_LINES 16
+static int misfits;
+
+// NULL when v fits the set, else what the log line says of it (in buf).
+static const char *misfit(const char *set, const char *v, char *buf, size_t cap) {
+    if (!strcmp(set, "0|1")) return strcmp(v, "0") && strcmp(v, "1") ? "is not 0 or 1" : NULL;
+    const char *dots = strstr(set, "..");
+    if (dots && !strchr(set, '|')) {
+        char lo_s[32], *end;   // the low end apart: strtod would take "0." of "0..100" for a number
+        size_t ln = (size_t)(dots - set);
+        if (!ln || ln >= sizeof lo_s) return NULL;
+        memcpy(lo_s, set, ln), lo_s[ln] = 0;
+        double lo = strtod(lo_s, &end);
+        if (*end) return NULL;
+        double hi = strtod(dots + 2, &end);
+        if (end == dots + 2 || *end) return NULL;
+        // any number: some rows with whole ends take fractions (dyn_res_target 16.7 in 1..100)
+        double x = strtod(v, &end);
+        if (end != v && !*end && x == x && x >= lo && x <= hi) return NULL;
+        snprintf(buf, cap, "is not a number in %s", set);
+        return buf;
+    }
+    for (const char *m = set; *m;) {   // a member that is a number: the menu's presets, not checked
+        char *end;
+        size_t n = strcspn(m, "|");
+        strtod(m, &end);
+        if (end == m + n) return NULL;
+        m += n + (m[n] == '|');
+    }
+    for (const char *m = set; *m;) {
+        size_t n = strcspn(m, "|");
+        if (strlen(v) == n && !strncasecmp(m, v, n)) return NULL;
+        m += n + (m[n] == '|');
+    }
+    snprintf(buf, cap, "is none of the menu's choices %s", set);
+    return buf;
+}
+
+// key: upper case without the prefix; line 0: the value comes from the environment.
+static void check_value(const char *key, const char *v, int line) {
+    const CfgMeta *m = cfg_meta(key);
+    if (!m) return;
+    char buf[160];
+    const char *bad = m->values ? misfit(m->values, v, buf, sizeof buf) : NULL;
+    int comment = strstr(v, " ;") || strstr(v, " #") || strstr(v, "\t;") || strstr(v, "\t#");
+    if (!bad && !comment) return;
+    if (++misfits > CHECK_LINES) return;
+    char low[64], where[96];
+    size_t n = 0;
+    for (; key[n] && n < sizeof low - 1; n++) low[n] = (char)tolower((unsigned char)key[n]);
+    low[n] = 0;
+    if (line) snprintf(where, sizeof where, "nx2navi.ini line %d: %s", line, low);
+    else snprintf(where, sizeof where, "the environment's " PREFIX "%s", key);
+    rt_log("cfg: %s = '%s' %s%s%s", where, v, bad ? bad : "", bad && comment ? "; " : "",
+           comment ? "a ';' or '#' after the value is part of it (a comment goes on a line of its own)" : "");
+}
+
+static void check_end(void) {
+    if (misfits > CHECK_LINES)
+        rt_log("cfg: %d more values outside their settings' choices are not listed", misfits - CHECK_LINES);
+    misfits = 0;
+}
+
+static void check_values(void) {
+    for (int i = 0; i < n_entries; i++)
+        if (entries[i].value && entry_line[i]) check_value(entries[i].key, entries[i].value, entry_line[i]);
+    check_end();
 }
 
 // 0.1.9 had the Xbox prompts as a pad layout: pad_layout = xbox_prompts is pad_layout = nintendo with prompts = xbox.
@@ -541,7 +621,8 @@ static void migrate(void) {
     free(layout->value);
     layout->value = strdup("nintendo");
     layout->dirty = 1;
-    if (!prompts && n_entries < CFG_MAX_KEYS) entries[n_entries++] = (CfgEntry){strdup("PROMPTS"), strdup("xbox"), 1, 0};
+    if (!prompts && n_entries < CFG_MAX_KEYS)
+        entry_line[n_entries] = 0, entries[n_entries++] = (CfgEntry){strdup("PROMPTS"), strdup("xbox"), 1, 0};
     rt_log("cfg: nx2navi.ini pad_layout = xbox_prompts is read as pad_layout = nintendo and prompts = %s",
            prompts ? prompts->value : "xbox");
 }
@@ -604,6 +685,7 @@ int cfg_load(const char *path) {
     }
     free(data);
     migrate();
+    check_values();   // after migrate: a value it rewrites is checked as the game reads it
     return 1;
 }
 
@@ -1243,6 +1325,13 @@ static void load_ini(void) {
 
 void cfg_init(void) {
     load_ini();
+    for (size_t i = 0; i < sizeof metas / sizeof *metas; i++) {   // the environment's values, as the file's (cfg_load)
+        char var[80];
+        snprintf(var, sizeof var, PREFIX "%s", metas[i].key);
+        const char *e = getenv(var);
+        if (e && *e) check_value(metas[i].key, e, 0);
+    }
+    check_end();
     __atomic_store_n(&lowend, -1, __ATOMIC_RELEASE);   // asked before the file was read: decided again (lowend_of)
     if (profile_of())
         rt_log("cfg: device profile Steam Deck: defaults for the keys nx2navi.ini does not set (NX2NAVI_DEVICE_PROFILE=desktop "
