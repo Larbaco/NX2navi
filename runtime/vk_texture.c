@@ -3281,12 +3281,25 @@ static void commit_evict(void) {   // tex_lock held, the commit is low and the r
 // resolved to in each submission (pool_touch), a finalized slot's released one too: at 5120x2160 a session's log had
 // 989 and then 2,172 released entries holding 9.2 and 10.1 GiB against a bound of 4,008 MiB, and its overwritten
 // render targets "last used 1 presents ago". Each entry counts once, under the first reason that holds.
+// The same line, at most every REL_CENSUS_ROOM_NS of wall time and REL_CENSUS_ROOM_LINES times a run, while they hold
+// more than the bound itself but not a quarter more than what they may keep (room 1): with room on the card trl_keep
+// lets them keep twice the bound, and a session that held 7,150 MiB against a bound of 4,008 MiB (2026-11-13) never
+// logged what kept them.
 #define REL_CENSUS_SUBS 3600
 #define REL_CENSUS_LINES 24
-static void rel_census(uint64_t cap) {   // tex_lock held
-    static uint32_t last, lines;
-    if (lines >= REL_CENSUS_LINES || (last && submit_epoch - last < REL_CENSUS_SUBS)) return;
-    last = submit_epoch ? submit_epoch : 1, lines++;
+#define REL_CENSUS_ROOM_NS 60000000000ull
+#define REL_CENSUS_ROOM_LINES 60
+static void rel_census(uint64_t cap, int room) {   // tex_lock held
+    static uint32_t last, lines, room_lines;
+    static uint64_t room_at;
+    if (room) {
+        uint64_t t = plat_now_ns();
+        if (room_lines >= REL_CENSUS_ROOM_LINES || (room_at && t - room_at < REL_CENSUS_ROOM_NS)) return;
+        room_at = t, room_lines++;
+    } else {
+        if (lines >= REL_CENSUS_LINES || (last && submit_epoch - last < REL_CENSUS_SUBS)) return;
+        last = submit_epoch ? submit_epoch : 1, lines++;
+    }
     uint64_t now = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     enum { YOUNG, SLOT, SLOT_OVER, SAMPLED, LOOKED, NEXT, KINDS };
     uint64_t by[KINDS] = {0}, gpu = 0;
@@ -3302,10 +3315,11 @@ static void rel_census(uint64_t cap) {   // tex_lock held
         if (!comes_back_intact(e)) gpu += e->bytes, ngpu++;
     }
     const double M = 1048576.0;
-    rt_log("vk: released textures over their bound: %d entries, %.0f MiB of %.0f MiB (%d of them, %.0f MiB, hold content "
+    rt_log("vk: released textures over their bound%s: %d entries, %.0f MiB of %.0f MiB (%d of them, %.0f MiB, hold content "
            "only the GPU made): %d, %.0f MiB, released too lately to go; %d, %.0f MiB, sampled or drawn into lately; %d, "
            "%.0f MiB, shown by a texture pool slot and not sampled, and %d more, %.0f MiB, that another target was drawn "
-           "over; %d, %.0f MiB, reached by another lookup; %d, %.0f MiB, next to go", nreleased, rel_bytes / M, cap / M,
+           "over; %d, %.0f MiB, reached by another lookup; %d, %.0f MiB, next to go",
+           room ? " (kept past it while the card has room)" : "", nreleased, rel_bytes / M, cap / M,
            ngpu, gpu / M, n[YOUNG], by[YOUNG] / M, n[SAMPLED], by[SAMPLED] / M, n[SLOT], by[SLOT] / M, n[SLOT_OVER],
            by[SLOT_OVER] / M, n[LOOKED], by[LOOKED] / M, n[NEXT], by[NEXT] / M);
 }
@@ -3378,7 +3392,8 @@ static void sweep_pressure(void) {   // tex_lock held
                             trl_room(vused, vbudget, vram_pressure ? vram_pressure : VRAM_PRESSURE_DEFAULT,
                                      commit_free_now, commit_low_mark));
         if (rel_bytes > keep) drop_stale(keep, &n_cap_drops, DROP_CAP);
-        if (keep != UINT64_MAX && rel_bytes > keep + keep / 4) rel_census(keep);   // well over it: what holds the rest
+        if (keep != UINT64_MAX && rel_bytes > keep + keep / 4) rel_census(keep, 0);   // well over it: what holds the rest
+        else if (cap != UINT64_MAX && rel_bytes > cap) rel_census(cap, 1);
         if (rel_bytes > COMMIT_LOW_KEEP && low && !held)
             more = drop_stale(COMMIT_LOW_KEEP, &n_commit_drops, DROP_COMMIT) == PRESSURE_STEP;
     }
@@ -6607,16 +6622,31 @@ enum { AGE_YOUNG, AGE_10S, AGE_1M, AGE_3M, AGE_5M, AGE_OLD, AGE_N };
 static const char *const age_names[AGE_N] = {"under 2 s", "2-10 s", "10-60 s", "1-3 min", "3-5 min", "longer"};
 static uint64_t rb_n[AGE_N], rb_bytes[AGE_N];       // take-backs by the time released (tex_lock)
 static uint64_t ra_n[AGE_N], ra_bytes, ra_why[DROP_N];   // made again by the time since the drop, and by its reason
+// The same split by kind and own memory, which decides whether a shorter hold for some kind could save memory without
+// a take-back finding its entry gone: an entry that comes back intact from the game's memory, one another target was
+// drawn over, one whose content only the GPU made; each under 1 MiB of own memory (none included) or more.
+enum { RK_INTACT, RK_INTACT_BIG, RK_OVER, RK_OVER_BIG, RK_GPU, RK_GPU_BIG, RK_N };
+static const char *const rk_names[RK_N] = {"intact under 1 MiB", "intact 1 MiB or more", "overwritten under 1 MiB",
+                                           "overwritten 1 MiB or more", "made by the GPU under 1 MiB",
+                                           "made by the GPU 1 MiB or more"};
+static uint64_t rkb_n[RK_N][AGE_N], rkb_bytes[RK_N][AGE_N], rka_n[RK_N][AGE_N];   // tex_lock
 #define DROPPED_N 8192
-static struct { uint64_t kh, frame; uint8_t why; } dropped[DROPPED_N];   // tex_lock
+static struct { uint64_t kh, frame; uint8_t why, kind; } dropped[DROPPED_N];   // tex_lock
 
 static int age_of(uint32_t s) {   // seconds
     return s < 2 ? AGE_YOUNG : s < 10 ? AGE_10S : s < 60 ? AGE_1M : s < 180 ? AGE_3M : s < 300 ? AGE_5M : AGE_OLD;
 }
 
+static int reuse_kind(const Tex *e) {
+    int big = e->alloc && e->bytes >= (1ull << 20);
+    return (e->overwritten ? RK_OVER : comes_back_intact(e) ? RK_INTACT : RK_GPU) + big;
+}
+
 static void reuse_taken_back(const Tex *e) {   // tex_lock held; e is being taken back, rel_frame still its release
-    int a = age_of(secs_since(e->rel_frame));
-    rb_n[a]++, rb_bytes[a] += e->alloc ? e->bytes : 0;
+    int a = age_of(secs_since(e->rel_frame)), k = reuse_kind(e);
+    uint64_t own = e->alloc ? e->bytes : 0;
+    rb_n[a]++, rb_bytes[a] += own;
+    rkb_n[k][a]++, rkb_bytes[k][a] += own;
 }
 
 // Drops of an entry the game may still ask for: past a bound, or under a pressure, or unsampled.
@@ -6629,6 +6659,7 @@ static void reuse_dropped(const Tex *e, int why) {   // tex_lock held
     if (!drop_costs(why)) return;
     uint64_t kh = key_hash(&e->key);
     dropped[kh % DROPPED_N].kh = kh, dropped[kh % DROPPED_N].frame = frames_now(), dropped[kh % DROPPED_N].why = (uint8_t)why;
+    dropped[kh % DROPPED_N].kind = (uint8_t)reuse_kind(e);   // the entry is gone when it is made again
 }
 
 static void reuse_made(const Tex *e) {   // tex_lock held; e was just made
@@ -6636,6 +6667,7 @@ static void reuse_made(const Tex *e) {   // tex_lock held; e was just made
     if (dropped[kh % DROPPED_N].kh != kh || !dropped[kh % DROPPED_N].why) return;
     int a = age_of(secs_since(dropped[kh % DROPPED_N].frame));
     ra_n[a]++, ra_bytes += e->alloc ? e->bytes : 0, ra_why[dropped[kh % DROPPED_N].why]++;
+    rka_n[dropped[kh % DROPPED_N].kind % RK_N][a]++;
     dropped[kh % DROPPED_N].why = 0;
 }
 
@@ -6665,10 +6697,31 @@ void vk_texture_reuse_log(uint64_t frame) {
              (unsigned long long)ra_why[DROP_IDLE_COMMIT], (unsigned long long)ra_why[DROP_DISUSE],
              (unsigned long long)n_age_drops, n_age_bytes / M, nreleased, rel_bytes / M,
              released_cap_bytes() == UINT64_MAX ? 0.0 : released_cap_bytes() / M, released_hold());
+    // the split by kind and own memory: one group per kind that had any, the take-backs and the makes again by age
+    char kline[1536];
+    int ko = snprintf(kline, sizeof kline, "vk: released textures frame %llu by kind and own memory, since the last line "
+                      "(ages under 2 s/2-10 s/10-60 s/1-3 min/3-5 min/longer):", (unsigned long long)frame);
+    int kinds = 0;
+    for (int k = 0; k < RK_N && ko < (int)sizeof kline - 200; k++) {
+        uint64_t any = 0, late = 0;
+        for (int a = 0; a < AGE_N; a++) any += rkb_n[k][a] + rka_n[k][a];
+        for (int a = AGE_3M; a < AGE_N; a++) late += rkb_bytes[k][a];
+        if (!any) continue;
+        kinds++;
+        ko += snprintf(kline + ko, sizeof kline - (size_t)ko, "%s %s: taken back %llu/%llu/%llu/%llu/%llu/%llu (%.0f MiB "
+                       "after a minute), made again %llu/%llu/%llu/%llu/%llu/%llu", kinds > 1 ? ";" : "", rk_names[k],
+                       (unsigned long long)rkb_n[k][0], (unsigned long long)rkb_n[k][1], (unsigned long long)rkb_n[k][2],
+                       (unsigned long long)rkb_n[k][3], (unsigned long long)rkb_n[k][4], (unsigned long long)rkb_n[k][5],
+                       late / M, (unsigned long long)rka_n[k][0], (unsigned long long)rka_n[k][1],
+                       (unsigned long long)rka_n[k][2], (unsigned long long)rka_n[k][3], (unsigned long long)rka_n[k][4],
+                       (unsigned long long)rka_n[k][5]);
+    }
     memset(rb_n, 0, sizeof rb_n), memset(rb_bytes, 0, sizeof rb_bytes), memset(ra_n, 0, sizeof ra_n);
     memset(ra_why, 0, sizeof ra_why), ra_bytes = 0, n_age_drops = n_age_bytes = 0;
+    memset(rkb_n, 0, sizeof rkb_n), memset(rkb_bytes, 0, sizeof rkb_bytes), memset(rka_n, 0, sizeof rka_n);
     unlock();
     rt_log("%s", line);
+    if (kinds) rt_log("%s", kline);
 }
 
 // With NX2NAVI_TRACE=perf every 600 frames, after vk_memory.c's vram line: what the live entries' own memory holds. By
