@@ -222,11 +222,13 @@ static void put_back_op(void *ctx, const RtssOut *o) {   // rtss_poll's RtssOps.
 
 // Whether RTSS holds the game to the want w this poll read, and the log of which limiter is in use: the first decision,
 // then each change. The want may have changed since the poll read it: rtss_limit_active compares the two, so a stale
-// store never lets the game's limiter stand aside for a newer want.
+// store never lets the game's limiter stand aside for a newer want. The store is made either way (a want that went
+// w, w2, w again must not find an older hold), but a hold is logged only while its want is still the current one: the
+// game's limiter paces a newer want, and the next poll logs what holds it.
 static void set_active(int64_t w, int on, const char *why) {
     static int logged = -1;
     atomic_store(&active_for, on ? w : RTSS_UNSET);
-    if (logged == on) return;
+    if (logged == on || (on && atomic_load(&want) != w)) return;
     logged = on;
     if (on) rt_log("frame rate: RivaTuner Statistics Server does the limiting; the game's own limiter stands aside");
     else rt_log("frame rate: the game's own limiter (%s)", why);

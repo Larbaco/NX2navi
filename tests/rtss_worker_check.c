@@ -67,9 +67,15 @@ static void WINAPI f_load(LPCSTR name) {
     (void)name;
     loaded = own.exists ? own : global;
 }
+static void (*during_save)(void);   // runs inside the next SaveProfile, once
 static void WINAPI f_save(LPCSTR name) {
     (void)name;
     saves++;
+    if (during_save) {
+        void (*f)(void) = during_save;
+        during_save = NULL;
+        f();
+    }
     if (readonly) return;
     DWORD stamp = own.stamp;
     own = loaded, own.exists = 1, own.stamp = stamp;
@@ -453,6 +459,28 @@ static void active_race(void) {
     CHECK(!hits, "the game's limiter stood aside for a kept-out want %ld times", hits);
 }
 
+// Frame generation switched on while the worker writes the first limit: RTSS holds that limit, but the game's limiter
+// paces the kept-out want, so the log must not say RTSS does the limiting; the next poll logs the kept-out line. A later
+// limit is held and logged as usual.
+static void framegen_on(void) { rtss_limit_want(RTSS_OUT_FRAMEGEN); }
+static void active_logged(void) {
+    app_set(1, 0xA, 1000, 2000, 60);
+    during_save = framegen_on;
+    ask(60000);
+    show("frame generation switched on during the first write");
+    CHECK(own.exists && own.limit == 60, "the limit went into the profile");
+    CHECK(!rtss_limit_active(), "the game's limiter paces the kept-out want");
+    CHECK(!logged("does the limiting"), "no line says RTSS does the limiting");
+    poll();
+    show("the next poll");
+    CHECK(logged("the game's own limiter (RivaTuner Statistics Server kept out: frame generation)"), "the kept-out line");
+    CHECK(!logged("does the limiting"), "still no line says RTSS does the limiting");
+    ask(60000);
+    poll();
+    show("frame generation off");
+    CHECK(rtss_limit_active() && logged("does the limiting; the game's own limiter stands aside"), "held and logged");
+}
+
 // A limit of a fractional monitor (display at 59.94 and 143.856 Hz): an RTSS that knows the denominator holds it as it
 // is, one that does not holds it rounded to whole frames, and the log says what the profile holds, not what was asked.
 static void round_logged(void) {
@@ -721,6 +749,7 @@ static const struct { const char *name; void (*run)(void); } scenarios[] = {
     {"kept_lowlat_then_limit", kept_lowlat_then_limit},
     {"kept_framegen", kept_framegen},
     {"active_race", active_race},
+    {"active_logged", active_logged},
     {"round_logged", round_logged},
     {"round_logged_whole", round_logged_whole},
     {"start_off_present", start_off_present},
