@@ -440,6 +440,10 @@
 # Textures the game released that are kept as they are (1 to 16384); past this count only those that lose nothing
 # when dropped go. Default: one per 2 MB of the video memory budget, 2048 to 8192. Read at start.
 # tex_released_max = 4096
+# Past 16384 kept textures some go whatever they cost. 1: the cheapest first: those drawn over, then those that come
+# back unchanged from the game's memory (the oldest first), and only then those whose content only the GPU made, which
+# would come back empty. 0: the first one in release order that nothing showed for 2 seconds, of any kind (0.10.1).
+# tex_hard_order = 1
 # Megabytes of this process's commit above which the log says so. Windows counts video memory against the commit;
 # with a discrete GPU the video memory in use is left out of the comparison, since it is not in RAM. Textures no longer
 # give way at this bound: dropping one lowers both sides of the comparison alike, so nothing they could do brought the

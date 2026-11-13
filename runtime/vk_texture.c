@@ -750,7 +750,7 @@ static int slot_names(const Tex *e) {
 // Why an entry was destroyed (drop_tex), in the order of drop_names.
 enum { DROP_NONE, DROP_MAX, DROP_CAP, DROP_COMMIT, DROP_VRAM, DROP_IDLE_VRAM, DROP_IDLE_COMMIT, DROP_DISUSE,
        DROP_OVERWRITTEN, DROP_REPLACED, DROP_REUSED, DROP_RANGE, DROP_EXACT, DROP_SHUTDOWN, DROP_COMPACT,
-       DROP_AGE, DROP_N };
+       DROP_AGE, DROP_HARD, DROP_N };
 static void drop_tex(Tex *e, int why);
 static void reuse_dropped(const Tex *e, int why);   // "reuse of released textures", after vk_texture_census
 static void reuse_made(const Tex *e);
@@ -1951,7 +1951,7 @@ static const char *const drop_names[DROP_N] = {
     "under VRAM pressure", "idle, under VRAM pressure", "idle, under commit pressure", "unsampled (disuse)",
     "overwritten at another address", "replaced by another descriptor at its address", "its image went to another texture",
     "its storage went", "made whole again (texture detail)", "shutdown", "released, in a block a compaction empties",
-    "released and unused for longer than the hold"};
+    "released and unused for longer than the hold", "past RELEASED_HARD released entries"};
 static const char *const start_names[START_N] = {
     "started on its own", "filled from storage over a live entry", "content copied from a live entry",
     "content copied from a released entry", "started empty over a live entry", "started empty over a released entry",
@@ -2322,6 +2322,7 @@ __attribute__((noinline)) static void destroy_tex(Tex *e) {
 static int comes_back_intact(const Tex *e);
 
 static uint64_t stale_after(const Tex *e);
+static void sweep_hard(void);
 
 // The limit of released entries past which the sweep drops those that lose nothing: one per 2 MiB of the video memory
 // budget, from RELEASED_MAX to RELEASED_MAX_TOP. In Castle Town market on a 16 GB card (RTX 5060 Ti) with 2048 the
@@ -2365,20 +2366,81 @@ static void sweep_released(void) {
         }
         sweep_at = e;
     }
+    if (nreleased > RELEASED_HARD) sweep_hard();
+}
+
+// Past RELEASED_HARD the count is a hard bound: entries go whatever they cost. The rule was the first entry in release
+// order that was overwritten or that nothing sampled for SWEEP_UNSAMPLED presents, of whatever kind, render targets
+// included, whose drop the comment above ties to a black frame; and each drop walked the list from its head again.
+// Most entries there cost little to make again: at the end of a session of 2026-11-13, when the count sat at 16,384
+// for a minute, 12,811 of 15,734 released entries owned no memory. So the entries now go cheapest first, by the
+// classes of vk_tex_release.h trl_hard_class: overwritten ones; ones that come back intact, released longer ago than
+// their stale_after and not looked up lately; other ones that come back intact; ones whose content only the GPU made;
+// the last three only when nothing sampled them for SWEEP_UNSAMPLED presents; while every entry was sampled lately, the
+// one sampled longest ago, as before. Within a class in release order. One walk of the list takes a batch down to
+// RELEASED_HARD - HARD_SLACK entries, so the next HARD_SLACK releases need no walk. NX2NAVI_TEX_HARD_ORDER=0: the
+// rule before.
+#define HARD_SLACK 256
+#define HARD_BATCH 1024
+static uint64_t n_hard_by[TRL_HC_N];   // entries dropped past RELEASED_HARD since the last perf line, by class
+
+static int hard_order(void) {
+    static int on = -1;
+    if (on < 0) on = rt_knob("TEX_HARD_ORDER", "1") == 1;
+    return on;
+}
+
+static int e_hard_class(const Tex *e, uint64_t now, uint64_t stale) {
+    int intact = comes_back_intact(e);
+    return trl_hard_class(e->overwritten, now - e->samp_frame < SWEEP_UNSAMPLED, intact,
+                          intact && now - e->rel_frame >= stale_after(e) && !used_lately(e, now, stale));
+}
+
+static void hard_lru_drop(Tex *lru) {
+    static volatile int32_t n_all_used;
+    log_limited(&n_all_used, "all %d released textures were sampled or drawn into lately: the one longest ago goes "
+                "(%#llx fmt %#x %ux%u, last in frame %llu)", nreleased, (unsigned long long)lru->key.addr,
+                lru->t.d.format, lru->t.d.width, lru->t.d.height, (unsigned long long)lru->samp_frame);
+    n_hard_by[TRL_HC_LATELY]++;
+    drop_tex(lru, DROP_HARD);
+}
+
+static void sweep_hard(void) {   // tex_lock held
+    static Tex **walk;
+    static uint8_t *cls;
+    static int *out, cap;
+    const uint64_t stale = PRESENTS(120);   // STALE_FRAMES
     while (nreleased > RELEASED_HARD && rel_head) {
         uint64_t now = frames_now();
-        Tex *gone = NULL, *lru = rel_head;
-        for (Tex *e = rel_head; e && !gone; e = e->rel_next) {   // in release order
-            if (e->overwritten || now - e->samp_frame >= SWEEP_UNSAMPLED) gone = e;
-            else if (e->samp_frame < lru->samp_frame) lru = e;
+        Tex *lru = rel_head;
+        if (nreleased > cap && hard_order()) {   // room for the whole list; without it the rule before
+            int want = nreleased + HARD_BATCH;
+            Tex **w = realloc(walk, (size_t)want * sizeof *w);
+            if (w) walk = w;
+            uint8_t *c = w ? realloc(cls, (size_t)want) : NULL;
+            if (c) cls = c;
+            int *o = c ? realloc(out, (size_t)want * sizeof *o) : NULL;
+            if (o) out = o, cap = want;
         }
-        if (!gone) {
-            static volatile int32_t n_all_used;
-            log_limited(&n_all_used, "all %d released textures were sampled or drawn into lately: the one longest ago goes "
-                        "(%#llx fmt %#x %ux%u, last in frame %llu)", nreleased, (unsigned long long)lru->key.addr,
-                        lru->t.d.format, lru->t.d.width, lru->t.d.height, (unsigned long long)lru->samp_frame);
+        if (!hard_order() || nreleased > cap) {
+            Tex *gone = NULL;
+            for (Tex *e = rel_head; e && !gone; e = e->rel_next) {   // in release order
+                if (e->overwritten || now - e->samp_frame >= SWEEP_UNSAMPLED) gone = e;
+                else if (e->samp_frame < lru->samp_frame) lru = e;
+            }
+            if (!gone) hard_lru_drop(lru);
+            else n_hard_by[e_hard_class(gone, now, stale)]++, drop_tex(gone, DROP_HARD);
+            continue;
         }
-        drop_tex(gone ? gone : lru, DROP_MAX);
+        int n = 0;
+        for (Tex *e = rel_head; e && n < cap; e = e->rel_next) {   // in release order
+            walk[n] = e, cls[n] = (uint8_t)e_hard_class(e, now, stale), n++;
+            if (e->samp_frame < lru->samp_frame) lru = e;
+        }
+        int need = nreleased - (RELEASED_HARD - HARD_SLACK);
+        int k = trl_hard_pick(cls, n, need < HARD_BATCH ? need : HARD_BATCH, out);
+        for (int i = 0; i < k; i++) n_hard_by[cls[out[i]]]++, drop_tex(walk[out[i]], DROP_HARD);
+        if (!k) hard_lru_drop(lru);
     }
 }
 
@@ -5134,14 +5196,19 @@ void vk_texture_new_submit(void) {
         n_commit_back = n_commit_held = 0;
         n_disuse = n_disuse_bytes = n_disuse_back = n_retire_freed = n_retire_cancel = 0;
         n_reused = n_reuse_new = n_bind_skips = n_restarts = n_overwritten = n_over_drops = 0;
-        rt_log("perf: frame %llu: texture origins: released entries dropped past RELEASED_MAX %llu, replaced by another "
+        rt_log("perf: frame %llu: texture origins: released entries dropped past RELEASED_MAX %llu, past RELEASED_HARD %llu "
+               "(overwritten %llu, intact past their gap %llu, intact %llu, made by the GPU %llu, all sampled lately %llu), "
+               "replaced by another "
                "descriptor at their address %llu; entries the CPU does not write made without content at an address it "
                "can see: on their own %llu, over a released entry %llu, over a live one %llu; marked slots that met an "
                "entry without content %llu, that show no entry %llu; GPU-drawn entries written back before their drop %llu",
-               (unsigned long long)f * 60, (unsigned long long)n_drop_by[DROP_MAX], (unsigned long long)n_drop_by[DROP_REPLACED],
+               (unsigned long long)f * 60, (unsigned long long)n_drop_by[DROP_MAX], (unsigned long long)n_drop_by[DROP_HARD],
+               (unsigned long long)n_hard_by[TRL_HC_OVER], (unsigned long long)n_hard_by[TRL_HC_INTACT_OLD],
+               (unsigned long long)n_hard_by[TRL_HC_INTACT], (unsigned long long)n_hard_by[TRL_HC_GPU],
+               (unsigned long long)n_hard_by[TRL_HC_LATELY], (unsigned long long)n_drop_by[DROP_REPLACED],
                (unsigned long long)n_cpu_empty[0], (unsigned long long)n_cpu_empty[1], (unsigned long long)n_cpu_empty[2],
                (unsigned long long)n_mark_empty, (unsigned long long)n_mark_none, (unsigned long long)n_drop_wb);
-        memset(n_drop_by, 0, sizeof n_drop_by), memset(n_cpu_empty, 0, sizeof n_cpu_empty);
+        memset(n_drop_by, 0, sizeof n_drop_by), memset(n_cpu_empty, 0, sizeof n_cpu_empty), memset(n_hard_by, 0, sizeof n_hard_by);
         n_mark_empty = n_mark_none = n_drop_wb = 0;
         rt_log("perf: frame %llu: texture finalizes: slots marked %llu; slots of another live texture with the same "
                "parameters at the storage, left current %llu (terrain heightmaps %llu); lookups the stale rule gave the "
@@ -6554,8 +6621,8 @@ static void reuse_taken_back(const Tex *e) {   // tex_lock held; e is being take
 
 // Drops of an entry the game may still ask for: past a bound, or under a pressure, or unsampled.
 static int drop_costs(int why) {
-    return why == DROP_MAX || why == DROP_CAP || why == DROP_COMMIT || why == DROP_VRAM || why == DROP_IDLE_VRAM ||
-           why == DROP_IDLE_COMMIT || why == DROP_DISUSE || why == DROP_AGE;
+    return why == DROP_MAX || why == DROP_HARD || why == DROP_CAP || why == DROP_COMMIT || why == DROP_VRAM ||
+           why == DROP_IDLE_VRAM || why == DROP_IDLE_COMMIT || why == DROP_DISUSE || why == DROP_AGE;
 }
 
 static void reuse_dropped(const Tex *e, int why) {   // tex_lock held
@@ -6588,11 +6655,12 @@ void vk_texture_reuse_log(uint64_t frame) {
     for (int a = 0; a < AGE_N; a++)
         o += snprintf(line + o, sizeof line - (size_t)o, "%s %s %llu", a ? "," : "", age_names[a], (unsigned long long)ra_n[a]);
     snprintf(line + o, sizeof line - (size_t)o, "; by the drop: released past the hold %llu, past the size bound "
-             "%llu, past the count %llu, VRAM pressure %llu released and %llu idle, commit %llu released and %llu "
-             "idle, unsampled %llu); dropped past the hold %llu (%.0f MiB); now %d released, %.0f MiB of a bound of "
-             "%.0f MiB, hold %u s",
+             "%llu, past the count %llu (of them past the hard count %llu), VRAM pressure %llu released and %llu idle, "
+             "commit %llu released and %llu idle, unsampled %llu); dropped past the hold %llu (%.0f MiB); now %d "
+             "released, %.0f MiB of a bound of %.0f MiB, hold %u s",
              (unsigned long long)ra_why[DROP_AGE], (unsigned long long)ra_why[DROP_CAP],
-             (unsigned long long)ra_why[DROP_MAX], (unsigned long long)ra_why[DROP_VRAM],
+             (unsigned long long)(ra_why[DROP_MAX] + ra_why[DROP_HARD]), (unsigned long long)ra_why[DROP_HARD],
+             (unsigned long long)ra_why[DROP_VRAM],
              (unsigned long long)ra_why[DROP_IDLE_VRAM], (unsigned long long)ra_why[DROP_COMMIT],
              (unsigned long long)ra_why[DROP_IDLE_COMMIT], (unsigned long long)ra_why[DROP_DISUSE],
              (unsigned long long)n_age_drops, n_age_bytes / M, nreleased, rel_bytes / M,

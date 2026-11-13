@@ -63,6 +63,31 @@ static inline uint64_t trl_keep(uint32_t hold_s, uint64_t cap, int room) {
     return cap > UINT64_MAX / TRL_ROOM_TIMES ? UINT64_MAX : cap * TRL_ROOM_TIMES;
 }
 
+// Past the hard count of released textures (vk_texture.c sweep_hard, RELEASED_HARD) entries go whatever they cost,
+// cheapest first by class: one drawn over (its content is gone anyway); one that comes back intact from the game's
+// memory, released longer ago than its usual gap before a take-back and not looked up lately (past_gap); another one
+// that comes back intact; one whose content only the GPU made, which would come back empty. The last three only when
+// nothing sampled them lately (TRL_HC_LATELY, kept).
+enum { TRL_HC_OVER, TRL_HC_INTACT_OLD, TRL_HC_INTACT, TRL_HC_GPU, TRL_HC_LATELY, TRL_HC_N };
+
+static inline int trl_hard_class(int overwritten, int sampled_lately, int intact, int past_gap) {
+    if (overwritten) return TRL_HC_OVER;
+    if (sampled_lately) return TRL_HC_LATELY;
+    if (!intact) return TRL_HC_GPU;
+    return past_gap ? TRL_HC_INTACT_OLD : TRL_HC_INTACT;
+}
+
+// Up to need entries to drop: cls[i] is the class of the i-th released entry in release order, n of them; out gets
+// their indices, the cheapest class first and in release order within a class. Returns how many; 0 when every entry
+// was sampled lately (the caller then takes the one sampled longest ago).
+static inline int trl_hard_pick(const uint8_t *cls, int n, int need, int *out) {
+    int k = 0;
+    for (int c = 0; c < TRL_HC_LATELY && k < need; c++)
+        for (int i = 0; i < n && k < need; i++)
+            if (cls[i] == c) out[k++] = i;
+    return k;
+}
+
 // The wall clock of the presents. The cache stamps its textures with present counts (gfx_counters.frames), and the
 // presents per second change with the scene and the menus: a hold counted in presents would be shorter in wall time
 // after a fast stretch. The clock notes the present count once a second or so (tick) and answers how many seconds ago
