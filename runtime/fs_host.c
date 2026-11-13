@@ -38,7 +38,9 @@
 enum { M_FREE, M_SAVE, M_TEMP, M_CACHE, M_SAVE_RO };   // M_SAVE: the working copy; M_SAVE_RO: the committed save
 
 typedef struct { int kind; char name[32]; char root[1024]; } Mount;
-typedef struct { PlatFile *h; int mode, save; } File;   // h NULL = free; save: on a save-data mount
+// h NULL = free; save: on a save-data mount; users: calls using h now (file_of .. file_release); closing: CloseFile
+// came while users > 0, and the last of them closes h
+typedef struct { PlatFile *h; int mode, save; int32_t users; int closing; } File;
 typedef struct { char *name; int kind; uint64_t size; } Listed;
 typedef struct { Listed *e; int n, next, mode, used; } Dir;   // the directory's entries at open; used 0 = free
 
@@ -1145,15 +1147,45 @@ static uint32_t commit(const char *name) {
 }
 
 // ---- files
+// A guest handle's host file is used outside `lock` (a read or write may take long, and a save write waits for a
+// Commit first, save_touched), so a CloseFile on another thread could close it in the middle of a call. Windows hands
+// a closed HANDLE's value to the next file opened, so the call went on in another file: a save write could land in the
+// wrong one. Each call now counts itself in the slot from file_of to file_release. CloseFile closes at once when no
+// call is under way, and otherwise marks the slot; the last call out closes it. Nothing waits for another call, the
+// slot (and with it the guest's handle value) is not handed out again before the close, and a call that comes after
+// the CloseFile gets FS_R_INVALID_ARGUMENT, as a closed handle does.
 static File *file_of(uint64_t h, PlatFile **fh, int *mode) {
     if (h < FILE_BASE || h >= FILE_BASE + NFILES) return NULL;
     plat_mutex_lock_shared(&lock);
     File *f = &files[h - FILE_BASE];
-    PlatFile *v = f->h;
-    if (fh) *fh = f->h;
-    if (mode) *mode = f->mode;
+    int ok = f->h && !f->closing;
+    if (ok) {
+        __atomic_add_fetch(&f->users, 1, __ATOMIC_ACQ_REL);   // shared holders count at once; close_file reads it exclusive
+        if (fh) *fh = f->h;
+        if (mode) *mode = f->mode;
+    }
     plat_mutex_unlock_shared(&lock);
-    return v ? f : NULL;
+    return ok ? f : NULL;
+}
+
+// After the host file's close: the save's bookkeeping, as a closed save file needs.
+static void file_closed(PlatFile *h, int save) {
+    plat_file_close(h);
+    if (save) {
+        save_touched();
+        plat_dec32(&save_writers);
+    }
+}
+
+// The end of a call that file_of let in. The last call out of a slot CloseFile closed meanwhile closes the file.
+static void file_release(File *f) {
+    if (__atomic_sub_fetch(&f->users, 1, __ATOMIC_ACQ_REL)) return;
+    PlatFile *h = NULL;
+    int save = 0;
+    plat_mutex_lock(&lock);
+    if (f->h && f->closing && !__atomic_load_n(&f->users, __ATOMIC_ACQUIRE)) h = f->h, save = f->save, *f = (File){0};
+    plat_mutex_unlock(&lock);
+    if (h) file_closed(h, save);
 }
 
 // Positional reads: bytes read at off, 0 at the end, -1 on an error.
@@ -1184,7 +1216,7 @@ static uint32_t open_file(uint64_t *out, const char *path, int mode) {
     plat_mutex_lock(&lock);
     for (int i = 0; i < NFILES; i++)
         if (!files[i].h) {
-            files[i] = (File){f, mode, save_writer};
+            files[i] = (File){.h = f, .mode = mode, .save = save_writer};
             *out = FILE_BASE + (uint64_t)i;
             plat_mutex_unlock(&lock);
             if (save_writer) {
@@ -1201,8 +1233,12 @@ static uint32_t read_file(uint64_t *out, uint64_t h, int64_t offset, void *buffe
     if (romfs_handle(h)) return romfs_read(out, h, offset, buffer, size);
     PlatFile *f;
     int mode;
-    if (!out || offset < 0 || (!buffer && size) || !file_of(h, &f, &mode)) return FS_R_INVALID_ARGUMENT;
-    if (!(mode & FS_OPEN_READ)) return FS_R_OPEN_MODE;
+    File *file = !out || offset < 0 || (!buffer && size) ? NULL : file_of(h, &f, &mode);
+    if (!file) return FS_R_INVALID_ARGUMENT;
+    if (!(mode & FS_OPEN_READ)) {
+        file_release(file);
+        return FS_R_OPEN_MODE;
+    }
     uint64_t done = 0;
     while (done < size) {
         uint32_t chunk = size - done > 0x40000000 ? 0x40000000 : (uint32_t)(size - done);
@@ -1211,6 +1247,7 @@ static uint32_t read_file(uint64_t *out, uint64_t h, int64_t offset, void *buffe
         if (!n) break;
         done += (uint64_t)n;
     }
+    file_release(file);
     *out = done;
     return 0;
 }
@@ -1226,11 +1263,17 @@ static uint32_t write_file(uint64_t h, int64_t offset, const void *buffer, uint6
     int mode;
     File *file = offset < 0 || (!buffer && size) ? NULL : file_of(h, &f, &mode);
     if (!file) return FS_R_INVALID_ARGUMENT;
-    if (!(mode & FS_OPEN_WRITE)) return FS_R_OPEN_MODE;
+    if (!(mode & FS_OPEN_WRITE)) {
+        file_release(file);
+        return FS_R_OPEN_MODE;
+    }
     PlatFileId id;
     if (!plat_file_id(f, &id)) rt_fatal("fs: host save size");
     // offset + size without the sum: a size near 2^64 would wrap it below the file's size
-    if ((size > id.size || (uint64_t)offset > id.size - size) && !(mode & FS_OPEN_APPEND)) return FS_R_APPEND_REQUIRED;
+    if ((size > id.size || (uint64_t)offset > id.size - size) && !(mode & FS_OPEN_APPEND)) {
+        file_release(file);
+        return FS_R_APPEND_REQUIRED;
+    }
     if (file->save) save_touched();
     for (uint64_t done = 0; done < size;) {
         uint32_t chunk = size - done > 0x40000000 ? 0x40000000 : (uint32_t)(size - done);
@@ -1243,6 +1286,7 @@ static uint32_t write_file(uint64_t h, int64_t offset, const void *buffer, uint6
         done += (uint64_t)put;
     }
     if (option && (*option & 1)) plat_file_fsync(f);   // WriteOptionFlag_Flush
+    file_release(file);
     return 0;
 }
 
@@ -1250,7 +1294,11 @@ static uint32_t file_size(int64_t *out, uint64_t h) {
     if (romfs_handle(h)) return romfs_size(out, h);
     PlatFile *f;
     PlatFileId id;
-    if (!out || !file_of(h, &f, NULL) || !plat_file_id(f, &id)) return FS_R_INVALID_ARGUMENT;
+    File *file = out ? file_of(h, &f, NULL) : NULL;
+    if (!file) return FS_R_INVALID_ARGUMENT;
+    int ok = plat_file_id(f, &id);
+    file_release(file);
+    if (!ok) return FS_R_INVALID_ARGUMENT;
     *out = (int64_t)id.size;
     return 0;
 }
@@ -1260,16 +1308,23 @@ static uint32_t set_file_size(uint64_t h, int64_t size) {
     int mode;
     File *file = size < 0 ? NULL : file_of(h, &f, &mode);
     if (!file) return FS_R_INVALID_ARGUMENT;
-    if (!(mode & FS_OPEN_WRITE)) return FS_R_OPEN_MODE;
+    if (!(mode & FS_OPEN_WRITE)) {
+        file_release(file);
+        return FS_R_OPEN_MODE;
+    }
     if (file->save) save_touched();
-    return fs_result(plat_file_set_size(f, (uint64_t)size));
+    uint32_t r = fs_result(plat_file_set_size(f, (uint64_t)size));
+    file_release(file);
+    return r;
 }
 
 static uint32_t flush_file(uint64_t h) {
     PlatFile *f;
     int mode;
-    if (!file_of(h, &f, &mode)) return FS_R_INVALID_ARGUMENT;
+    File *file = file_of(h, &f, &mode);
+    if (!file) return FS_R_INVALID_ARGUMENT;
     if (mode & FS_OPEN_WRITE) plat_file_fsync(f);
+    file_release(file);
     return 0;
 }
 
@@ -1278,17 +1333,18 @@ static void close_file(uint64_t h) {
         romfs_close(h);
         return;
     }
-    if (!file_of(h, NULL, NULL)) rt_fatal("fs: close of invalid file handle %#llx", (unsigned long long)h);
+    File *f = h >= FILE_BASE && h < FILE_BASE + NFILES ? &files[h - FILE_BASE] : NULL;
+    PlatFile *close_now = NULL;
+    int open = 0, save = 0;
     plat_mutex_lock(&lock);
-    PlatFile *f = files[h - FILE_BASE].h;
-    int save = files[h - FILE_BASE].save;
-    files[h - FILE_BASE] = (File){0};
-    plat_mutex_unlock(&lock);
-    plat_file_close(f);
-    if (save) {
-        save_touched();
-        plat_dec32(&save_writers);
+    if (f && f->h && !f->closing) {
+        open = 1;
+        if (__atomic_load_n(&f->users, __ATOMIC_ACQUIRE)) f->closing = 1;   // the last call under way closes it
+        else close_now = f->h, save = f->save, *f = (File){0};
     }
+    plat_mutex_unlock(&lock);
+    if (!open) rt_fatal("fs: close of invalid file handle %#llx", (unsigned long long)h);
+    if (close_now) file_closed(close_now, save);
 }
 
 static uint32_t create_file(const char *path, int64_t size) {
