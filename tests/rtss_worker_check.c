@@ -1,5 +1,5 @@
 // The real runtime/rtss_limit.c against a fake RivaTuner Statistics Server: the Win32 calls it makes go to the fakes
-// below (its folder in the registry, its hooks library with the profile calls, the profiles, the shared memory
+// below (its folder in the registry, its hooks library with the profile calls, the profile files, the shared memory
 // RTSSSharedMemoryV2), and its worker thread polls when a scenario says so (plat_sleep_ms on that thread waits for the
 // next poll). Each scenario runs in a process of its own, since rtss_limit.c's state lasts the process. Windows only;
 // built and run by tests/rtss_limit_check.py. Prints the log and each failed check, and exits 1 on any.
@@ -22,6 +22,8 @@ BOOL stub_UnmapViewOfFile(LPCVOID);
 SIZE_T stub_VirtualQuery(LPCVOID, PMEMORY_BASIC_INFORMATION, SIZE_T);
 BOOL stub_CloseHandle(HANDLE);
 DWORD stub_GetFileAttributesA(LPCSTR);
+BOOL stub_GetFileAttributesExA(LPCSTR, GET_FILEEX_INFO_LEVELS, LPVOID);
+DWORD stub_GetPrivateProfileStringA(LPCSTR, LPCSTR, LPCSTR, LPSTR, DWORD, LPCSTR);
 DWORD stub_GetModuleFileNameA(HMODULE, LPSTR, DWORD);
 DWORD stub_GetCurrentProcessId(void);
 #define RegGetValueA stub_RegGetValueA
@@ -34,6 +36,8 @@ DWORD stub_GetCurrentProcessId(void);
 #define VirtualQuery stub_VirtualQuery
 #define CloseHandle stub_CloseHandle
 #define GetFileAttributesA stub_GetFileAttributesA
+#define GetFileAttributesExA stub_GetFileAttributesExA
+#define GetPrivateProfileStringA stub_GetPrivateProfileStringA
 #define GetModuleFileNameA stub_GetModuleFileNameA
 #define GetCurrentProcessId stub_GetCurrentProcessId
 
@@ -42,43 +46,58 @@ DWORD stub_GetCurrentProcessId(void);
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL line %d: ", __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
-// ---- the fake profiles: Global, and the game's own Profiles\ocarina.exe.cfg; LoadProfile copies one into the loaded copy
-typedef struct { int exists; DWORD limit, denom; } Prof;
-static Prof global = {1, 0, 1}, own;
-static DWORD loaded_limit, loaded_denom;
+// ---- the fake profiles: Global, and the game's own Profiles\ocarina.exe.cfg. LoadProfile copies one into the loaded
+// copy (Global for a name without its own), SaveProfile writes the loaded copy as the game's own. Each [Framerate] key
+// rtss_limit.c reads is a field; stamp is the file's write time, which every change moves on.
+typedef struct {
+    int exists;
+    DWORD limit, denom;   // FramerateLimit and FramerateLimitDenominator: Limit and LimitDenominator in the file
+    int time, time_den, scan0, scan1;
+    DWORD stamp;
+} Prof;
+static Prof global = {1, 0, 1, 0, 0, 0, 0, 1}, own, loaded;
 static int no_denominator;   // an RTSS that does not know FramerateLimitDenominator
 static int readonly;         // SaveProfile does not reach the file (no administrator rights)
 static volatile LONG saves, deletes, updates, loads, created, removed;
 
+static void touch(Prof *p) { p->stamp++; }
 static void WINAPI f_load(LPCSTR name) {
     (void)name;
-    const Prof *p = own.exists ? &own : &global;
-    loaded_limit = p->limit, loaded_denom = p->denom;
+    loaded = own.exists ? own : global;
 }
 static void WINAPI f_save(LPCSTR name) {
     (void)name;
     saves++;
-    if (!readonly) own.exists = 1, own.limit = loaded_limit, own.denom = loaded_denom;
+    if (readonly) return;
+    DWORD stamp = own.stamp;
+    own = loaded, own.exists = 1, own.stamp = stamp;
+    touch(&own);
 }
 static void WINAPI f_delete(LPCSTR name) {
     (void)name;
     deletes++;
-    if (!readonly) own.exists = 0;
+    if (!readonly) own.exists = 0, touch(&own);
 }
 static BOOL WINAPI f_get(LPCSTR prop, LPBYTE data, DWORD size) {
     if (size != 4) return FALSE;
-    if (!strcmp(prop, "FramerateLimit")) return memcpy(data, &loaded_limit, 4), TRUE;
-    if (!strcmp(prop, "FramerateLimitDenominator") && !no_denominator) return memcpy(data, &loaded_denom, 4), TRUE;
+    if (!strcmp(prop, "FramerateLimit")) return memcpy(data, &loaded.limit, 4), TRUE;
+    if (!strcmp(prop, "FramerateLimitDenominator") && !no_denominator) return memcpy(data, &loaded.denom, 4), TRUE;
     return FALSE;
 }
 static BOOL WINAPI f_set(LPCSTR prop, LPBYTE data, DWORD size) {
     if (size != 4) return FALSE;
-    if (!strcmp(prop, "FramerateLimit")) return memcpy(&loaded_limit, data, 4), TRUE;
-    if (!strcmp(prop, "FramerateLimitDenominator") && !no_denominator) return memcpy(&loaded_denom, data, 4), TRUE;
+    if (!strcmp(prop, "FramerateLimit")) return memcpy(&loaded.limit, data, 4), TRUE;
+    if (!strcmp(prop, "FramerateLimitDenominator") && !no_denominator) return memcpy(&loaded.denom, data, 4), TRUE;
     return FALSE;
 }
 static void WINAPI f_update(void) { updates++; }
 static DWORD WINAPI f_enum(LPSTR list, DWORD size) { (void)size; list[0] = 0; return 1; }
+
+static Prof *file_of(const char *path) {
+    if (strstr(path, "\\Profiles\\ocarina.exe.cfg")) return own.exists ? &own : NULL;
+    if (strstr(path, "\\Profiles\\Global")) return &global;
+    return NULL;
+}
 
 // ---- the fake shared memory: the header and one application entry, this process's (listed) or another's
 static uint8_t shm[65536];
@@ -135,8 +154,32 @@ SIZE_T stub_VirtualQuery(LPCVOID p, PMEMORY_BASIC_INFORMATION mi, SIZE_T n) {
 BOOL stub_CloseHandle(HANDLE h) { (void)h; return TRUE; }
 DWORD stub_GetFileAttributesA(LPCSTR p) {
     if (strstr(p, "RTSSHooks64.dll")) return FILE_ATTRIBUTE_NORMAL;
-    if (strstr(p, "\\Profiles\\ocarina.exe.cfg")) return own.exists ? FILE_ATTRIBUTE_NORMAL : INVALID_FILE_ATTRIBUTES;
-    return INVALID_FILE_ATTRIBUTES;
+    return file_of(p) ? FILE_ATTRIBUTE_NORMAL : INVALID_FILE_ATTRIBUTES;
+}
+BOOL stub_GetFileAttributesExA(LPCSTR p, GET_FILEEX_INFO_LEVELS level, LPVOID out) {
+    (void)level;
+    const Prof *f = file_of(p);
+    if (!f) return FALSE;
+    WIN32_FILE_ATTRIBUTE_DATA *a = out;
+    memset(a, 0, sizeof *a);
+    a->ftLastWriteTime.dwLowDateTime = f->stamp;
+    return TRUE;
+}
+DWORD stub_GetPrivateProfileStringA(LPCSTR sec, LPCSTR key, LPCSTR def, LPSTR out, DWORD n, LPCSTR path) {
+    const Prof *f = file_of(path);
+    long v = 0;
+    int have = f && !strcmp(sec, "Framerate");
+    if (have) {
+        if (!strcmp(key, "Limit")) v = (long)f->limit;
+        else if (!strcmp(key, "LimitDenominator")) v = (long)f->denom;
+        else if (!strcmp(key, "LimitTime")) v = f->time;
+        else if (!strcmp(key, "LimitTimeDenominator")) v = f->time_den;
+        else if (!strcmp(key, "SyncScanline0")) v = f->scan0;
+        else if (!strcmp(key, "SyncScanline1")) v = f->scan1;
+        else have = 0;
+    }
+    if (have) return (DWORD)snprintf(out, n, "%ld", v);
+    return (DWORD)snprintf(out, n, "%s", def);
 }
 DWORD stub_GetModuleFileNameA(HMODULE m, LPSTR out, DWORD n) {
     (void)m;
@@ -145,7 +188,8 @@ DWORD stub_GetModuleFileNameA(HMODULE m, LPSTR out, DWORD n) {
 DWORD stub_GetCurrentProcessId(void) { return PID; }
 
 // ---- host.h and platform.h, as far as rtss_limit.c uses them
-static char last_line[512];
+static char logged_lines[1 << 16];
+static size_t logged_at;
 void rt_log(const char *fmt, ...) {
     char line[512];
     va_list ap;
@@ -154,9 +198,11 @@ void rt_log(const char *fmt, ...) {
     va_end(ap);
     if (strstr(line, " created;")) created++;
     if (strstr(line, " removed,")) removed++;
-    snprintf(last_line, sizeof last_line, "%s", line);
+    int k = snprintf(logged_lines + logged_at, sizeof logged_lines - logged_at, "%s\n", line);
+    if (k > 0 && logged_at + (size_t)k < sizeof logged_lines) logged_at += (size_t)k;
     printf("    log: %s\n", line);
 }
+static int logged(const char *text) { return strstr(logged_lines, text) != NULL; }
 int rt_knob(const char *name, const char *def) { (void)name, (void)def; return 0; }
 
 static DWORD worker_tid;
@@ -207,9 +253,9 @@ static void ask(int64_t mhz) {   // a want at a present; the first one that star
     if (spawned && !was) CHECK(wait_done(), "the worker did not finish its first poll");
 }
 static void show(const char *what) {
-    printf("  %s: profile %s %lu/%lu; active %d; state %d; saves %ld deletes %ld updates %ld\n", what,
+    printf("  %s: profile %s %lu/%lu; active %d; state %d; saves %ld deletes %ld updates %ld loads %ld\n", what,
            own.exists ? "exists," : "absent,", own.limit, own.denom, rtss_limit_active(), rtss_limit_state(), saves,
-           deletes, updates);
+           deletes, updates, loads);
 }
 
 // The exit puts the profile back (rtss_limit_restore) and the game presents on until the process ends: a want after it
@@ -235,7 +281,7 @@ static void restore_race(void) {
 
 // The same with the player's own profile: it keeps the player's limit.
 static void restore_player(void) {
-    own = (Prof){1, 30, 1};
+    own = (Prof){1, 30, 1, 0, 0, 0, 0, 1};
     app_set(1, 0xA, 1000, 2000, 60);
     ask(60000);
     poll();
@@ -265,7 +311,7 @@ static void restore_inflight(void) {
     CHECK(created == 1, "the profile was created %ld times", created);
 }
 
-// An exit before the first want, and one while RTSS was kept out: a want after it does not start the worker.
+// An exit before the first want, and one while RTSS was kept out: a want after it does not reach the profile.
 static void restore_first(void) {
     app_set(1, 0xA, 1000, 2000, 60);
     rtss_limit_restore();
@@ -277,7 +323,7 @@ static void restore_first(void) {
 }
 static void restore_kept_out(void) {
     app_set(1, 0xA, 1000, 2000, 60);
-    ask(-1);
+    ask(RTSS_OUT_SETTING);
     rtss_limit_restore();
     ask(60000);
     if (spawned) poll();
@@ -286,9 +332,72 @@ static void restore_kept_out(void) {
     CHECK(!rtss_limit_active(), "the game's limiter paces");
 }
 
+// NX2NAVI_RTSS=0 with a limit set in RTSS's Global profile: the worker only reads, never loads the hooks library, and
+// tells of the two limiters until the player clears that limit.
+static void kept_two(void) {
+    global.limit = 50;
+    app_set(1, 0xA, 1000, 2000, 50);
+    ask(RTSS_OUT_SETTING);
+    poll();
+    show("kept out by the setting, Global limit 50");
+    CHECK(spawned, "a kept-out first want starts the worker");
+    CHECK(!loads && !saves && !deletes, "kept out, the hooks library is never loaded and no profile written");
+    CHECK(rtss_limit_state() == 4 && !rtss_limit_active(), "the menu says two limiters; the game's limiter paces");
+    CHECK(logged("kept out: NX2NAVI_RTSS=0"), "the kept-out line names the setting");
+    CHECK(logged("two limiters: RivaTuner Statistics Server's own setting for the game (Profiles\\Global: limit 50/1, "
+                 "frame time limit 0/0, scanline sync 0/0) limits it beside the game's limiter"),
+          "the two-limiter line names the file and the values");
+    global.limit = 0, touch(&global);
+    poll();
+    show("the player cleared RTSS's limit");
+    CHECK(rtss_limit_state() == 0, "one limiter again");
+    CHECK(logged("RivaTuner Statistics Server no longer limits the game beside the game's limiter"), "logged once it ended");
+}
+
+// Low latency keeps RTSS out from the first present, with scanline sync set in the game's own profile (a negative line
+// counts from the bottom); once low latency is off, a limit starts RTSS's part as usual.
+static void kept_lowlat_then_limit(void) {
+    own = (Prof){1, 0, 1, 0, 0, -40, 0, 1};
+    app_set(0, 0xA, 1000, 2000, 60);
+    ask(RTSS_OUT_LOWLAT);
+    poll();
+    CHECK(rtss_limit_state() == 0, "not listed yet: RTSS holds nothing");
+    app_set(1, 0xA, 1000, 2000, 60);
+    poll();
+    show("listed, kept out by low latency");
+    CHECK(rtss_limit_state() == 4, "scanline sync -40 holds the game: two limiters");
+    CHECK(logged("kept out: the driver's low latency"), "the kept-out line names low latency");
+    CHECK(logged("(Profiles\\ocarina.exe.cfg: limit 0/1, frame time limit 0/0, scanline sync -40/0) limits it beside "
+                 "the driver's low latency"),
+          "the two-limiter line names the game's profile and low latency");
+    CHECK(!loads, "kept out, the hooks library is never loaded");
+    ask(60000);
+    poll();
+    show("low latency off, limit 60");
+    CHECK(loads == 1 && own.exists && own.limit == 60, "the limit goes into the profile once RTSS is let in");
+    CHECK(rtss_limit_state() == 1 && rtss_limit_active(), "RTSS limits the game");
+}
+
+// Frame generation keeps RTSS out, with no limit of RTSS's own: one limiter, and the line names frame generation.
+static void kept_framegen(void) {
+    app_set(1, 0xA, 1000, 2000, 60);
+    ask(RTSS_OUT_FRAMEGEN);
+    poll();
+    show("kept out by frame generation");
+    CHECK(logged("kept out: frame generation"), "the kept-out line names frame generation");
+    CHECK(!logged("two limiters") && rtss_limit_state() == 0, "no second limiter");
+    CHECK(!loads && !saves, "kept out, the hooks library is never loaded");
+}
+
 static const struct { const char *name; void (*run)(void); } scenarios[] = {
-    {"restore_race", restore_race},   {"restore_player", restore_player}, {"restore_inflight", restore_inflight},
-    {"restore_first", restore_first}, {"restore_kept_out", restore_kept_out},
+    {"restore_race", restore_race},
+    {"restore_player", restore_player},
+    {"restore_inflight", restore_inflight},
+    {"restore_first", restore_first},
+    {"restore_kept_out", restore_kept_out},
+    {"kept_two", kept_two},
+    {"kept_lowlat_then_limit", kept_lowlat_then_limit},
+    {"kept_framegen", kept_framegen},
 };
 
 int main(int argc, char **argv) {

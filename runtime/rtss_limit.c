@@ -33,6 +33,7 @@
 
 #include "host.h"
 #include "platform/platform.h"
+#include "rtss_decide.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -50,10 +51,11 @@ typedef void (*UpdateFn)(void);
 enum { FAIL_NONE, FAIL_LIBRARY, FAIL_READONLY, FAIL_NOT_LIMITING };
 
 static PlatMutex lock = PLAT_MUTEX_INIT;   // the hooks calls and the state below
-static _Atomic int64_t want = -2;          // millihertz from the pacer: >0 a limit, 0 none, -1 RTSS kept out; -2 unset
+static _Atomic int64_t want = RTSS_UNSET;  // millihertz from the pacer: >0 a limit, 0 none; RTSS_OUT_* kept out
 static _Atomic int active;                 // RTSS limits this process now
 static _Atomic int failed;                 // FAIL_*: RTSS is out of it for the rest of the run
 static _Atomic int closed;                 // rtss_limit_restore ran: nothing reaches the profile any more
+static _Atomic int two;                    // kept out, and RTSS limits the game by a setting of its own (watch)
 static int started;
 static char dll_path[MAX_PATH], profile[MAX_PATH], rtss_dir[MAX_PATH];
 static HMODULE dll;
@@ -243,12 +245,76 @@ static const char *fail_reason(int f) {
                                     : "RivaTuner Statistics Server's hooks library did not load";
 }
 
+// RTSS's own settings for the game, read from its profile file as RTSS keeps it: Profiles\<exe>.cfg, else
+// Profiles\Global, and a key the game's profile lacks from Global. The system's ini reader does it, so no call goes into
+// RTSS's hooks library, which a run that keeps RTSS out never loads. The files are read again only when the time
+// either was written changes. Worker thread only.
+static RtssSettings settings;
+static char settings_file[MAX_PATH + 16];   // which file they came from, as Profiles\<name>
+
+static uint64_t file_stamp(const char *path) {   // 0: no such file
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &a)) return 0;
+    return ((uint64_t)a.ftLastWriteTime.dwHighDateTime << 32 | a.ftLastWriteTime.dwLowDateTime) | 1;
+}
+
+static int cfg_int(const char *own, const char *global, const char *key) {
+    char v[32] = "";
+    if (own) GetPrivateProfileStringA("Framerate", key, "", v, sizeof v, own);
+    if (!*v) GetPrivateProfileStringA("Framerate", key, "", v, sizeof v, global);
+    return (int)strtol(v, NULL, 10);   // GetPrivateProfileIntA would read a negative scanline as 0
+}
+
+static void read_settings(void) {
+    static uint64_t stamps[2] = {~0ull, ~0ull};   // never read
+    char own[MAX_PATH * 2], global[MAX_PATH * 2];
+    snprintf(own, sizeof own, "%s\\Profiles\\%s.cfg", rtss_dir, profile);
+    snprintf(global, sizeof global, "%s\\Profiles\\Global", rtss_dir);
+    uint64_t a = file_stamp(own), b = file_stamp(global);
+    if (a == stamps[0] && b == stamps[1]) return;
+    stamps[0] = a, stamps[1] = b;
+    const char *p = a ? own : NULL;
+    settings = (RtssSettings){cfg_int(p, global, "Limit"), cfg_int(p, global, "LimitDenominator"),
+                              cfg_int(p, global, "LimitTime"), cfg_int(p, global, "LimitTimeDenominator"),
+                              cfg_int(p, global, "SyncScanline0"), cfg_int(p, global, "SyncScanline1")};
+    if (a) snprintf(settings_file, sizeof settings_file, "Profiles\\%s.cfg", profile);
+    else snprintf(settings_file, sizeof settings_file, "Profiles\\Global");
+}
+
+// While RTSS is kept out (w < 0) the game's own limiter, the driver's low latency or frame generation holds the frames,
+// and a limit the player set in RTSS itself for the game (its global profile or the game's own, a frame time limit or
+// scanline sync) still holds them a second time. Logged once per change and shown in the menu (rtss_limit_state 4).
+static void watch(int64_t w, int listed) {
+    static int said, lines;
+    static char said_text[128];
+    int on = 0;
+    char text[128] = "";
+    if (w < 0 && listed) {
+        read_settings();
+        on = rtss_settings_limit(&settings);
+        rtss_settings_text(text, sizeof text, &settings);
+    }
+    if (w >= 0) said = 0;   // a later kept-out want logs afresh
+    else if (on != said || (on && strcmp(text, said_text))) {
+        if (lines++ < 40) {
+            if (on)
+                rt_log("frame rate: two limiters: RivaTuner Statistics Server's own setting for the game (%s: %s) limits "
+                       "it beside %s", settings_file, text, rtss_out_limiter(w));
+            else
+                rt_log("frame rate: RivaTuner Statistics Server no longer limits the game beside %s", rtss_out_limiter(w));
+        }
+        said = on;
+        snprintf(said_text, sizeof said_text, "%s", text);
+    }
+    atomic_store(&two, on);
+}
+
 static void worker(void *arg) {
     (void)arg;
     int was_running = -1, was_hooked = 0, over = 0;
     for (;; plat_sleep_ms(POLL_MS)) {
         int64_t w = atomic_load(&want);
-        if (w == -2) continue;
+        if (w == RTSS_UNSET) continue;
         plat_mutex_lock(&lock);
         if (atomic_load(&closed)) {   // a want read before rtss_limit_restore must not reach the profile after it
             plat_mutex_unlock(&lock);
@@ -265,7 +331,9 @@ static void worker(void *arg) {
         }
         if (w < 0) {
             if (dll) put_back();
-            set_active(0, "RivaTuner Statistics Server kept out: NX2NAVI_RTSS=0 or frame generation");
+            char why[96];
+            snprintf(why, sizeof why, "RivaTuner Statistics Server kept out: %s", rtss_out_text(w));
+            set_active(0, why);
         } else if (f) {
             set_active(0, fail_reason(f));
         } else if (!run) {
@@ -294,11 +362,12 @@ static void worker(void *arg) {
                 set_active(0, fail_reason(FAIL_NOT_LIMITING));
             }
         }
+        watch(w, run && hooked);
         plat_mutex_unlock(&lock);
     }
 }
 
-static void start(void) {
+static void start(int64_t first) {
     started = 1;
     char dir[MAX_PATH];
     DWORD size = sizeof dir;
@@ -320,14 +389,17 @@ static void start(void) {
     for (const char *s = exe; *s; s++)
         if (*s == '\\' || *s == '/') base = s + 1;
     snprintf(profile, sizeof profile, "%s", base);   // RTSS names a profile after the executable, as ocarina.exe
-    rt_log("frame rate: RivaTuner Statistics Server found in %s; it takes the frame limit while it runs", dir);
+    if (first >= 0)
+        rt_log("frame rate: RivaTuner Statistics Server found in %s; it takes the frame limit while it runs", dir);
+    else
+        rt_log("frame rate: RivaTuner Statistics Server found in %s; kept out (%s), so its thread only reads RTSS's own "
+               "settings for the game, to tell when RTSS limits it a second time", dir, rtss_out_text(first));
     if (!plat_thread_spawn(worker, NULL, "rtss", 0)) rt_log("frame rate: the RivaTuner Statistics Server thread did not start");
 }
 
 void rtss_limit_want(int64_t mhz) {
     if (atomic_load_explicit(&closed, memory_order_relaxed)) return;   // the exit put the profile back
-    if (!started && mhz < 0) return;   // kept out from the start, for the whole run (both reasons need a restart)
-    if (!started) start();
+    if (!started) start(mhz);   // a first want that keeps RTSS out starts the worker too, which then only reads (watch)
     // a new limit: the game's own limiter holds it until the worker had RTSS apply it, up to POLL_MS later (a movie's
     // cap that waited for that ran the movie's 60 Hz count fast for half a second)
     if (atomic_exchange(&want, mhz) != mhz) atomic_store(&active, 0);
@@ -340,8 +412,10 @@ int rtss_limit_active(void) {
 int rtss_limit_state(void) {
     if (atomic_load_explicit(&closed, memory_order_relaxed)) return 0;
     int f = atomic_load_explicit(&failed, memory_order_relaxed);
-    if (atomic_load(&want) >= 0 && (f == FAIL_READONLY || f == FAIL_NOT_LIMITING)) return f == FAIL_READONLY ? 2 : 3;
-    return rtss_limit_active() && atomic_load(&want) > 0;
+    int64_t w = atomic_load(&want);
+    if (w >= 0 && (f == FAIL_READONLY || f == FAIL_NOT_LIMITING)) return f == FAIL_READONLY ? 2 : 3;
+    if (w < 0 && w != RTSS_UNSET && atomic_load_explicit(&two, memory_order_relaxed)) return 4;
+    return rtss_limit_active() && w > 0;
 }
 
 void rtss_limit_restore(void) {

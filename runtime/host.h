@@ -428,10 +428,12 @@ void frame_rate_sound_step_host(Cpu *c);                  // the step the sound 
 float frame_step_frames(void);                            // the 60 Hz frames the game steps per update (set ostep), else 1
 void frame_step_flight(float *page, float *game, uint64_t *presents);   // flight.c: the step at a host present
 // rtss_limit.c: RivaTuner Statistics Server takes the frame limit where it runs
-void rtss_limit_want(int64_t mhz);                        // the pacer's limit in millihertz: >0, 0 none, -1 keep RTSS out
+void rtss_limit_want(int64_t mhz);                        // the pacer's limit in millihertz: >0, 0 none; or why RTSS is
+                                                           // kept out (rtss_decide.h RTSS_OUT_*)
 int rtss_limit_active(void);                              // RTSS limits to the wanted rate: the pacer holds no frames
 int rtss_limit_state(void);                               // menu: 1 RTSS limits, 2 its profile is read-only, 3 it let the
-                                                           // game run past its limit
+                                                           // game run past its limit, 4 kept out while a limit set in
+                                                           // RTSS itself holds the game too
 void rtss_limit_restore(void);                            // before the process ends: the profile's old limit back
 int64_t frame_step_world_us(void);                         // game time since the loaded save's first frame, -1 before
                                                            // (NX2NAVI_FPS_LIMIT, live)

@@ -861,6 +861,7 @@ static void row_fps_limit() {
     const char *note = rtss == 1   ? menu_text(UI_MENU_FPS_RTSS)
                        : rtss == 2 ? menu_text(UI_MENU_FPS_RTSS_READONLY)
                        : rtss == 3 ? menu_text(UI_MENU_FPS_RTSS_IGNORED)
+                       : rtss == 4 ? menu_text(UI_MENU_FPS_RTSS_TWO)
                                    : nullptr;
     opt_choice_list("NX2NAVI_FPS_LIMIT", UI_MENU_FPS_LIMIT, vals, names, n, UI_MENU_FPS_LIMIT_DESC, cur, note);
 }

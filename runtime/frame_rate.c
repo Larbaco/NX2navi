@@ -55,6 +55,7 @@
 #include "input.h"
 #include "layout.h"
 #include "platform/platform.h"
+#include "rtss_decide.h"
 #include "vk_dlssg.h"
 #include "vk_fg.h"
 #include "vk_lowlat.h"
@@ -276,7 +277,8 @@ double frame_step_game_hz(void) {
 // RivaTuner Statistics Server (rtss_limit.c) gets the same limit; while it limits this process the pacer holds no
 // frames, so the two never stack. NX2NAVI_RTSS=0 and frame generation (RTSS would count the generated frames) keep it
 // out, and so does a driver's low latency while it is in effect (vk_lowlat.c): the driver holds the limit where the
-// frame starts, and RTSS would hold the finished picture, the wait that mode is there to remove.
+// frame starts, and RTSS would hold the finished picture, the wait that mode is there to remove. RTSS gets the reason
+// (RTSS_OUT_*), for the log and for its check of a limit set in RTSS itself.
 static double paced_hz;   // the game frames a second the newest frame_step_cap_ns paces at (ocarina_step); 0: none
 static int movie_paced;   // the movie rate the newest frame_step_cap_ns paces at (ocarina_step, frame_step_movie_hz); 0: none
 int frame_step_movie_hz(void) { return movie_paced; }
@@ -287,7 +289,10 @@ uint64_t frame_step_cap_ns(void) {
         const char *e = cfg_get("NX2NAVI_RTSS");
         rtss_allowed = !(e && !strcmp(e, "0"));
     }
-    int rtss = rtss_allowed && !vk_fg_wanted() && !vk_dlssg_active() && !vk_lowlat_on();
+    int64_t rtss_out = !rtss_allowed                          ? RTSS_OUT_SETTING
+                       : vk_fg_wanted() || vk_dlssg_active() ? RTSS_OUT_FRAMEGEN
+                       : vk_lowlat_on()                      ? RTSS_OUT_LOWLAT
+                                                             : 0;
     int gen = generated_factor();
     int movie_hz = movie_cap_hz();
     static int movie_clock = -1;   // NX2NAVI_MOVIE_CLOCK=0: the steady step and the usual pacing through a movie too
@@ -305,7 +310,7 @@ uint64_t frame_step_cap_ns(void) {
         }
     }
     if (limit_hz == -2 && !movie_hz && !frame_free_running()) {   // unlimited: the pacer does not hold frames, and
-        rtss_limit_want(rtss ? 0 : -1);                              // RTSS's limit is cleared
+        rtss_limit_want(rtss_out ? rtss_out : 0);                    // RTSS's limit is cleared
         paced_hz = 0;
         return 0;
     }
@@ -322,7 +327,7 @@ uint64_t frame_step_cap_ns(void) {
     }
     if (movie_hz) hz = movie_hz;
     paced_hz = hz;
-    rtss_limit_want(rtss ? (int64_t)(hz * 1000 + 0.5) : -1);
+    rtss_limit_want(rtss_out ? rtss_out : (int64_t)(hz * 1000 + 0.5));
     if (rtss_limit_active()) return 0;
     return (uint64_t)(1e9 / hz + 0.5);
 }
