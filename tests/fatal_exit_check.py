@@ -5,7 +5,8 @@ checks statically that no runtime file outside the platform layer ends the proce
 error's end and the lost device's (runtime/vk_device.c lost_wait_exit) end with plat_terminate. No game files, no GPU.
 
 A fatal error stops HD rumble on a thread of its own and waits for it 300 ms at most (runtime/dispatch.c
-rt_rumble_stop_bounded), so a stop that hangs on SDL's lock does not hold the end.
+rt_rumble_stop_bounded), so a stop that hangs on SDL's lock does not hold the end. A fatal error on RTSS's own thread
+("rtss") skips RivaTuner's restore, whose lock that thread may hold.
 
 Two failures at once end once: two threads that fault, a fault while a fatal error is reported and a fatal error
 while a crash is: the first report is written whole, the process ends with its code, and the second adds no line
@@ -105,7 +106,10 @@ def static_checks():
 
 CASES = [
     # mode, exit code, lines that must be there, lines that must not
-    ('fatal', 70, ['FATAL: the test\'s fatal error 1', 'frametime: at a fatal error', 'rumble: stopped'], ['detach:']),
+    ('fatal', 70, ['FATAL: the test\'s fatal error 1', 'frametime: at a fatal error', 'rumble: stopped', 'rtss: restored'],
+     ['detach:']),
+    # rt_fatal on RTSS's own thread, which may hold the lock the restore tries: no restore from there
+    ('fatal_rtss', 70, ['FATAL: the test\'s fatal error 3', 'rumble: stopped'], ['rtss: restored', 'detach:']),
     # the rumble stop hangs (SDL's lock held by a thread that crashed): the end goes on after 300 ms
     ('fatal_rumble', 70, ['FATAL: the test\'s fatal error 1'], ['rumble: stopped', 'detach:']),
     # two faults at once: the first report whole, the second thread waits (dispatch.c rt_ending_enter)

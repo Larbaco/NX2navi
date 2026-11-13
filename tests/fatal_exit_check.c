@@ -8,6 +8,7 @@
 //   fatal_exit_check fatal_crash   a fault on another thread while rt_fatal reports: its FATAL line alone, exit code 70
 //   fatal_exit_check crash_fatal   rt_fatal on another thread while a crash is reported: the whole report, exit code 71
 //   fatal_exit_check fatal_rumble  rt_fatal while the HD rumble stop hangs (SDL's lock held): exit code 70 all the same
+//   fatal_exit_check fatal_rtss    rt_fatal on RTSS's thread ("rtss"): exit code 70, no RTSS restore from there
 //
 // The crash handler here is a stand-in for main.c crash_handler with its first line (the static check in
 // tests/fatal_exit_check.py holds main.c to it): it writes three report lines 100 ms apart and ends with plat_exit(71).
@@ -58,7 +59,7 @@ void rt_log(const char *fmt, ...) {
 }
 void kern_free_cores_note(void) {}
 void prof_sampler_write(void) {}
-void rtss_limit_restore(void) {}
+void rtss_limit_restore(void) { say("rtss: restored\n"); }
 void kern_checkpoint(void) {}
 
 // perf.c's summary at a fatal error, which dispatch.c calls through a weak symbol
@@ -93,6 +94,10 @@ static DWORD WINAPI fault(void *arg) {
 static DWORD WINAPI fatal_thread(void *arg) {
     Sleep((DWORD)(uintptr_t)arg);
     rt_fatal("the test's fatal error %d", 2);
+}
+static void rtss_thread(void *arg) {   // rtss_limit.c's worker, named as plat_thread_spawn names it there
+    (void)arg;
+    rt_fatal("the test's fatal error %d", 3);
 }
 static void slow_note(void) {   // a fatal note that takes a while, as the card's and the memory settings' may
     say("fatal note: start\n");
@@ -130,6 +135,11 @@ int main(int argc, char **argv) {
         fault(0);
         return 3;
     }
-    printf("usage: fatal_exit_check fatal|crash_crash|fatal_crash|crash_fatal|fatal_rumble\n");
+    if (!strcmp(mode, "fatal_rtss")) {
+        plat_thread_spawn(rtss_thread, NULL, "rtss", 0);
+        Sleep(10000);
+        return 3;
+    }
+    printf("usage: fatal_exit_check fatal|crash_crash|fatal_crash|crash_fatal|fatal_rumble|fatal_rtss\n");
     return 2;
 }
