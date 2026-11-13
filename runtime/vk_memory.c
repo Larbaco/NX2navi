@@ -3010,6 +3010,15 @@ static void mirror_forget(PoolRec *r) {
 static PoolRec **retiring;
 static int nretiring, cretiring;
 static PlatMutex retire_lock = PLAT_MUTEX_INIT;
+// Finalized pools the GPU is done with, destroyed by the next vk_mem_collect outside every lock (pool_dead_drain).
+// pool_retire runs in the completion thread's callbacks, before it publishes done, so every fence waiter waited for
+// those destroys (vmaDestroyBuffer of the mirror, vkDestroyBuffer and vkFreeMemory of the imported memory, which the
+// driver unpins: up to 77 ms in one 240-submission window at an area change). It also runs from pool_wait_collect
+// under cmd_lock, in the upload flush of whichever thread collects first: the replay's per-submission flush or the
+// game's presenting thread, with every upload and deferral waiting on cmd_lock meanwhile. Under retire_lock.
+static PoolRec **pool_dead;
+static int npool_dead, cpool_dead;
+static uint64_t n_pool_destroyed;   // so far, for the "mem: sizes" line
 
 static void pool_retiring(PoolRec *r) {
     plat_mutex_lock(&retire_lock);
@@ -3018,12 +3027,27 @@ static void pool_retiring(PoolRec *r) {
     plat_mutex_unlock(&retire_lock);
 }
 
+// The GPU is done with the pool: off the retiring list, onto pool_dead.
 static void pool_retire(void *arg) {
     plat_mutex_lock(&retire_lock);
     for (int i = 0; i < nretiring; i++)
         if (retiring[i] == arg) { retiring[i] = retiring[--nretiring]; break; }
+    if (npool_dead == cpool_dead) grow((void **)&pool_dead, &cpool_dead, sizeof *pool_dead);
+    pool_dead[npool_dead++] = arg;
     plat_mutex_unlock(&retire_lock);
-    destroy_rec(vk_ctx(), arg);
+}
+
+// vk_mem_collect only, holding no lock: destroys the records pool_retire put on pool_dead.
+static void pool_dead_drain(VkCtx *c) {
+    if (!__atomic_load_n(&npool_dead, __ATOMIC_RELAXED)) return;
+    plat_mutex_lock(&retire_lock);
+    PoolRec **go = pool_dead;
+    int n = npool_dead;
+    pool_dead = NULL, npool_dead = cpool_dead = 0;
+    plat_mutex_unlock(&retire_lock);
+    for (int i = 0; i < n; i++) destroy_rec(c, go[i]);
+    free(go);
+    __atomic_add_fetch(&n_pool_destroyed, (uint64_t)n, __ATOMIC_RELAXED);
 }
 
 // Replay thread, the first access of this submission: queues the copies of the pages written since the last sync.
@@ -5204,7 +5228,7 @@ static void pool_wait_collect(uint64_t tl) {
         if (pwait[i].seq <= done_seq && pwait[i].tl <= tl) go[n++] = pwait[i].r, pwait[i] = pwait[--npwait];
         else i++;
     plat_mutex_unlock(&retire_lock);
-    for (int i = 0; i < n; i++) pool_retire(go[i]);   // off the retiring list, then destroyed
+    for (int i = 0; i < n; i++) pool_retire(go[i]);   // off the retiring list; vk_mem_collect destroys them
 }
 
 static void collect_locked_out(VkCtx *c, Dead **out, int *nout, int *cout) {
@@ -6038,7 +6062,7 @@ void vk_mem_note_submit(uint64_t timeline_value) {
 
 // The objects go once cmd_lock is released: destroying an image and its memory takes up to milliseconds (the
 // collect's 0.3 slow ones a frame took a median 0.26-0.43 ms, up to 1.9 ms), and the replay's uploads
-// (vk_upload_begin) wait for cmd_lock.
+// (vk_upload_begin) wait for cmd_lock. So do the finalized pools (pool_dead): destroyed here only, until shutdown.
 void vk_mem_collect(void) {
     VkCtx *c = vk_ctx();
     if (!c) return;
@@ -6050,6 +6074,7 @@ void vk_mem_collect(void) {
     plat_rmutex_unlock(&cmd_lock);
     for (int i = 0; i < nout; i++) destroy_dead(c, &out[i]);
     free(out);
+    pool_dead_drain(c);
 }
 
 void vk_mem_stats(VkMemStats *s) {
@@ -6115,6 +6140,8 @@ void vk_mem_shutdown(void) {
     for (int i = 0; i < nretiring; i++) destroy_rec(c, retiring[i]);   // finalized ones whose callback never ran
     nretiring = 0;
     npwait = 0;   // those waiting for pool_wait_collect were on the retiring list too
+    for (int i = 0; i < npool_dead; i++) destroy_rec(c, pool_dead[i]);   // retired ones no collect destroyed yet
+    npool_dead = 0;
     __atomic_add_fetch(&pool_gen, 1, __ATOMIC_RELEASE);
     nphys = 0;
     plat_mutex_unlock(&pool_lock);
@@ -6146,6 +6173,8 @@ void vk_mem_sizes(PerfSizes *s) {
     perf_size(s, "VRAM mirrors", (uint64_t)__atomic_load_n(&m_live_n, __ATOMIC_RELAXED), 0,
               (uint64_t)__atomic_load_n(&m_live_bytes, __ATOMIC_RELAXED));
     perf_size(s, "deferred destructions", dead_n, 0, PERF_SIZE_NONE);
+    perf_size(s, "finalized pools destroyed after the GPU", __atomic_load_n(&n_pool_destroyed, __ATOMIC_RELAXED), 0,
+              PERF_SIZE_NONE);
     perf_size(s, "upload batches in flight", infl, 0, PERF_SIZE_NONE);
     perf_size(s, "spare upload batches", spare_b, 0, PERF_SIZE_NONE);
     perf_size(s, "staging cache", stg_n, STG_CACHE, stg_b);
