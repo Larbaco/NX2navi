@@ -1171,6 +1171,7 @@ int vk_mem_vram_live(uint64_t *used, uint64_t *budget) {
 #define GEN_PER_CHUNK (1u << (GEN_CHUNK_SHIFT - GEN_PAGE_SHIFT))
 static uint64_t *gen_chunk[GEN_CHUNKS];
 static uint64_t gen_now;                 // last generation handed out (gen_lock; read without it atomically)
+static uint32_t n_gen_chunks;            // chunks slot_in allocated, both tables (gen_lock; vk_mem_sizes reads it)
 static PlatMutex gen_lock = PLAT_MUTEX_INIT;
 static uint64_t gen_pages[1024];
 // lazy_clean, cpu_wrote_since, verify_cb and vk_mem_sizes read generations without gen_lock: 64-bit loads and stores
@@ -1281,6 +1282,7 @@ static uint64_t *slot_in(uint64_t **tab, uint64_t page_addr, int create) {
         if (!p) rt_fatal("vk: out of memory for page generations");
         // published with release: lazy_clean and cpu_wrote_since load the chunk pointers without gen_lock
         __atomic_store_n(&tab[ci], p, __ATOMIC_RELEASE);
+        __atomic_add_fetch(&n_gen_chunks, 1, __ATOMIC_RELAXED);
     }
     return &tab[ci][(page_addr >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)];
 }
@@ -6277,4 +6279,9 @@ void vk_mem_sizes(PerfSizes *s) {
     perf_size(s, "shadow base copies", sb, 0, sb * SB_PAGE);
     // the page generations handed out so far (gen_now, 64 bits: they do not run out)
     perf_size(s, "page generations handed out", (uint64_t)__atomic_load_n(&gen_now, __ATOMIC_RELAXED), 0, PERF_SIZE_NONE);
+    // their tables: the chunks of both (8 bytes a page of each 256 MiB of guest address space stamped, allocated in
+    // full though only the pages holding stamps become resident) and the per-region maxima reg_max and creg_max
+    uint64_t gch = __atomic_load_n(&n_gen_chunks, __ATOMIC_RELAXED);
+    perf_size(s, "page generation table chunks", gch, 0,
+              gch * GEN_PER_CHUNK * sizeof **gen_chunk + sizeof reg_max + sizeof creg_max);
 }
