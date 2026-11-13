@@ -1104,8 +1104,8 @@
 # 1: with trace = perf, the "mem: sizes" line also counts the recording copies (the game's recorded command lists,
 # kept until the game hands their control memory over again) that no submission used for 5 minutes and whose control
 # memory the game has written over since, or no longer maps: copies the game will not use again. A thread of its own
-# reads 16 bytes of game memory per copy every 5 seconds; nothing is freed. The count is a lower bound: memory written
-# over with the same bytes is not seen. Read at start. Default: 0.
+# reads 16 bytes of game memory for each new copy, and for up to 4096 known copies every 5 seconds; nothing is freed.
+# The count is a lower bound: memory written over with the same bytes is not seen. Read at start. Default: 0.
 # copy_retire = 0
 # Texture entries the bindless texture pool may create in one refresh (images and their uploads); the rest wait for
 # the next refresh and show their stand-in until then. Lower spreads streaming over more frames (smaller hitches, a
