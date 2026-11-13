@@ -8978,6 +8978,10 @@ void vk_pipeline_save_exit(void) {
     save_with(SAVE_WAIT_MS, 1);
 }
 
+// An orderly end before the guest starts that saves no pipelines (cheats.c's rebuild exit): the boot's journal closed
+// as vk_pipeline_save_exit closes it, so the next start does not take the end for a driver crash in the library warm.
+void vk_pipeline_boot_abandon(void) { journal_close(); }
+
 // The memory report's figure for the pipeline caches the driver keeps in process memory (vk_pipeline_mem): the size of
 // each cache's data, asked once a minute here on the autosave thread, and by every save (cache_save_one). The size is
 // asked as the save asks it, at a moment no build runs into either cache (cache_rw, tried once and never waited for),

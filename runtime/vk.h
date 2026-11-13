@@ -1074,6 +1074,7 @@ void vk_pipeline_prewarm(void);
 // Ends the boot prebuild's crash marker (vk_pipeline.c, "boot prebuild crash marker"): boot_wait calls it when it lets
 // the game start while the prewarm goes on, so a crash in play is not taken for one in the boot's builds.
 void vk_pipeline_prewarm_marker_clear(void);
+void vk_pipeline_boot_abandon(void);   // an end before the guest starts that saves nothing: the boot's journal closed
 // boot_wait calls it when it lets the game start while the prewarm goes on: the builders of the whole warm after a
 // driver change (vk_pipeline.c bf_decide) go on as in play, at idle priority and in the background's numbers.
 void vk_pipeline_prewarm_detach(void);
