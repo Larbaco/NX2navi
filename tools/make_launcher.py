@@ -188,32 +188,17 @@ def build_python(py):
 
 # ---------------------------------------------------------------- app/<version>/
 
-def xlate_source_identity():
-    """The identity tools/build_xlate.py writes for a translator built from this checkout: the vendor tree copied and
-    patched in a folder of its own (build_xlate.prepare_sources) and hashed as the build hashes it (build_xlate.identity).
-    Nothing is compiled; it takes a few seconds."""
-    import tempfile
-    import build_xlate
-    old = build_xlate.BUILD
-    with tempfile.TemporaryDirectory(prefix='xlate-id-') as d:
-        build_xlate.BUILD = Path(d) / 'xlate'
-        try:
-            build_xlate.prepare_sources()
-            return build_xlate.identity()
-        finally:
-            build_xlate.BUILD = old
-
-
 def check_xlate(xlate):
     """A release carries the translator of its own sources. 0.10.0 and 0.10.1 shipped the 0.9.2 translator (identity
     4d051299) after tools/xlate/Program.cs had raised the texture pool to 40960 slots, so their translations still
     clamped every pool handle to slot 32767 and the ground went see-through after some area loads (issues #569 and
-    #824). A translator whose nx2navi_xlate.id differs from this checkout's sources stops the build."""
+    #824). A missing translator, or one whose nx2navi_xlate.id differs from this checkout's sources
+    (build_xlate.check_built), stops the build; main runs this before anything is resolved, downloaded or deleted."""
+    import build_xlate
+    reason = build_xlate.check_built(xlate, 'nx2navi_xlate.exe')
+    if reason:
+        sys.exit(reason)
     have = (xlate / 'nx2navi_xlate.id').read_text(encoding='ascii').strip()
-    want = xlate_source_identity()
-    if have != want:
-        sys.exit(f'{xlate}: its translator was built from other sources (identity {have[:16]}) than this checkout\'s '
-                 f'({want[:16]}): build it again with tools/build_xlate.py --out {xlate}')
     print(f'translator identity {have[:16]}: built from this checkout\'s sources')
 
 
@@ -233,11 +218,7 @@ def build_app(app, ver, xlate, feed_repo, lock, ffx=None, dlss=None, art=None, d
             shutil.copy2(ROOT / t, app / t)
     (app / 'VERSION').write_text(ver + '\n', encoding='utf-8')
     (app / 'bin').mkdir()
-    for n in ('nx2navi_xlate.exe', 'nx2navi_xlate.id'):
-        if not (xlate / n).is_file():
-            sys.exit(f'{xlate / n} is missing: build the shader translator first (tools/build_xlate.py)')
-    check_xlate(xlate)
-    for n in ('nx2navi_xlate.exe', 'nx2navi_xlate.id'):
+    for n in ('nx2navi_xlate.exe', 'nx2navi_xlate.id'):   # main checked them first (check_xlate)
         shutil.copy2(xlate / n, app / 'bin' / n)
     if ffx:   # FSR 3.1 loads it from beside the game (runtime/vk_ffx.cpp); make_game.py copies it there
         shutil.copy2(ffx, app / 'bin' / 'amd_fidelityfx_vk.dll')
@@ -415,6 +396,7 @@ def main():
         prompt_art.art_files(a.prompt_art)   # the art is all there before anything is downloaded or built
     if a.pgo:
         pgo.fitting(a.pgo)   # the profile fits this checkout's recomp/ before anything is downloaded or built
+    check_xlate(a.xlate)   # the translator is this checkout's before anything is downloaded, built or deleted
     out = a.out
     shutil.rmtree(out, ignore_errors=True)
     folder = out / 'NX2navi'
