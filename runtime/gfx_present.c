@@ -1537,8 +1537,15 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     if (wsys_minimized() || !g_sc) goto out;
 
     unsigned slot = g_frame % FRAMES;
-    if (vkWaitForFences(c->device, 1, &g_fence[slot], VK_TRUE, 5000000000ull) != VK_SUCCESS) {
-        rt_log("gfx: present fence wait timed out");
+    VkResult fw = vkWaitForFences(c->device, 1, &g_fence[slot], VK_TRUE, 5000000000ull);
+    if (fw != VK_SUCCESS) {
+        // A lost device ends the run here as anywhere else; a hung GPU times out at every present, so the line is
+        // kept to the first 8 and each doubling.
+        vk_device_lost_check(fw, "the present slot's fence wait");
+        static uint32_t n_fw;
+        if (++n_fw <= 8 || !(n_fw & (n_fw - 1)))
+            rt_log("gfx: present fence wait %s (%d), the frame is skipped: %u times so far",
+                   fw == VK_TIMEOUT ? "timed out" : "failed", (int)fw, n_fw);
         goto out;
     }
     pts_read(c, slot);   // the GPU timeline (vk_gtl_note): this slot's last present is done
@@ -1569,6 +1576,17 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         }
     } else {
         n_timeouts = 0;
+    }
+    if (r < 0 && r != VK_ERROR_OUT_OF_DATE_KHR) {   // an error (the surface lost, say), logged once per code
+        static VkResult seen[8];
+        static int nseen;
+        int k = 0;
+        while (k < nseen && seen[k] != r) k++;
+        if (k == nseen && nseen < 8) {
+            seen[nseen++] = r;
+            rt_log("gfx: the acquire of a swapchain image failed (%d%s): the frame is skipped", (int)r,
+                   r == VK_ERROR_SURFACE_LOST_KHR ? ", the window's surface is lost" : "");
+        }
     }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) goto out;
     if (r == VK_SUBOPTIMAL_KHR) plat_xchg32(&g_dirty, 1);
@@ -1780,8 +1798,18 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         plat_xchg32(&g_dirty, 1);
     }
     g_frame++;
-    if (cap) {
-        vkWaitForFences(c->device, 1, &g_fence[slot], VK_TRUE, 5000000000ull);
+    VkResult cap_r = cap ? vkWaitForFences(c->device, 1, &g_fence[slot], VK_TRUE, 5000000000ull) : VK_SUCCESS;
+    if (cap && cap_r != VK_SUCCESS) {   // the read-back buffer may not hold this frame yet: nothing reads it
+        vk_device_lost_check(cap_r, "the wait for a captured frame");
+        g_cap_valid = 0;
+        static int logged;
+        if (logged++ < 8) rt_log("gfx: the wait for a captured frame ended with %d: no capture this frame", (int)cap_r);
+        if (grab) {
+            void (*cb)(VkGrab *g, void *ctx) = g_grab_cb;
+            g_grab_cb = NULL;
+            cb(NULL, g_grab_ctx);
+        }
+    } else if (cap) {
         vmaInvalidateAllocation(c->vma, g_cap_alloc, 0, VK_WHOLE_SIZE);
         g_cap_w = (int)g_sc_ext.width;
         g_cap_h = (int)g_sc_ext.height;
