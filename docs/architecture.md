@@ -239,6 +239,47 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   while the swapchain is SDR, and a change of the setting makes the swapchain again in the other format
   (`gfx_present.c` `window_settings_live`). Only `native` waits for a restart, as the game asks about the display
   once. `NX2NAVI_HDR_LIVE=0` leaves the HDR path out of a run that starts with HDR off.
+- Frame pacing (`nvn_api_obj.c` `nvnQueuePresentTexture` and `pace`, `frame_rate.c` `frame_step_cap_ns`,
+  `vk_backend.c` `present_main`): the frame limit (`NX2NAVI_FPS_LIMIT`, live) counts the frames the game draws.
+  Ocarina steps by the clock, so the pacer holds the frames to the limit alone: at most `LIMIT_FREE_MAX_HZ` (240, also
+  for "unlimited"), and while a movie plays at the movie's rate (`movie_cap_hz`, `NX2NAVI_MOVIE_FPS`). Each game
+  present gets a slot one period after the one before: an early frame waits for it, a frame late by less than a period
+  keeps the phase, a later one starts again from now, and while a movie plays the slots are kept through a lateness of
+  up to a second (`MOVIE_CATCHUP_NS`). The game's present returns at once; the present thread blits the picture,
+  waits until the slot (`wait_until`, with `pace_smooth`'s floor of seven eighths of the recent interval, off with
+  frame generation) and presents under the present and queue locks (`gfx_present.c` `flip_locked`). A window image is
+  free again one period after its slot, and its acquire also waits for the GPU to finish the image's previous frame
+  (`NX2NAVI_ACQUIRE_WAIT`); `frame_step_present` gives `ocarina_step` the slot times, snapped to the paced rate within
+  3%.
+- One limiter is the goal: the driver's low latency (`vk_lowlat.c`), RivaTuner Statistics Server (`rtss_limit.c`) or
+  the game's pacer holds the frame limit, and the log's "frame rate:" and "lowlat:" lines name the one in charge.
+  Frame generation keeps RTSS out (it would count the generated frames), and the game's pacer holds the drawn frames
+  beside it. The exceptions as they stand: `pace_smooth` still waits on the present thread while RTSS holds the limit;
+  DLSS Frame Generation's Reflex sleeps where the frame starts while the pacer holds the limit; while RTSS holds it the
+  pacer holds nothing at all, through movies and while no picture goes out (a minimised window, `frame_hold`) too; and
+  a limit set in RTSS itself still holds the game where the game keeps RTSS out, which the log ("two limiters") and the
+  frame rate row of the menu point out.
+- RivaTuner Statistics Server (`rtss_limit.c`, `NX2NAVI_RTSS`, restart; its decisions in `rtss_decide.h`): the game's
+  first present starts a thread that looks RTSS up (`InstallDir` under `HKLM\SOFTWARE\WOW6432Node\Unwinder\RTSS`,
+  `RTSSHooks64.dll`) and reads its shared memory (`RTSSSharedMemoryV2`) every 500 ms. While RTSS runs, the limit goes
+  into RTSS's profile for the executable (`Profiles\<exe>.cfg`, through the hooks library's profile calls, read back
+  from the saved file; a fractional rate over a denominator where RTSS knows one, else rounded to whole frames), and
+  once RTSS lists the process the pacer stands aside (`rtss_limit_active`). The pacer keeps the limit while RTSS does
+  not run or has not hooked the game, for a limit RTSS refuses, and for the rest of the run when the profile cannot be
+  written (no administrator rights), the hooks library does not load, or RTSS's own frame count of the game stays
+  above 1.2 times the limit for six polls; the menu names the first and the last of these. Frame generation, the
+  driver's low latency and `NX2NAVI_RTSS=0` keep RTSS out (`RTSS_OUT_*`): the profile gets back what it held, and a
+  run kept out from its first present never loads the hooks library, its thread only reading RTSS's own settings for
+  the game. While RTSS lists the game the log names those settings (limit, frame time limit, scanline sync, display
+  sync, Reflex sleep, passive wait) once per change. Every orderly exit puts the profile back as it was before the run
+  (`rtss_limit_restore`), and no want reaches it after that; a kill, the device-lost watchdog or a crash inside the
+  crash handler leaves the game's limit in the profile, and the next run takes it for the player's own.
+- Measuring pacing: `NX2NAVI_TRACE=present` logs a line per picture (the host present's interval, the game's present
+  interval, the wait for the slot and how far past it the present went), `NX2NAVI_TRACE=perf` each wait's share of the
+  frame ("bound:"), and `tools/perf_summary.py` condenses both. Both measure before the host present, so a wait RTSS
+  adds inside it does not show there: PresentMon is the reference for what reached the screen. Compare runs with the
+  same executable name, cache state and save, and keep `trace` off when counting hitches; `NX2NAVI_MEM_CENSUS` and
+  the memory report every 3600 frames are the runtime's own hitches.
 - Low latency (`vk_lowlat.c`, `NX2NAVI_LOW_LATENCY`, off by default): the graphics driver holds each frame's start, so
   the pad is read as late as the picture's time allows and no finished picture waits. NVIDIA's mode runs through
   `VK_NV_low_latency2`: the window's swapchain is made with the latency mode, the frame sleeps in the driver before its

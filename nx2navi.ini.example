@@ -25,9 +25,13 @@
 # fps_limit = 60
 # Where RivaTuner Statistics Server is installed and running, the limit goes into its profile for the game's
 # executable and RTSS does the limiting instead of the game; closing the game puts back what the profile held.
-# Changing that profile needs the game run as administrator (RTSS keeps its profiles under Program Files); without
-# it, or with frame generation on, the game limits by itself, and also when RTSS's own frame counter shows the game
-# well past the limit (RTSS then hooks the game without holding it back). rtss = 0 always leaves it to the game.
+# Changing that profile needs the game run as administrator (RTSS keeps its profiles under Program Files). Without it
+# the game limits by itself, as it does with frame generation on (RTSS would count the generated frames) and for the
+# rest of the run when RTSS's own frame counter shows the game well past the limit (RTSS then hooks the game without
+# holding it back); with low latency on, the driver holds the limit. rtss = 0 always leaves it to the game. With
+# rtss = 0, frame generation or low latency, a limit set in RTSS itself (its global profile or the game's, a frame time
+# limit or scanline sync) limits the game a second time: the log and the settings menu say so, and setting it to 0 in
+# RTSS leaves one limiter.
 # rtss = 1
 # 1: asks RTSS's EnumProfiles whether the game's profile exists, instead of looking for its file. EnumProfiles crashes
 # the game (RTSS keeps a pointer of the game's in 32 bits); only for testing an RTSS that fixed it.

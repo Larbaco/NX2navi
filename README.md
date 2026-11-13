@@ -38,7 +38,8 @@ Report problems as issues, following [CONTRIBUTING.md](CONTRIBUTING.md).
   display; in a window of another shape than the picture, frames are generated inside the picture only, so the black
   bars stay clean. The frame limit counts the frames the game draws, and frame generation adds its
   frames on top of it. The frame limit can also be
-  handed to RivaTuner Statistics Server
+  handed to RivaTuner Statistics Server, which then limits the game in its place; where frame generation or low
+  latency keeps it out, the game says when a limit set in RivaTuner itself holds the game as well
 - HDR on HDR displays, two kinds: the game's scene tone mapped to the display's peak, matched to the game's mid grey and tone, with true blacks, or the game's own native HDR; peak, game and HUD brightness in the menu
 - The game's known shaders prepared when the game is built, and the pipelines met in play built again in the
   background at each start, so play rarely stops to compile them; a shader or pipeline met for the first time can
