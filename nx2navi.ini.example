@@ -69,6 +69,11 @@
 # on moving platforms (the Deku Tree's floating one). 1 makes the floor carry him as at 60 fps at any frame rate; 0 is
 # the game's own cut. Read at start; needs game code generated with this release.
 # floor_carry = 1
+# The ocarina's recorder counts how long each note and rest lasts in 60 Hz frames, and the game cut each frame's step
+# to a whole number: above 60 fps that was 0, so a recorded performance lost its rests and the recorder's time limits
+# never came, and at the 40 and 45 fps limits it counted slow. 1 keeps the fraction for the next frame, 60 a second at
+# any frame rate; 0 is the game's own count. Read at start; needs game code generated with this release.
+# ocarina_timing = 1
 # A movie's narration and fades follow the picture on screen: 1 counts their time from the shown picture's
 # timestamp, so they stay with it at any frame rate (with movie_fps = 0 too) and wait when the picture stalls; 0 counts
 # the game's redraws, as before, which keeps them with the music when the picture stalls. Read at start; needs game

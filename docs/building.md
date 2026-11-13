@@ -550,6 +550,17 @@ words each setting writes and the set it switches, the skip site's decide bit an
 player may skip and one the game keeps from skipping, the speed site's factor for that typewriter and no other, the
 registers and flags both sites leave alone, and a start that kept the set off. No game files.
 
+A change to the ocarina recorder's clock (the set `orecord` of `recomp/patches-v111.txt`, `ocarina_timing`) passes
+`python tests\ocarina_timing_check.py --cc <clang>` (`.venv`, Unicorn): it checks the set's four sites, their original
+word and nine replacement words, the page word resolved to the patch page at each site and no other set's word on the
+page's +264; it lifts the words and runs them against the game's word and a float32 model: steps of one and two frames
+give the game's count with the fraction left at 0, the steps of the 40 to 240 fps limits count 3600 frames a minute
+(0 and 1 in turn at 120, 5 in every 12 updates at 144, 1 in every 4 at 240), NaN, negative, infinite and huge steps
+give the game's count, and only x8, v16-v18 and FPSR change; and it runs the nine words in Unicorn at each site against
+the lifted C over 10,000 random steps and fractions, comparing registers and the page bit for bit. It does not cover
+the sites inside their functions: a regenerate of the game code does, and its check of the original words. No game
+files.
+
 A change to the mouse camera (`runtime/mouse_direct.c`, the mouse path of `runtime/input.c`, the set `mouse_direct` of
 `recomp/patches-v111.txt` or `patches-v143.txt`) passes `python tests\mouse_direct_check.py --cc <clang> --deps
 <ucrt64>\include`, which builds `mouse_direct.c`, and `input.c` with `--deps`, with the rest of the runtime stubbed and
