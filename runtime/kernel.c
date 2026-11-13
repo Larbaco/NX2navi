@@ -49,7 +49,9 @@ enum { W_NONE = KERN_WAIT_NONE, W_LOCK = KERN_WAIT_LOCK, W_CONDVAR = KERN_WAIT_C
 enum { S_OFF, S_RUN, S_CORE, S_HOST, S_SLEEP, S_SYNC, S_CV, S_LOCK, S_ADDR, S_N };
 static const char *const s_name[S_N] = {"off", "run", "core", "host", "sleep", "sync", "cv", "lock", "addr"};
 
-typedef struct Event { int signaled, refs; } Event;
+// serial: a number no other Event of the run gets (set holding G), so a kept writable handle can be checked to still
+// name the Event it named when it was kept (kern_bind_system_event, system_event_set).
+typedef struct Event { int signaled, refs; uint64_t serial; } Event;
 typedef struct Fiber Fiber;
 
 struct RtThread {
@@ -125,6 +127,7 @@ _Static_assert(offsetof(RtThread, preempt) == 0, "host.h kern_preempt_pending re
 _Static_assert(offsetof(RtThread, host_depth) == sizeof(int), "host.h kern_host_depth reads the second int");
 static RtThread *g_all, *g_wait, *g_main;
 static uint64_t g_next_id = 0x51, g_wseq, g_created;
+static uint64_t g_ev_serial;   // the last Event's serial number (holding G)
 static uint64_t g_main_stack;
 
 static void lock(void) { plat_mutex_lock(&G); }
@@ -1940,6 +1943,7 @@ static int kern_svc_inner(Cpu *c, uint32_t imm) {
         if (!e) rt_fatal("kernel: event allocation");
         e->refs = 2;
         lock();
+        e->serial = ++g_ev_serial;
         uint32_t hw = h_new(O_EVENT_W, e), hr = h_new(O_EVENT_R, e);
         unlock();
         x[0] = R_OK;
@@ -2091,6 +2095,7 @@ uint32_t kern_event_new(void) {
     if (!e) rt_fatal("kernel: event allocation");
     e->refs = 1;
     lock();
+    e->serial = ++g_ev_serial;
     uint32_t hw = h_new(O_EVENT_W, e);
     unlock();
     return hw;
@@ -2130,8 +2135,13 @@ void kern_event_clear(uint32_t hw) {
 // activate and deactivate events before each detection. nn::os::DestroySystemEvent zeroes the state byte at +0x28
 // (0 not initialised, 1 event, 2 inter-process event; nn::os::TryWaitSystemEvent aborts on 0) and closes both
 // handles, so a kept handle counts only while that byte is nonzero.
+// Each entry also keeps the serial number of the Event its handle named at bind time (h_new hands a closed number to
+// the next new object at once, so the number alone does not say it is still that event), and whether the object lies
+// in guest memory: host services keep some in their own allocations (ov_movie2.c Video.in_ev/out_ev, net_offline.c
+// HostTask.event), which mem_readable does not know and the SDK never destroys.
+// Lock order: G before g_se_lock (system_event_set); kern_bind_system_event never holds both.
 #define SE_STATE 0x28
-static struct { uint64_t ev; uint32_t wh; } g_se[512];
+static struct { uint64_t ev, serial; uint32_t wh; uint8_t guest; } g_se[512];
 static int g_nse;
 static PlatMutex g_se_lock = PLAT_MUTEX_INIT;
 
@@ -2139,18 +2149,23 @@ static int se_live(uint64_t ev) {
     return __atomic_load_n((const uint8_t *)(uintptr_t)(ev + SE_STATE), __ATOMIC_RELAXED) != 0;
 }
 
-static uint32_t se_find(uint64_t ev) {
+// The entry's writable handle, 0 when ev is not bound; *serial (when not NULL) gets the Event's serial number.
+static uint32_t se_find(uint64_t ev, uint64_t *serial) {
     plat_mutex_lock_shared(&g_se_lock);
     uint32_t wh = 0;
-    for (int i = 0; i < g_nse && !wh; i++)
-        if (g_se[i].ev == ev) wh = g_se[i].wh;
+    for (int i = 0; i < g_nse; i++)
+        if (g_se[i].ev == ev) {
+            wh = g_se[i].wh;
+            if (serial) *serial = g_se[i].serial;
+            break;
+        }
     plat_mutex_unlock_shared(&g_se_lock);
     return wh;
 }
 
 // A bound event the guest destroyed since is created again and its table entry takes the new writable handle.
 void kern_bind_system_event(Cpu *c, uint64_t ev, int autoclear) {
-    if (se_find(ev) && se_live(ev)) return;
+    if (se_find(ev, NULL) && se_live(ev)) return;
     if (!tcur || !c) rt_fatal("kern_bind_system_event(%#llx) on a host thread", (unsigned long long)ev);
     static uint64_t create, getw;
     if (!create) {
@@ -2161,39 +2176,67 @@ void kern_bind_system_event(Cpu *c, uint64_t ev, int autoclear) {
     uint32_t r = (uint32_t)rt_call(c, create, 3, ev, (uint64_t)(autoclear ? 1 : 0), (uint64_t)1);
     if (r) rt_fatal("kern_bind_system_event: CreateSystemEvent(%#llx) failed %#x", (unsigned long long)ev, r);
     uint32_t wh = (uint32_t)rt_call(c, getw, 1, ev);
+    lock();
+    Event *e = h_peek(wh, O_EVENT_W);
+    uint64_t serial = e ? e->serial : 0;   // 0 matches no Event: such an entry is never signalled
+    unlock();
+    uint8_t guest = (uint8_t)mem_readable(ev + SE_STATE, 1);
     plat_mutex_lock(&g_se_lock);
     int i = 0;
     while (i < g_nse && g_se[i].ev != ev) i++;
     if (i == g_nse && g_nse == (int)(sizeof g_se / sizeof *g_se)) {
         // Full: entries are never removed, and a long session binds events at new addresses (two per reload of a
-        // save). An entry whose event the guest destroyed (its state byte is 0, or its memory is gone) gives its slot.
+        // save). An entry in guest memory whose event the guest destroyed (its state byte is 0, or its memory is gone)
+        // gives its slot. Entries in host memory count as live: their services never destroy them through the SDK, and
+        // taking a live one would make the service's next signal bind again on a host thread, which is fatal.
         i = 0;
-        while (i < g_nse && mem_readable(g_se[i].ev + SE_STATE, 1) && se_live(g_se[i].ev)) i++;
+        while (i < g_nse && (!g_se[i].guest || (mem_readable(g_se[i].ev + SE_STATE, 1) && se_live(g_se[i].ev)))) i++;
         if (i == g_nse) rt_fatal("kern_bind_system_event: table full (%d live system events)", g_nse);
         g_se[i].ev = ev;
     } else if (i == g_nse) {
         g_se[g_nse++].ev = ev;
     }
     g_se[i].wh = wh;
+    g_se[i].serial = serial;
+    g_se[i].guest = guest;
     plat_mutex_unlock(&g_se_lock);
+}
+
+// Sets (set 1, waking its waiters) or clears a bound event, holding G from reading the entry to the change. It acts
+// only while the entry's writable handle still names the Event the binder saw: DestroySystemEvent closes both handles
+// under G, and the closed number goes to the next new object at once, so a stale entry would otherwise end the process
+// (kern_event_signal's fatal on a closed handle) or set an unrelated event. A stale entry is skipped and logged once.
+static void system_event_set(uint64_t ev, int set) {
+    static int told;
+    int tell = 0;
+    lock();
+    uint64_t serial = 0;
+    uint32_t wh = se_find(ev, &serial);
+    Event *e = wh ? h_peek(wh, O_EVENT_W) : NULL;
+    if (e && e->serial == serial) {
+        e->signaled = set;
+        if (set) wake_sync_waiters(e);
+    } else if (wh && !told) {
+        told = tell = 1;
+    }
+    unlock();
+    if (tell)
+        rt_log("kernel: system event %#llx: its kept handle %#x no longer names its event; %s skipped (logged once)",
+               (unsigned long long)ev, wh, set ? "signal" : "clear");
 }
 
 // An event not bound yet is bound on the spot with manual clear, which needs a guest thread. A bound event the guest
 // destroyed is not signalled: its handles are closed and the kernel hands their numbers to new objects.
 void kern_signal_system_event(uint64_t ev) {
-    uint32_t wh = se_find(ev);
+    uint32_t wh = se_find(ev, NULL);
     if (wh && !se_live(ev)) return;
-    if (!wh) {
-        kern_bind_system_event(kern_cpu(), ev, 0);
-        wh = se_find(ev);
-    }
-    kern_event_signal(wh);
+    if (!wh) kern_bind_system_event(kern_cpu(), ev, 0);
+    system_event_set(ev, 1);
 }
 
 // Clears a bound event (one never bound or since destroyed is left alone).
 void kern_clear_system_event(uint64_t ev) {
-    uint32_t wh = se_find(ev);
-    if (wh && se_live(ev)) kern_event_clear(wh);
+    if (se_find(ev, NULL) && se_live(ev)) system_event_set(ev, 0);
 }
 
 // ---- fibers
