@@ -52,10 +52,10 @@ static int fails;
 typedef struct {
     int exists;
     DWORD limit, denom;   // FramerateLimit and FramerateLimitDenominator: Limit and LimitDenominator in the file
-    int time, time_den, scan0, scan1;
+    int time, time_den, scan0, scan1, sync_display, reflex, passive;
     DWORD stamp;
 } Prof;
-static Prof global = {1, 0, 1, 0, 0, 0, 0, 1}, own, loaded;
+static Prof global = {1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1}, own, loaded;
 static int no_denominator;   // an RTSS that does not know FramerateLimitDenominator
 static int readonly;         // SaveProfile does not reach the file (no administrator rights)
 static volatile LONG saves, deletes, updates, loads, created, removed;
@@ -190,6 +190,9 @@ DWORD stub_GetPrivateProfileStringA(LPCSTR sec, LPCSTR key, LPCSTR def, LPSTR ou
         else if (!strcmp(key, "LimitTimeDenominator")) v = f->time_den;
         else if (!strcmp(key, "SyncScanline0")) v = f->scan0;
         else if (!strcmp(key, "SyncScanline1")) v = f->scan1;
+        else if (!strcmp(key, "SyncDisplay")) v = f->sync_display;
+        else if (!strcmp(key, "ReflexSleep")) v = f->reflex;
+        else if (!strcmp(key, "PassiveWait")) v = f->passive;
         else have = 0;
     }
     if (have) return (DWORD)snprintf(out, n, "%ld", v);
@@ -307,7 +310,7 @@ static void restore_race(void) {
 
 // The same with the player's own profile: it keeps the player's limit.
 static void restore_player(void) {
-    own = (Prof){1, 30, 1, 0, 0, 0, 0, 1};
+    own = (Prof){1, 30, 1, 0, 0, 0, 0, 0, 0, 0, 1};
     app_set(1, 0xA, 1000, 2000, 60);
     ask(60000);
     poll();
@@ -383,7 +386,7 @@ static void kept_two(void) {
 // Low latency keeps RTSS out from the first present, with scanline sync set in the game's own profile (a negative line
 // counts from the bottom); once low latency is off, a limit starts RTSS's part as usual.
 static void kept_lowlat_then_limit(void) {
-    own = (Prof){1, 0, 1, 0, 0, -40, 0, 1};
+    own = (Prof){1, 0, 1, 0, 0, -40, 0, 0, 0, 0, 1};
     app_set(0, 0xA, 1000, 2000, 60);
     ask(RTSS_OUT_LOWLAT);
     poll();
@@ -494,6 +497,33 @@ static void not_installed(void) {
     CHECK(!loads && !saves && !own.exists, "nothing loaded or written");
 }
 
+// While RTSS lists the game, its settings for the game are logged once per change: Global's before the game has a
+// profile of its own, then the game's own with the limit it wrote, frame time limit, scanline sync and the modes.
+static int count(const char *text) {
+    int n = 0;
+    for (const char *p = logged_lines; (p = strstr(p, text)); p++) n++;
+    return n;
+}
+static void settings_logged(void) {
+    global.time = 16667, global.time_den = 1, global.sync_display = 1, global.reflex = 1, global.passive = 1;
+    app_set(0, 0xA, 1000, 2000, 60);
+    ask(60000);
+    poll();
+    CHECK(!count("settings for the game"), "not listed: nothing read");
+    app_set(1, 0xA, 1000, 2000, 60);
+    poll();
+    poll();
+    CHECK(logged("frame rate: RivaTuner Statistics Server's settings for the game (Profiles\\ocarina.exe.cfg): limit "
+                 "60/1, frame time limit 16667/1, scanline sync 0/0, display sync 1, Reflex sleep 1, passive wait 1\n"),
+          "the game's profile, with what it took from Global");
+    CHECK(count("settings for the game") == 1, "logged once while nothing changes (%d)", count("settings for the game"));
+    ask(144000);
+    poll();
+    poll();
+    CHECK(logged("(Profiles\\ocarina.exe.cfg): limit 144/1, frame time limit 16667/1"), "logged again on a change");
+    CHECK(count("settings for the game") == 2, "once per change (%d)", count("settings for the game"));
+}
+
 static const struct { const char *name; void (*run)(void); } scenarios[] = {
     {"restore_race", restore_race},
     {"restore_player", restore_player},
@@ -508,6 +538,7 @@ static const struct { const char *name; void (*run)(void); } scenarios[] = {
     {"round_logged_whole", round_logged_whole},
     {"start_off_present", start_off_present},
     {"not_installed", not_installed},
+    {"settings_logged", settings_logged},
 };
 
 int main(int argc, char **argv) {

@@ -10,7 +10,7 @@ static int fails;
 
 // RTSS's own settings: which of them hold the game's frames, and the log's text of them.
 static void settings(void) {
-    RtssSettings none = {0, 1, 0, 0, 0, 0};
+    RtssSettings none = {0, 1, 0, 0, 0, 0, 1, 1, 1};
     CHECK(!rtss_settings_limit(&none), "no limit, no frame time limit, no scanline sync: RTSS holds nothing");
     RtssSettings s = none;
     s.limit = 50;
@@ -23,13 +23,20 @@ static void settings(void) {
     CHECK(rtss_settings_limit(&s), "the second scanline sync holds the frames");
     s = none, s.limit_den = 1000, s.time_den = 7;
     CHECK(!rtss_settings_limit(&s), "denominators alone hold nothing");
-    char text[128];
-    s = (RtssSettings){59940, 1000, 16667, 1, -40, 0};
-    rtss_settings_text(text, sizeof text, &s);
+    CHECK(!rtss_settings_limit(&none), "display sync, Reflex sleep and passive wait alone hold nothing");
+    char text[192];
+    s = (RtssSettings){59940, 1000, 16667, 1, -40, 0, 1, 2, 0};
+    rtss_settings_text(text, sizeof text, &s, 0);
     CHECK(!strcmp(text, "limit 59940/1000, frame time limit 16667/1, scanline sync -40/0"), "text: %s", text);
-    char small[16];
-    rtss_settings_text(small, sizeof small, &s);
+    rtss_settings_text(text, sizeof text, &s, 1);
+    CHECK(!strcmp(text, "limit 59940/1000, frame time limit 16667/1, scanline sync -40/0, display sync 1, Reflex sleep 2, "
+                        "passive wait 0"),
+          "text with the modes: %s", text);
+    char small[16], mid[70];
+    rtss_settings_text(small, sizeof small, &s, 1);
     CHECK(strlen(small) == sizeof small - 1, "a short buffer is cut, not overrun");
+    rtss_settings_text(mid, sizeof mid, &s, 1);
+    CHECK(strlen(mid) == sizeof mid - 1 && !strncmp(mid, text, sizeof mid - 1), "the modes cut at the buffer's end");
 }
 
 // The kept-out reasons, for the log.

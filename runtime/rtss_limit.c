@@ -255,7 +255,7 @@ static const char *fail_reason(int f) {
 // RTSS's own settings for the game, read from its profile file as RTSS keeps it: Profiles\<exe>.cfg, else
 // Profiles\Global, and a key the game's profile lacks from Global. The system's ini reader does it, so no call goes into
 // RTSS's hooks library, which a run that keeps RTSS out never loads. The files are read again only when the time
-// either was written changes. Worker thread only.
+// either was written changes. Worker thread only, while RTSS lists the game (watch).
 static RtssSettings settings;
 static char settings_file[MAX_PATH + 16];   // which file they came from, as Profiles\<name>
 
@@ -283,23 +283,35 @@ static void read_settings(void) {
     const char *p = a ? own : NULL;
     settings = (RtssSettings){cfg_int(p, global, "Limit"), cfg_int(p, global, "LimitDenominator"),
                               cfg_int(p, global, "LimitTime"), cfg_int(p, global, "LimitTimeDenominator"),
-                              cfg_int(p, global, "SyncScanline0"), cfg_int(p, global, "SyncScanline1")};
+                              cfg_int(p, global, "SyncScanline0"), cfg_int(p, global, "SyncScanline1"),
+                              cfg_int(p, global, "SyncDisplay"), cfg_int(p, global, "ReflexSleep"),
+                              cfg_int(p, global, "PassiveWait")};
     if (a) snprintf(settings_file, sizeof settings_file, "Profiles\\%s.cfg", profile);
     else snprintf(settings_file, sizeof settings_file, "Profiles\\Global");
 }
 
-// While RTSS is kept out (w < 0) the game's own limiter, the driver's low latency or frame generation holds the frames,
-// and a limit the player set in RTSS itself for the game (its global profile or the game's own, a frame time limit or
-// scanline sync) still holds them a second time. Logged once per change and shown in the menu (rtss_limit_state 4).
+// While RTSS lists the game, the settings it holds for it are logged once per change: what RTSS applies may be more than
+// the FramerateLimit the game writes (a frame time limit, scanline sync, its own Reflex). While RTSS is kept out
+// (w < 0) the game's own limiter, the driver's low latency or frame generation holds the frames, and a limit the player
+// set in RTSS itself for the game (its global profile or the game's own, a frame time limit or scanline sync) still
+// holds them a second time. Logged once per change and shown in the menu (rtss_limit_state 4).
 static void watch(int64_t w, int listed) {
-    static int said, lines;
-    static char said_text[128];
+    static int said, lines, settings_lines;
+    static char said_text[128], said_settings[MAX_PATH + 256];
     int on = 0;
     char text[128] = "";
-    if (w < 0 && listed) {
+    if (listed) {
         read_settings();
+        char all[MAX_PATH + 256], modes[192];
+        rtss_settings_text(modes, sizeof modes, &settings, 1);
+        snprintf(all, sizeof all, "(%s): %s", settings_file, modes);
+        if (strcmp(all, said_settings) && settings_lines++ < 40)
+            rt_log("frame rate: RivaTuner Statistics Server's settings for the game %s", all);
+        snprintf(said_settings, sizeof said_settings, "%s", all);
+    }
+    if (w < 0 && listed) {
         on = rtss_settings_limit(&settings);
-        rtss_settings_text(text, sizeof text, &settings);
+        rtss_settings_text(text, sizeof text, &settings, 0);
     }
     if (w >= 0) said = 0;   // a later kept-out want logs afresh
     else if (on != said || (on && strcmp(text, said_text))) {

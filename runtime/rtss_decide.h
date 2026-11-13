@@ -30,16 +30,22 @@ static inline const char *rtss_out_limiter(int64_t want) {
 
 // RTSS's own [Framerate] settings for the game, as its profile file holds them (rtss_limit.c read_settings): a frame
 // rate limit (Limit over LimitDenominator), a frame time limit (LimitTime over LimitTimeDenominator) and scanline sync
-// (SyncScanline0 and SyncScanline1); 0 is off for each.
+// (SyncScanline0 and SyncScanline1), 0 off for each; and the modes beside them, for the log: SyncDisplay, ReflexSleep
+// and PassiveWait.
 typedef struct {
     int limit, limit_den, time, time_den, scan0, scan1;
+    int sync_display, reflex_sleep, passive_wait;
 } RtssSettings;
 
 // RTSS holds the game's frames by a setting of its own.
 static inline int rtss_settings_limit(const RtssSettings *s) { return s->limit || s->time || s->scan0 || s->scan1; }
 
-// "limit L/D, frame time limit T/TD, scanline sync S0/S1", the values as the file holds them.
-static inline void rtss_settings_text(char *out, size_t n, const RtssSettings *s) {
-    snprintf(out, n, "limit %d/%d, frame time limit %d/%d, scanline sync %d/%d", s->limit, s->limit_den, s->time,
-             s->time_den, s->scan0, s->scan1);
+// "limit L/D, frame time limit T/TD, scanline sync S0/S1", and with modes ", display sync X, Reflex sleep R, passive
+// wait P": the values as the file holds them.
+static inline void rtss_settings_text(char *out, size_t n, const RtssSettings *s, int modes) {
+    int k = snprintf(out, n, "limit %d/%d, frame time limit %d/%d, scanline sync %d/%d", s->limit, s->limit_den, s->time,
+                     s->time_den, s->scan0, s->scan1);
+    if (modes && k >= 0 && (size_t)k < n)
+        snprintf(out + k, n - (size_t)k, ", display sync %d, Reflex sleep %d, passive wait %d", s->sync_display,
+                 s->reflex_sleep, s->passive_wait);
 }
