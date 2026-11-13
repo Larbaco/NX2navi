@@ -309,8 +309,8 @@ uint64_t frame_step_cap_ns(void) {
             else rt_log("frame rate: the movie ended: the frame limit again");
         }
     }
-    if (limit_hz == -2 && !movie_hz && !frame_free_running()) {   // unlimited: the pacer does not hold frames, and
-        rtss_limit_want(rtss_out ? rtss_out : 0);                    // RTSS's limit is cleared
+    if (limit_hz == -2 && !movie_hz && !frame_free_running()) {   // unlimited: the pacer does not hold frames
+        rtss_limit_want(rtss_out);   // kept out (RTSS_OUT_*), or 0: RTSS's limit is cleared
         paced_hz = 0;
         return 0;
     }
