@@ -6063,17 +6063,47 @@ void vk_mem_note_submit(uint64_t timeline_value) {
 // The objects go once cmd_lock is released: destroying an image and its memory takes up to milliseconds (the
 // collect's 0.3 slow ones a frame took a median 0.26-0.43 ms, up to 1.9 ms), and the replay's uploads
 // (vk_upload_begin) wait for cmd_lock. So do the finalized pools (pool_dead): destroyed here only, until shutdown.
-void vk_mem_collect(void) {
-    VkCtx *c = vk_ctx();
-    if (!c) return;
-    plat_once(&cmd_once, cmd_init, NULL);
+static void collect_held(VkCtx *c) {   // cmd_lock held; released here
     Dead *out = NULL;
     int nout = 0, cout = 0;
-    plat_rmutex_lock(&cmd_lock);
     collect_locked_out(c, &out, &nout, &cout);
     plat_rmutex_unlock(&cmd_lock);
     for (int i = 0; i < nout; i++) destroy_dead(c, &out[i]);
     free(out);
+}
+
+void vk_mem_collect(void) {
+    VkCtx *c = vk_ctx();
+    if (!c) return;
+    plat_once(&cmd_once, cmd_init, NULL);
+    plat_rmutex_lock(&cmd_lock);
+    collect_held(c);
+    pool_dead_drain(c);
+}
+
+// The completion thread's collect (vk_sync.c completion_main), after each new done. It only tries cmd_lock: an upload
+// flush holds that lock while it waits for the queue lock behind a present (FIFO, a frame limiter inside the present
+// call, frame generation) or for its batches' fences, and the single completion thread waiting there held back the
+// next value's done and every fence waiter for it. The deferred objects then go at a later completion, or with any
+// upload flush (collect_locked); after COLLECT_TRY_MAX busy tries in a row it waits as vk_mem_collect does, which
+// keeps the deferred list bounded. The finalized pools need only retire_lock: they go either way.
+#define COLLECT_TRY_MAX 8
+static uint64_t collect_skips;   // collects that found cmd_lock busy, so far (the "mem: sizes" line)
+void vk_mem_collect_try(void) {
+    static int busy;   // busy tries in a row; the completion thread is the only caller
+    VkCtx *c = vk_ctx();
+    if (!c) return;
+    plat_once(&cmd_once, cmd_init, NULL);
+    if (!plat_rmutex_trylock(&cmd_lock)) {
+        if (++busy <= COLLECT_TRY_MAX) {
+            __atomic_add_fetch(&collect_skips, 1, __ATOMIC_RELAXED);
+            pool_dead_drain(c);
+            return;
+        }
+        plat_rmutex_lock(&cmd_lock);
+    }
+    busy = 0;
+    collect_held(c);
     pool_dead_drain(c);
 }
 
@@ -6175,6 +6205,8 @@ void vk_mem_sizes(PerfSizes *s) {
     perf_size(s, "deferred destructions", dead_n, 0, PERF_SIZE_NONE);
     perf_size(s, "finalized pools destroyed after the GPU", __atomic_load_n(&n_pool_destroyed, __ATOMIC_RELAXED), 0,
               PERF_SIZE_NONE);
+    perf_size(s, "completion collects that found the upload lock busy",
+              __atomic_load_n(&collect_skips, __ATOMIC_RELAXED), 0, PERF_SIZE_NONE);
     perf_size(s, "upload batches in flight", infl, 0, PERF_SIZE_NONE);
     perf_size(s, "spare upload batches", spare_b, 0, PERF_SIZE_NONE);
     perf_size(s, "staging cache", stg_n, STG_CACHE, stg_b);

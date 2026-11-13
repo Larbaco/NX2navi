@@ -1052,7 +1052,8 @@ static void completion_main(void *arg) {
             // The waiters go first (a fence wait, the frame's first submission, the acquire): freeing what the
             // finished submissions held (vk_mem_collect: upload batches, destroyed images, views and buffers, each
             // checked against the timeline itself) is nothing they read, and it takes cmd_lock, which the upload
-            // path holds, so done waited behind uploads.
+            // path holds, so done waited behind uploads. It only tries that lock (vk_mem_collect_try): an upload flush
+            // can hold it while it waits behind a present for the queue lock, and the next value's done waited too.
             uint64_t tv = __atomic_load_n(&tail_val, __ATOMIC_ACQUIRE);
             if (tv && reached >= tv) {   // the tail a wait went ahead of is through: how long it took from there
                 uint64_t d = kern_now_ns() - __atomic_load_n(&tail_t0, __ATOMIC_RELAXED), a = tail_ns;
@@ -1064,7 +1065,7 @@ static void completion_main(void *arg) {
             plat_cond_broadcast(&cv_done);
             for (uint64_t v = reached - was > GW_RING ? reached - GW_RING + 1 : was + 1; v <= reached; v++) gw_mark(v, 2);
             plat_mutex_unlock(&st_lock);
-            vk_mem_collect();
+            vk_mem_collect_try();
             plat_mutex_lock(&st_lock);
         }
     }

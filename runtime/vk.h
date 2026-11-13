@@ -609,6 +609,7 @@ void vk_astc_release(void);             // vk_device.c, before the device goes: 
 void vk_mem_note_submit(uint64_t timeline_value);  // vk_sync.c: after each submit that signals ctx->timeline with this value
 void vk_mem_oom_report(const char *what, VkResult r);   // logs heaps and upload batches after an out-of-memory failure
 void vk_mem_collect(void);                         // frees what has completed
+void vk_mem_collect_try(void);                     // the same, unless the upload lock is busy (completion thread)
 typedef struct { uint64_t imported_pools, physical_pools, virtual_pools, import_failures, upload_batches; } VkMemStats;
 void vk_mem_stats(VkMemStats *s);
 void vk_mem_shutdown(void);                        // before vk_shutdown: waits idle, frees every memory and texture object
