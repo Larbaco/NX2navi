@@ -273,10 +273,11 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   driver's low latency and `NX2NAVI_RTSS=0` keep RTSS out (`RTSS_OUT_*`): the profile gets back what it held before
   the run changed it, and while RTSS is kept out its thread does not load the hooks library and only reads RTSS's own
   settings for the game; a later limit (frame generation or low latency switched off) loads it and hands RTSS the limit
-  as usual, and `NX2NAVI_RTSS=0` keeps the thread read-only for the run. While RTSS lists the game the log names those settings (limit, frame time limit, scanline sync, display
-  sync, Reflex sleep, passive wait) once per change. Every orderly exit puts the profile back as it was before the run
-  (`rtss_limit_restore`), and no want reaches it after that; a kill, the device-lost watchdog or a crash inside the
-  crash handler leaves the game's limit in the profile, and the next run takes it for the player's own.
+  as usual, and `NX2NAVI_RTSS=0` keeps the thread read-only for the run. While RTSS lists the game the log names those
+  settings (limit, frame time limit, scanline sync, display sync, Reflex sleep, passive wait) once per change. Every
+  orderly exit puts the profile back as it was before the run (`rtss_limit_restore`), and no want reaches it after
+  that; a kill, the device-lost watchdog or a crash inside the crash handler leaves the game's limit in the profile,
+  and the next run takes it for the player's own.
 - Measuring pacing: `NX2NAVI_TRACE=present` logs a line per picture (the host present's interval, the game's present
   interval, the wait for the slot and how far past it the present went), `NX2NAVI_TRACE=perf` each wait's share of the
   frame ("bound:"), and `tools/perf_summary.py` condenses both. Both measure before the host present, so a wait RTSS

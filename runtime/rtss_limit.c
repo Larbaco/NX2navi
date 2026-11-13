@@ -68,7 +68,7 @@ static RtssState S = RTSS_STATE_INIT;   // the worker's decisions (rtss_decide.h
 static int has_denominator;   // this RTSS knows FramerateLimitDenominator
 static int had_profile;       // the profile existed before this run changed it
 static DWORD old_limit, old_denominator = 1;
-static int creations, removals;   // the profile's "created" and "removed" lines this run, numbered for the log (under lock)
+static int creations, removals;   // the profile's "created" and "removed" lines this run, numbered (under lock)
 
 // RTSS's shared memory as rtss_parse reads it: whether RTSS runs, whether it lists this process, and its frame count.
 static void rtss_map(RtssApp *a) {
@@ -201,8 +201,8 @@ static int apply(void *ctx, int64_t mhz, int first, int clear) {
 static void put_back(void) {
     if (!had_profile) {
         delete_profile(profile);
-        rt_log("frame rate: RivaTuner Statistics Server profile %s removed, as before the game started (removal %d this "
-               "run)", profile, ++removals);
+        rt_log("frame rate: RivaTuner Statistics Server profile %s removed, as before the game started "
+               "(removal %d this run)", profile, ++removals);
     } else if (write_limit(old_limit, old_denominator) > 0) {
         rt_log("frame rate: RivaTuner Statistics Server profile %s has its limit of %lu/%lu back", profile, old_limit,
                old_denominator);
@@ -342,8 +342,8 @@ static int find_rtss(void) {
     if (first >= 0)
         rt_log("frame rate: RivaTuner Statistics Server found in %s; it takes the frame limit while it runs", dir);
     else
-        rt_log("frame rate: RivaTuner Statistics Server found in %s; kept out (%s), and while it is kept out its thread "
-               "only reads RTSS's own settings for the game, to tell when RTSS limits it a second time", dir,
+        rt_log("frame rate: RivaTuner Statistics Server found in %s; kept out (%s), and while it is kept out its "
+               "thread only reads RTSS's own settings for the game, to tell when RTSS limits it a second time", dir,
                rtss_out_text(first));
     return 1;
 }

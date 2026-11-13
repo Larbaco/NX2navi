@@ -460,8 +460,8 @@ static void active_race(void) {
 }
 
 // Frame generation switched on while the worker writes the first limit: RTSS holds that limit, but the game's limiter
-// paces the kept-out want, so the log must not say RTSS does the limiting; the next poll logs the kept-out line. A later
-// limit is held and logged as usual.
+// paces the kept-out want, so the log must not say RTSS does the limiting; the next poll logs the kept-out line. A
+// later limit is held and logged as usual.
 static void framegen_on(void) { rtss_limit_want(RTSS_OUT_FRAMEGEN); }
 static void active_logged(void) {
     app_set(1, 0xA, 1000, 2000, 60);
@@ -473,7 +473,8 @@ static void active_logged(void) {
     CHECK(!logged("does the limiting"), "no line says RTSS does the limiting");
     poll();
     show("the next poll");
-    CHECK(logged("the game's own limiter (RivaTuner Statistics Server kept out: frame generation)"), "the kept-out line");
+    CHECK(logged("the game's own limiter (RivaTuner Statistics Server kept out: frame generation)"),
+          "the kept-out line");
     CHECK(!logged("does the limiting"), "still no line says RTSS does the limiting");
     ask(60000);
     poll();
@@ -596,7 +597,8 @@ static void readonly_two(void) {
     poll();
     global.limit = 0, touch(&global);
     poll();
-    CHECK(logged("RivaTuner Statistics Server no longer limits the game beside the game's limiter"), "logged once it ended");
+    CHECK(logged("RivaTuner Statistics Server no longer limits the game beside the game's limiter"),
+          "logged once it ended");
     CHECK(rtss_limit_state() == 2, "the administrator note again");
 }
 
