@@ -3336,9 +3336,10 @@ static void commit_evict(void) {   // tex_lock held, the commit is low and the r
 // 989 and then 2,172 released entries holding 9.2 and 10.1 GiB against a bound of 4,008 MiB, and its overwritten
 // render targets "last used 1 presents ago". Each entry counts once, under the first reason that holds.
 // The same line, at most every REL_CENSUS_ROOM_NS of wall time and REL_CENSUS_ROOM_LINES times a run, while they hold
-// more than the bound itself but not a quarter more than what they may keep (room 1): with room on the card trl_keep
-// lets them keep twice the bound, and a session that held 7,150 MiB against a bound of 4,008 MiB (2026-11-13) never
-// logged what kept them.
+// more than the bound itself but not a quarter more than what they may keep (room 1), and only while trl_keep lets
+// them keep more than the bound: with room on the card it lets them keep twice the bound, and a session that held
+// 7,150 MiB against a bound of 4,008 MiB (2026-11-13) never logged what kept them. Without that room what they may
+// keep is the bound, and the line said "kept past it while the card has room" of entries drop_stale was taking.
 #define REL_CENSUS_SUBS 3600
 #define REL_CENSUS_LINES 24
 #define REL_CENSUS_ROOM_NS 60000000000ull
@@ -3459,7 +3460,7 @@ static void sweep_pressure(void) {   // tex_lock held
                                      commit_free_now, commit_low_mark));
         if (rel_bytes > keep) drop_stale(keep, &n_cap_drops, DROP_CAP);
         if (keep != UINT64_MAX && rel_bytes > keep + keep / 4) rel_census(keep, 0);   // well over it: what holds the rest
-        else if (cap != UINT64_MAX && rel_bytes > cap) rel_census(cap, 1);
+        else if (keep > cap && rel_bytes > cap) rel_census(cap, 1);   // kept past the bound while the card has room
         if (rel_bytes > COMMIT_LOW_KEEP && low && !held)
             more = drop_stale(COMMIT_LOW_KEEP, &n_commit_drops, DROP_COMMIT) == PRESSURE_STEP;
     }
