@@ -318,13 +318,17 @@ static int readable(uint64_t a, uint64_t n) { return plat_mem_readable(a, n); }
 // capture tool or a post-processing injector, by the words such files carry in their names. A crash inside one is that
 // program's: one report was an access violation in a recorder's layer the moment the present mode changed and the
 // swapchain was made again, another an injector's layer reading a null pointer at the end of every shader
-// preparation.
+// preparation. Vulkan layers are mostly named VkLayer_<name>.dll, and a recorder's Vulkan hook and a driver's capture
+// tool carry names of their own (the words below). The validation layer is left out: the game loads it itself when
+// NX2NAVI_VK_VALIDATION asks.
 static int foreign_hook(const char *module) {
     char low[160];
     size_t n = 0;
     for (; module && module[n] && n < sizeof low - 1; n++) low[n] = (char)tolower((unsigned char)module[n]);
     low[n] = 0;
-    return strstr(low, "vk_layer") || strstr(low, "hook") || strstr(low, "overlay") || strstr(low, "reshade");
+    if (strstr(low, "vklayer_khronos")) return 0;
+    return strstr(low, "vk_layer") || strstr(low, "vklayer") || strstr(low, "hook") || strstr(low, "overlay") ||
+           strstr(low, "reshade") || strstr(low, "obs-vulkan") || strstr(low, "nvspcap");
 }
 
 // Set when main_run has returned: the mode's work is done and saved, and all that still runs is the C runtime's exit
