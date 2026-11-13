@@ -116,7 +116,9 @@ void perf_summary_flush(void);                  // prints the frame-time summary
 void perf_summary_flush_try(void);              // the same at a fatal error, the stutter map only if its lock is free
 void perf_focus_lost(void);                     // the window lost the focus: the session's reports at the next present, in play
 void gfx_exit_log(void);                        // back end's lines for the exit summary (weak no-op in prof_win.c)
-void gfx_window_closed(void);                   // gfx_present.c (gfx_wsys.h): the end of a closed window; does not return
+// gfx_present.c (gfx_wsys.h): the end of a closed window. It does not return, but for its own thread coming back
+// (gfx_present.c rt_exit_begin)
+void gfx_window_closed(void);
 // gfx_present.c: the orderly end every exit the game asks for shares (the window's close, svc.c ExitProcess, boot.c
 // --seconds). rt_exit_begin: 1 for the first caller; another thread waits there for good; 0 for that caller's own
 // thread again. rt_exit_steps: the saves and the put-backs, the slow pipeline save late and the final save flush last.

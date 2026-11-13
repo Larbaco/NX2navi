@@ -151,6 +151,11 @@ def static_checks():
         print(f'{name}: {"rt_exit_begin, then " + steps + ", then plat_exit" if ok else "FAIL"}'
               + (f'; calls exit steps of its own: {", ".join(own)}' if own else ''), flush=True)
         bad += not ok
+    # the guest's exit line comes after the guard: a thread the guard parks (a close already ending) logs no exit
+    code = strip_comments(exit07)
+    ok = 0 <= code.find('rt_exit_begin()') < code.find('rt_log(')
+    print(f'svc.c ExitProcess (0x07): its exit line after rt_exit_begin: {"ok" if ok else "FAIL"}', flush=True)
+    bad += not ok
     # the cheats rebuild's end, before the guest runs: the guard, RTSS, the boot's marker and journal, the summary
     cheats = (RT / 'cheats.c').read_text(encoding='utf-8')
     body = strip_comments(function(cheats, 'static void rebuild_if_needed(const char *dir)'))

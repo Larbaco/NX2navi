@@ -115,8 +115,9 @@ void gfx_window_focus_changed(int in) {
 // Once per process, whichever comes first. The window's close and the console's (main.c console_closed) can come
 // together, or the guest's ExitProcess beside either: each ran its own sequence, so two pipeline saves and two
 // frame-time summaries were written while both raced. 1 for the first caller; a caller on another thread waits here
-// for good while the first ends the process; 0 for the first caller's own thread coming back (a message the window
-// thread handles inside the sequence), which goes on with the sequence it is in.
+// for good while the first ends the process; 0 for the first caller's own thread coming back, which goes on with the
+// sequence it is in. The window's close runs on a thread of its own (gfx_window_win.c exit_start); the window thread
+// runs the sequence itself, and may handle a message inside it, only when that thread could not be made.
 static volatile uint32_t exit_tid;   // the thread that runs the orderly end, 0 before one started
 
 int rt_exit_begin(void) {

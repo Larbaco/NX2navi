@@ -240,11 +240,12 @@ static void svc_body(Cpu *c, uint32_t imm, uint64_t pc) {
     }
     case 0x29: get_info(c, pc); return;
     case 0x07: {   // ExitProcess, as closing the window: the orderly end (gfx_present.c rt_exit_steps), exit code 0
-        char at[160];
-        rt_log("guest ExitProcess at %s; exiting", ldr_describe(pc, at, sizeof at));
-        // once, shared with the window's close: a close already ending the process keeps this thread there; this
-        // thread coming back would resume guest code after its ExitProcess, so it ends the process instead
+        // once, shared with the window's close: a close already ending the process keeps this thread there, and the
+        // exit line is that close's alone; this thread coming back would resume guest code after its ExitProcess, so it
+        // ends the process instead
         if (!rt_exit_begin()) plat_exit(0);
+        char at[160];   // after the guard, which also lets the line reach the log file past its cap (main.c log_sink)
+        rt_log("guest ExitProcess at %s; exiting", ldr_describe(pc, at, sizeof at));
         rt_exit_steps(RT_EXIT_SETTINGS);
         fflush(NULL);
         if (svc_test_exit_hook) return svc_test_exit_hook(0);
