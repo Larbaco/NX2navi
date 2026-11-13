@@ -22,6 +22,10 @@ VkResult vk_dlssg_present(VkQueue q, const VkPresentInfoKHR *pi);
 void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext);   // each present, before its command buffer is submitted
 // Frames are numbered by the game's presents (frame n ends with the n-th). Reflex's frame timing while active:
 void vk_dlssg_frame_start(void);    // the game starts a frame (nvn_api_obj.c nvnWindowAcquireTexture): Reflex's sleep
+// The game presents (nvn_api_obj.c nvnQueuePresentTexture, through vk_backend.c vk_be_frame_paced) with the pacer's
+// period, 0 during a movie: 1 when Reflex holds the frame limit where the frame starts (dlssg_pace.h), so the pacer
+// keeps only the game's ceiling. Atomics only, no wait; 0 while DLSS-G does not run.
+int vk_dlssg_pace(uint64_t period_ns);
 void vk_dlssg_game_present(void);   // the game presents it (vk_backend.c vk_be_present): counts it
 // its submissions went out (vk_backend.c: vk_be_present, or replay_main with asynchronous replay): the render-submit-end
 // marker; frame is gfx_counters.frames of its present, the same count

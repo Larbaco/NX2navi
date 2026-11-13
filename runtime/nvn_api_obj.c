@@ -896,11 +896,17 @@ NVN_API(nvnQueuePresentTexture) {
     }
     if (hitch_every && o->presents % (uint64_t)hitch_every == 0) plat_wait_ns((uint64_t)hitch_ms * 1000000);
     uint64_t period = present_period(o), now = kern_now_ns();
-    // A driver's low-latency sleep (vk_lowlat.c) holds the next frame to the period where the frame starts, before
-    // its pad read, so this pacer holds nothing: the present goes out as soon as it is drawn and the image is free at
-    // once. A wait here as well would be a second one, after the picture is drawn. Not while a movie plays: its slots
-    // are kept through a late frame (pace), which only this pacer does, so the back end is told there is no period.
-    if (gfx_backend()->frame_paced && gfx_backend()->frame_paced(frame_step_movie_hz() > 0 ? 0 : period)) period = 0;
+    // A driver's low-latency sleep (vk_lowlat.c) or Reflex with DLSS Frame Generation (vk_dlssg.c) holds the next frame
+    // to the period where the frame starts, before its pad read, so this pacer holds at most the game's ceiling: the
+    // present goes out as soon as it is drawn and the image is free again at once, or a ceiling's period after its
+    // slot. A wait here as well would be a second one, after the picture is drawn. Not while a movie plays: its slots
+    // are kept through a late frame (pace), which only this pacer does, so the back end is told there is no period and
+    // the pacer keeps the movie's.
+    if (gfx_backend()->frame_paced) {
+        int movie = frame_step_movie_hz() > 0;
+        uint64_t held = gfx_backend()->frame_paced(movie ? 0 : period);
+        if (!movie) period = held;
+    }
     uint64_t slot = now + pace(&o->pace, now, period);
     gfx_backend()->present(t, o->crop, slot);
     o->ticket[idx] = o->presents;

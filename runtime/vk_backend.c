@@ -962,6 +962,14 @@ static void vk_be_frame_start(void) {
 }
 static void vk_be_input_read(void) { vk_lowlat_frame_start(1); }
 
+// The period nvnQueuePresentTexture's pacer keeps (GfxBackend.frame_paced). At most one of the two holds the limit in a
+// run: DLSS Frame Generation's Reflex, which leaves the pacer its ceiling, or a driver's low latency, which leaves it
+// nothing. Each lets go of the limit when given 0 (a movie plays).
+static uint64_t vk_be_frame_paced(uint64_t period_ns) {
+    if (vk_dlssg_pace(period_ns)) return frame_step_ceiling_ns();
+    return vk_lowlat_pace(period_ns) ? 0 : period_ns;
+}
+
 const GfxBackend gfx_vulkan_backend = {
     .name = "vulkan",
     .pool_init = vk_be_pool_init,
@@ -979,7 +987,7 @@ const GfxBackend gfx_vulkan_backend = {
     .present = vk_be_present,
     .frame_start = vk_be_frame_start,
     .input_read = vk_be_input_read,
-    .frame_paced = vk_lowlat_pace,
+    .frame_paced = vk_be_frame_paced,
     .finish = vk_be_finish,
     .read_texels = vk_be_read_texels,
     .write_texels = vk_be_write_texels,

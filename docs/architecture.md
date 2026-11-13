@@ -255,20 +255,20 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   free again one period after its slot, and its acquire also waits for the GPU to finish the image's previous frame
   (`NX2NAVI_ACQUIRE_WAIT`); `frame_step_present` gives `ocarina_step` the slot times, snapped to the paced rate within
   3%.
-- One limiter is the goal: the driver's low latency (`vk_lowlat.c`), RivaTuner Statistics Server (`rtss_limit.c`) or
-  the game's pacer holds the frame limit, and the log's "frame rate:" and "lowlat:" lines name the one in charge.
-  The pacer is the fallback wherever the other limiter's hold is not proven: before the first host present, while a
-  movie plays (the pacer keeps the movie's slots, which no other limiter knows), once no picture went out for 200 ms (a
-  minimised window, `frame_hold`), for the rest of the run once the frames show the other limiter letting them through
-  faster than the limit or once it was not seen holding them for 30 s, and after any failure. While RTSS holds the
-  limit the pacer keeps only the 240-frame ceiling
-  the game's code needs (`rtss_decide.h` `rtss_pace_period`). Frame generation keeps RTSS out (it would count the
-  generated frames), and the game's pacer holds the drawn frames beside it. The exceptions as they stand: `pace_smooth`
-  still waits on the present thread while RTSS holds the limit; DLSS Frame Generation's Reflex sleeps where the frame
-  starts while the pacer holds the limit; at a play limit equal to a movie's rate (60, the default, for the game's 60
-  fps movies) RTSS's profile keeps that limit and RTSS holds the movie beside the pacer; once RTSS hooks the game with
-  the limit in its profile it holds the frames beside the pacer until it is seen holding them, for 30 s at most, after
-  which the profile goes back for the run; and a limit set in RTSS itself
+- One limiter is the goal: the driver's low latency (`vk_lowlat.c`), Reflex with DLSS Frame Generation (`vk_dlssg.c`),
+  RivaTuner Statistics Server (`rtss_limit.c`) or the game's pacer holds the frame limit, and the log's "frame rate:"
+  and "lowlat:" lines name the one in charge. The pacer is the fallback wherever the other limiter's hold is not
+  proven: before the first host present, while a movie plays (the pacer keeps the movie's slots, which no other
+  limiter knows), once no picture went out for 200 ms (a minimised window, `frame_hold`), for the rest of the run once
+  the frames show the other limiter letting them through faster than the limit (for RTSS also once it was not seen
+  holding them for 30 s), and after any failure. While RTSS or Reflex holds the limit the pacer keeps only the
+  240-frame ceiling the game's code needs (`rtss_decide.h` `rtss_pace_period`, `frame_rate.c` `frame_step_ceiling_ns`).
+  Frame generation keeps RTSS out (it would count the generated frames); with AMD's frame generation the game's pacer
+  holds the drawn frames beside it. The exceptions as they stand: `pace_smooth` still waits on the present thread while
+  RTSS holds the limit; at a play limit equal to a movie's rate (60, the default, for the game's 60 fps movies) RTSS's
+  profile keeps that limit and RTSS holds the movie beside the pacer; once RTSS hooks the game with the limit in its
+  profile it holds the frames beside the pacer until it is seen holding them, for 30 s at most, after which the
+  profile goes back for the run; and a limit set in RTSS itself
   still holds the game where the game keeps RTSS out, which the log ("two limiters") and the
   frame rate row of the menu point out, and the same where RTSS is out of it for the run because its profile cannot be
   written, its hooks library does not load or it never showed its hold, which the log points out the same way (the
@@ -327,7 +327,14 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   limit and the pacer holds nothing (`nvn_api_obj.c` `nvnQueuePresentTexture`, `vk_lowlat_pace`); the pacer takes the
   limit back while a movie plays, while no present goes out, and for the rest of the run when the frames show that the
   driver does not hold it. DLSS Frame Generation brings its own low latency (`vk_dlssg.c`), and the direct path is off
-  in such a run; NVIDIA's is also off while another frame generation presents the frames.
+  in such a run; NVIDIA's is also off while another frame generation presents the frames. There Reflex's sleep holds
+  the frame limit the same way, through Streamline's frame limit (`nx2_sl.cpp` `nx2sl_reflex2`), with the same
+  exceptions, a DLL older than that export and a limit Streamline refuses besides (`vk_dlssg.c` `vk_dlssg_pace`,
+  `dlssg_pace.h`); the pacer stands aside only once Streamline took the limit and keeps the game's ceiling of 240
+  (`frame_rate.c` `frame_step_ceiling_ns`). Since the SDK does not say whether the driver's interval counts the frames
+  the game draws or every frame on screen, the frames are checked: about the multiplier periods apart switches Reflex
+  to the period over the multiplier once, and the same again or frames too soon give the limit to the pacer for the
+  run.
   The device gets the drivers' extensions only in a run that starts with the setting on (`vk_device.c`
   `create_device`): turning it on takes a restart, and with it off the device is made as it was before the mode.
 - ASTC textures are uploaded as they are where the device samples ASTC, and decoded by a compute shader everywhere

@@ -209,10 +209,12 @@ typedef struct {
     // first thing a frame does, the back end holds the frame's start here, before the input is sampled (vk_lowlat.c
     // vk_lowlat_frame_start). NULL: nothing to do.
     void (*input_read)(void);
-    // nvnQueuePresentTexture, with the pacer's period in ns (0: it holds nothing): 1 when the back end holds the next
-    // frame's start to that period itself (vk_lowlat.c vk_lowlat_pace, a driver's low-latency sleep), so the pacer
-    // waits for neither the present's slot nor the window image. NULL: never.
-    int (*frame_paced)(uint64_t period_ns);
+    // nvnQueuePresentTexture, with the pacer's period in ns (0: it holds nothing; also during a movie, whose slots only
+    // the pacer keeps): the period the pacer still holds, for both the present's slot and the window image. period_ns
+    // while nothing else holds the limit; less when the back end holds the next frame's start to the period itself:
+    // the game's ceiling (frame_rate.c frame_step_ceiling_ns) where Reflex holds it with DLSS Frame Generation
+    // (vk_dlssg.c vk_dlssg_pace), 0 where a driver's low-latency sleep does (vk_lowlat.c vk_lowlat_pace). NULL: never.
+    uint64_t (*frame_paced)(uint64_t period_ns);
     void (*finish)(void);
     void (*read_texels)(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint8_t *dst, uint64_t row, uint64_t img);
     void (*write_texels)(const tex_t *t, const view_t *v, const NVNcopyRegion *r, const uint8_t *src, uint64_t row, uint64_t img);
