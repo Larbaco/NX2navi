@@ -648,6 +648,11 @@ A change to the layout of `shader-prepared.bin` (`runtime/prp_file.h`, `runtime/
 the header alone, checks the parse of both versions and has `make_game.py` read the list the C side wrote. No game
 files, no GPU.
 
+A change to which translations of a previous translator are served (`runtime/gfx_shader.c` `carry_usable`,
+`carry_load`, `carry_find_iid`) passes `python tests\carry_pool_check.py`, which cuts the carry lookups out of
+`gfx_shader.c` and runs them against stand-in caches: a translation whose texture pool array has the earlier length
+(32768) is freed and the lookup goes on, one with the current length or no pool is served. No game files, no GPU.
+
 A change to where the lazy write-back is on by default (`runtime/wb_lazy_choice.h`, `runtime/vk_memory.c`
 `vk_mem_lazy_decide`) passes `python tests\wb_lazy_check.py`, which builds the header alone and checks the choice and
 its reason by platform, by GPU driver and by what the player set. No game files, no GPU.
