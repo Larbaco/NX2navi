@@ -1352,18 +1352,32 @@ void audio_mixer_render(AudioRenderer *r, double seconds, int drop) {
 // ---- IAudioDevice: one output device, stereo or 5.1 (output_channels)
 static const char device_name[] = "AudioTvOutput";
 
-// The events the game took to hear of a change of the output device (IAudioDevice's, its notifications' and the
+// The events the game took to hear of a change of the output device (IAudioDevice's, its two notifications' and the
 // virtual device manager's). audio_channels_live signals them all: the game then asks for the channel count again, as
 // it does on a console whose output moves from the TV to headphones.
 static uint32_t change_events[16];
 static _Atomic int n_change_events;
 
-static uint32_t change_event_new(void) {
-    uint32_t ev = kern_event_new();
+static void change_event_list(uint32_t ev) {
     int i = atomic_fetch_add(&n_change_events, 1);
     if (i < 16) change_events[i] = ev;
-    return ev;
 }
+
+// One event per kind, made at the kind's first request; every request gets its own readable handle to it. Made per
+// request, each call took a kernel handle for good, and past 16 the events were no longer signalled. Two first
+// requests at once each make one: the loser closes its own, which was never listed, so nothing signals a closed handle.
+static uint32_t change_event_of(volatile uint32_t *kind) {
+    uint32_t ev = __atomic_load_n(kind, __ATOMIC_ACQUIRE);
+    if (ev) return ev;
+    uint32_t mine = kern_event_new(), expected = 0;
+    if (__atomic_compare_exchange_n(kind, &expected, mine, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        change_event_list(mine);
+        return mine;
+    }
+    kern_handle_close(mine);
+    return expected;
+}
+static volatile uint32_t device_event, input_notify_event, output_notify_event, vdm_event;
 
 // Present path, after a settings change (gfx_present.c window_settings_live): a changed NX2NAVI_AUDIO_CHANNELS is
 // decided again, and when it gives another channel count the game is told its output device changed. The game asks
@@ -1402,7 +1416,6 @@ static IpcBuffer out_buffer(const IpcRequest *rq, int *pointer) {
 }
 
 void audio_device_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
-    static uint32_t change_event;   // the device change event: signalled when the output's channels change (audio_channels_live)
     int pointer;
     switch (rq->cmd) {
     case 0: case 6: case 14: {   // ListAudioDeviceName(Auto), ListAudioOutputDeviceName [13.0.0+]
@@ -1424,27 +1437,17 @@ void audio_device_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) 
         return;
     }
     case 5: { int32_t n = output_channels(); IPC_OUT(rs, n); return; }   // GetActiveChannelCount
-    case 4: case 11: case 12: {   // QueryAudioDeviceSystemEvent, ...InputEvent, ...OutputEvent
-        uint32_t ev = __atomic_load_n(&change_event, __ATOMIC_ACQUIRE);
-        if (!ev) {
-            uint32_t mine = change_event_new(), expected = 0;
-            if (__atomic_compare_exchange_n(&change_event, &expected, mine, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-                ev = mine;
-            else
-                ev = expected;   // the loser's event stays unused (no host-side close yet)
-        }
-        rs->copy[rs->ncopy++] = kern_event_readable(ev);
+    case 4: case 11: case 12:   // QueryAudioDeviceSystemEvent, ...InputEvent, ...OutputEvent
+        rs->copy[rs->ncopy++] = kern_event_readable(change_event_of(&device_event));
         return;
-    }
     // 17.0.0+: Acquire/Release Audio{Input,Output}DeviceNotification (15-18), 18.0.0+: SetAudioDeviceOutputVolume-
     // AutoTuneEnabled (19) / IsAudioDeviceOutputVolumeAutoTuneEnabled (20), 21.0.0+:
     // IsActiveOutputDeviceEstimatedLowLatency (21). Command ids as the system answers them. The
     // host applies no auto-tuned volume, so the answers are "off" / "no".
-    case 15: case 17: {   // Acquire...Notification -> a readable event, signalled with the others
-        uint32_t ev = change_event_new();
-        rs->copy[rs->ncopy++] = kern_event_readable(ev);
+    case 15: case 17:   // Acquire...Notification -> a readable event, signalled with the others
+        rs->copy[rs->ncopy++] = kern_event_readable(change_event_of(rq->cmd == 15 ? &input_notify_event
+                                                                                  : &output_notify_event));
         return;
-    }
     case 16: case 18: case 19: return;
     case 20: case 21: { uint8_t no = 0; IPC_OUT(rs, no); return; }
     default: ipc_unimplemented(s, rq);
@@ -1510,7 +1513,7 @@ static void virtual_device_manager_handler(IpcSession *s, const IpcRequest *rq, 
         put_block(rq, rs, block, sizeof block);
         return;
     }
-    case 500: rs->copy[rs->ncopy++] = kern_event_readable(change_event_new()); return;   // state change event
+    case 500: rs->copy[rs->ncopy++] = kern_event_readable(change_event_of(&vdm_event)); return;   // state change event
     case 700: case 800: return;   // AttachStream / DetachStream
     default: {
         static volatile int32_t seen[64];
