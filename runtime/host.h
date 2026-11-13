@@ -451,6 +451,7 @@ void frame_step_init(void);                                // after rt_patches_i
 int frame_step_realtime(void);                             // the real-time step is on: presents ignore the interval
 uint64_t frame_step_cap_ns(void);                          // with the real-time step: the shortest frame in ns
 int frame_step_movie_hz(void);                             // the movie rate frame_step_cap_ns paces at; 0: no movie
+uint64_t frame_step_ceiling_ns(void);                      // the shortest frame the game survives, whoever holds the limit
 int ov_movie_live(void);                                   // ov_movie2.c: a movie plays (frame_rate.c movie_cap_hz)
 int frame_limit_adjustable(void);                         // the frame limit setting changes the rate (always)
 int frame_free_running(void);                             // no fps60/realtime patch set: the game steps by the clock

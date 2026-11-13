@@ -182,6 +182,9 @@ int main(int argc, char **argv) {
     int mean = argc > 1 && !strcmp(argv[1], "mean");
     if (mean) steady = "0";
     frame_step_init();
+    // the pacer's period while Reflex holds the limit (vk_dlssg.c vk_dlssg_pace): 240 fps for a game stepping by the clock
+    CHECK(frame_step_ceiling_ns() == 4166666, "the ceiling of a game that steps by the clock: %llu ns",
+          (unsigned long long)frame_step_ceiling_ns());
     float one, cut0;
     memcpy(&one, page + 256, 4);
     memcpy(&cut0, page + 260, 4);

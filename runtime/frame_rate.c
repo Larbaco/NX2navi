@@ -180,6 +180,13 @@ static double shown_hz(double hz) { return hz <= 0 ? 60 : hz < LIMIT_MIN_HZ ? LI
 #define LIMIT_FREE_MAX_HZ 240
 int frame_free_running(void) { return rt_patch_set("fps60") < 0 && rt_patch_set("realtime") < 0; }
 int frame_limit_adjustable(void) { return 1; }
+
+// The period the pacer keeps while something else holds the frame limit where the frame starts (Reflex with DLSS Frame
+// Generation, vk_dlssg.c vk_dlssg_pace): a limiter that lets go, or counts other frames than the game's, still leaves
+// the game no faster than the rate its code survives.
+uint64_t frame_step_ceiling_ns(void) {
+    return 1000000000ull / (frame_free_running() ? LIMIT_FREE_MAX_HZ : LIMIT_MAX_HZ);
+}
 static unsigned limit_seen;
 static int limit_read;
 static int limit_hz = -1;   // 0: display; -2: unlimited (free-running builds); -1 before the first read
