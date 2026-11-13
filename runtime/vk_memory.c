@@ -4559,17 +4559,18 @@ static void census_main(void *arg) {
     free(arg);
     const double M = 1048576.0;
     uint64_t priv = 0, wc = 0, wcn = 0, now;
-    // perf.c ft_frame charges the frames the walk overlapped to "census"; the line gives the walk's span on the run's
-    // clock (kern_now_ns) so that it can be set beside the frames it held up
+    // perf.c ft_frame charges the frames the walk overlapped to "census". The line gives the frames presented when the
+    // walk began and ended (span_frame, which vk_mem_census sets at every present) and its length: the frame numbers
+    // are the ones the "stutter: frame" and "perf: slow frame" lines carry, so it can be set beside the frames it held up
     perf_census_walk(1);
-    uint64_t w0 = kern_now_ns();
+    uint64_t w0 = kern_now_ns(), f0 = __atomic_load_n(&span_frame, __ATOMIC_RELAXED);
     int have = plat_mem_census(&priv, &wc, &wcn);
-    uint64_t w1 = kern_now_ns();
+    uint64_t w1 = kern_now_ns(), f1 = __atomic_load_n(&span_frame, __ATOMIC_RELAXED);
     perf_census_walk(0);
     if (have) {
-        rt_log("mem: process frame %llu: private %.0f MiB, write-combined %.0f MiB in %llu allocations; the walk %.3f s "
-               "to %.3f s, %.1f ms", (unsigned long long)j.frame, priv / M, wc / M, (unsigned long long)wcn, w0 / 1e9,
-               w1 / 1e9, (w1 - w0) / 1e6);
+        rt_log("mem: process frame %llu: private %.0f MiB, write-combined %.0f MiB in %llu allocations; the walk from "
+               "frame %llu to frame %llu, %.1f ms", (unsigned long long)j.frame, priv / M, wc / M,
+               (unsigned long long)wcn, (unsigned long long)f0, (unsigned long long)f1, (w1 - w0) / 1e6);
         uint64_t used = 0, budget = 0;
         int exact = 0;
         if (!vk_mem_vram(&used, &budget, &exact)) used = 0;
