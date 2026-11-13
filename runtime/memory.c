@@ -1775,31 +1775,68 @@ void mem_lazy_heap_report(uint64_t frame) {
     faults_prv = faults, bytes_prv = bytes;
 }
 
-// NX2NAVI_TRACE=perf: how many bytes of each guest region are committed, so a process that has grown says which region
-// holds the memory. A region is reserved whole at start-up and committed page by page, so the walk reads each run of
-// pages of the same state; the alias window is the largest and costs the most steps when it is full.
-void mem_guest_census(uint64_t frame) {
+// The guest's ranges: the regions reserved at start-up and the loaded modules. The span from the low block to
+// RT_ADDRESS_LIMIT (layout aslr) is not one of them: the graphics driver maps device memory into its free parts, and
+// counted as guest it made the guest regions grow by gigabytes with the textures (13.5 to 32.0 GiB in a session of
+// 2026-11-13).
+int mem_guest_ranges(const char **name, RtRange *r, int max) {
     const RtGuestLayout *g = mem_layout();
     const struct { const char *name; RtRange r; } reg[] = {
-        {"aslr", g->aslr}, {"stack", g->stack}, {"heap", g->heap},
-        {"alias", g->alias}, {"kernel", g->kernel}, {"hostfn", g->hostfn},
+        {"stack", g->stack}, {"heap", g->heap}, {"alias", g->alias}, {"kernel", g->kernel}, {"hostfn", g->hostfn},
     };
+    int n = 0;
+    for (unsigned i = 0; i < sizeof reg / sizeof *reg && n < max; i++)
+        if (reg[i].r.size) name[n] = reg[i].name, r[n++] = reg[i].r;
+    for (int i = 0; i < ldr_count() && n < max; i++) {
+        const RtLoaded *m = ldr_module(i);
+        if (m && m->size) name[n] = "modules", r[n++] = (RtRange){m->base, m->size};
+    }
+    return n;
+}
+
+// The census line: ranges of one name (the modules) are summed.
+void mem_guest_census_log(uint64_t frame, const char *const *name, const uint64_t *committed, int n) {
     char line[400];
-    int o = snprintf(line, sizeof line, "mem: guest regions at frame %llu (MiB committed):",
-                     (unsigned long long)frame);
+    int o = snprintf(line, sizeof line, "mem: guest regions at frame %llu (MiB committed):", (unsigned long long)frame);
     uint64_t all = 0;
-    for (unsigned i = 0; i < sizeof reg / sizeof *reg && o < (int)sizeof line - 40; i++) {
-        uint64_t x = reg[i].r.base, end = reg[i].r.base + reg[i].r.size, committed = 0, b = 0;
+    for (int i = 0; i < n && o < (int)sizeof line - 40; i++) {
+        int first = 1;
+        for (int k = 0; k < i && first; k++) first = strcmp(name[k], name[i]) != 0;
+        if (!first) continue;
+        uint64_t sum = 0;
+        for (int k = i; k < n; k++)
+            if (!strcmp(name[k], name[i])) sum += committed[k];
+        all += sum;
+        o += snprintf(line + o, sizeof line - o, " %s %.0f", name[i], sum / 1048576.0);
+    }
+    rt_log("%s; all %.0f", line, all / 1048576.0);
+}
+
+// NX2NAVI_MEM_CENSUS: how many bytes of each guest range are committed, so a process that has grown says which region
+// holds the memory. A region is reserved whole at start-up and committed page by page, so the walk reads each run of
+// pages of the same state; the alias window is the largest and costs the most steps when it is full. Where the OS has
+// a walk of the whole address space (prof_win.c prof_commit_census) that walk counts these too and this one is not
+// made (perf.c census_check).
+void mem_guest_census(uint64_t frame) {
+    const char *name[16];
+    RtRange r[16];
+    uint64_t committed[16];
+    int n = mem_guest_ranges(name, r, 16);
+    for (int i = 0; i < n; i++) {
+        uint64_t x = r[i].base, end = r[i].base + r[i].size, b = 0;
+        committed[i] = 0;
         while (x < end) {
             int st = plat_mem_state(x, end, &b);
             if (b <= x) break;
-            if (st >= 0) committed += b - x;   // a PLAT_PROT_* state: these pages are committed
+            if (st >= 0) committed[i] += b - x;   // a PLAT_PROT_* state: these pages are committed
             x = b;
         }
-        all += committed;
-        o += snprintf(line + o, sizeof line - o, " %s %.0f", reg[i].name, committed / 1048576.0);
     }
-    rt_log("%s; all %.0f", line, all / 1048576.0);
+    mem_guest_census_log(frame, name, committed, n);
+    mem_lazy_heap_census(frame);
+}
+
+void mem_lazy_heap_census(uint64_t frame) {
     if (heap_lazy)
         rt_log("mem: lazy heap at frame %llu: %.0f of %.0f MiB committed, by %llu faults and the rest by kernel "
                "accesses and pointer checks", (unsigned long long)frame, heap_lazy_bytes / 1048576.0,

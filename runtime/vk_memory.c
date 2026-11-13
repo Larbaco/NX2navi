@@ -4508,6 +4508,10 @@ static void census_main(void *arg) {
     if (have) {
         rt_log("mem: process frame %llu: private %.0f MiB, write-combined %.0f MiB in %llu allocations",
                (unsigned long long)j.frame, priv / M, wc / M, (unsigned long long)wcn);
+        uint64_t used = 0, budget = 0;
+        int exact = 0;
+        if (!vk_mem_vram(&used, &budget, &exact)) used = 0;
+        perf_note_wc(wc, used);   // perf.c host_commit and the memory report (system_log) take the device memory out
         now = wc;
     } else {
         VmaBudget vb[VK_MAX_MEMORY_HEAPS];

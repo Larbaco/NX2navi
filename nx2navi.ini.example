@@ -996,9 +996,10 @@
 # fps or more with Link on the floor. Each pass slows the game for its few seconds. 0 is off.
 # floor_watch = 0
 # 1: with trace = perf, walks of the process's address space count its private and write-combined memory every 600
-# frames (the "mem: process" line) and where its committed memory lies every 3600 frames (the "commit census" lines).
-# Each walk holds the address-space lock for 100-240 ms and delays the next frame by as much, so they are off unless
-# asked for.
+# frames (the "mem: process" line) and where its committed memory lies every 3600 frames, and when the process's own
+# commit (without the video memory Windows charges to it) rose 1 GiB over the highest it was, at most once a minute
+# (the "commit census" lines). Each walk holds the address-space lock for 100-260 ms and delays the next frame by as
+# much, so they are off unless asked for: leave it off in a run whose smoothness is judged.
 # mem_census = 0
 # The memory the game is taken to need, in MB of commit (RAM plus page file not yet promised to a program). When less
 # is free at the start, the log gets a warning line: short of memory the game stutters, loses textures or stops with

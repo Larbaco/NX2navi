@@ -116,6 +116,11 @@ typedef struct {
     uint64_t mirror_ns;                         // of gpu_ns, the copies into VRAM mirrors (vk_sync.c ts_submitted)
 } PerfGpu;
 extern void (*perf_gpu_stats)(PerfGpu *out);
+// The write-combined memory of the process (device memory the driver maps into it) as a walk of the address space
+// counted it, with the driver's device-local figure at that time (NX2NAVI_MEM_CENSUS: vk_memory.c census_main, perf.c's
+// commit census). perf_wc_recent: the last such figure when it is at most max_age_ns old, else 0.
+void perf_note_wc(uint64_t wc, uint64_t vram_used);
+int perf_wc_recent(uint64_t max_age_ns, uint64_t *wc, uint64_t *vram_used);
 // The performance overlay (perfmon.c): mode 0 off, 1 fps, 2 full. While it is on, perf_present hands every frame to
 // perfmon_frame; full also takes the event counts (perf_count) and the GPU timestamps as NX2NAVI_TRACE=perf does.
 void perf_set_overlay(int mode);
@@ -196,6 +201,11 @@ const RtGuestLayout *mem_layout(void);
 int mem_start_note(int probe);                             // a game's start: a warning line when the free commit is
                                                            // below the game's need (mem_need.h); 1 when it is
 void mem_guest_census(uint64_t frame);   // NX2NAVI_TRACE=perf: committed bytes per guest region
+// The guest's ranges for a census, each with its name (the loaded modules one range each, all named "modules"), at most
+// max; mem_guest_census_log logs the bytes a walk found committed in each (committed[i] for range i).
+int mem_guest_ranges(const char **name, RtRange *r, int max);
+void mem_guest_census_log(uint64_t frame, const char *const *name, const uint64_t *committed, int n);
+void mem_lazy_heap_census(uint64_t frame);   // the census's lazy heap line (NX2NAVI_HEAP_LAZY only)
 void mem_lazy_heap_report(uint64_t frame);   // NX2NAVI_TRACE=perf: the lazy heap's faults since the last line
 // The game's own memory for the memory report (vk_memory.c owner_log): its heap's size, the part of it committed (the
 // size itself unless the heap is lazy), and the physical memory it mapped. No lock: a log may read a figure late.

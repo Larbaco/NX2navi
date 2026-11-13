@@ -300,8 +300,9 @@ void stutter_frame(uint64_t frame, uint64_t now, uint64_t d, const uint64_t *par
     }
 }
 
+// In the order of perf.c's causes (FT_C_*); "census" is NX2NAVI_MEM_CENSUS's walk of the address space.
 static const char *const cause_short[SM_CAUSES] = {"pipeline", "translation", "texture", "fence", "pacing", "replay",
-                                                   "unattributed", "?"};
+                                                   "census", "unattributed"};
 
 static int area_cmp(const void *x, const void *y) {
     const Area *a = &areas[*(const int *)x], *b = &areas[*(const int *)y];

@@ -24,7 +24,7 @@ __attribute__((weak)) int prof_sampler_start(void) {
 }
 __attribute__((weak)) void prof_sampler_write(void) {}
 __attribute__((weak)) void prof_sampler_frame(uint64_t frame, uint64_t now, uint64_t d) { (void)frame, (void)now, (void)d; }
-__attribute__((weak)) void prof_commit_census(uint64_t frame) { (void)frame; }
+__attribute__((weak)) int prof_commit_census(uint64_t frame, uint64_t *wc) { (void)frame, *wc = 0; return 0; }
 __attribute__((weak)) void mem_guest_census(uint64_t frame) { (void)frame; }
 __attribute__((weak)) void mem_lazy_heap_report(uint64_t frame) { (void)frame; }
 
@@ -371,9 +371,12 @@ typedef struct {
 // The replay's part is its time without the pipeline, translation and texture waits, which all happen inside it: with
 // them in, every frame that waited 900 ms for a pipeline was charged to "replay", the larger number, and a log
 // could not tell a pipeline stall from a slow replay.
-enum { FT_C_PIPE, FT_C_XLATE, FT_C_TEX, FT_C_FENCE, FT_C_PACE, FT_C_REPLAY, FT_C_OTHER, FT_C_N };
+// "census" is the address-space walk of NX2NAVI_MEM_CENSUS (census_check), which runs on the presenting thread after a
+// present: its time is charged to the next frame, which it delays.
+enum { FT_C_PIPE, FT_C_XLATE, FT_C_TEX, FT_C_FENCE, FT_C_PACE, FT_C_REPLAY, FT_C_CENSUS, FT_C_OTHER, FT_C_N };
 static const char *const ft_cause_name[FT_C_N] = { "pipeline", "translation", "texture", "fence", "pacing", "replay",
-                                                   "unattributed" };
+                                                   "census", "unattributed" };
+static uint64_t census_part_ns;   // present thread: the census walks since the last present (census_check)
 static struct {
     uint64_t t0, frames, sum, over25, over50, over100;
     uint32_t hist[FT_BINS];
@@ -617,7 +620,10 @@ static uint64_t ft_frame(uint64_t frame, uint64_t now, uint64_t d) {
     // (stutter_map.c)
     uint64_t part[FT_C_N] = {0};
     int best = FT_C_OTHER;
+    uint64_t census_ns = census_part_ns;
+    census_part_ns = 0;
     if (d > 25000000ull || (stutter_map_on && d >= 12000000ull)) {
+        part[FT_C_CENSUS] = census_ns < d ? census_ns : d;
         part[FT_C_PIPE] = frame_ns[PERF_PIPE];
         part[FT_C_XLATE] = frame_ns[PERF_XLATE];
         part[FT_C_TEX] = frame_ns[PERF_TEX];
@@ -660,6 +666,70 @@ static uint64_t ft_frame(uint64_t frame, uint64_t now, uint64_t d) {
     return (uint64_t)rep;
 }
 
+// The write-combined memory of the process (device-local memory the driver maps into it, which Windows charges to the
+// process's private bytes) as the latest walk of the address space counted it: vk_memory.c census_main every 600 frames
+// and the commit census below, both only with NX2NAVI_MEM_CENSUS=1. vram_used: the driver's device-local figure at that
+// walk, so that a later estimate can add what the device memory grew since.
+static PlatMutex wc_lock = PLAT_MUTEX_INIT;
+static uint64_t wc_bytes, wc_vram, wc_at;   // wc_lock; wc_at 0: no walk yet
+
+void perf_note_wc(uint64_t wc, uint64_t vram_used) {
+    plat_mutex_lock(&wc_lock);
+    wc_bytes = wc, wc_vram = vram_used, wc_at = kern_now_ns();
+    plat_mutex_unlock(&wc_lock);
+}
+
+int perf_wc_recent(uint64_t max_age_ns, uint64_t *wc, uint64_t *vram_used) {
+    plat_mutex_lock(&wc_lock);
+    int ok = wc_at && kern_now_ns() - wc_at <= max_age_ns;
+    if (ok) *wc = wc_bytes, *vram_used = wc_vram;
+    plat_mutex_unlock(&wc_lock);
+    return ok;
+}
+
+// The process's commit without the device memory charged to it: the private bytes less the write-combined memory of
+// the last walk and less what the driver's device-local figure grew since (before any walk, less that figure alone).
+// The device-local figure (heapUsage) lies 0.2-1.1 GiB under the write-combined total, so it serves for the change only.
+// Where the commit does not count device memory (plat_commit_counts_vram) it is the private bytes.
+static uint64_t host_commit(uint64_t prv, const PerfGpu *g) {
+    if (!plat_commit_counts_vram()) return prv;
+    uint64_t wc, at_vram;
+    int64_t dev;
+    if (perf_wc_recent(~0ull, &wc, &at_vram))
+        dev = (int64_t)wc + (g->have_vram && at_vram ? (int64_t)g->vram_used - (int64_t)at_vram : 0);
+    else
+        dev = g->have_vram ? (int64_t)g->vram_used : 0;
+    if (dev <= 0) return prv;
+    return (uint64_t)dev >= prv ? 0 : prv - (uint64_t)dev;
+}
+
+// Where the committed memory lies (NX2NAVI_MEM_CENSUS=1 only), every 3600 frames and when the process's own commit
+// (host_commit) rose 1 GiB over the highest it was at a census: the process has run out of commit in long sessions
+// while the game's own pools stayed flat. The walk holds the address-space lock the game's threads take at every page
+// fault and runs here on the presenting thread, so each one delays the next frame by 130-260 ms (ft_frame charges it
+// to "census"). In a session of 2026-11-13 the trigger read the private bytes, which take in the device memory Windows
+// charges to the process, so every gigabyte of textures re-armed it: 22 of the 33 walks came from it, 120 frames
+// apart in bursts, while the process's own commit grew 307 MiB in 7 minutes of play. So the trigger reads the commit
+// without the device memory against the highest it was at a census (a figure that falls and rises again does not
+// re-arm it), and a growth census waits CENSUS_GAP_NS after the last walk. The scheduled ones stay.
+#define CENSUS_GAP_NS 60000000000ull
+static void census_check(uint64_t frame, uint64_t prv, const PerfGpu *g) {
+    static int census_on = -1;
+    static uint64_t census_high, census_ns;
+    if (census_on < 0) census_on = cfg_bool("NX2NAVI_MEM_CENSUS");
+    if (!census_on) return;
+    uint64_t host = host_commit(prv, g), t0 = kern_now_ns();
+    int grown = host >= census_high + (1ull << 30) && (!census_ns || t0 - census_ns >= CENSUS_GAP_NS);
+    if (frame % 3600 && !grown) return;
+    uint64_t wc = 0;
+    if (prof_commit_census(frame, &wc)) perf_note_wc(wc, g->have_vram ? g->vram_used : 0);   // one walk for both lines
+    else mem_guest_census(frame);
+    uint64_t t1 = kern_now_ns();
+    census_part_ns += t1 - t0, census_ns = t1;
+    host = host_commit(prv, g);   // with the walk's own write-combined figure
+    if (host > census_high) census_high = host;
+}
+
 // The second line of the 60-frame window: GPU busy time (timestamps), the time threads waited for GPU fences, VRAM and
 // process memory, and which side holds the frame back. pace: the frame waited for pacing (vsync, the frame limiter) at
 // least 15% of the window; gpu: the GPU was busy for 80% of the frame interval or more (without timestamps: threads
@@ -689,15 +759,7 @@ static void perf_gpu_line(uint64_t frame, double interval_ms, double pace_share,
     rt_log("perf: frame %llu: %s; fence wait per frame: render thread %.2f ms, other threads %.2f ms; %s; ram working set "
            "%.0f MiB, private %.0f MiB; bound: %s",
            (unsigned long long)frame, gs, rw, ow, vs, ws, priv, bound);
-    // Where the committed memory lies, every 3600 frames and whenever it grew by 1 GiB since the last census: the process
-    // has run out of commit in long sessions while the game's own pools stayed flat. Only with NX2NAVI_MEM_CENSUS=1, as
-    // vk_memory.c's census: the walk holds the address-space lock the game's threads take at every page fault, and here
-    // it ran on the presenting thread, so each one delayed a frame by 65-240 ms.
-    static int census_on = -1;
-    static uint64_t census_prv;
-    if (census_on < 0) census_on = cfg_bool("NX2NAVI_MEM_CENSUS");
-    if (census_on && (frame % 3600 == 0 || prv >= census_prv + (1ull << 30)))
-        prof_commit_census(frame), mem_guest_census(frame), census_prv = prv;
+    census_check(frame, prv, &g);
     mem_lazy_heap_report(frame);
     if (g.have_gpu && g.have_idle)
         rt_log("perf: frame %llu: gpu idle per frame %.2f ms between timed parts: %.2f ms waiting for the next submission, "

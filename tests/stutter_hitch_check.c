@@ -17,16 +17,18 @@ void rt_log(const char *fmt, ...) {
     logged++;
 }
 
-static const char *const names[7] = {"pipeline", "translation", "texture", "fence", "pacing", "replay", "unattributed"};
+// perf.c's causes, in its order (FT_C_*)
+static const char *const names[8] = {"pipeline", "translation", "texture", "fence", "pacing", "replay", "census",
+                                     "unattributed"};
 static uint64_t frame_no;
 
 static void frames(int n, double ms) {
-    uint64_t part[7] = {0};
+    uint64_t part[8] = {0};
     for (int i = 0; i < n; i++) {
         uint64_t d = (uint64_t)(ms * 1e6);
         clock_ns += d;
-        part[6] = d;
-        stutter_frame(++frame_no, clock_ns, d, part, names, 7, 6);
+        part[7] = d;
+        stutter_frame(++frame_no, clock_ns, d, part, names, 8, 7);
     }
 }
 
