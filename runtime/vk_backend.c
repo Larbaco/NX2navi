@@ -110,7 +110,7 @@ static void present_main(void *arg) {
         busy = 1;
         plat_cond_broadcast(&pcv);
         plat_mutex_unlock(&pl);
-        unsigned tr = rt_trace;   // once, as the menu's performance log can switch the trace meanwhile
+        unsigned tr = rt_trace;   // read once: the stamps and both lines below follow the same flags
         int timed = (tr & (RT_TRACE_PRESENT | RT_TRACE_PERF)) != 0;
         uint64_t b0 = timed ? kern_now_ns() : 0;
         if (flight_on || vk_dump_white) vk_thumbs_frame(j.frame);   // NX2NAVI_DUMP_WHITE reads them too
