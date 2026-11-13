@@ -17,6 +17,10 @@ typedef struct PlatThread PlatThread;
 typedef void (*PlatThreadFn)(void *arg);
 
 // Starts fn(arg) on a new thread named name (shown in debuggers and profilers; may be NULL). NULL on failure.
+// Keeps PLAT_STACK_GUARANTEE bytes of the calling thread's (or fiber's) stack for its own stack overflow: the crash
+// report then runs on them. The threads and fibers made here get it at their start; main calls it for its thread.
+#define PLAT_STACK_GUARANTEE 32768
+void plat_stack_guarantee(void);
 PlatThread *plat_thread_new(PlatThreadFn fn, void *arg, const char *name);
 // The same with the stack size given: stack bytes reserved for the thread (0: PLAT_STACK_DEFAULT). The default is the
 // same on every OS, so a thread that fits on Windows fits elsewhere.

@@ -641,6 +641,7 @@ static int main_run(int argc, char **argv);
 
 // A game run never comes back here: it ends in plat_exit (boot.c, gfx_present.c). Every other mode returns its code.
 int main(int argc, char **argv) {
+    plat_stack_guarantee();   // a stack overflow on the main thread still gets its crash report (platform.h)
     mode_rc = main_run(argc, argv);
     __atomic_store_n(&mode_done, 1, __ATOMIC_RELEASE);   // from here on only the exit runs (mode_done, above)
     return mode_rc;

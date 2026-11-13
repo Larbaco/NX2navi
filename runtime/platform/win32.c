@@ -44,8 +44,20 @@ struct PlatThread {
 // ExitThread jumps back to the thread's start).
 static void thread_handles_close(void);
 
+// A stack overflow leaves the faulting thread a guard page's worth of stack, about 12 KiB of which a crash handler
+// gets, and the report (main.c crash_handler) needs more: rt_log's 2 KiB buffers, the frame walk, and during the
+// boot's builds a file write first (plat_file_write's frame is about 4 KiB). It faulted again inside the report, and
+// the process ended with no FATAL line (the audit's probe: a 16 MiB-reserve thread recursing in 1 KiB frames). With
+// 32 KiB kept back, the probe's report ran whole with room to spare. The guarantee belongs to the running fiber, so
+// fiber_start asks for it too. Each thread and fiber commits that much more of its stack.
+void plat_stack_guarantee(void) {
+    ULONG g = PLAT_STACK_GUARANTEE;
+    SetThreadStackGuarantee(&g);
+}
+
 static DWORD WINAPI thread_main(LPVOID p) {
     PlatThread *t = p;
+    plat_stack_guarantee();
     t->fn(t->arg);
     plat_thread_end_run();
     thread_handles_close();
@@ -336,6 +348,7 @@ void plat_fiber_unself(void) {
 
 static void WINAPI fiber_start(void *p) {
     PlatFiber *f = p;
+    plat_stack_guarantee();   // a guest fiber's stack is its own (kernel.c kern_fiber_init)
     f->fn(f->arg);
 }
 

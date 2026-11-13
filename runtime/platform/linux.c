@@ -1929,6 +1929,8 @@ void plat_exit(int code) {
 
 void plat_terminate(int code) { _exit(code); }
 
+void plat_stack_guarantee(void) {}   // the crash report runs on the signal stack crash handling sets up
+
 int plat_setenv(const char *name, const char *value) {
     return (value ? setenv(name, value, 1) : unsetenv(name)) == 0;
 }
