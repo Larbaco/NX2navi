@@ -1143,8 +1143,11 @@
 # mesh_ahead = 1
 # Graphics cards without mesh shaders (GTX 10 series, RX 500 and 5000 series, many integrated ones): the game's mesh
 # draws, most of the world, are computed in compute passes and drawn as ordinary triangles. auto (default) does that
-# only on such a card; 1 does it on every card (for testing: it is slower than mesh shaders); 0 never, and such a
-# card then draws no world.
+# on such a card, and on the RX 6000 series with AMD's Windows driver, where the game drawn with mesh shaders lost the
+# graphics card in play ("driver timeout", the game ends with code 72); there it costs some frame rate, and a place's
+# ground, rocks and plants show a moment late the first time they are drawn in a run. 1 does it on every card (for
+# testing: it is slower than mesh shaders); 0 never: an RX 6000 card then draws with mesh shaders as version 0.10.1
+# did, and a card without them draws no world.
 # mesh_fallback = auto
 # Video memory in MB for what those compute passes hand to the draws. A draw that needs more loses the geometry that
 # does not fit, and the log says so.

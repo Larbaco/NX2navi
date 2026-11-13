@@ -1165,7 +1165,8 @@ static uint64_t n_parts, n_subs, n_idle_parts, n_pass_splits, n_cuts;
 // tests there; in area loads and some places a tail hands the CPU results and goes as before. The pictures matched
 // those without it standing, along the route and through warps to five areas. Not measured with the lazy write-back
 // (NVIDIA's and Intel's default), where a tail's uniform updates are noted as writes and no tail goes early.
-// Not with shadow storage, emulated mesh shaders, a frame dump or a pass capture, nor inside a chunk or a continuation.
+// Not with shadow storage, emulated mesh shaders, the mesh fallback (vk_mesh_path.h: never measured with the early
+// tail), a frame dump or a pass capture, nor inside a chunk or a continuation.
 static struct {
     int on;                  // the submission's tail is being recorded
     int live0;               // vk_mem_live_swap's note from before it
@@ -2639,7 +2640,9 @@ static void rec_claim(void) {
 void vk_exec_tail_begin(VkExec *ex) {
     if (!tail_enabled() || TL.on || ex != x_cur || rw_chunk || evo_in) return;
     if (Q.drained != Q.out) group_drain(ex, PW_OP);   // the cut needs every piece of the part
-    if (!vk_sync_wb_split() || !vk_mesh_shader_native() || vk_dump_armed || vk_gpu_passes_capturing()) return;
+    if (!vk_sync_wb_split() || !vk_mesh_shader_native() || vk_ctx()->mesh_fallback || vk_dump_armed ||
+        vk_gpu_passes_capturing())
+        return;
     if (!vk_sync_tail_ok()) return;
     if (ex->in_pass) vk_exec_pass_end(ex);
     vk_exec_barrier(ex);   // the command buffer so far ends behind a full barrier, every image back in GENERAL

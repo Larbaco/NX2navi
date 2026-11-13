@@ -1038,7 +1038,7 @@ static VkPipelineCreateFlags noopt_flag_for(int mesh);
 
 static void mesh_lib_init(const VkCtx *c) {
     const char *why = !c->has_mesh_shader ? "this GPU has no mesh shaders"
-                    : c->mesh_fallback ? "mesh draws go through the mesh fallback (mesh_fallback = 1)"
+                    : c->mesh_fallback ? "mesh draws go through the mesh fallback (vk_device.c, mesh_fallback)"
                     : !vk_caps.gpl ? "the graphics pipeline library is off"
                     : !cfg_bool("NX2NAVI_GPL_MESH") ? "NX2NAVI_GPL_MESH=0"
                     : noopt_flag_for(1) != noopt_flag_for(0) ? "they alone are built without the driver's optimiser "
@@ -3379,11 +3379,14 @@ static int is_src1(unsigned f) { return f >= NVN_BLEND_FUNC_SRC1_COLOR && f <= N
 // ("No fault detected", a timeout) minutes into play on RX 6600 to RX 6950 XT cards in every version from 0.6.0 to
 // 0.9.2, with the pipeline library on or off and the lazy write-back on or off. Where the reports' pass marks name a
 // pass the GPU was in, twelve logs of five reporters, it is a pass whose first draw is a mesh pipeline (mesh shader
-// ba4302f1 with fragment shader f64a96dd in nine, the one-draw pass of 1bbdb17e with 6cc3a476 in three); the five
-// logs of 0.9.1 and 0.9.2 stop between the compute dispatch before such a pass and the pass. No reporter ran with
-// the optimiser off, so that it is the cause is not shown: it is the one suspect the marks leave, it costs shader
-// speed in those pipelines and not the picture, and NX2NAVI_VK_NOOPT=0 gives the optimised ones back. The flag is
-// part of what the driver's cache keys a pipeline by, so those pipelines are built once more after the change.
+// ba4302f1 with fragment shader f64a96dd in nine, the one-draw pass of 1bbdb17e with 6cc3a476 in three). The logs of
+// 0.9.1 and 0.9.2 end with the game's dispatch of cs d7566eb1 finished and nothing after it marked: the group of draws
+// that followed was recorded by the replay workers, whose passes have no marks, so which draw of it hung is not known.
+// No reporter ran with the optimiser off, so that it is the cause is not shown: it costs shader speed in those
+// pipelines and not the picture, and NX2NAVI_VK_NOOPT=0 gives the optimised ones back. The flag is part of what the
+// driver's cache keys a pipeline by, so those pipelines are built once more after the change.
+// Since then that driver draws mesh programs through the mesh fallback by default (vk_mesh_path.h), and no mesh
+// pipeline is built there: this applies with mesh_fallback = 0 alone, as the 0.10.x way to compare against.
 static VkPipelineCreateFlags noopt_flag_for(int mesh) {
     static int on = -1;
     if (on < 0) {
@@ -6031,8 +6034,9 @@ static void prewarm_run(void) {
         // (NX2NAVI_MESH_EMULATION) it is a vertex pipeline and its compute stages (pipe_miss: layout_get_emu), built
         // here like the others: left to the first draw, each took 113-830 ms on an RX 580 and the draws waiting for it
         // were skipped (22 of the 48 pipelines missed entering Kokiri Forest, 0.9.1), frames held back or shown without
-        // them.
-        if (is_mesh(&s) && !vk_ctx()->has_mesh_shader && !mesh_emu_on()) {
+        // them. With the mesh fallback on a device that has mesh shaders (vk_mesh_path.h: AMD's driver for RDNA 1 and
+        // 2) none is built either: no mesh draw uses one, and that driver is not to compile them.
+        if (is_mesh(&s) && (vk_ctx()->mesh_fallback || (!vk_ctx()->has_mesh_shader && !mesh_emu_on()))) {
             dropped++;
             continue;
         }
@@ -8338,7 +8342,7 @@ static int seed_pipelines(const char *dir) {
             other++;
             continue;
         }
-        if (is_mesh(&s) && !vk_ctx()->has_mesh_shader) {   // this GPU draws no mesh pipeline
+        if (is_mesh(&s) && (!vk_ctx()->has_mesh_shader || vk_ctx()->mesh_fallback)) {   // no mesh draw uses one
             no_mesh++;
             continue;
         }
@@ -8840,7 +8844,7 @@ static int save_with(uint32_t wait_ms, int exiting) {
                (unsigned long long)P.g.ready_fresh);
         // The mesh pipelines by themselves: with stage libraries the first two numbers follow each other and the
         // times are a link's; without (the start's line says why) none is linked and the time is a whole build's.
-        if (vk_ctx()->has_mesh_shader)
+        if (vk_ctx()->has_mesh_shader && !vk_ctx()->mesh_fallback)
             rt_log("vk_pipeline: gpl: mesh pipelines (%s): %llu fast links (avg %.2f ms, max %.2f ms); the %llu a draw "
                    "missed were usable after avg %.1f ms, longest %.0f ms, %llu of them through a fast link (the others "
                    "after their whole build); their libraries made in this run: %llu of task and mesh stages (avg %.1f "

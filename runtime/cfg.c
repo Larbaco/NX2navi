@@ -323,7 +323,8 @@ static const CfgMeta metas[] = {
     {"DRAW_WRITERS_WAIT", "1", "0|1", RESTART},   // vk_exec_draw.c writers_wait_on
     {"PREPARE_PIPELINES", "all", "0|mesh|all", RESTART},   // vk_pipeline.c seed_pipelines
     // vk_device.c: task and mesh programs through compute passes (vk_exec_draw.c "mesh fallback"); auto: on a device
-    // without mesh shaders. The megabytes are the buffers the passes write (vk_mesh_fb.c).
+    // without mesh shaders and on AMD's Windows driver for RDNA 1 and 2 (vk_mesh_path.h). The megabytes are the
+    // buffers the passes write (vk_mesh_fb.c).
     {"MESH_FALLBACK", "auto", "auto|0|1", RESTART}, {"MESH_FALLBACK_MB", "128", "16..4096", RESTART},
     {"MESH_FALLBACK_WORKERS", "auto", "auto|1|2|3|4", RESTART},   // vk_exec_draw.c mfb_worker_count
     {"PIPE_AHEAD", "1", "0|1", RESTART},        // vk_exec.c vk_exec_ahead, vk_pipeline.c vk_pipeline_hint

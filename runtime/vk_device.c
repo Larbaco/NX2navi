@@ -19,6 +19,7 @@
 #include "vk_fg.h"
 #include "vk_dlssg.h"
 #include "vk_lowlat.h"
+#include "vk_mesh_path.h"
 
 // The loader's vkGetDeviceProcAddr until Streamline is on the device (see vk.h).
 PFN_vkGetDeviceProcAddr vk_dpa = vkGetDeviceProcAddr;
@@ -606,19 +607,23 @@ static int create_device(void) {
         if (!c->mesh.meshShader || !c->mesh.taskShader) g_vk.has_mesh_shader = 0;
         rt_log("vk: mesh shaders: %s", g_vk.has_mesh_shader ? "VK_EXT_mesh_shader" : "the extension is there, its task or mesh feature is not");
     }   // vkGetDeviceFaultInfoEXT needs the feature, not just the extension
-    {   // mesh_fallback: auto (on a device without mesh shaders), 1 (on every device, for testing) or 0
-        // without mesh shaders the mesh emulation (NX2NAVI_MESH_EMULATION, on unless 0) draws them; mesh_emulation = 0
-        // leaves them to this fallback
-        const char *mf = cfg_value("NX2NAVI_MESH_FALLBACK"), *me = cfg_value("NX2NAVI_MESH_EMULATION");
-        int emu = !g_vk.has_mesh_shader && strcmp(me, "0");
-        g_vk.mesh_fallback = !emu && (!strcmp(mf, "1") || (strcmp(mf, "0") && !g_vk.has_mesh_shader));
-        g_mesh_path = emu ? "emulated (mesh_emulation)" : g_vk.mesh_fallback ? "through the mesh fallback (compute passes)"
-                    : g_vk.has_mesh_shader ? "native (VK_EXT_mesh_shader)" : "skipped (no mesh shaders, mesh_fallback = 0)";
-        if (emu) rt_log("vk: mesh shaders: emulated with compute (mesh_emulation = 1); mesh_fallback is not used");
-        else if (g_vk.mesh_fallback)
+    {   // mesh_fallback: auto, 1 (on every device) or 0 (vk_mesh_path.h says when auto takes it, and why on AMD's driver
+        // for RDNA 1 and 2). Without mesh shaders the mesh emulation (mesh_emulation = 1) draws them instead.
+        // has_mesh_shader keeps saying what the hardware has: the recorder thread (vk_rec.c) and the low-end card
+        // test (vk_low_end_card) go by it, not by how mesh programs are drawn.
+        const char *mf = cfg_value("NX2NAVI_MESH_FALLBACK"), *me = cfg_value("NX2NAVI_MESH_EMULATION"), *why = "";
+        int path = mesh_path_decide(g_vk.has_mesh_shader, vk_caps.amd_sc, mf, me, &why);
+        g_vk.mesh_fallback = path == MESH_PATH_FALLBACK;
+        g_mesh_path = path == MESH_PATH_EMULATION ? "emulated (mesh_emulation)"
+                    : path == MESH_PATH_FALLBACK ? (g_vk.has_mesh_shader ? "through the mesh fallback on a device with mesh "
+                                                                           "shaders (compute passes)"
+                                                                         : "through the mesh fallback (compute passes)")
+                    : path == MESH_PATH_NATIVE ? "native (VK_EXT_mesh_shader)" : "skipped (no mesh shaders, mesh_fallback = 0)";
+        if (path == MESH_PATH_EMULATION) rt_log("vk: mesh shaders: emulated with compute (mesh_emulation = 1); mesh_fallback is not used");
+        else if (path == MESH_PATH_FALLBACK)
             rt_log("vk: mesh fallback: task and mesh programs run as compute passes and are drawn from their buffers (%s)",
-                   g_vk.has_mesh_shader ? "mesh_fallback = 1" : "this device has no mesh shaders");
-        else if (!g_vk.has_mesh_shader)
+                   why);
+        else if (path == MESH_PATH_NONE)
             rt_log("vk: mesh shaders: not supported and mesh_fallback = 0 (task/mesh draws are skipped)");
     }
     if (g_vk.has_maximal_reconvergence && !c->mrc.shaderMaximalReconvergence) g_vk.has_maximal_reconvergence = 0;
