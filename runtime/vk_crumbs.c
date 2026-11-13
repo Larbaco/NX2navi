@@ -614,7 +614,7 @@ VkPassMark *vk_pass_mark_begin(VkCommandBuffer cb, int kind, uint64_t fence) {
     uint32_t id = ++seq;
     if (!id) id = ++seq;   // 0 means no mark
     VkPassMark *m = &ring[id & (VK_PASS_MARKS - 1)];
-    m->id = id, m->kind = (uint8_t)kind, m->fence = fence, m->draws = UINT32_MAX;
+    m->id = id, m->kind = (uint8_t)kind, m->fence = fence, m->draws = UINT32_MAX, m->mesh = m->mesh_ind = 0;
     m->gap = gap_now, gap_now = 0;   // what was recorded between the mark before and this one
     // timed unless the slot's previous mark is still waiting to be read (its queries are not reset yet)
     if (pt_pool) pt_timed[id & (VK_PASS_MARKS - 1)] = !pt_timed[id & (VK_PASS_MARKS - 1)] ? 1 : 2;

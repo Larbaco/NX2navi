@@ -865,7 +865,6 @@ void vk_exec_pass_begin(VkExec *ex) {
     VkPassMark *m = ex->mark = rw_chunk ? NULL : vk_pass_mark_begin(ex->cb, VK_MARK_PASS, ex->fence);   // one ring
     if (m) {
         m->step = ex->mark_passes++;
-        m->mesh = m->mesh_ind = 0;
         m->w = ex->pass_w, m->h = ex->pass_h, m->d = ex->pass_layers;
         m->layer = ex->depth.image ? ex->depth.base_layer : 0;
         m->vw = m->vh = 0;
