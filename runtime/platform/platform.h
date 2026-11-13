@@ -536,6 +536,8 @@ int plat_page_file_managed(void);
 // This process's memory in bytes: resident (the working set) and private (Windows: committed private bytes; Linux: the
 // resident anonymous pages). 0 when unknown.
 void plat_process_memory(uint64_t *resident, uint64_t *private_bytes);
+// The handles (Windows) or file descriptors (Linux) this process holds; 0 when unknown.
+uint32_t plat_handle_count(void);
 // The C runtime's malloc heap in bytes, for the memory report (vk_memory.c system_log): what it took from the system
 // (committed) and what of that it handed out (used), and how many other heaps the process has (Windows: those DLLs made
 // with HeapCreate, the graphics driver's among them; their sizes are not asked, as a heap made without serialization

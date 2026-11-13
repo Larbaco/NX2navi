@@ -5540,33 +5540,46 @@ static void system_log(uint64_t frame, const ReportFig *f, const VkPipeMem *pm, 
         snprintf(spv, sizeof spv, " (their SPIR-V %.0f, uncompressed%s)", sr.spv_held / M,
                  sr.compress < 0 ? ": shader_compress = 0" : "");
     uint64_t pipes = pm->ram_pipes + pm->ram_keys + pm->ram_seed + pm->ram_binaries;
-    uint64_t texhost = th.bytes + th.tmp, known = shaders + pipes + texhost + lq + frec;
+    uint64_t cn, cb, cidle_n, cidle_b;   // the NVN recording copies (nvn_api_cmd.c), malloc'd
+    nvn_copies_stats(&cn, &cb, &cidle_n, &cidle_b);
+    uint64_t texhost = th.bytes + th.tmp, known = shaders + pipes + texhost + lq + frec + cb;
     uint64_t pcache = pm->cache[0] + pm->cache[1];
     // Windows charges the device-local memory the driver allocates to the process's commit (platform.h
-    // plat_commit_counts_vram): the driver's figure, VMA's blocks and what VMA never allocated alike.
+    // plat_commit_counts_vram): the driver's figure, VMA's blocks and what VMA never allocated alike. The driver's
+    // views of that memory (write-combined, counted by a walk of the address space, NX2NAVI_MEM_CENSUS) came to
+    // 0.2-1.1 GiB more than its device-local figure in a session of 2026-11-13, and that part went to "other": "other
+    // system memory" grew 1,283 MiB in play while the process's own commit grew 307. With a walk less than a minute old
+    // the gap at that walk is a term of its own.
     int charged = plat_commit_counts_vram();
-    uint64_t dev = charged ? f->usage : 0, crt = hi.committed ? hi.committed : known;
-    int64_t other = (int64_t)priv - (int64_t)(f->heap_c + f->maps + dev + f->hblocks + crt + pcache);
+    uint64_t dev = charged ? f->usage : 0, crt = hi.committed ? hi.committed : known, wc = 0, wc_vram = 0, wc_gap = 0;
+    if (charged && perf_wc_recent(60000000000ull, &wc, &wc_vram) && wc > wc_vram) wc_gap = wc - wc_vram;
+    int64_t other = (int64_t)priv - (int64_t)(f->heap_c + f->maps + dev + wc_gap + f->hblocks + crt + pcache);
     char line[2000];
     size_t k = 0;
     mg_put(line, sizeof line, &k, "mem: system frame %llu: process commit %.0f MiB%s = the game's heap %.0f + its physical "
            "maps %.0f", (unsigned long long)frame, priv / M, charged ? "" : " (the resident anonymous pages)",
            f->heap_c / M, f->maps / M);
     if (charged) mg_put(line, sizeof line, &k, " + device-local memory, which Windows charges to the process, %.0f", dev / M);
+    if (wc_gap)
+        mg_put(line, sizeof line, &k, " + the driver's write-combined views beyond that figure %.0f (at the last walk of the "
+               "address space)", wc_gap / M);
     mg_put(line, sizeof line, &k, " + VMA's host-visible blocks %.0f (the flight recorder's thumbnails %.0f of them)",
            f->hblocks / M, fthumb / M);
     if (hi.committed)
         mg_put(line, sizeof line, &k, " + the C runtime heap %.0f (%.0f of it handed out; of it known: shader caches %.0f in "
                "%llu shaders%s, pipeline tables %.0f, the texture cache %.0f with decode temporaries %.0f now and %.0f at most "
-               "since the last report, the log queue %.0f, the flight recorder's records %.0f; the rest %.0f)",
+               "since the last report, the log queue %.0f, the flight recorder's records %.0f, NVN recording copies %.0f in "
+               "%llu, %.0f of it in %llu unused for 5 minutes; the rest %.0f)",
                hi.committed / M, hi.used / M, shaders / M, (unsigned long long)sr.shaders, spv, pipes / M, texhost / M,
-               th.tmp / M, th.tmp_peak / M, lq / M, frec / M, ((double)hi.committed - (double)known) / M);
+               th.tmp / M, th.tmp_peak / M, lq / M, frec / M, cb / M, (unsigned long long)cn, cidle_b / M,
+               (unsigned long long)cidle_n, ((double)hi.committed - (double)known) / M);
     else
         mg_put(line, sizeof line, &k, " + what the runtime knows it allocated %.0f (the C runtime heap's size is not "
                "known: shader caches %.0f in %llu shaders%s, pipeline tables %.0f, the texture cache %.0f with decode "
                "temporaries %.0f now and %.0f at most since the last report, the log queue %.0f, the flight recorder's "
-               "records %.0f)", known / M, shaders / M, (unsigned long long)sr.shaders, spv, pipes / M, texhost / M,
-               th.tmp / M, th.tmp_peak / M, lq / M, frec / M);
+               "records %.0f, NVN recording copies %.0f in %llu, %.0f of it in %llu unused for 5 minutes)", known / M,
+               shaders / M, (unsigned long long)sr.shaders, spv, pipes / M, texhost / M, th.tmp / M, th.tmp_peak / M,
+               lq / M, frec / M, cb / M, (unsigned long long)cn, cidle_b / M, (unsigned long long)cidle_n);
     mg_put(line, sizeof line, &k, " + the driver's pipeline cache data %.0f (pipeline-cache.bin's %.0f, the play cache's "
            "%.0f, %s) + other %.0f (the driver's own memory, thread stacks, the program's data; %u other heaps)",
            pcache / M, pm->cache[0] / M, pm->cache[1] / M, pm->cache_asked ? "as last asked" : "as loaded at the boot",
@@ -5574,6 +5587,8 @@ static void system_log(uint64_t frame, const ReportFig *f, const VkPipeMem *pm, 
     char room[160];
     mem_budget_text(room, sizeof room);   // the levels the owners that give memory back go by (mem_budget.h)
     mg_put(line, sizeof line, &k, "; room: %s", room);
+    uint32_t handles = plat_handle_count();   // they rose at area loads and never fell in a session of 2026-11-13
+    if (handles) mg_put(line, sizeof line, &k, "; handles %u", handles);
     rt_log("%s", line);
     *out = (SysFig){priv, crt, shaders, pipes, texhost, pcache, other > 0 ? (uint64_t)other : 0};
 }

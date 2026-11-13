@@ -2183,6 +2183,11 @@ void plat_process_memory(uint64_t *resident, uint64_t *private_bytes) {
         *resident = pm.WorkingSetSize, *private_bytes = pm.PrivateUsage;
 }
 
+uint32_t plat_handle_count(void) {
+    DWORD n = 0;
+    return GetProcessHandleCount(GetCurrentProcess(), &n) ? (uint32_t)n : 0;
+}
+
 // The UCRT's malloc takes its memory from the heap _get_heap_handle names (the process heap); HeapSummary sums it. The
 // other heaps are only counted: one made with HEAP_NO_SERIALIZE has no lock to take.
 void plat_heap_info(PlatHeapInfo *h) {

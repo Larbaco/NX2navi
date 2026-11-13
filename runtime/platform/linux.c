@@ -2248,6 +2248,15 @@ void plat_process_memory(uint64_t *resident, uint64_t *private_bytes) {
     fclose(f);
 }
 
+uint32_t plat_handle_count(void) {
+    DIR *d = opendir("/proc/self/fd");
+    if (!d) return 0;
+    uint32_t n = 0;
+    for (struct dirent *e; (e = readdir(d));) n += e->d_name[0] != '.';
+    closedir(d);
+    return n ? n - 1 : 0;   // less the descriptor of this walk
+}
+
 // glibc's mallinfo2 (2.33 and later) sums every arena: arena is what the arenas took with brk and mmap, hblkhd the
 // blocks mmapped one by one, uordblks what the arenas handed out. Other C libraries leave the figures unknown.
 void plat_heap_info(PlatHeapInfo *h) {
