@@ -2385,6 +2385,11 @@ static void sweep_released(void) {
 #define HARD_SLACK 256
 #define HARD_BATCH 1024
 static uint64_t n_hard_by[TRL_HC_N];   // entries dropped past RELEASED_HARD since the last perf line, by class
+// Each call of sweep_hard is timed: it walks every released entry and drops a batch under the texture lock, on the
+// thread that releases (a guest thread's finalize, the replay's overwrite_others), and nothing measured what a batch
+// costs. A call of HARD_LOG_NS or more gets a line (16 at most); the texture origins perf line sums them.
+#define HARD_LOG_NS 2000000ull
+static uint64_t n_hard_calls, ns_hard, ns_hard_max;   // since the last perf line
 
 static int hard_order(void) {
     static int on = -1;
@@ -2412,6 +2417,8 @@ static void sweep_hard(void) {   // tex_lock held
     static uint8_t *cls;
     static int *out, cap;
     const uint64_t stale = PRESENTS(120);   // STALE_FRAMES
+    const uint64_t t0 = plat_now_ns(), drops0 = n_drop_by[DROP_HARD], wb0 = n_drop_wb;
+    uint64_t walked = 0;
     while (nreleased > RELEASED_HARD && rel_head) {
         uint64_t now = frames_now();
         Tex *lru = rel_head;
@@ -2427,6 +2434,7 @@ static void sweep_hard(void) {   // tex_lock held
         if (!hard_order() || nreleased > cap) {
             Tex *gone = NULL;
             for (Tex *e = rel_head; e && !gone; e = e->rel_next) {   // in release order
+                walked++;
                 if (e->overwritten || now - e->samp_frame >= SWEEP_UNSAMPLED) gone = e;
                 else if (e->samp_frame < lru->samp_frame) lru = e;
             }
@@ -2439,6 +2447,7 @@ static void sweep_hard(void) {   // tex_lock held
             walk[n] = e, cls[n] = (uint8_t)e_hard_class(e, now, stale), n++;
             if (e->samp_frame < lru->samp_frame) lru = e;
         }
+        walked += (uint64_t)n;
         int need = nreleased - (RELEASED_HARD - HARD_SLACK);
         int k = trl_hard_pick(cls, n, need < HARD_BATCH ? need : HARD_BATCH, out);
         // The picks the GPU drew into go back to their storage first, in one upload batch with one wait
@@ -2458,6 +2467,16 @@ static void sweep_hard(void) {   // tex_lock held
         if (m) write_back_n(wbv, m), n_drop_wb += (uint64_t)m;
         for (int i = 0; i < k; i++) n_hard_by[cls[out[i]]]++, drop_tex(walk[out[i]], DROP_HARD);
         if (!k) hard_lru_drop(lru);
+    }
+    uint64_t d = plat_now_ns() - t0;
+    n_hard_calls++, ns_hard += d;
+    if (d > ns_hard_max) ns_hard_max = d;
+    if (d >= HARD_LOG_NS) {
+        static volatile int32_t n_slow;
+        log_limited(&n_slow, "released textures past the hard count: a batch walked %llu entries and dropped %llu "
+                    "(%llu written back) in %.2f ms", (unsigned long long)walked,
+                    (unsigned long long)(n_drop_by[DROP_HARD] - drops0), (unsigned long long)(n_drop_wb - wb0),
+                    d / 1e6);
     }
 }
 
@@ -5266,15 +5285,18 @@ void vk_texture_new_submit(void) {
                "replaced by another "
                "descriptor at their address %llu; entries the CPU does not write made without content at an address it "
                "can see: on their own %llu, over a released entry %llu, over a live one %llu; marked slots that met an "
-               "entry without content %llu, that show no entry %llu; GPU-drawn entries written back before their drop %llu",
+               "entry without content %llu, that show no entry %llu; GPU-drawn entries written back before their drop %llu"
+               "; hard-count batches %llu, %.1f ms in all, the longest %.2f ms",
                (unsigned long long)f * 60, (unsigned long long)n_drop_by[DROP_MAX], (unsigned long long)n_drop_by[DROP_HARD],
                (unsigned long long)n_hard_by[TRL_HC_OVER], (unsigned long long)n_hard_by[TRL_HC_INTACT_OLD],
                (unsigned long long)n_hard_by[TRL_HC_INTACT], (unsigned long long)n_hard_by[TRL_HC_GPU],
                (unsigned long long)n_hard_by[TRL_HC_LATELY], (unsigned long long)n_drop_by[DROP_REPLACED],
                (unsigned long long)n_cpu_empty[0], (unsigned long long)n_cpu_empty[1], (unsigned long long)n_cpu_empty[2],
-               (unsigned long long)n_mark_empty, (unsigned long long)n_mark_none, (unsigned long long)n_drop_wb);
+               (unsigned long long)n_mark_empty, (unsigned long long)n_mark_none, (unsigned long long)n_drop_wb,
+               (unsigned long long)n_hard_calls, ns_hard / 1e6, ns_hard_max / 1e6);
         memset(n_drop_by, 0, sizeof n_drop_by), memset(n_cpu_empty, 0, sizeof n_cpu_empty), memset(n_hard_by, 0, sizeof n_hard_by);
         n_mark_empty = n_mark_none = n_drop_wb = 0;
+        n_hard_calls = ns_hard = ns_hard_max = 0;
         rt_log("perf: frame %llu: texture finalizes: slots marked %llu; slots of another live texture with the same "
                "parameters at the storage, left current %llu (terrain heightmaps %llu); lookups the stale rule gave the "
                "stand-in %llu (terrain heightmaps %llu), their own kept image %llu (NX2NAVI_TEX_STALE_KEPT)",
