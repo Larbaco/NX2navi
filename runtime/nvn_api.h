@@ -22,6 +22,11 @@ void nvn_called(uint8_t *seen, const char *name);          // the counting prolo
 // A wait for the GPU, the display or another thread gives the virtual core up until the end of the enclosing scope.
 #define NVN_BLOCKING() __attribute__((cleanup(kern_core_back))) int nvn_away_ = kern_core_away()
 static inline int nvn_arg_bool(const Cpu *c, int i) { return (int)(arg_x(c, i) & 0xff); }   // NVNboolean: low 8 bits only
+// 1 when argument 0, the object of a getter, is NULL: the call is answered with 0 instead of reading the object at
+// address 0 plus a field's offset. The game's scene-loading thread makes a few such calls while an area or Kakariko's
+// time of day changes (a memory pool's flags, a texture builder's storage size). The first calls are logged with
+// their caller (nvn_api_core.c).
+int nvn_no_object(Cpu *c, const char *what);
 
 #define NVN_POOL_MAGIC MAGIC('P', 'O', 'O', 'L')           // pool_t.magic of an initialized pool
 #define NVN_VPOOL_PAGE 0x10000ull                          // NVN virtual mapping granularity (64 KiB)

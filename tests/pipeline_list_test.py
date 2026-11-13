@@ -1,5 +1,6 @@
 """tools/pipeline_list.py on made-up game folders: records folded once, a key whose shader the folder's answers do not
-name left out, --mesh-only, a folder of another record layout left out, the file read back, and what
+name left out, the compute variants taken, a list made before as an input, --mesh-only, a folder of another record
+layout left out, the file read back, and what
 tools/prepare_shaders.py takes from a list for its seed. Also tools/check_content.py refusing such files in a commit.
 No game files; stdlib only.
 
@@ -18,7 +19,7 @@ import check_content  # noqa: E402
 import pipeline_list as pl  # noqa: E402
 
 REC = 464          # a KeyRec of the runtime that wrote the test's files: three ids, two flags, the state
-VS, FS, TS, MS = 0, 4, 6, 7
+VS, FS, CS, TS, MS = 0, 4, 5, 6, 7
 
 
 def h(seed):
@@ -72,6 +73,24 @@ class PipelineList(unittest.TestCase):
         _, keys, answers = self.merge([a], mesh_only=True)
         self.assertEqual(keys, [key('m1', 'f2', 't1'), key('m1', None)])
         self.assertEqual({x[36:68] for x in answers}, {h('id ' + s) for s in ('m1', 'f2', 't1')})
+
+    def test_compute_variants_and_a_list_as_input(self):
+        a = folder(self.root, 'a', [key('v1', 'f1')], [answer('v1', VS), answer('f1', FS), answer('c1', CS), answer('f9', FS)])
+        header, keys, answers = self.merge([a])
+        self.assertEqual({x[36:68] for x in answers}, {h('id ' + s) for s in ('v1', 'f1', 'c1')})   # f9: no key names it
+        self.assertIn('1 compute variants new', self.log[0])
+        lst = self.root / 'first.bin'
+        lst.write_bytes(pl.pack(header, keys, answers))
+        b = folder(self.root, 'b', [key('v1', 'f1'), key('v2', 'f1')],
+                   [answer('v2', VS), answer('f1', FS), answer('c1', CS), answer('c2', CS)])   # v1's answers: the list's
+        header, keys, answers = self.merge([lst, b])
+        self.assertEqual(keys, [key('v1', 'f1'), key('v2', 'f1')])
+        self.assertEqual({x[36:68] for x in answers}, {h('id ' + s) for s in ('v1', 'f1', 'c1', 'v2', 'c2')})
+        self.assertIn('1 key records, 1 new to the list', self.log[1])
+        self.assertIn('2 key records, 1 new to the list, 0 without', self.log[2])
+        self.assertIn('1 compute variants new', self.log[2])
+        _, _, answers = self.merge([a], mesh_only=True)
+        self.assertEqual(answers, [])
 
     def test_other_layout_left_out(self):
         a = folder(self.root, 'a', [key('v1', 'f1')], [answer('v1', VS), answer('f1', FS)])

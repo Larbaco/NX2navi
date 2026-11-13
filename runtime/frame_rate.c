@@ -235,6 +235,8 @@ double frame_step_game_hz(void) {
 // RivaTuner Statistics Server (rtss_limit.c) gets the same limit; while it limits this process the pacer holds no
 // frames, so the two never stack. NX2NAVI_RTSS=0 and frame generation (RTSS would count the generated frames) keep it out.
 static double paced_hz;   // the game frames a second the newest frame_step_cap_ns paces at (ocarina_step); 0: none
+static int movie_paced;   // the movie rate the newest frame_step_cap_ns paces at (ocarina_step, frame_step_movie_hz); 0: none
+int frame_step_movie_hz(void) { return movie_paced; }
 uint64_t frame_step_cap_ns(void) {
     frame_limit_live();
     static int rtss_allowed = -1;
@@ -245,6 +247,12 @@ uint64_t frame_step_cap_ns(void) {
     int rtss = rtss_allowed && !vk_fg_wanted() && !vk_dlssg_active();
     int gen = generated_factor();
     int movie_hz = movie_cap_hz();
+    static int movie_clock = -1;   // NX2NAVI_MOVIE_CLOCK=0: the steady step and the usual pacing through a movie too
+    if (movie_clock < 0) {
+        const char *e = cfg_get("NX2NAVI_MOVIE_CLOCK");
+        movie_clock = !(e && !strcmp(e, "0"));
+    }
+    movie_paced = movie_clock ? movie_hz : 0;
     static int movie_was, movie_logs;
     if (!!movie_hz != movie_was) {
         movie_was = !!movie_hz;
@@ -353,6 +361,18 @@ static double ocarina_step_s(void) {
     return base * speed / 60.0;
 }
 
+static _Atomic uint64_t guest_presents;   // frame_step_present calls so far (frame_step_flight)
+
+// The flight recorder's view of the step at a host present (flight.c, render thread): the newest step the patch page
+// holds in 60 Hz frames per update (set ostep; -1 without), the game's own step from its time manager in 60 Hz frames
+// (-1 unknown or not free-running), and the game's presents so far, which name the update those two belong to.
+void frame_step_flight(float *page, float *game, uint64_t *presents) {
+    *page = ostep_page ? frame_step_frames() : -1.0f;
+    double s = frame_free_running() ? ocarina_step_s() : -1;
+    *game = s > 0 ? (float)(s * 60.0) : -1.0f;
+    *presents = atomic_load_explicit(&guest_presents, memory_order_relaxed);
+}
+
 // Free-running builds (Ocarina): the game's step follows the display interval (ocarina_step, in 60 Hz frames), written
 // at each present: frames per update on the patch page with the set ostep, else the time manager's base step. The
 // game left it at one 60 Hz frame whatever the frame rate, so at 144 fps it ran 2.4 times too fast.
@@ -392,11 +412,32 @@ static void ocarina_step_reset(void) {
     os_owed = 0;
 }
 
+// While a movie plays (frame_step_cap_ns paces the game at the movie's rate) the step is exactly one movie frame, whatever
+// the display intervals; NX2NAVI_MOVIE_CLOCK=0 leaves movies to the steady step (comparison runs). The game's movie
+// player (main+0x3b5ca60) adds the time manager's seconds times 60 to an accumulator at each update and advances the
+// movie by its whole pictures, at most the player's limit per update (+0x20, set at main+0x3b5d094: 1, or 2 in one of
+// its modes), keeping the rest. The Triforce movie showed one picture per update (600 pictures in 600 updates at 59.6
+// updates a second), so the time a late frame left owed, which the steady step pays back as steps over one frame, never
+// became pictures: the picture fell behind its sound, which plays by the clock, by each late frame for good. The
+// movie's event counts updates as 60 Hz frames too (frame_step_cap_ns). So the updates themselves keep the clock
+// (nvn_api_obj.c pace keeps the movie's slots through a late frame) and each counts as one movie frame, for the
+// picture, the event and the game's clock alike. The filter starts again at a movie's start and end, so neither rate's
+// intervals reach the other.
 static double ocarina_step(double dt) {
-    static int steady = -1;
+    static int steady = -1, movie_was;
     if (steady < 0) {
         const char *e = cfg_get("NX2NAVI_STEP_STEADY");
         steady = !(e && !strcmp(e, "0"));
+    }
+    if (movie_paced != movie_was) {
+        movie_was = movie_paced;
+        ocarina_step_reset();
+    }
+    if (movie_paced > 0) {
+        double step = 1.0 / movie_paced;
+        if (os_step_lo <= 0 || step < os_step_lo) os_step_lo = step;
+        if (step > os_step_hi) os_step_hi = step;
+        return step;
     }
     if (dt > STEP_MAX_S) dt = STEP_MAX_S;
     os_ring[os_next++ % OSTEP_WINDOW] = dt;
@@ -433,6 +474,65 @@ static double ocarina_step(double dt) {
     if (os_step_lo <= 0 || step < os_step_lo) os_step_lo = step;
     if (step > os_step_hi) os_step_hi = step;
     return step;
+}
+
+// ---- whole frames out of the real-time step (the set ostep's sites that cut it to a whole number, patches-v111.txt)
+// The game adds the step, or the step times a whole number, to a few counters and cuts the sum to a whole number: at the
+// console's 60 fps the step is 1 and they count frames. With the step the display interval in 60 Hz frames, under one
+// above 60 fps, the cut loses the fraction every frame. whole_frames keeps it per counter (by its guest address) and
+// hands out the whole part, so each counter moves at the game's pace at any frame rate; at a step of exactly one it
+// gives what the game computes. A value that is not positive, or too large for a count, is cut as fcvtzs cuts it.
+#define WHOLE_SLOTS 8
+static struct { uint64_t at; float rem; uint32_t used; } whole_slot[WHOLE_SLOTS];
+static uint32_t whole_calls;
+static PlatMutex whole_lock = PLAT_MUTEX_INIT;
+
+static uint32_t cut_fcvtzs(float f) {   // fcvtzs w, s: toward zero, saturating, NaN 0
+    if (f != f) return 0;
+    if (f >= 2147483648.0f) return 0x7fffffffu;
+    if (f <= -2147483648.0f) return 0x80000000u;
+    return (uint32_t)(int32_t)f;
+}
+
+static uint32_t whole_frames(uint64_t at, float amount) {
+    if (!(amount > 0.0f) || amount >= 2147483648.0f) return cut_fcvtzs(amount);
+    plat_mutex_lock(&whole_lock);
+    int k = -1, oldest = 0;
+    for (int i = 0; i < WHOLE_SLOTS; i++) {
+        if (whole_slot[i].at == at) { k = i; break; }
+        if (whole_slot[i].used < whole_slot[oldest].used) oldest = i;
+    }
+    if (k < 0) k = oldest, whole_slot[k].at = at, whole_slot[k].rem = 0.0f;
+    whole_slot[k].used = ++whole_calls;
+    float sum = whole_slot[k].rem + amount;
+    uint32_t whole = cut_fcvtzs(sum);
+    whole_slot[k].rem = sum - (float)whole;
+    plat_mutex_unlock(&whole_lock);
+    return whole;
+}
+
+// The time of day (main+0x3cdf70, patches-v111.txt): s0 holds twice the step, the game seconds of this frame; w8 gets
+// the whole ones, the counter being the seconds of the day at +0x3c of the object in x19.
+// NX2NAVI_TRACE=perf: every 10 s, the game seconds the day was given beside those the cut alone would have given.
+void frame_rate_day_host(Cpu *c) {
+    uint32_t bits = (uint32_t)c->v[0];
+    float secs;
+    memcpy(&secs, &bits, 4);
+    uint32_t whole = whole_frames(c->x[19] + 0x3c, secs);
+    c->x[8] = whole;
+    if (rt_trace & RT_TRACE_PERF) {
+        static uint64_t t0, given, cut;
+        static double exact;
+        uint64_t now = plat_now_ns();
+        given += whole, cut += cut_fcvtzs(secs), exact += secs;
+        if (!t0) t0 = now;
+        if (now - t0 >= 10000000000ull) {
+            rt_log("frame rate: the time of day got %llu game seconds in %.1f s (the frames' step makes %.1f; cut "
+                   "to whole seconds each frame, as the game cuts them, %llu)", (unsigned long long)given,
+                   (now - t0) / 1e9, exact, (unsigned long long)cut);
+            t0 = now, given = cut = 0, exact = 0;
+        }
+    }
 }
 
 // The 60 Hz frames the game steps at each update where the set ostep gives them (Ocarina); 1 elsewhere, the game's own
@@ -527,6 +627,11 @@ static void speed_report(uint64_t now, double step, int interval) {
         memcpy(last_pos, p, sizeof p);
         last_pos_ns = now;
     }
+    float global_step;   // Ocarina 1.1.1: the engine's global step (patches-v111.txt, the set ostep's second site)
+    if (probe && ostep_page && read_guest(MOD_MAIN_BASE + 0x4d41fc8, &global_step, 4)) {
+        size_t o = strlen(pos);
+        snprintf(pos + o, sizeof pos - o, "; global step %.3f frames", (double)global_step);
+    }
     if (os_step_hi > 0) {   // Ocarina: the shortest and longest step given in these frames, and the time still owed
         size_t o = strlen(pos);
         snprintf(pos + o, sizeof pos - o, "; step %.3f..%.3f frames, %.1f ms owed", os_step_lo * 60, os_step_hi * 60,
@@ -571,6 +676,7 @@ static void world_clock(double dt, double step) {
 }
 
 void frame_step_present(uint64_t display_ns, int interval) {
+    atomic_fetch_add_explicit(&guest_presents, 1, memory_order_relaxed);
     game_interval = interval > 0 ? interval : 1;
     frame_limit_live();
     double step = 0, dt = last_ns ? (double)(display_ns - last_ns) * 1e-9 : 0;

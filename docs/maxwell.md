@@ -90,7 +90,7 @@ Source shorthands:
 | 4.7 | **Virtual memory pools** map physical pool pages; the same bytes reachable at two GPU addresses. | Two `VkBuffer`s over one allocation need alias-aware barriers. | — | — |
 | 4.8 | **Events gate queues**: a command buffer's `WaitEvent` holds its queue until a `SignalEvent` of another queue, or `nvnEventSignal` on the CPU, gives the event the value; the GPU reads what the commands behind the wait use only from then on. Ocarina's worker queues wait for the main queue's signals and the other way round, and the main queue waits each frame for a signal the CPU gives once the game has written the frame's data, before, after or during the main queue's submit call. | One queue in submission order, and the replay copies what a submission reads (VRAM mirror sync, uniform snapshot) when its recording starts. | A wait reached before its signal stops its submission, which goes on when the signal has been replayed (`vk_exec.c`, "event order across the game's queues"). A CPU signal counts for a submission only when it came before those copies; one that comes during the replay stops the submission, and it goes on at once in a submission of its own (`vk_exec_xfer.c`, "events the CPU signals"). Passing the wait on it drew single frames from copies taken before the game had finished writing: the scene's shadowing missing or the scene black, the interface as it was. | — |
 | 4.8 | **Command list calls**: a `CallCommands` / `CallList` is not a GPU subroutine. A call is stored as a control entry; at submit the CPU walks the entries and recurses into the called list, emitting gpfifo entries that point at the command words, which the GPU fetches later (prefetch can be switched off per entry). So list structure is fixed at submit, command words are read when fetched. | n/a | Ours: `OP_CALL` is walked at replay, `CallCommands` inlines the recording at record time (`vk_exec.c` `walk`, `nvn_api_cmd.c` `inline_recording`). Equivalent for control flow; deferred bind handles are the data read late (2.4). | — |
-| 4.9 | **The texture pool is read as the GPU goes** (bindless `TEX.B` handles index it), and the GPU runs a submission right after it is submitted, so it sees the pool as of about the submit; Ocarina registers the next submission's textures right after submitting. | A descriptor a pending command buffer may read must not be updated (update-after-bind allows only unused ones), and on RADV a view of memory allocated after a submit is not in that submit's page tables. | A replay part handed to the queue early (`NX2NAVI_SPLIT_DRAWS`) kept reading the set later parts wrote: GPU page fault (`gfxhub`, TCP read) on the 128×128 probe pass of Kokiri Forest's first world frame, about 40 s in, nearly every run on RX 9070 XT. Ours: one pool set per submission from a ring, sealed when a part goes; the next sync that has entries to write takes another set, and no part is split off while every other set belongs to the same submission (`vk_exec_draw.c` `vk_exec_pool_split`, `pool_take_set`). | — |
+| 4.9 | **The texture pool is read as the GPU goes** (bindless `TEX.B` handles index it), and the GPU runs a submission right after it is submitted, so it sees the pool as of about the submit; Ocarina registers the next submission's textures right after submitting. | A descriptor a pending command buffer may read must not be updated (update-after-bind allows only unused ones), and on RADV a view of memory allocated after a submit is not in that submit's page tables. | A replay part handed to the queue early (`NX2NAVI_SPLIT_DRAWS`) kept reading the set later parts wrote: GPU page fault (`gfxhub`, TCP read) on the 128×128 probe pass of Kokiri Forest's first world frame, about 40 s in, nearly every run on RX 9070 XT. Ours: one pool set per submission from a ring, sealed when a part goes; the next sync that has entries to write takes another set, and no part is split off while every other set belongs to the same submission (`vk_exec_draw.c` `vk_exec_pool_split`, `pool_take_set`). A registration the game makes while a submission is being replayed takes effect after that submission has gone to the queue, and with the replay on its own thread where the game made it among its submits (`vk_backend.c` "registrations in submit order", `NX2NAVI_REG_ORDER`). | — |
 
 ## 5. Fixed function
 
@@ -121,7 +121,14 @@ Grep-level look on 2026-10-22, statuses updated 2026-10-26; "saw" is what the gr
    not just their base location: an FS `vec4[16]` requires all 16 locations even when it only accesses some elements.
    The same reflected mask feeds recorded-pipeline prewarm, independent stage-library unions and direct pipeline builds.
    Our translator never links stages, so its `InitializeVertexOutputs` would initialise no user output;
-   translator patch 0006 initialises the unlinked outputs. **Implemented; array-span runtime validation pending.**
+   translator patch 0006 initialises the unlinked outputs. Mesh programs: a component of a position or generic vector
+   that the program's output map leaves out is written as (0, 0, 0, 1) by the mesh entry function
+   (`tools/xlate/MeshSpirv.cs`) and by the fallback's vertex stage (`runtime/mesh_fb.c` `meshfb_vs`); a whole location
+   the fragment stage reads and the mesh program does not write is filled in the fragment module of the mesh pipeline
+   (`vk_pipeline.c` `spirv_fs_fill_inputs`): (0, 0, 0, 1), or for a mesh program that draws points the point sprite's
+   coordinate (s, t, 0, 1): the fragment shaders recorded with two of the game's point-drawing mesh programs read
+   location 5, which those programs never write.
+   **Implemented; array-span runtime validation pending.**
 3. **Masked clears.** `vk_exec.c` skips colour clears with a partial channel mask (`W_CLEAR_MASK`); `clear_ds` skips stencil
    clears with a partial mask (`W_STENCIL_MASK`). NX2navi issues such clears. Check the log for
    `colour clear with channel mask` and `stencil clear with mask`. The hardware recipe (1.3) shows what the replay must do: colour clear = scissor 0 + channel mask, stencil clear = `value & mask` merged under the front write mask; so a draw with `colorWriteMask` / `stencilWriteMask` set to the clear mask is the exact equivalent. **Missing.**
@@ -159,7 +166,10 @@ Grep-level look on 2026-10-22, statuses updated 2026-10-26; "saw" is what the gr
     black; integer formats use the float path. Confirm the RX 9070 reports the feature (grass map needs 0.5).
     **OK if supported.**
 12. **Dual-source blend.** `vk_pipeline.c` `blend_factor` maps SRC1 factors; `Program.cs` `QueryGraphicsState` always passes
-    `dualSourceBlendEnable = false`, so no `Index 1` output exists. Log pipelines with SRC1 factors. **Mismatch if used.**
+    `dualSourceBlendEnable = false`, so no `Index 1` output exists in the translation. `vk_pipeline.c` gives a
+    pipeline whose blend state uses a SRC1 factor (`uses_src1`, `GKey.dsb`) a fragment module with the second output
+    at `Index 1` (`spirv_dual_source`) where the device has `dualSrcBlend`. **Fixed** (checked in the code on
+    2026-11-12, not by a capture).
 13. **FMZ / NaN.** Count `FMUL/FFMA/FMUL32I/FFMA32I` words with the `Fmz` field set (`Decoders/InstDecoders.cs:1901`
     bit positions) in `build/v121/shaders/`; FMin/FMax/FClamp NaN results are undefined (3.1). Census (2026-10-22):
     FMZ in 1 instruction of 12397 shaders, FTZ in 12241 shaders, FMNMX in 7457. The translator emits GLSL.std.450
@@ -167,7 +177,10 @@ Grep-level look on 2026-10-22, statuses updated 2026-10-26; "saw" is what the gr
     where the driver keeps NaNs (3.13).
 14. **Point size / line width.** Census: `SetLineWidth 4.5` ~1/frame (2 line draws into a 144x144 R8 target),
     `SetPointSize 5` ~14/frame; 4 point VS rely on it. Point size: translator patch 0008 reads it from the support
-    buffer, **fixed**. Line width: 1 px, non-default values logged (`nvn_ext.c`), **mismatch, minor**.
+    buffer, **fixed**. Line width: recorded with the draw state (`nvn_api_cmd.c`, `OP_BIND_STATE` kind 7) and set as
+    dynamic state for draws of the line topology class (`vk_pipeline.c` `vk_pipeline_line_width`), held to the
+    device's `lineWidthRange`; 1 px on a device without `wideLines` and for triangles drawn in the line polygon mode.
+    **Implemented; not compared with the hardware's wide-line coverage.**
 15. **Block height.** `nvn_tex.c` truncates like NVN (2.1); every other step of the layout matches. **OK.**
 16. **Depth mode and clamp.** `vk_pipeline.c` `create_graphics` (`negativeOneToOne` from `nvn_depth_minus_w`, `depthClampEnable`
     from NVN state). Matches the hardware z maths (1.5) and clamp switch (1.6). **OK.**
@@ -176,7 +189,10 @@ Grep-level look on 2026-10-22, statuses updated 2026-10-26; "saw" is what the gr
 19. **Viewport / scissor arrays.** Single viewport (`vk_exec_draw.c` `record_fixed`), extra scissors logged. Census: 0 differing. **OK.**
 
 20. **Depth-compare sampling in compute** (VUID-vkCmdDispatch-None-06479): one compute shader samples a 4x4 R32F
-    CPU-written placeholder through an R32_SFLOAT view with compare on, ~1/frame. Needs a D32 copy. **Minor.**
+    CPU-written placeholder through an R32_SFLOAT view with compare on, ~1/frame. Where the driver does not compare
+    the colour format, the dispatch samples a depth twin of the image, copied right before it (`vk_exec_draw.c`,
+    "depth twins"; R32_SFLOAT and R16_UNORM). **Fixed for compute passes**; a draw that samples such an image keeps
+    the colour view.
 21. **Report timestamps: unit and instant.** `write_counter` (`vk_exec_xfer.c`) writes host `ns * 12 / 625` (19.2 MHz
     ticks) at fence completion for every report; `nvnDeviceGetTimestampInNanoseconds` converts back with the same factor
     (`nvn_ext.c`). On the hardware, GPU ticks convert at 625/384 ns (614.4 MHz), TIMESTAMP is written when the ROP has retired
@@ -184,4 +200,8 @@ Grep-level look on 2026-10-22, statuses updated 2026-10-26; "saw" is what the gr
     (a) if the game's consumer scales raw report ticks with its own constant rather than the NVN conversion call, our
     19.2 MHz unit is 32x off from the hardware's; find that consumer before fixing the unit; (b) the delta needs
     `vkCmdWriteTimestamp2` with `TOP_OF_PIPE` for TIMESTAMP_TOP and `BOTTOM_OF_PIPE` for TIMESTAMP, per submission
-    segment, converted to whichever unit (a) shows. **Mismatch (instant); unit unverified.**
+    segment, converted to whichever unit (a) shows. **Mismatch (instant); unit unverified.** What it can change:
+    both differences make the GPU time the game computes shorter than the hardware's (a report written at fence
+    completion spans less than top to bottom of the pipeline, and 19.2 MHz ticks read as 614.4 MHz ones are a
+    thirty-second), so an engine that lowers its resolution or detail under GPU load would stay at its highest
+    here. That is reasoning from the two units, not something measured; no picture difference is tied to it.

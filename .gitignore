@@ -44,6 +44,8 @@ __pycache__/
 *.spv
 # The menu font's bytes as a header for compilers without #embed (tools/build_shaders.py EMBEDDED)
 /runtime/ui/roboto_ttf.h
+/runtime/smaa_area_tex.h
+/runtime/smaa_search_tex.h
 
 # Build outputs
 *.exe

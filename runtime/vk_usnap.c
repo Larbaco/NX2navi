@@ -24,6 +24,7 @@
 #include "host.h"
 #include "nvn_api.h"
 #include "vk.h"
+#include "motion_owner.h"
 #include "vk_dlaa.h"
 #include "platform/platform.h"
 
@@ -44,14 +45,16 @@ typedef struct Arena {
 } Arena;
 
 typedef struct { uint64_t lo, hi; } Rng;
-typedef struct { uint64_t lo, hi, off; int dropped; } Reg;
-typedef struct { uint64_t lo, hi, fence; } Wrote;
+// dropped: 0, or the epoch of its first drop in the stream (vk_exec_epoch); epoch: of the write
+typedef struct { uint64_t lo, hi, off, dropped; } Reg;
+typedef struct { uint64_t lo, hi, fence, epoch; } Wrote;
 
 static struct {
     int mode;                   // rt_knob: 0 off, 1 on, 2 ab
     int on;                     // this submission has a snapshot
     uint64_t fence, gen;
     Arena *arena;
+    MotionOwnerSnapshot *owners;
     Rng *col;                   // collected ranges
     int ncol, ccol;
     Reg *reg;                   // merged, sorted by lo, disjoint
@@ -71,6 +74,7 @@ static PlatMutex gather_lock = PLAT_MUTEX_INIT;
 // A copy taken at the submit call for the replay thread (vk_usnap_take), in submission order.
 typedef struct Taken {
     struct Taken *next;
+    MotionOwnerSnapshot *owners;
     Arena *arena;
     Reg *reg;
     int nreg, n;
@@ -263,15 +267,39 @@ static void summary(void) {
     U.subs = U.off_subs = U.regions = U.bytes = U.copy_ns = U.hits = U.drops = U.inflight = U.refused = 0;
 }
 
-// The bytes of regions reg[0..nreg) (total bytes in all) into a's device copy, through its host copy with DLSS.
-static void copy_regions(Arena *a, const Reg *reg, int nreg, uint64_t total) {
+// copy_regions's work, sliced for the replay workers (vk_exec_par): regions of the game's memory into the arena, then
+// the host copy into the device copy in COPY_SLICE pieces.
+#define COPY_SLICE (64u << 10)
+typedef struct { uint8_t *dst, *map; const Reg *reg; uint64_t total; } CopyJob;
+static void copy_some(void *arg, int lo, int hi) {
+    const CopyJob *j = arg;
+    for (int i = lo; i < hi; i++)
+        memcpy(j->dst + j->reg[i].off, (const void *)(uintptr_t)j->reg[i].lo, j->reg[i].hi - j->reg[i].lo);
+}
+static void copy_down(void *arg, int lo, int hi) {
+    const CopyJob *j = arg;
+    uint64_t a = (uint64_t)lo * COPY_SLICE, b = (uint64_t)hi * COPY_SLICE;
+    if (b > j->total) b = j->total;
+    memcpy(j->map + a, j->dst + a, b - a);
+}
+
+// The bytes of regions reg[0..nreg) (total bytes in all) into a's device copy, through its host copy with DLSS. With
+// par (the replay thread at a submission's start), split over the replay workers: about 700 regions and 0.7 MiB in
+// Hyrule Field, half a millisecond of the submitting thread's time on one thread.
+static void copy_regions(Arena *a, const Reg *reg, int nreg, uint64_t total, int par) {
     uint8_t *dst = a->map;
     if (vk_dlaa_available()) {
         if (!a->cpu && !(a->cpu = malloc(a->size))) rt_fatal("vk_usnap: out of memory");
         dst = a->cpu;
     }
-    for (int i = 0; i < nreg; i++) memcpy(dst + reg[i].off, (const void *)(uintptr_t)reg[i].lo, reg[i].hi - reg[i].lo);
-    if (dst != a->map) memcpy(a->map, dst, total);   // one sequential write into the device copy
+    CopyJob j = {dst, a->map, reg, total};
+    if (par) vk_exec_par(copy_some, &j, nreg, 48);
+    else copy_some(&j, 0, nreg);
+    if (dst != a->map) {   // sequential writes into the device copy
+        int slices = (int)((total + COPY_SLICE - 1) / COPY_SLICE);
+        if (par) vk_exec_par(copy_down, &j, slices, 2);
+        else copy_down(&j, 0, slices);
+    }
     vmaFlushAllocation(vk_ctx()->vma, a->alloc, 0, total);   // a no-op on coherent memory
 }
 
@@ -285,6 +313,10 @@ void vk_usnap_take(const uint64_t *handles, int n) {
     Taken *t = calloc(1, sizeof *t);
     if (!t) rt_fatal("vk_usnap: out of memory");
     t->n = n, t->first = handles[0];
+    if (motion_owner_enabled()) {
+        t->owners = malloc(sizeof *t->owners);
+        if (t->owners) motion_owner_capture(t->owners);
+    }
     int creg = 0;
     plat_mutex_lock(&gather_lock);
     U.ncol = 0;
@@ -306,7 +338,7 @@ void vk_usnap_take(const uint64_t *handles, int n) {
         t->total += (hi - lo + ALIGN - 1) & ~(uint64_t)(ALIGN - 1);
     }
     plat_mutex_unlock(&gather_lock);
-    if (t->nreg && (t->arena = arena_get(t->total))) copy_regions(t->arena, t->reg, t->nreg, t->total);
+    if (t->nreg && (t->arena = arena_get(t->total))) copy_regions(t->arena, t->reg, t->nreg, t->total, 0);
     t->ns = kern_now_ns() - t0;
     plat_mutex_lock(&tq_lock);
     if (tq_tail) tq_tail->next = t;
@@ -317,6 +349,7 @@ void vk_usnap_take(const uint64_t *handles, int n) {
 
 static void taken_free(Taken *t) {
     if (t->arena) arena_done(t->arena);
+    free(t->owners);
     free(t->reg);
     free(t);
 }
@@ -345,6 +378,7 @@ static int adopt(const uint64_t *handles, int n) {
             if (wr_hits(U.reg[i].lo, U.reg[i].hi)) U.reg[i].dropped = 1, U.inflight++;
         U.arena = t->arena, t->arena = NULL;
         U.on = 1;
+        U.owners = t->owners, t->owners = NULL;
         U.subs++, U.regions += (uint64_t)U.nreg, U.bytes += t->total, U.copy_ns += t->ns;
     }
     taken_free(t);
@@ -353,6 +387,7 @@ static int adopt(const uint64_t *handles, int n) {
 
 void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
     if (!U.mode) U.mode = rt_knob("UBO_SNAPSHOT", "1") + 1;   // stored +1: 0 is "not read yet"
+    free(U.owners), U.owners = NULL;
     U.on = 0, U.fence = fence, U.gen++;
     summary();
     if (!RT_KNOB_ON(U.mode - 1)) {
@@ -361,6 +396,11 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
         return;
     }
     if (adopt(handles, n)) return;
+    // Without a producer snapshot, asynchronous replay must not read present-day actor ownership.
+    if (!gfx_replay_async() && motion_owner_enabled()) {
+        U.owners = malloc(sizeof *U.owners);
+        if (U.owners) motion_owner_capture(U.owners);
+    }
     uint64_t t0 = kern_now_ns();
     plat_mutex_lock(&gather_lock);
     U.ncol = 0;
@@ -392,13 +432,14 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
     plat_mutex_unlock(&gather_lock);
     if (!U.nreg) return;
     if (!(U.arena = arena_get(total))) return;
-    copy_regions(U.arena, U.reg, U.nreg, total);
+    copy_regions(U.arena, U.reg, U.nreg, total, 1);   // the replay thread at the submission's start
     U.on = 1;
     U.subs++, U.regions += (uint64_t)U.nreg, U.bytes += total, U.copy_ns += kern_now_ns() - t0;
 }
 
 void vk_usnap_end(uint64_t fence) {
     if (U.arena) vk_completion_add(fence, arena_done, U.arena), U.arena = NULL;
+    free(U.owners), U.owners = NULL;
     U.on = 0, U.gen++;
 }
 
@@ -417,12 +458,12 @@ int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferI
     if (!U.on || !n) return 0;
     // Consecutive bindings mostly name the region the last one did: that one is tried before the binary search. The
     // regions are sorted and disjoint, so the region that holds addr is the one first_above finds.
-    static int hint;
+    static _Thread_local int hint;   // per thread: the replay workers look up at once
     int i = hint;
     if (i >= U.nreg || addr < U.reg[i].lo || addr >= U.reg[i].hi) i = first_above(addr);
     if (i >= U.nreg) return 0;
     const Reg *r = &U.reg[i];
-    if (r->dropped || addr < r->lo || addr + n > r->hi) return 0;
+    if ((r->dropped && r->dropped <= vk_exec_epoch(0)) || addr < r->lo || addr + n > r->hi) return 0;
     uint64_t off = r->off + (addr - r->lo);
     if (off % align) return 0;
     *out = (VkDescriptorBufferInfo){U.arena->buf, off, n};
@@ -431,13 +472,25 @@ int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferI
     return 1;
 }
 
+static PlatMutex drop_lock = PLAT_MUTEX_INIT;   // the replay workers' shaders write storage at once
+
+// The replay workers (vk_exec.c NX2NAVI_REPLAY_PIPE) record a group's draws while the submitting thread goes on past
+// it: a drop holds from its place in the stream on (vk_exec_epoch), so a chunk does not see the drops of ops after its
+// group, and the submitting thread sees every one.
 void vk_usnap_drop(uint64_t addr, uint64_t n) {
     if (!U.mode || !n) return;
+    uint64_t ep = vk_exec_epoch(1);
+    int lk = vk_exec_shared();
+    if (lk) plat_mutex_lock(&drop_lock);
     if (U.nwr == U.cwr) U.wr = grow(U.wr, &U.cwr, sizeof *U.wr);
-    U.wr[U.nwr++] = (Wrote){addr, addr + n, U.fence};
-    if (!U.on) return;
-    for (int i = first_above(addr); i < U.nreg && U.reg[i].lo < addr + n; i++)
-        if (!U.reg[i].dropped) U.reg[i].dropped = 1, U.drops++, U.gen++;
+    U.wr[U.nwr++] = (Wrote){addr, addr + n, U.fence, ep};
+    if (U.on)
+        for (int i = first_above(addr); i < U.nreg && U.reg[i].lo < addr + n; i++)
+            if (!U.reg[i].dropped || ep < U.reg[i].dropped) {
+                if (!U.reg[i].dropped) U.drops++;
+                U.reg[i].dropped = ep, __atomic_add_fetch(&U.gen, 1, __ATOMIC_RELAXED);
+            }
+    if (lk) plat_mutex_unlock(&drop_lock);
 }
 
 uint64_t vk_usnap_gen(void) { return U.gen; }
@@ -445,8 +498,9 @@ uint64_t vk_usnap_gen(void) { return U.gen; }
 // A GPU write of a submission not known to be complete touches [lo, hi). A linear scan: vk_usnap_drop appends after
 // wr_prune sorted the list, so wr_hits's binary search does not hold here; only called on rare paths.
 static int wr_overlaps(uint64_t lo, uint64_t hi) {
+    uint64_t ep = vk_exec_epoch(0);
     for (int i = 0; i < U.nwr; i++)
-        if (U.wr[i].lo < hi && lo < U.wr[i].hi) return 1;
+        if (U.wr[i].lo < hi && lo < U.wr[i].hi && U.wr[i].epoch <= ep) return 1;
     return 0;
 }
 
@@ -459,7 +513,12 @@ static int cpu_written(uint64_t addr, uint64_t n) {   // the same test vk_usnap_
 int vk_usnap_read(uint64_t addr, uint64_t n, void *dst) {
     const uint8_t *s = vk_usnap_bytes(addr, n);
     if (s) return memcpy(dst, s, n), 1;
-    if (!n || !cpu_written(addr, n) || wr_overlaps(addr, addr + n)) return 0;
+    if (!n || !cpu_written(addr, n)) return 0;
+    int lk = vk_exec_shared();   // a chunk's drop may grow the list
+    if (lk) plat_mutex_lock(&drop_lock);
+    int w = wr_overlaps(addr, addr + n);
+    if (lk) plat_mutex_unlock(&drop_lock);
+    if (w) return 0;
     memcpy(dst, (const void *)(uintptr_t)addr, n);
     return 2;
 }
@@ -486,6 +545,7 @@ const uint8_t *vk_usnap_bytes(uint64_t addr, uint64_t n) {
 
 // The arenas back on the free list (vk_exec_draw_shutdown: the device is idle, every completion ran).
 void vk_usnap_shutdown(void) {
+    free(U.owners), U.owners = NULL;
     plat_mutex_lock(&free_lock);
     for (Arena *a = free_arenas, *next; a; a = next) next = a->next, vmaDestroyBuffer(vk_ctx()->vma, a->buf, a->alloc), free(a->cpu), free(a);
     free_arenas = NULL;
@@ -501,4 +561,23 @@ void vk_usnap_sizes(PerfSizes *s) {
     plat_mutex_unlock(&free_lock);
     perf_size(s, "free uniform snapshot arenas", n, 0, b);
     perf_size(s, "uniform snapshot GPU writes", (uint64_t)__atomic_load_n(&U.nwr, __ATOMIC_RELAXED), 0, PERF_SIZE_NONE);
+}
+
+// Ownership travels with the uniform snapshot. A missing, GPU-written, or overlapping range is not a match.
+int vk_usnap_motion_owner(uint64_t address, uint64_t size, MotionOwner *out) {
+    if (!U.on || !U.owners || !size || address > UINT64_MAX - size ||
+        vk_usnap_why(address, size) != VK_USNAP_FOUND) return 0;
+    // The producer excludes overlapping identities and sorts the remaining disjoint ranges once.
+    // Most scene draws are unowned, so do not scan every player binding for each one.
+    unsigned lo = 0, hi = U.owners->count;
+    while (lo < hi) {
+        unsigned mid = lo + (hi - lo) / 2;
+        if (U.owners->bindings[mid].address <= address) lo = mid + 1;
+        else hi = mid;
+    }
+    if (!lo) return 0;
+    const MotionOwnerBinding *b = &U.owners->bindings[lo - 1];
+    if (size > b->size || address - b->address > b->size - size) return 0;
+    *out = b->owner;
+    return 1;
 }

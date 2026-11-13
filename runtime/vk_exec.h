@@ -45,6 +45,8 @@ void vk_exec_cond_why(const p_render_cond *c, char *buf, size_t cap);   // NX2NA
 // the next. The "per command buffer" fields are reset by vk_exec_record.
 typedef struct VkExec {
     // ---- per command buffer
+    struct DrawCtx *dc;                  // vk_exec_draw.c: the draw context this state records with (NULL until a
+                                         // draw op names it: the calling thread's, vk_exec_draw_ctx_use)
     VkCommandBuffer cb;                  // being recorded
     uint64_t fence;                      // timeline value the submission signals (vk_completion_add)
     int recorded;                        // Vulkan commands recorded so far; every handler adds the ones it records
@@ -71,11 +73,14 @@ typedef struct VkExec {
     // ---- fixed-function state (vk_exec.c keeps it; vk_exec_draw.c records it before draws)
     float vp[16][6];                     // OP_VIEWPORTS: x, y, w, h, near, far
     int has_vp;                          // a viewport was set; else the render area
+    int vp_jittered;                     // the viewport recorded last took the DLAA jitter (vk_dlaa.c vk_dlaa_viewport)
+    int pass_jit;                        // a viewport of the pass open now took it: its targets' edges are filled at its end (vk_dlaa_pass_end)
     p_scissor scissor;                   // OP_SCISSOR (scissor 0)
     int has_scissor;                     // a scissor was set; else unbounded
     float depth_range[2];                // OP_DEPTH_RANGE: overrides the viewports' near and far
     uint32_t st_vmask[2], st_wmask[2], st_ref[2];   // OP_STENCIL per face (0 front, 1 back): compare mask, write mask, ref
     float point_size;                    // OP_BIND_STATE kind 6: NVN point size for the support buffer; 0 = never set = 1
+    float line_width;                    // OP_BIND_STATE kind 7: NVN line width in pixels; 0 = never set = 1
     p_poly_offset poly_offset;           // OP_POLY_OFFSET: depth bias factor, units, clamp
     p_prim_restart prim_restart;         // OP_PRIM_RESTART: applied to indexed strip and fan draws (op_draw_idx)
     float blend_color[4];                // OP_BLEND_COLOR
@@ -122,6 +127,8 @@ typedef struct VkExec {
     const void *fb_fs;                   // feedback_scan's memo: fragment shader, texture bind serial, pass serial
     uint32_t fb_serial, fb_pass, fb_sampled;
     uint32_t tex_serial, pass_serial;    // bumped by every texture or image bind and pass begin
+    uint32_t pre_pass;                   // the pass (pass_serial) the part's pre-pass command buffer serves (vk_sync_pre;
+                                         // vk_exec_draw.c mesh emulation); a pass begins after it with another serial
 } VkExec;
 
 // Begins dynamic rendering with the current targets unless a pass is open (a full memory barrier precedes it). Call
@@ -137,6 +144,9 @@ void vk_exec_barrier(VkExec *ex);
 void vk_exec_barrier_dispatch(VkExec *ex);
 // NX2NAVI_TRACE=perf, every 600 frames: the barriers per frame by kind.
 void vk_exec_barrier_log(uint64_t frame);
+// Ends the open pass and the part without handing it to the queue (vk_sync_cut): the next draw begins the pass again
+// at the start of a new command buffer, which the part's pre-pass command buffer precedes. 0 when no more can wait.
+int vk_exec_split_now(VkExec *ex);
 // vk_texture.c (NX2NAVI_TEX_ALIAS): commands that must run at the replay's current position. vk_exec_inline_begin returns
 // the command buffer being recorded after a full barrier (an open pass is ended; *reopen says so), or VK_NULL_HANDLE
 // when this thread is not recording a replay. vk_exec_inline_end begins the pass again when it was open.
@@ -147,6 +157,33 @@ void vk_exec_inline_end(int reopen);
 // recording a replay into cb for submission `fence`, so vk_exec_inline_begin hands cb out. Called from the record
 // callback of vk_sync_submit_own, where a replay would be recorded.
 void vk_exec_probe_inline(VkCommandBuffer cb, uint64_t fence);
+// vk_exec_draw.c, the replay workers: a draw context of their own (what draws keep from one to the next while they
+// record: vk_exec_draw.c DrawCtx), and the one the calling thread records with from now on (NULL: the replay's).
+void *vk_exec_draw_ctx_new(void);
+void vk_exec_draw_ctx_use(void *ctx);
+// vk_exec_draw.c, before the chunks of a parallel group are recorded (submitting thread): the stand-ins are made and the
+// texture pool set this submission took is brought up to date, which the chunks then only bind. Returns the inline
+// uniform updates of the submission so far (vk_exec_upd_top).
+uint32_t vk_exec_draw_group_begin(VkExec *ex);
+// vk_exec.c: of the submission's inline uniform updates (all), those a draw on the calling thread may read.
+uint32_t vk_exec_upd_top(uint32_t all);
+// vk_exec_xfer.c, parallel groups: vk_exec_xfer_group turns the front pass of the group in slot `group` on (it lists
+// the group's occlusion segments) or off (-1); vk_exec_xfer_front replays a counter report or reset, render enable or
+// render condition in the front pass (returns the condition's decision, 1 renders); vk_exec_xfer_chunk_state is the
+// occlusion counting at a chunk's first op, which vk_exec_xfer_worker hands to the worker side with the chunk's
+// decisions and its group's slot (on), or turns it off.
+void vk_exec_xfer_group(int group);
+int vk_exec_xfer_front(VkExec *fx, uint32_t op, const void *payload);
+uint64_t vk_exec_xfer_chunk_state(void);
+void vk_exec_xfer_worker(int on, const uint8_t *cond, uint32_t ncond, uint64_t state, uint32_t slot0, uint32_t nslots,
+                         int chunk, int group);
+// After every chunk of the group in slot `group` is done (submitting thread, groups oldest first): the slots the
+// chunks closed go into their segments, in the order of the chunks.
+void vk_exec_xfer_group_merge(int group, int nchunks);
+// The front pass: whether a draw here counts samples (a query slot), and n slots of the ring in the order of the stream
+// for one chunk (the first is returned; vk_exec_xfer_worker hands them to the chunk's worker).
+int vk_exec_xfer_counting(void);
+uint32_t vk_exec_xfer_slots(uint32_t n);
 // vk_exec_draw.c: forget what the command buffer being recorded has bound (pipeline, sets, dynamic state, vertex
 // buffers): the replay continues in a new one (vk_sync_split).
 void vk_exec_draw_new_cb(void);
@@ -223,6 +260,10 @@ void vk_dump_init(void);                 // reads the environment; vk_exec_recor
 void vk_dump_pass_end(VkExec *ex);       // after vkCmdEndRendering
 // after a draw's binds; mesh: a mesh draw (s->vs is its mesh stage, s->ts its task stage or NULL)
 void vk_dump_draw(VkExec *ex, const VkPipeState *s, VkPipeline p, const VkPipeInfo *info, int mesh);
+enum { SK_DISABLED, SK_SCISSOR, SK_NO_PROGRAM, SK_NO_VERTEX_STAGE, SK_SHADER_PENDING, SK_SHADER_FAILED, SK_DLAA,
+       SK_PIPE_PENDING, SK_PIPE_FAILED, SK_POOL_OFF, SK_PROG_FILTER, SK_SHADER_FILTER, SK_COUNT };
+extern const char *const vk_draw_skip_names[SK_COUNT];
+void vk_dump_draw_skipped(const VkExec *ex, int mesh, int why);
 // Around a mesh draw of the dumped frame (after vk_dump_draw): a primitives-generated query, listed in mesh_prims.txt.
 // begin returns the query, or -1 when none was begun; end takes that value.
 int vk_dump_mesh_begin(VkExec *ex);
@@ -268,6 +309,7 @@ uint64_t vk_exec_event_late_take(void);       // waits only a CPU signal after t
 void vk_exec_event_stats(uint64_t *waits, uint64_t *unmet, uint64_t *late, uint64_t *late_subs);
 extern uint64_t vk_exec_submit_seq;   // replay thread: submissions replayed so far
 extern uint32_t vk_exec_brk;          // replay thread: bumped by every op that is not state or a draw (vk_exec.c op_linear)
+uint32_t vk_exec_brk_now(void);       // vk_exec_brk, or in a parallel group's chunk the chunk's own count
 int vk_exec_mesh_run(const void *cur, const void **out, int max);
 void vk_exec_mesh_run_stops(char *out, size_t n);
 // NX2NAVI_EVO_TRACE=1 (diagnostics, vk_exec.c "event order trace"): one token per step of the replay's event order.
@@ -279,9 +321,23 @@ int vk_exec_held_ready(void);         // ... and one of them can go on now (vk_b
 // sample DLSS's output vk_dlaa_swap_view in its place, so the game's scaling draw scales DLSS's picture.
 extern const VkTexImage *vk_dlaa_swap_img;
 extern VkImageView vk_dlaa_swap_view;
+// vk_aa.c, the anti-aliasing setting in place of the game's SMAA (vk_exec_draw.c aa_dispatch). vk_aa_mode: this frame's
+// replacement, VK_AA_GAME when the game's SMAA runs as it is. vk_aa_role: which of the game's SMAA passes a compute
+// program is, by the hash of its guest code. vk_aa_skip_ok: the edge and weight passes may be left out (the last
+// composition was replaced). vk_aa_record: the replacement of the composition into cb, from src (the composite, sampled)
+// into dst (the scene target's R32_UINT storage view) of w x h; 0 when it could not. vk_aa_composed: what became of the
+// composition this frame.
+enum { VK_AA_GAME, VK_AA_OFF, VK_AA_FXAA, VK_AA_SMAA };
+enum { VK_AA_ROLE_NONE, VK_AA_ROLE_EDGES, VK_AA_ROLE_WEIGHTS, VK_AA_ROLE_COMPOSE };
+int vk_aa_mode(void);
+int vk_aa_role(uint64_t guest_hash);
+int vk_aa_skip_ok(void);
+int vk_aa_record(VkCommandBuffer cb, int mode, VkImageView src, VkImageView dst, uint32_t w, uint32_t h);
+void vk_aa_composed(int ok);
 // vk_contact.c: a pass about to begin (its targets resolved, no pass open), and a dispatch or copy about to be recorded
 void vk_contact_pass_begin(VkExec *ex);
 void vk_contact_flush(VkExec *ex);
+int vk_contact_pending(void);   // a contact shadows' pass waits for the next transfer outside a pass
 // vk_exec_xfer.c, samples-passed counting: a draw about to be recorded in the open pass (begins an occlusion query
 // when counting and none is active), and the open pass about to end (ends the active query).
 void vk_exec_oq_draw(VkExec *ex);

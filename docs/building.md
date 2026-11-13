@@ -160,15 +160,22 @@ of them.
 
    What this step leaves for play, and the shared pipeline list. The step translates every shader's default variant
    and the shader list's variants and builds each one's stage library or compute pipeline. A whole graphics pipeline
-   is built ahead only at the start of a game folder that has drawn it before (`pipeline-keys.bin`); a pipeline met
-   for the first time is linked from its stage libraries in 2 to 6 ms, except a mesh pipeline, which has no libraries
-   and compiles whole (0.2 to 1.1 s, its draws left out of the picture meanwhile). `tools/pipeline_list.py merge`
-   folds the `pipeline-keys.bin` and `shader-answers.bin` of game folders that were played into a pipeline list;
-   `prepare_shaders.py` reads it from `tools\data\pipeline_list.bin` (`data\pipeline_list.bin` in a release folder, or
-   `--pipeline-list`), adds the shader variants it names to the seed and writes its records next to the game as
-   `seed-pipeline-keys.bin`, and `--prepare-shaders` builds the mesh pipelines among them into the pipeline cache and
-   the driver's (`runtime/vk_pipeline.c` `seed_pipelines`; `NX2NAVI_PREPARE_PIPELINES=all` builds the vertex pipelines
-   too). `--warm-shaders` builds them again, and `nx2navi.exe --prepare-pipelines` does that step alone. The list is
+   is built ahead at the start of a game folder that has drawn it before (`pipeline-keys.bin`) or whose release
+   listed it (below); a pipeline met for the first time is linked from its stage libraries in 2 to 8 ms, of which its
+   first draw waits 3 (`pipe_link_draw_ms`, from the pipeline's first miss; `runtime/vk_exec_draw.c` `link_budget`),
+   except a mesh
+   pipeline, which has no libraries and compiles whole (0.2 to 1.1 s, its draws left out of the picture meanwhile),
+   and many of them on a first visit add up to hitches. `tools/pipeline_list.py merge` folds the `pipeline-keys.bin`
+   and `shader-answers.bin` of game folders that were played, and lists made before, into a pipeline list, with the
+   compute variants those folders dispatched (no pipeline record names a compute shader, and a variant the shader list
+   lacks is translated on the frame that first dispatches it); `prepare_shaders.py` reads it from
+   `tools\data\pipeline_list.bin` (`data\pipeline_list.bin` in a release folder, or `--pipeline-list`), adds the
+   shader variants it names to the seed and writes its records next to the game as `seed-pipeline-keys.bin`, and
+   `--prepare-shaders` builds every one of them into the pipeline cache and the driver's (`runtime/vk_pipeline.c`
+   `seed_pipelines`; `NX2NAVI_PREPARE_PIPELINES=mesh` builds only the mesh pipelines). Every start then counts the
+   list as known pipelines beside the folder's own and builds them before play, from those caches (`keys_open_seed`;
+   `pipe_seed = 0` in `nx2navi.ini` leaves the list out). `--warm-shaders` builds them again, and
+   `nx2navi.exe --prepare-pipelines` does that step alone. The list is
    derived from game data: it is not in the repository (`tools/check_content.py` refuses it), and a kit, a launcher
    release or an installer release takes one with `--pipeline-list` (`tools/make_kit.py`, `make_launcher.py`,
    `make_release.py`). A list belongs to the record layout of the runtime that wrote it; another runtime says so and
@@ -372,8 +379,9 @@ instead of timing one. No game files.
 
 A change to the button prompts (`tools/make_romfs_patches.py --prompts`, `tools/button_icons.py`) passes
 `.venv-py314\Scripts\python tests\romfs_prompts_test.py`, which runs the tool on a RomFS it makes itself (no game
-files); a change to the settings passes `nx2navi.exe --probe-cfg`; a change to the co-op layer (`runtime/coop*.c`,
-`tools/coop_relay.py`) passes `python tests\coop_relay_test.py` and `nx2navi.exe --probe-coop` ([coop.md](coop.md)).
+files); a change to the settings passes `nx2navi.exe --probe-cfg`; a change to co-op (`runtime/coop*.c`,
+`runtime/steam.c`, `runtime/ui/coop_page.cpp`) is run with one game and `python tests\coop_peer.py` as the second player
+([coop.md](coop.md), "Checks").
 
 A change to the action prompt's diamond of face buttons (`runtime/action_prompt.c`) or to the SARC and zstd dictionary
 helpers (`runtime/sarc.c`) passes `python tests\action_prompt_check.py`. It builds them alone, with the
@@ -452,11 +460,24 @@ A change to the mouse camera's stick deflection (`runtime/input_map.c` `input_mo
 deflection at each camera speed: a slow movement is divided by the factor, a fast flick reaches full tilt. No game
 files.
 
+A change to how a gamepad's axes are read (`runtime/input.c` `pad_axis`: an axis counts once it has been seen at rest)
+passes `python tests\pad_rest_check.py`, which builds that function with stand-ins for SDL. No game files.
+
+A change to how a mesh pipeline's fragment module gets the inputs no mesh output feeds (`runtime/vk_pipeline.c`
+`spirv_mesh_outputs`, `spirv_fs_fill_inputs`) passes `python tests\fs_fill_inputs_check.py`, which builds both
+functions and runs them on mesh and fragment shaders it compiles with glslang, then validates the result. No game
+files.
+
 A change to which render passes count as drawn frame after frame (`runtime/vk_target_frames.h`: a draw into one is
 skipped while its pipeline builds, a draw into any other waits) passes `python tests\target_frames_check.py`, which
 builds the header alone and replays an area change after a loading screen from a player's log: the scene, probe and
 half-resolution passes are per-frame again at once, a lookup table, a volume's slices and an icon capture still wait,
 and an image taken over by another texture starts without the history of the one before. No GPU, no game files.
+
+A change to which frames FSR 3.1 frame generation is told are camera cuts (`runtime/vk_fg_reset.h`, `runtime/vk_fg.cpp`
+`generate` and `vk_fg_frame`) passes `python tests\fg_reset_check.py`, which builds the header alone and checks that each
+frame id gets its own frame's cut, that an id never noted or no longer held counts as a cut, and that a slot rewritten
+on another thread never answers an old id with a newer frame's value. No GPU, no game files.
 
 The lifter (`recomp/`) and the CPU headers (`runtime/cpu.h`, `runtime/simd.h`) are checked against Unicorn. Every lifter
 change passes these, all run with `.venv`:

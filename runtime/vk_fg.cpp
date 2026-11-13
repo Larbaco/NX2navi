@@ -28,6 +28,7 @@ extern "C" {
 #include "vk_dlssg.h"
 #include "vk_ffx.h"
 #include "vk_fg.h"
+#include "vk_fg_reset.h"
 #include "ui/menu.h"
 }
 
@@ -35,6 +36,7 @@ namespace {
 
 struct {
     VkQueue present = VK_NULL_HANDLE, acquire = VK_NULL_HANDLE;
+    uint32_t pfam = 0, afam = 0;   // their queue families
     ffxContext sc = nullptr;   // the swapchain context
     ffxContext fg = nullptr;   // the frame generation context
     VkExtent2D fg_ext = {0, 0};
@@ -45,6 +47,9 @@ struct {
     int failed = 0;
     uint64_t generated = 0, paused = 0, no_inputs = 0, hudless = 0, no_hudless = 0;
     int on = 0;   // the last configured frame had generation on (vk_fg_generating)
+    FgrRing cuts;   // each frame id's camera cut, for the generation callback (vk_fg_reset.h)
+    uint64_t cut_frames = 0;   // frames handed to the callback as cuts
+    int prepared = 0;          // the last frame was prepared (generation on with its inputs)
 } F;
 
 VkResult submit_game(uint32_t n, const VkSubmitInfo *si, VkFence fence) {
@@ -56,6 +61,8 @@ VkResult submit_game(uint32_t n, const VkSubmitInfo *si, VkFence fence) {
 
 ffxReturnCode_t generate(ffxDispatchDescFrameGeneration *d, void *user) {
     F.generated++;
+    // the swapchain's own reset (a frame id that did not follow the last) stays; a cut vk_fg_frame noted is added
+    if (fgr_cut(&F.cuts, d->frameID)) d->reset = true;
     return vk_ffx_dispatch((ffxContext *)user, &d->header);
 }
 
@@ -102,6 +109,12 @@ extern "C" int vk_fg_wanted(void) {
     if (F.sc) return !F.failed && !four;
     if (four) return 1;
     if (F.failed) return 0;
+    if (!F.present) {   // no queue to present on besides the game's (vk_device.c says why): the plain swapchain stays
+        static int told_q;
+        if (!__atomic_exchange_n(&told_q, 1, __ATOMIC_RELAXED))
+            rt_log("fg: AMD FSR 3.1 frame generation is set, but the device got no queue for its presents: off");
+        return 0;
+    }
     if (vk_ffx_framegen_available()) return 1;
     static int told;
     if (!__atomic_exchange_n(&told, 1, __ATOMIC_RELAXED))
@@ -112,10 +125,12 @@ extern "C" int vk_fg_wanted(void) {
 // Always the three queues: the setting can be switched on during a run, and idle queues cost nothing.
 extern "C" uint32_t vk_fg_queue_count(void) { return 3; }
 
-extern "C" void vk_fg_queues(VkQueue present, VkQueue acquire) {
-    F.present = present, F.acquire = acquire;
-    vk_fg4_queues(present, acquire);
+extern "C" void vk_fg_queues(VkQueue present, uint32_t present_family, VkQueue acquire, uint32_t acquire_family) {
+    F.present = present, F.acquire = acquire, F.pfam = present_family, F.afam = acquire_family;
+    vk_fg4_queues(present, present_family, acquire, acquire_family);
 }
+
+extern "C" int vk_fg_has_queues(void) { return F.present != VK_NULL_HANDLE; }
 
 // AMD's swapchain is in place: the window's swapchain handle is AMD's object, and every swapchain call has to go
 // through AMD's functions. That holds after a failure too, until the present code has replaced the swapchain
@@ -147,8 +162,8 @@ extern "C" VkResult vk_fg_create_swapchain(const VkSwapchainCreateInfoKHR *ci, V
     d.createInfo.oldSwapchain = VK_NULL_HANDLE;
     d.gameQueue = {c->gfx_queue, c->gfx_family, submit_game};
     d.asyncComputeQueue = {VK_NULL_HANDLE, c->gfx_family, nullptr};
-    d.presentQueue = {F.present, c->gfx_family, nullptr};
-    d.imageAcquireQueue = {F.acquire, c->gfx_family, nullptr};
+    d.presentQueue = {F.present, F.pfam, nullptr};
+    d.imageAcquireQueue = {F.acquire, F.afam, nullptr};
     ffxReturnCode_t r = vk_ffx_create(&F.sc, &d.header);
     if (r != FFX_API_RETURN_OK) {
         F.sc = nullptr;
@@ -241,7 +256,8 @@ extern "C" void vk_fg_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt,
         ffxCreateContextDescFrameGeneration d = {};
         d.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
         d.header.pNext = &hl.header;
-        d.flags = FFX_FRAMEGENERATION_ENABLE_DEPTH_INFINITE | (hdr_format(fmt) ? FFX_FRAMEGENERATION_ENABLE_HIGH_DYNAMIC_RANGE : 0);
+        // no infinite-depth flag: the game's far plane is finite, and each preparation gives it (vk_fg_frame)
+        d.flags = hdr_format(fmt) ? FFX_FRAMEGENERATION_ENABLE_HIGH_DYNAMIC_RANGE : 0;
         d.displaySize = {ext.width, ext.height};
         d.maxRenderSize = {max_render.width, max_render.height};
         d.backBufferFormat = ffxApiGetSurfaceFormatVK(fmt);
@@ -266,6 +282,20 @@ extern "C" void vk_fg_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt,
     else if (!hudless) F.no_hudless++;
     else if (!on) F.paused++;
     F.frame++;
+    // A cut: DLSS started a new history (vk_dlaa_fg_inputs), or the frame before was not prepared (generation off for
+    // the menu, no inputs), so the frame between the two would be made from a stale depth and motion
+    fgr_note(&F.cuts, F.frame, reset || !F.prepared);
+    if ((reset || !F.prepared) && on) F.cut_frames++;
+    F.prepared = on;
+    // Every 600 frames, whether this one generates or not: what kept frames from being generated, and how many frames
+    // AMD's swapchain presented (generated ones included). Logged only from a generating frame, as before, a run whose
+    // frames never generated (the menu open at the swapchain's second frame, no inputs, no HUD-less picture) said nothing.
+    if (F.frame == 120 || F.frame % 600 == 0)
+        rt_log("fg: %llu frames, %llu generated (%llu with the HUD kept out), %llu presents by the swapchain; not generated: "
+               "%llu menu open, %llu without depth and motion, %llu without the HUD-less picture; %llu after a camera cut",
+               (unsigned long long)F.frame, (unsigned long long)F.generated, (unsigned long long)F.hudless,
+               (unsigned long long)vk_fg_presents(sc), (unsigned long long)F.paused, (unsigned long long)F.no_inputs,
+               (unsigned long long)F.no_hudless, (unsigned long long)F.cut_frames);
     ffxConfigureDescFrameGeneration cfg = {};
     cfg.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
     cfg.swapChain = (void *)sc;
@@ -298,19 +328,17 @@ extern "C" void vk_fg_frame(VkCommandBuffer cb, VkSwapchainKHR sc, VkFormat fmt,
     double dt = last_ns ? (now - last_ns) / 1e6 : 16.67;
     last_ns = now;
     p.frameTimeDelta = dt > 0 && dt < 100 ? (float)dt : 16.67f;
-    p.cameraNear = 0.1f;   // Ocarina's projection: near 0.1, far at infinity (vk_ffx.cpp)
-    p.cameraFar = 1e8f;
-    p.cameraFovAngleVertical = 1.0f;
-    p.viewSpaceToMetersFactor = 0.01f;
+    // the frame's camera (vk_dlaa.c proj_planes), as the upscaler gets it (vk_ffx.cpp)
+    VkFfxCamera cam;
+    if (!vk_dlaa_ffx_camera(&cam)) memset(&cam, 0, sizeof cam);
+    p.cameraNear = cam.znear > 0 ? cam.znear : 0.1f;
+    p.cameraFar = cam.zfar > 0 ? cam.zfar : 1e8f;
+    p.cameraFovAngleVertical = cam.fov_y > 0 ? cam.fov_y : 1.0f;
+    p.viewSpaceToMetersFactor = cam.meters > 0 ? cam.meters : 1.0f;
     p.depth = image(&depth);
     p.motionVectors = image(&mv);
     r = vk_ffx_dispatch(&F.fg, &p.header);
     if (r != FFX_API_RETURN_OK) return fail("frame generation preparation", r);
-    if (F.frame == 2 || F.frame % 3600 == 0)
-        rt_log("fg: %llu frames presented, %llu generated (%llu with the HUD kept out); paused %llu (menu), %llu without depth "
-               "and motion, %llu without the HUD-less picture", (unsigned long long)F.frame, (unsigned long long)F.generated,
-               (unsigned long long)F.hudless, (unsigned long long)F.paused, (unsigned long long)F.no_inputs,
-               (unsigned long long)F.no_hudless);
 }
 
 extern "C" void vk_fg_release(void) {
@@ -318,4 +346,5 @@ extern "C" void vk_fg_release(void) {
     if (F.fg) vk_ffx_destroy(&F.fg), F.fg = nullptr;
     if (F.sc) vk_ffx_destroy(&F.sc), F.sc = nullptr;
     __atomic_store_n(&F.on, 0, __ATOMIC_RELAXED);
+    F.prepared = 0;
 }

@@ -135,6 +135,7 @@ NVN_API(nvnTextureBuilderGetStorageClass) { ret_x(c, storage_class(&TB(c)->d)); 
 NVN_API(nvnTextureBuilderGetFlags) { ret_x(c, (uint32_t)TB(c)->d.flags); }
 // size_t nvnTextureBuilderGetStorageSize(const NVNtextureBuilder *b)
 NVN_API(nvnTextureBuilderGetStorageSize) {
+    if (nvn_no_object(c, "nvnTextureBuilderGetStorageSize")) return;
     nvn_texlayout L;
     nvn_tex_layout(&TB(c)->d, &L);
     if (!L.bpb) rt_log("nvn: TextureBuilderGetStorageSize: unknown format %#x", TB(c)->d.format);
@@ -142,6 +143,7 @@ NVN_API(nvnTextureBuilderGetStorageSize) {
 }
 // size_t nvnTextureBuilderGetStorageAlignment(const NVNtextureBuilder *b)
 NVN_API(nvnTextureBuilderGetStorageAlignment) {
+    if (nvn_no_object(c, "nvnTextureBuilderGetStorageAlignment")) return;
     nvn_texlayout L;
     nvn_tex_layout(&TB(c)->d, &L);
     ret_x(c, L.align);
@@ -773,12 +775,20 @@ static uint64_t present_period(const win_t *o) {
 
 // The present slot is the previous slot plus one period. Early: wait for the slot. Late by
 // less than a period: present at once and keep the phase. Behind by a period or more: restart from now, no catch-up
-// burst. Returns the ns to wait.
+// burst, except while a movie plays (frame_step_movie_hz): then the slots are kept through a lateness up to
+// MOVIE_CATCHUP_NS and the frames after a late one go at once until the game is back on them. A movie shows one
+// picture per game update and its sound plays by the clock (frame_rate.c ocarina_step), so every period dropped here
+// was a picture the movie fell behind for good: with a 70 ms frame every two seconds (NX2NAVI_TEST_HITCH=120:70) the
+// updates averaged 58.9 a second and the Triforce movie's picture fell 190 ms behind its sound every ten seconds, 2.2 s
+// by the end of its 117 s, at every frame limit from 60 to unlimited; with the slots kept it stayed within 22 ms. A
+// stall of a second or more (a load) restarts the slots as before. Returns the ns to wait.
+#define MOVIE_CATCHUP_NS 1000000000ull
 static uint64_t pace(uint64_t *target, uint64_t now, uint64_t period) {
     if (!period || !*target) { *target = now; return 0; }
     uint64_t next = *target + period;
     if (now <= next) { *target = next; return next - now; }
-    *target = now - next < period ? next : now;
+    uint64_t keep = frame_step_movie_hz() > 0 ? MOVIE_CATCHUP_NS : period;
+    *target = now - next < keep ? next : now;
     return 0;
 }
 
@@ -864,8 +874,8 @@ NVN_API(nvnQueuePresentTexture) {
     int idx = (int)arg_x(c, 2);
     movie_tick(c);   // ov_movie.c: hand over decoded movie frames that are due; needs the core, so before the wait
     res_present(c);  // resolution.c: a DLSS mode change sets the game's render size again, between frames
+    coop_present(c); // coop_game.c: co-op reads Link and the game's flags and sets the flags the room has, between frames
     wide_present();  // widescreen.c: Ocarina's DLSS render scale
-    coop_present(c); // coop_game.c: co-op progress sync reads and sets the game's flags, between frames
     NVN_BLOCKING();
     if (o->magic != NVN_WIN_MAGIC || idx < 0 || idx >= o->ntex || idx >= 4 || !o->tex[idx])
         rt_fatal("nvn: QueuePresentTexture of image %d on window %p", idx, (void *)o);
@@ -873,6 +883,15 @@ NVN_API(nvnQueuePresentTexture) {
     o->presents++;
     __atomic_store_n(&nvn_submits_in_frame, 0, __ATOMIC_RELAXED);
     const tex_t *t = (const tex_t *)o->tex[idx];
+    static int hitch_every = -1, hitch_ms;   // NX2NAVI_TEST_HITCH=<every>:<ms>: a late frame every so many presents
+    if (hitch_every < 0) {
+        const char *e = cfg_get("NX2NAVI_TEST_HITCH");
+        int every = 0, ms = 0;
+        hitch_every = e && sscanf(e, "%d:%d", &every, &ms) == 2 && every > 0 && ms > 0 ? every : 0;
+        hitch_ms = ms;
+        if (hitch_every) rt_log("nvn: a %d ms late frame every %d presents (NX2NAVI_TEST_HITCH)", hitch_ms, hitch_every);
+    }
+    if (hitch_every && o->presents % (uint64_t)hitch_every == 0) plat_wait_ns((uint64_t)hitch_ms * 1000000);
     uint64_t period = present_period(o), now = kern_now_ns();
     uint64_t slot = now + pace(&o->pace, now, period);
     gfx_backend()->present(t, o->crop, slot);

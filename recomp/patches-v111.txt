@@ -30,6 +30,22 @@ set freecam     NX2NAVI_PATCH_FREECAM     0
 # (runtime/frame_rate.c). x10 is rewritten before it is read again, and the tst's flags feed only the fcsel.
 site ostep main 6e6cc0 1e220c21 @page:x10   # fcsel s1, s1, s2, eq -> adrp x10, page
 site ostep main 6e6cc4 1e201828 bd410148    # fdiv s8, s1, s0 -> ldr s8, [x10, #256]
+# The engine's second step: the graphics system's update (main+0x3b4ea90) also divides 60.0 by the same nominal rate
+# (its +0x2c8) and stores the result as a global, main+0x4d41fc8, the 60 Hz frames of the last update. Its reader is the
+# hold-to-repeat timer of the buttons (main+0x3483680), which adds it to each held button's time and repeats the button
+# once that passes the button's delay and period in 60 Hz frames; above 60 fps it added 1.0 a rendered frame, so a held
+# button repeated fps / 60 times too often. The global takes frames per update from the patch page too, so the two steps
+# never differ. x9 is not read in the function and is free across the call that follows; the store keeps x8.
+site ostep main 3b4eaf4 5e21d800 @page:x9   # scvtf s0, s0 -> adrp x9, page
+site ostep main 3b4eaf8 1e201820 bd410120   # fdiv s0, s1, s0 -> ldr s0, [x9, #256]
+# The time of day: its update (main+0x3cdf70) adds trunc(2 * frames per update) game seconds a frame to the seconds of
+# the day (+0x3c of its object, carried into the day count by the code after it). With the step above below one frame
+# per update the sum was 1 from 61 to 119 fps (the day at 83% of its pace at 100 fps) and 0 above 120, where the clock
+# stood still and the sun swung back and forth around a frozen hour; at 60 fps a step a little under one frame lost a
+# second too. The cut calls the page's +0xf60 instead (runtime/frame_rate.c frame_rate_day_host): the frame's seconds
+# with the fraction kept for the next frame, so the day keeps the game's pace at any frame rate. x30 is the function's
+# own saved one, and the call at main+0x3cdfc8 sets it again.
+site ostep main 3cdfc0 1e380008 952b4be8   # fcvtzs w8, s0 -> bl page+0xf60
 
 # Physics solver steps: the physics system's step setup (main+0x38aeb80, and the same code in main+0x38afc10) gives the
 # rigid body world its solver step count for the frame, trunc(frames per update * count + 0.001) with the count at

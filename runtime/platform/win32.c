@@ -908,6 +908,7 @@ static void (*crash_fn)(const PlatCrash *c);
 static const char *image_name(const char *base);
 static __thread const char *crash_ctx;
 void plat_crash_context(const char *s) { crash_ctx = s; }
+const char *plat_crash_context_get(void) { return crash_ctx; }
 static void raw_note(const char *tag, DWORD code, uintptr_t rip, uintptr_t addr) {
     char b[256];
     void *base = NULL;
@@ -2138,7 +2139,7 @@ void plat_ipc_close(PlatIpc *p) {
     free(p);
 }
 
-// ---- UDP sockets (platform.h): the co-op layer's transport. Winsock starts at the first call that needs it.
+// ---- UDP sockets (platform.h). Winsock starts at the first call that needs it.
 #ifndef SIO_UDP_CONNRESET
 #define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
 #endif

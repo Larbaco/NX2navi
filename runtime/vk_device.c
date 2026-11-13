@@ -21,6 +21,10 @@
 PFN_vkGetDeviceProcAddr vk_dpa = vkGetDeviceProcAddr;
 
 static uint32_t g_gfx_queues = 1;   // queues the graphics family offers (pick_device)
+#define QFAM_MAX 16
+static uint32_t g_nqfam;                  // the device's queue families (pick_device): their flags and queue counts
+static VkQueueFlags g_qfam_flags[QFAM_MAX];
+static uint32_t g_qfam_count[QFAM_MAX];
 
 static VkCtx g_vk;
 static int g_ready;
@@ -70,14 +74,19 @@ static int instance_ext_present(const char *name) {
 // Mesa's drivers (RADV on Linux and the Steam Deck) keep a shader cache of their own beside our pipeline cache, by
 // default in ~/.cache and up to 1 GB: about 35 MB in a minute of the title screen. A Deck's /home is small and the game
 // usually sits on the SD card, so unless MESA_SHADER_CACHE_DIR names a folder, it goes to mesa-cache beside the exe.
+// That folder is ours alone, so its limit is raised to MESA_CACHE_SIZE unless MESA_SHADER_CACHE_MAX_SIZE is set: the
+// stage libraries the library warm builds in play live only in the driver's cache (vk_pipeline.c, "the play cache"),
+// and a preparation of every shader variant does not fit in 1 GB, so the rest would be compiled again in play.
+#define MESA_CACHE_SIZE "8G"
 static void mesa_cache_beside_exe(void) {
-    char dir[PLAT_PATH_MAX * 2];
+    char dir[PLAT_PATH_MAX * 2], size[32];
     if (plat_getenv("MESA_SHADER_CACHE_DIR", dir, sizeof dir)) return;
     int len = plat_exe_path(dir, sizeof dir - 16);
     char *cut = len ? plat_last_sep(dir) : NULL;
     if (!cut) return;
     strcpy(cut + 1, "mesa-cache");
     plat_setenv("MESA_SHADER_CACHE_DIR", dir);
+    if (!plat_getenv("MESA_SHADER_CACHE_MAX_SIZE", size, sizeof size)) plat_setenv("MESA_SHADER_CACHE_MAX_SIZE", MESA_CACHE_SIZE);
 }
 
 #ifdef __linux__
@@ -118,6 +127,30 @@ static void nvidia_cache_beside_exe(void) {
 }
 #endif
 
+// Mesa's Vulkan drivers on Linux (RADV, ANV, NVK) keep timeline semaphores as kernel sync objects, which cannot wait
+// for a value not submitted yet. Their queues therefore submit on the calling thread and use a thread of the queue's
+// own only for a submission that waits on such a value. Every other vkQueueSubmit2, the command stream's checks and
+// the kernel's ioctl, runs on the replaying thread, once for every part the replay hands to the queue early (vk_exec.c
+// maybe_split). MESA_VK_ENABLE_SUBMIT_THREAD=1 sends every submission to the queue's thread: in Kokiri Forest on an
+// RX 6800 XT (Mesa 26.2) the replay took 13.9 ms a frame with it and 15.0 ms without. NX2NAVI_SUBMIT_THREAD (default
+// 1 on Linux, 0 on Windows) sets it unless the environment already sets it; 0 leaves the driver's own choice. Drivers
+// that do not read the variable ignore it. vk_driver_cache_env calls this before any thread can load the driver.
+static const char *submit_thread_why;   // create_device logs it on a Mesa driver
+
+static void mesa_submit_thread(void) {
+    char cur[16];
+    if (plat_getenv("MESA_VK_ENABLE_SUBMIT_THREAD", cur, sizeof cur)) {
+        submit_thread_why = "MESA_VK_ENABLE_SUBMIT_THREAD is set in the environment";
+        return;
+    }
+    if (!cfg_bool("NX2NAVI_SUBMIT_THREAD")) {
+        submit_thread_why = "NX2NAVI_SUBMIT_THREAD=0: the driver's own choice";
+        return;
+    }
+    plat_setenv("MESA_VK_ENABLE_SUBMIT_THREAD", "1");
+    submit_thread_why = "every one on the queue's own thread (NX2NAVI_SUBMIT_THREAD=0 leaves the driver's own choice)";
+}
+
 // A driver may read these variables when it loads, and a thread can load the Vulkan driver before create_instance:
 // widescreen.c's wide_init asks for the monitor's size (fullscreen with a monitor chosen and the picture at the
 // window's size), and SDL's load of the Vulkan library there lists the instance extensions, which loads the drivers,
@@ -129,6 +162,7 @@ void vk_driver_cache_env(void) {
     if (done) return;
     done = 1;
     mesa_cache_beside_exe();
+    mesa_submit_thread();
 #ifdef __linux__
     nvidia_cache_beside_exe();
 #endif
@@ -266,6 +300,8 @@ retry:
     vkGetPhysicalDeviceQueueFamilyProperties(g_vk.phys, &nq, qp);
     g_vk.gfx_family = find_gfx_family(g_vk.phys, qp, nq);
     g_gfx_queues = qp[g_vk.gfx_family].queueCount;
+    g_nqfam = nq < QFAM_MAX ? nq : QFAM_MAX;
+    for (uint32_t i = 0; i < g_nqfam; i++) g_qfam_flags[i] = qp[i].queueFlags, g_qfam_count[i] = qp[i].queueCount;
     g_vk.xfer_family = g_vk.gfx_family;
     for (uint32_t i = 0; i < nq; i++)   // a family that does transfer only (async DMA engine)
         if ((qp[i].queueFlags & VK_QUEUE_TRANSFER_BIT) && !(qp[i].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT))) {
@@ -278,6 +314,53 @@ retry:
     vk_mem_class_log(&g_vk.props, &g_vk.mem_props);
     return 1;
 }
+// Heap limits for VMA where the GPU has more than one device-local heap. An RX 580 (8 GiB, AMD 23.10) shows a 6 GiB
+// heap and a 2 GiB host-visible one; Windows granted the game 5.1 GiB of the first. VMA, asked for device-local memory,
+// takes the first heap whatever its budget, and a save load put 5.6 GiB there while the second held 69 MiB: the next
+// submit failed with VK_ERROR_OUT_OF_DEVICE_MEMORY. With a limit VMA counts a heap full at it and places what follows in
+// the next memory type that allows it (the other device-local heap first), for every allocation: textures, render
+// targets, VRAM mirrors, pools. The limit is each device-local heap's budget when the device is made (VK_EXT_memory_budget,
+// what other programs leave) less a margin for memory VMA does not see (swapchain, FidelityFX): a tenth, at least
+// 256 MiB. NX2NAVI_VRAM_HEAP_LIMIT: auto (with low_end_gpu = 1), 0 (no limits, the default), or a number of MiB for the largest device-local heap.
+static int vram_heap_limits(VkDeviceSize *limit) {
+    const char *e = cfg_get("NX2NAVI_VRAM_HEAP_LIMIT");
+    long mb = !e || !*e ? 0 : strcmp(e, "auto") ? atol(e) : -1;   // unset: no limits, as before (low_end_gpu sets auto)
+    if (!mb) return 0;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT b = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
+                                            .pNext = g_vk.has_memory_budget ? &b : NULL};
+    vkGetPhysicalDeviceMemoryProperties2(g_vk.phys, &p2);
+    const VkPhysicalDeviceMemoryProperties *mp = &p2.memoryProperties;
+    int nlocal = 0;
+    uint32_t largest = 0;
+    for (uint32_t h = 0; h < mp->memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++)
+        if (mp->memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+            if (!nlocal++ || mp->memoryHeaps[h].size > mp->memoryHeaps[largest].size) largest = h;
+        }
+    if (mb < 0 && (nlocal < 2 || !g_vk.has_memory_budget)) return 0;   // auto: only where another heap can take the rest
+    for (uint32_t h = 0; h < VK_MAX_MEMORY_HEAPS; h++) limit[h] = VK_WHOLE_SIZE;
+    for (uint32_t h = 0; h < mp->memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++) {
+        if (!(mp->memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) continue;
+        VkDeviceSize lim;
+        if (mb > 0) {
+            if (h != largest) continue;
+            lim = (VkDeviceSize)mb << 20;
+        } else {
+            VkDeviceSize budget = b.heapBudget[h] && b.heapBudget[h] < mp->memoryHeaps[h].size ? b.heapBudget[h]
+                                                                                                 : mp->memoryHeaps[h].size;
+            VkDeviceSize margin = budget / 10 > (256ull << 20) ? budget / 10 : (256ull << 20);
+            if (budget <= margin * 2) continue;   // too small to limit
+            lim = budget - margin;
+        }
+        if (lim >= mp->memoryHeaps[h].size) continue;
+        limit[h] = lim;
+        rt_log("vk: memory heap %u (%llu MiB, budget %llu MiB): the allocator uses at most %llu MiB, then the next heap "
+               "(NX2NAVI_VRAM_HEAP_LIMIT)", h, (unsigned long long)(mp->memoryHeaps[h].size >> 20),
+               (unsigned long long)(b.heapBudget[h] >> 20), (unsigned long long)(lim >> 20));
+    }
+    return 1;
+}
+
 
 typedef struct {
     VkPhysicalDeviceFeatures2 f2;
@@ -462,9 +545,13 @@ static int create_device(void) {
         rt_log("vk: mesh shaders: %s", g_vk.has_mesh_shader ? "VK_EXT_mesh_shader" : "the extension is there, its task or mesh feature is not");
     }   // vkGetDeviceFaultInfoEXT needs the feature, not just the extension
     {   // mesh_fallback: auto (on a device without mesh shaders), 1 (on every device, for testing) or 0
-        const char *mf = cfg_value("NX2NAVI_MESH_FALLBACK");
-        g_vk.mesh_fallback = !strcmp(mf, "1") || (strcmp(mf, "0") && !g_vk.has_mesh_shader);
-        if (g_vk.mesh_fallback)
+        // without mesh shaders the mesh emulation (NX2NAVI_MESH_EMULATION, on unless 0) draws them; mesh_emulation = 0
+        // leaves them to this fallback
+        const char *mf = cfg_value("NX2NAVI_MESH_FALLBACK"), *me = cfg_value("NX2NAVI_MESH_EMULATION");
+        int emu = !g_vk.has_mesh_shader && strcmp(me, "0");
+        g_vk.mesh_fallback = !emu && (!strcmp(mf, "1") || (strcmp(mf, "0") && !g_vk.has_mesh_shader));
+        if (emu) rt_log("vk: mesh shaders: emulated with compute (mesh_emulation = 1); mesh_fallback is not used");
+        else if (g_vk.mesh_fallback)
             rt_log("vk: mesh fallback: task and mesh programs run as compute passes and are drawn from their buffers (%s)",
                    g_vk.has_mesh_shader ? "mesh_fallback = 1" : "this device has no mesh shaders");
         else if (!g_vk.has_mesh_shader)
@@ -485,34 +572,69 @@ static int create_device(void) {
                has_fbl && c->fbl.attachmentFeedbackLoopLayout, has_lr && c->lr.dynamicRenderingLocalRead);
     }
 
-    // Frame generation (vk_fg.cpp) presents on a second queue of the graphics family and acquires on a third
-    static const float prio[3] = {1.0f, 1.0f, 1.0f};
+    // Frame generation (vk_fg.cpp) presents on a second queue of the graphics family and acquires on a third. AMD's
+    // swapchain needs a present queue nothing else submits to (FidelityFX: the engine must not use it, or it can
+    // deadlock); the image acquire queue needs no capability. Where the graphics family has one queue (AMD's Windows
+    // driver, an RX 580), both come from another family: a queue of a family that can present for the present, and
+    // a second queue of it, or of any other family, for the acquire (the present queue itself when there is none).
+    // Without them vk_fg_create_swapchain gave up without a word: frame generation set in the menu did nothing.
+    static const float prio[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     uint32_t nq_gfx = vk_fg_queue_count() < g_gfx_queues ? vk_fg_queue_count() : g_gfx_queues;
-    VkDeviceQueueCreateInfo qi[2] = {
-        {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.gfx_family, .queueCount = nq_gfx,
-         .pQueuePriorities = prio}};
-    uint32_t nqi = 1;
-    if (g_vk.xfer_family != g_vk.gfx_family) {
-        qi[1] = (VkDeviceQueueCreateInfo){.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-                                          .queueFamilyIndex = g_vk.xfer_family, .queueCount = 1, .pQueuePriorities = prio};
-        nqi = 2;
+    uint32_t used[QFAM_MAX] = {0};
+    if (g_vk.gfx_family < QFAM_MAX) used[g_vk.gfx_family] = nq_gfx;
+    if (g_vk.xfer_family != g_vk.gfx_family && g_vk.xfer_family < QFAM_MAX) used[g_vk.xfer_family] = 1;
+    uint32_t fg_pf = UINT32_MAX, fg_pi = 0, fg_af = UINT32_MAX, fg_ai = 0;
+    if (nq_gfx >= 2) {
+        fg_pf = fg_af = g_vk.gfx_family, fg_pi = 1, fg_ai = nq_gfx - 1;
+    } else {
+        for (int pass = 0; pass < 2 && fg_pf == UINT32_MAX; pass++)   // compute families first, then the others
+            for (uint32_t f = 0; f < g_nqfam && fg_pf == UINT32_MAX; f++) {
+                if (f == g_vk.gfx_family || used[f] >= g_qfam_count[f]) continue;
+                if (!(g_qfam_flags[f] & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT))) continue;
+                if (!pass != !!(g_qfam_flags[f] & VK_QUEUE_COMPUTE_BIT)) continue;
+                if (!gfx_window_vk_presentable(g_vk.instance, g_vk.phys, f)) continue;
+                fg_pf = f, fg_pi = used[f]++;
+            }
+        if (fg_pf != UINT32_MAX) {
+            if (used[fg_pf] < g_qfam_count[fg_pf] && used[fg_pf] < 4) fg_af = fg_pf, fg_ai = used[fg_pf]++;
+            for (uint32_t f = 0; f < g_nqfam && fg_af == UINT32_MAX; f++)
+                if (f != g_vk.gfx_family && used[f] < g_qfam_count[f] && used[f] < 4) fg_af = f, fg_ai = used[f]++;
+            if (fg_af == UINT32_MAX) fg_af = fg_pf, fg_ai = fg_pi;
+        }
     }
+    VkDeviceQueueCreateInfo qi[QFAM_MAX];
+    uint32_t nqi = 0;
+    qi[nqi++] = (VkDeviceQueueCreateInfo){.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+                                          .queueFamilyIndex = g_vk.gfx_family, .queueCount = nq_gfx, .pQueuePriorities = prio};
+    for (uint32_t f = 0; f < g_nqfam; f++)
+        if (f != g_vk.gfx_family && used[f])
+            qi[nqi++] = (VkDeviceQueueCreateInfo){.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+                                                  .queueFamilyIndex = f, .queueCount = used[f], .pQueuePriorities = prio};
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &c->f2, .queueCreateInfoCount = nqi,
                              .pQueueCreateInfos = qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
     VkResult r = vk_dlssg_create_device(g_vk.instance, g_vk.phys, &di, &g_vk.device);
     free(c);
     if (r != VK_SUCCESS) { rt_log("vk: vkCreateDevice failed (%d)", (int)r); return 0; }
+    if (submit_thread_why && vk_caps.mesa) rt_log("vk: queue submissions: %s", submit_thread_why);
     vk_dlssg_device_ready(g_vk.phys, g_vk.device);
     if (vk_dlssg_dpa()) {   // Streamline's, so its plugins hook every entry point the replay fetches
         vk_dpa = vk_dlssg_dpa();
         rt_log("vk: device entry points come through Streamline's interposer (DLSS Frame Generation)");
     }
     vkGetDeviceQueue(g_vk.device, g_vk.gfx_family, 0, &g_vk.gfx_queue);
-    if (nq_gfx >= 2) {
+    if (fg_pf != UINT32_MAX) {
         VkQueue present, acquire;
-        vkGetDeviceQueue(g_vk.device, g_vk.gfx_family, 1, &present);
-        vkGetDeviceQueue(g_vk.device, g_vk.gfx_family, nq_gfx - 1, &acquire);
-        vk_fg_queues(present, acquire);
+        vkGetDeviceQueue(g_vk.device, fg_pf, fg_pi, &present);
+        vkGetDeviceQueue(g_vk.device, fg_af, fg_ai, &acquire);
+        vk_fg_queues(present, fg_pf, acquire, fg_af);
+        if (fg_pf != g_vk.gfx_family)
+            rt_log("vk: frame generation queues: the graphics family %u has %u queue%s; presents on family %u queue %u, "
+                   "image acquires on family %u queue %u", g_vk.gfx_family, g_gfx_queues, g_gfx_queues == 1 ? "" : "s",
+                   fg_pf, fg_pi, fg_af, fg_ai);
+    } else {
+        rt_log("vk: frame generation queues: none (the graphics family %u has %u queue%s and no other family with a free "
+               "queue can present): AMD FSR 3.1 frame generation cannot run", g_vk.gfx_family, g_gfx_queues,
+               g_gfx_queues == 1 ? "" : "s");
     }
     if (g_vk.xfer_family != g_vk.gfx_family) vkGetDeviceQueue(g_vk.device, g_vk.xfer_family, 0, &g_vk.xfer_queue);
     else { g_vk.xfer_queue = g_vk.gfx_queue; g_vk.xfer_shared = 1; }
@@ -531,7 +653,10 @@ static int create_device(void) {
                                           (g_vk.has_memory_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0),
                                  .preferredLargeHeapBlockSize = vk_vma_block_size(),
                                  .pDeviceMemoryCallbacks = vk_headroom_callbacks()};
+    VkDeviceSize heap_limit[VK_MAX_MEMORY_HEAPS];
+    if (vram_heap_limits(heap_limit)) ai.pHeapSizeLimit = heap_limit;
     if ((r = vmaCreateAllocator(&ai, &g_vk.vma)) != VK_SUCCESS) { rt_log("vk: vmaCreateAllocator failed (%d)", (int)r); return 0; }
+    vk_mem_ballast(g_vk.vma);
 
     VkSemaphoreTypeCreateInfo st = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
                                     .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE, .initialValue = 0};
@@ -556,6 +681,7 @@ static void destroy_all(void) {
     if (lost_fence) vkDestroyFence(g_vk.device, lost_fence, NULL);   // vk_device_lost_poll
     lost_fence = VK_NULL_HANDLE;
     vk_headroom_stop();
+    if (g_vk.vma) vk_mem_ballast_release(g_vk.vma);
     if (g_vk.vma) vmaDestroyAllocator(g_vk.vma);
     if (g_vk.device) vkDestroyDevice(g_vk.device, NULL);
     if (g_vk.messenger) {
@@ -734,3 +860,6 @@ int probe_vkdevice(void) {
     printf("probe-vkdevice: %s (validation errors %ld)\n", g_errors_total ? "FAILED" : "passed", g_errors_total);
     return g_errors_total ? 1 : 0;
 }
+
+// The GPU has mesh shaders: the mesh emulation (NX2NAVI_MESH_EMULATION) does nothing there (the low-end GPU rows of the menu's Game tab).
+int vk_mesh_shader_native(void) { return g_vk.has_mesh_shader; }

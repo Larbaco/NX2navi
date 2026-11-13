@@ -49,7 +49,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / 'tools'))
 
-from launcher import build, feed, gameini, gamefiles, jobs, net, saves, settings, toolchain, updater, versions, winsys  # noqa: E402
+from launcher import build, feed, gameini, gamefiles, jobs, net, saves, settings, steamlib, toolchain, updater, versions, winsys  # noqa: E402
 from launcher.context import Context  # noqa: E402
 from launcher.paths import Layout  # noqa: E402
 
@@ -498,6 +498,19 @@ class UninstallTest(Tmp):
 # ---------------------------------------------------------------- toolchain
 
 class ToolchainTest(Tmp):
+    def test_zstd_missing(self):
+        """A Python without compression.zstd and zstandard is named at startup, with the pip line for a checkout."""
+        with mock.patch.dict(sys.modules, {'compression.zstd': None, 'zstandard': mock.MagicMock()}):
+            self.assertEqual(toolchain.zstd_missing(self.layout), '')
+        with mock.patch.dict(sys.modules, {'compression.zstd': None, 'zstandard': None}):
+            msg = toolchain.zstd_missing(self.layout)
+            ctx = Context(self.layout)
+        self.assertIn('zstandard', msg)
+        self.assertIn('-m pip install -r', msg)
+        self.assertIn('requirements-launcher.txt', msg)
+        self.assertEqual(ctx.zstd_missing, msg)
+        self.assertTrue(any(msg in line for line in ctx.log_tail()))
+
     def test_resolve_and_install(self):
         repo = self.tmp / 'repo'
         repo.mkdir()
@@ -1541,13 +1554,14 @@ class MakeGameTest(Tmp):
         (kits[1] / 'runtime' / 'h.h').write_text('#define V 2\n')        # the new version changed the header
         self.assertEqual(go(kits[1])[:2], (1, 0))
 
-    def main_with(self, romfs, lift, compile_):
-        """make_game.main() in this process for a first build, with the given step functions in place of the real
+    def main_with(self, romfs, lift, compile_, rebuild=False):
+        """make_game.main() in this process, with the given step functions in place of the real
         lift and compile (they need real modules and clang). Returns the SystemExit code, or 0."""
         sys.path.insert(0, str(self.layout.pydeps))   # the fake zbic
         saved = (self.mg.step_romfs, self.mg.step_lift, self.mg.step_compile, sys.argv)
         self.mg.step_romfs, self.mg.step_lift, self.mg.step_compile = romfs, lift, compile_
-        sys.argv = ['make_game.py', '--nup', str(self.nup), '--out', str(self.out), '--msys', str(self.msys),
+        source = ['--rebuild'] if rebuild else ['--nup', str(self.nup)]
+        sys.argv = ['make_game.py', *source, '--out', str(self.out), '--msys', str(self.msys),
                     '--until', 'compile']   # the shaders step needs the shader translator
         try:
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -1558,6 +1572,37 @@ class MakeGameTest(Tmp):
         finally:
             self.mg.step_romfs, self.mg.step_lift, self.mg.step_compile, sys.argv = saved
             sys.path.remove(str(self.layout.pydeps))
+
+    def test_retry_interrupted_lift_after_cache_cleanup(self):
+        layout = self.out / 'build-cache' / 'lift' / 'layout.json'
+        ran = []
+
+        def lift(out, cache):
+            ran.append('lift')
+            layout.parent.mkdir(exist_ok=True)
+            layout.write_text('[]')
+
+        def compile_(out, cache, msys, jobs, romfs_job, update):
+            ran.append('compile')
+            self.assertTrue(layout.is_file())
+
+        def interrupted(out, cache):
+            lift(out, cache)
+            raise SystemExit(1)  # layout exists again, but the lift did not finish
+
+        with mock.patch.object(self.mg, 'WIN', True):  # use the fixture's MSYS toolchain check
+            self.assertEqual(self.main_with(self.mg.step_romfs, lift, compile_), 0)
+            self.nup.unlink()
+            ran.clear()
+            shutil.rmtree(layout.parent)
+            self.assertEqual(self.main_with(self.mg.step_romfs, lift, compile_, rebuild=True), 0)
+            self.assertEqual(ran, [])  # cleaning the cache alone does not require a compile
+
+            with mock.patch.object(self.mg, 'kit_version', return_value='updated kit'):
+                self.assertEqual(self.main_with(self.mg.step_romfs, interrupted, compile_, rebuild=True), 1)
+                self.assertEqual(self.main_with(self.mg.step_romfs, lift, compile_, rebuild=True), 0)
+                self.assertEqual(self.main_with(self.mg.step_romfs, lift, compile_, rebuild=True), 0)
+            self.assertEqual(ran, ['lift', 'lift', 'compile'])
 
     def test_romfs_beside_lift_and_compile(self):
         """A first build packs the RomFS image while the lift and the compile run; the compile gets the running step
@@ -1863,7 +1908,8 @@ class MakeGameTest(Tmp):
     def test_shaders_key_names_the_translator_the_build_uses(self):
         """A source checkout has its translator in build/xlate/ (tools/build_xlate.py), not in the kit's bin/: the
         shaders key follows its identity, so a rebuilt translator prepares the shaders again. A kit's bin/ comes first
-        when both exist, and a kit with no translator is refused with the way to build one."""
+        when both exist. A kit with no translator has a key that says so (the keys are worked out before the steps
+        run, steps_to_run), and the build refuses it with the way to build one when it needs the translator."""
         from unittest import mock
         kit = self.tmp / 'kit'
         (kit / 'tools').mkdir(parents=True)
@@ -1887,8 +1933,9 @@ class MakeGameTest(Tmp):
             self.assertEqual(key(), from_bin)
             shutil.rmtree(kit / 'bin')
             shutil.rmtree(xlate)
+            self.assertTrue(key().endswith('|missing'))
             with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
-                key()
+                self.mg.xlate_source()
             self.assertIn('tools/build_xlate.py', err.getvalue())
 
     def test_prompts_step(self):
@@ -1958,12 +2005,13 @@ class MakeGameTest(Tmp):
             self.assertEqual(build()[2], 3)
             (art / 'T_X_B_White.png').write_bytes(b'picture two')
             self.assertEqual(build()[2], 4)
-            # the lift running again makes the compile and the shaders run, not the prompts
+            # the lift running again makes the compile run, not the shaders (their key names the lift and the
+            # compile they depend on, make_game.py UNAFFECTED) nor the prompts
             st = json.loads((self.out / 'build-cache' / 'state.json').read_text())
             del st['steps']['lift']
             (self.out / 'build-cache' / 'state.json').write_text(json.dumps(st))
             others, ev, runs = build()
-            self.assertEqual((others, states(ev), runs), (['compile', 'lift', 'shaders'], ['skip'], 4))
+            self.assertEqual((others, states(ev), runs), (['compile', 'lift'], ['skip'], 4))
             # a kit without art: skipped, the folders an earlier build drew stay
             shutil.rmtree(kit / 'prompt-art')
             self.assertEqual(build(), ([], [{'ev': 'step', 'step': 'prompts', 'state': 'skip'}], 4))
@@ -2587,7 +2635,10 @@ class MakeGameTest(Tmp):
             self.assertEqual(build_shaders.stale(rt), [font])
         menu = (ROOT / 'runtime' / 'ui' / 'menu.cpp').read_text(encoding='utf-8')
         self.assertIn('#ifdef __has_embed\n#embed "fonts/Roboto-Medium.ttf"\n#else\n#include "roboto_ttf.h"\n#endif', menu)
-        self.assertEqual(build_shaders.EMBEDDED, {'ui/fonts/Roboto-Medium.ttf': 'ui/roboto_ttf.h'})
+        # the menu font, and the SMAA lookup textures of the anti-aliasing setting (runtime/vk_aa.c)
+        self.assertEqual(build_shaders.EMBEDDED, {'ui/fonts/Roboto-Medium.ttf': 'ui/roboto_ttf.h',
+                                                  'third_party/smaa/AreaTex.bin': 'smaa_area_tex.h',
+                                                  'third_party/smaa/SearchTex.bin': 'smaa_search_tex.h'})
 
     def test_objects_of_an_earlier_version_are_taken_over(self):
         """An entry under a key an earlier version gave the same compile is re-recorded under the new key when its
@@ -3083,7 +3134,8 @@ class MakeGameTest(Tmp):
         code, _ = self.main_rebuild(lambda out, cache: None, stop)
         self.assertEqual(code, 1)
         st = json.loads((self.out / 'build-cache' / 'state.json').read_text())
-        self.assertEqual(sorted(st['steps']), ['exefs', 'lift', 'romfs'])
+        # the shaders' record stays as the lift left it: the step's key names what it depends on (UNAFFECTED)
+        self.assertEqual(sorted(s for s in st['steps'] if s != 'shaders'), ['exefs', 'lift', 'romfs'])
         self.assertEqual(build.built_version(self.out), '')   # no finished build on record
         self.assertTrue(build.can_rebuild(self.out))
         self.assertTrue(build.installed(self.out))
@@ -3943,8 +3995,8 @@ class SaveShareTest(unittest.TestCase):
         self.assertEqual(len([n for n in names if n.startswith('save/')]), len(self.SAVE))
 
     def test_a_bug_report_keeps_the_private_settings_values_out(self):
-        """A co-op room's secret, the relay and the player's name are not in the nx2navi.ini a bug report carries;
-        every other byte of the file is."""
+        """The private settings' values (a room's secret, a relay and a name that an earlier version's co-op left in
+        the file) are not in the nx2navi.ini a bug report carries; every other byte of the file is."""
         ini = (b'\xef\xbb\xbf[coop]\r\ncoop = 1\r\n  Coop_Room = H7K3WM-BCDFGH-234567\r\ncoop_server=relay.example:24680\r\n'
                b'# coop_name = in a comment\r\ncoop_name =\r\ncoop_accept = 1a2b3c4d\nfps_limit = 60')
         self.game_with_save(self.game, self.SAVE)
@@ -4450,6 +4502,92 @@ def have_display():
 
 
 @unittest.skipUnless(have_display(), 'needs tkinter, numpy and a display')
+class SteamLibTest(Tmp):
+    """launcher/steamlib.py: Steam's library file for co-op, found in the player's Steam library and put beside the
+    game. The files here are made up: the bytes a library's exported names leave in it, no code."""
+
+    def lib(self, path, old=False, mtime=None):
+        names = list(steamlib.NEEDS) + [group[-1] for group in steamlib.ONE_OF]
+        if old:   # a library from before the networking messages interface
+            names = [n for n in names if b'NetworkingMessages' not in n]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'MZ' + bytes(64) + b'\x00'.join(names) + b'\x00')
+        if mtime:
+            os.utime(path, (mtime, mtime))
+        return path
+
+    def steam(self):
+        """A Steam folder with a second library elsewhere, as libraryfolders.vdf lists it (backslashes doubled)."""
+        steam = self.tmp / 'Steam'
+        other = self.tmp / 'Games Drive' / 'SteamLibrary'
+        (steam / 'steamapps' / 'common').mkdir(parents=True)
+        (other / 'steamapps' / 'common').mkdir(parents=True)
+        one = chr(92)
+        rows = ''.join('\t"%d"\n\t{\n\t\t"path"\t\t"%s"\n\t}\n' % (i, str(p).replace(one, one + one))
+                       for i, p in enumerate((steam, other)))
+        (steam / 'steamapps' / 'libraryfolders.vdf').write_text('"libraryfolders"\n{\n' + rows + '}\n', encoding='utf-8')
+        return steam, other
+
+    def test_a_library_is_suitable_only_with_every_call_co_op_uses(self):
+        self.assertTrue(steamlib.suitable(self.lib(self.tmp / 'a' / steamlib.NAME)))
+        self.assertFalse(steamlib.suitable(self.lib(self.tmp / 'b' / steamlib.NAME, old=True)))
+        (self.tmp / 'c').mkdir()
+        (self.tmp / 'c' / steamlib.NAME).write_bytes(b'not a library at all')
+        self.assertFalse(steamlib.suitable(self.tmp / 'c' / steamlib.NAME))
+        self.assertFalse(steamlib.suitable(self.tmp / 'missing' / steamlib.NAME))
+
+    def test_the_newest_suitable_signed_library_of_any_steam_library_is_found(self):
+        steam, other = self.steam()
+        now = time.time()
+        self.lib(steam / 'steamapps' / 'common' / 'Old Game' / steamlib.NAME, old=True, mtime=now)
+        mid = self.lib(steam / 'steamapps' / 'common' / 'Mid Game' / 'bin' / steamlib.NAME, mtime=now - 5000)
+        new = self.lib(other / 'steamapps' / 'common' / 'Unity Game' / 'Game_Data' / 'Plugins' / 'x86_64' / steamlib.NAME,
+                       mtime=now - 100)
+        unsigned = self.lib(other / 'steamapps' / 'common' / 'Replaced' / steamlib.NAME, mtime=now - 10)
+        self.lib(other / 'steamapps' / 'common' / 'Deep' / 'a' / 'b' / 'c' / 'd' / 'e' / 'f' / steamlib.NAME, mtime=now)
+        self.assertEqual([p.parent.name for p in steamlib.libraries(steam)], ['Steam', 'SteamLibrary'])
+        self.assertEqual(steamlib.find(steam, lambda p: Path(p) != unsigned), new)   # not the old, unsigned or too deep one
+        self.assertEqual(steamlib.find(steam, lambda p: Path(p) == mid), mid)
+        self.assertIsNone(steamlib.find(steam, lambda p: False))
+        self.assertIsNone(steamlib.find(self.tmp / 'no steam here', lambda p: True))
+
+    def test_the_library_is_put_beside_the_game_once(self):
+        steam, other = self.steam()
+        src = self.lib(other / 'steamapps' / 'common' / 'Some Game' / steamlib.NAME)
+        game = self.tmp / 'game'
+        game.mkdir()
+        lines = []
+        self.assertEqual(steamlib.ensure(game, None, steam, lines.append, lambda p: True), 'copied')
+        self.assertEqual((game / steamlib.NAME).read_bytes(), src.read_bytes())
+        self.assertIn('Some Game', lines[-1])
+        self.assertEqual(steamlib.ensure(game, None, self.tmp / 'gone', lines.append, lambda p: False), 'there')
+        # a file beside the game that is not a library co-op can use is replaced
+        (game / steamlib.NAME).write_bytes(b'MZ old')
+        self.assertEqual(steamlib.ensure(game, None, steam, lines.append, lambda p: True), 'copied')
+        self.assertTrue(steamlib.suitable(game / steamlib.NAME))
+
+    def test_a_library_the_release_ships_comes_first_and_none_is_said_once(self):
+        steam, other = self.steam()
+        kit_bin = self.tmp / 'kit' / 'bin'
+        shipped = self.lib(kit_bin / steamlib.NAME)
+        shipped.write_bytes(shipped.read_bytes() + b'shipped')
+        self.lib(other / 'steamapps' / 'common' / 'Some Game' / steamlib.NAME)
+        game = self.tmp / 'game'
+        game.mkdir()
+        self.assertEqual(steamlib.ensure(game, kit_bin, steam, lambda line: None, lambda p: True), 'copied')
+        self.assertTrue((game / steamlib.NAME).read_bytes().endswith(b'shipped'))
+        # nothing suitable anywhere: said in the log once, and not searched again by this process
+        empty = self.tmp / 'empty game'
+        empty.mkdir()
+        lines = []
+        nothing = self.tmp / 'Steam without games'
+        (nothing / 'steamapps' / 'common').mkdir(parents=True)
+        self.assertEqual(steamlib.ensure(empty, None, nothing, lines.append, lambda p: True), 'none')
+        self.assertEqual(steamlib.ensure(empty, None, steam, lines.append, lambda p: True), 'none')
+        self.assertEqual(len(lines), 1)
+        self.assertFalse((empty / steamlib.NAME).exists())
+
+
 class SteamTest(Tmp):
     """launcher/steam.py on made-up Steam files: the binary shortcuts file read and written back unchanged, our
     shortcut added beside another and updated in place, its id as Steam computes it, the accounts that signed in."""
@@ -4803,7 +4941,143 @@ class WindowTest(Tmp):
         r = subprocess.run([sys.executable, '-m', 'launcher', '--root', str(self.tmp / 'w'), '--selftest'],
                            cwd=ROOT, capture_output=True, text=True, timeout=180)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn('16 screens drawn', r.stdout)
+        self.assertIn('19 screens drawn', r.stdout)
+
+
+# ---------------------------------------------------------------- mods
+
+class ModsTest(Tmp):
+    """The mods folder as the launcher puts it in order for the game (launcher/mods.py) and the build takes its code
+    in (tools/make_game.py, tools/mod_files.py)."""
+
+    def setUp(self):
+        super().setUp()
+        from launcher import mods
+        self.mods = mods
+        self.game = self.tmp / 'game'
+        made_up_game(self.game)
+        self.folder = self.game / 'mods'
+        self.folder.mkdir()
+
+    def file(self, rel, text='x'):
+        p = self.folder / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+        return p
+
+    def tree(self):
+        return sorted(p.relative_to(self.folder).as_posix() for p in self.folder.rglob('*') if p.is_file())
+
+    def test_downloads_are_put_where_the_game_looks(self):
+        with zipfile.ZipFile(self.folder / 'Zipped.zip', 'w') as z:   # a zip holding the mod's own folder
+            z.writestr('Zipped/romfs/Actor/a.bfres', 'a')
+            z.writestr('Zipped/README.md', 'r')
+        with zipfile.ZipFile(self.folder / 'Escape.zip', 'w') as z:
+            z.writestr('../outside.txt', 'e')
+        self.file('Wrapped/readme.txt')                                # wrapped twice, a readme on each level
+        self.file('Wrapped/Wrapped v2/readme.txt')
+        self.file('Wrapped/Wrapped v2/Wrapped/romfs/UI/b.txt')
+        self.file('romfs/Actor/c.bfres')                               # a mod's romfs straight in the mods folder
+        self.file('atmosphere/contents/0400486024DEC000/romfs/d.txt')  # an Atmosphere layout: a mod as it is
+        self.file('Options/Option A/romfs/e')                           # a download with options: left alone
+        self.file('Options/Option B/romfs/e')
+        done = self.mods.prepare(self.game)
+        self.assertEqual(self.tree(), [
+            'Escape.zip', 'Options/Option A/romfs/e', 'Options/Option B/romfs/e', 'Unnamed mod/romfs/Actor/c.bfres',
+            'Wrapped/readme (2).txt', 'Wrapped/readme.txt', 'Wrapped/romfs/UI/b.txt', 'Zipped.zip',
+            'Zipped/README.md', 'Zipped/romfs/Actor/a.bfres',
+            'atmosphere/contents/0400486024DEC000/romfs/d.txt'])
+        self.assertFalse((self.game / 'outside.txt').exists())
+        self.assertTrue(any(line.startswith('Escape.zip was not unpacked') for line in done))
+        self.assertEqual(self.mods.prepare(self.game), [line for line in done if 'Escape.zip' in line])   # once
+        found = {m.name: m for m in self.mods.scan(self.game)}
+        self.assertEqual(sorted(n for n, m in found.items() if m.usable),
+                         ['Unnamed mod', 'Wrapped', 'Zipped', 'atmosphere'])
+        self.assertIn('options', found['Options'].problem)
+        self.assertEqual(found['Zipped'].files, ['actor/a.bfres'])
+
+    def test_what_the_game_cannot_use_is_named(self):
+        self.file('Plugin/exefs/subsdk9')
+        self.file('Other/atmosphere/contents/01007EF00011E000/romfs/x')
+        self.file('Readme only/readme.txt')
+        self.file('Old patch/exefs/0123456789ABCDEF0123456789ABCDEF.ips', 'PATCHEOF')
+        self.file('Patch/exefs/E0F3CCFAF50065AE4EA01EB5AEB13B1A.ips', 'PATCHEOF')
+        found = {m.name: m for m in self.mods.scan(self.game)}
+        self.assertIn('code module', found['Plugin'].problem)
+        self.assertIn('01007EF00011E000', found['Other'].problem)
+        self.assertIn('nothing the game reads', found['Readme only'].problem)
+        self.assertIn('another version', found['Old patch'].problem)
+        self.assertEqual((found['Patch'].problem, found['Patch'].patches), ('', 1))
+
+    def test_switches_and_order_are_the_games_settings(self):
+        for name in ('beta', 'Alpha', ' Lead'):
+            self.file(f'{name}/romfs/same.txt', name)
+        self.assertEqual([m.name for m in self.mods.scan(self.game)], [' Lead', 'Alpha', 'beta'])   # strcmp
+        self.mods.set_enabled(self.game, 'Alpha', False)
+        self.mods.move(self.game, 'beta', -2)
+        self.mods.set_enabled(self.game, ' Lead', False)
+        self.mods.set_enabled(self.game, 'Alpha', True)
+        self.assertEqual(gameini.get(self.game, 'MODS_ORDER'), 'beta| Lead|Alpha')
+        self.assertEqual(gameini.get(self.game, 'MODS_DISABLED'), ' Lead')
+        self.assertIn('mods_disabled = " Lead"', (self.game / 'nx2navi.ini').read_text())   # as runtime/cfg.c quotes
+        found = self.mods.scan(self.game)
+        self.assertEqual([(m.name, m.enabled) for m in found], [('beta', True), (' Lead', False), ('Alpha', True)])
+        self.assertEqual(self.mods.overlaps(found), {'beta': [('Alpha', 1, True)], 'Alpha': [('beta', 1, False)]})
+
+    def test_a_picked_archive_or_folder_is_added(self):
+        src = self.tmp / 'Downloads'
+        src.mkdir()
+        with zipfile.ZipFile(src / 'Picked.zip', 'w') as z:
+            z.writestr('romfs/a.txt', 'a')
+        (src / 'Folder Mod' / 'Inner' / 'exefs').mkdir(parents=True)
+        (src / 'Folder Mod' / 'Inner' / 'exefs' / 'E0F3CCFAF50065AE.ips').write_text('PATCHEOF')
+        (src / 'romfs').mkdir()
+        (src / 'romfs' / 'b.txt').write_text('b')
+        self.assertEqual(self.mods.add(self.game, src / 'Picked.zip').name, 'Picked')
+        self.assertEqual(self.mods.add(self.game, src / 'Picked.zip').name, 'Picked 2')
+        self.assertEqual(self.mods.add(self.game, src / 'Folder Mod').name, 'Folder Mod')
+        self.assertEqual(self.mods.add(self.game, src / 'romfs').name, 'Unnamed mod')
+        self.assertEqual(self.tree(), ['Folder Mod/exefs/E0F3CCFAF50065AE.ips', 'Picked 2/romfs/a.txt',
+                                       'Picked/romfs/a.txt', 'Unnamed mod/romfs/b.txt'])
+        self.assertTrue((src / 'Picked.zip').is_file())   # the player's download stays where it was
+        with self.assertRaises(self.mods.ModError):
+            self.mods.add(self.game, src / 'Folder Mod' / 'Inner' / 'exefs' / 'E0F3CCFAF50065AE.ips')
+
+    def test_code_waits_for_a_build_that_saw_it(self):
+        import make_game
+        cheat = self.file('Cheats/cheats/E0F3CCFAF50065AE.txt', '[Moon jump]\n04000000 00000000 D503201F\n')
+        self.file('Textures/romfs/a.txt')
+        self.assertEqual(self.mods.code_waiting(self.game), ['Cheats'])
+        self.mods.set_enabled(self.game, 'Cheats', False)
+        self.assertEqual(self.mods.code_waiting(self.game), [])          # a mod switched off waits for nothing
+        self.mods.set_enabled(self.game, 'Cheats', True)
+        (self.game / 'build-cache' / 'mod-code.json').write_text(json.dumps(make_game.mod_code(self.game)))
+        self.assertEqual(self.mods.code_waiting(self.game), [])          # the last build took it up
+        cheat.write_text('[Moon jump]\n04000000 00000000 D65F03C0\n')
+        self.assertEqual(self.mods.code_waiting(self.game), ['Cheats'])  # edited since
+
+    def test_the_mods_code_is_in_the_lift_key_and_not_the_shaders_key(self):
+        import make_game
+        kit = self.tmp / 'kit'
+        for d in ('tools', 'recomp', 'runtime', 'bin'):
+            (kit / d).mkdir(parents=True)
+        for f in ('tools/prepare_shaders.py', 'tools/cheats.py', 'tools/exefs_patches.py', 'tools/mod_files.py',
+                  'recomp/patches-v111.txt', 'bin/' + make_game.XLATE_NAME, 'bin/nx2navi_xlate.id', 'VERSION'):
+            (kit / f).write_text('1\n')
+
+        def keys():
+            return {s: make_game.step_key(s, 'game', self.game) for s in ('lift', 'compile', 'shaders')}
+        with mock.patch.object(make_game, 'KIT', kit):
+            plain = keys()
+            self.file('Textures/romfs/a.txt')
+            self.assertEqual(keys(), plain)                    # files of the game's data: no build
+            self.assertNotIn('|mods ', plain['lift'])
+            self.file('Patch/exefs/E0F3CCFAF50065AE.ips', 'PATCHEOF')
+            with_patch = keys()
+            self.assertTrue(with_patch['lift'].startswith(plain['lift'] + '|mods '))
+            self.assertNotEqual(with_patch['compile'], plain['compile'])
+            self.assertEqual(with_patch['shaders'], plain['shaders'])
+            self.assertEqual(list(make_game.mod_code(self.game)), ['Patch/exefs/E0F3CCFAF50065AE.ips'])
 
 
 if __name__ == '__main__':

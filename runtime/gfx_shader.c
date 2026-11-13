@@ -1175,6 +1175,185 @@ out:
     free(arrayed), free(need), free(bind), free(org), free(query);
 }
 
+// Every load of one component of a uniform block vector at a computed component index (OpAccessChain into a Uniform
+// block whose last index, into a vector, is not a constant: the translator's c[n][i >> 2][i & 3] for an LDC with a
+// register offset) becomes a load of the whole vector, its components extracted with constant indices and the one
+// wanted picked with OpSelect. AMD's Windows drivers can read the wrong component through such an access chain, the bug
+// Ryujinx works around with HasVectorIndexingBug (VectorComponentSelect). The volumetric fog's per-volume
+// extinction reads its colour this way. It did not change the fog's teal blotches on an RX 580 (23.10.01.14), so it is
+// off by default. NX2NAVI_VEC_INDEX_FIX: 1 everywhere, auto on AMD's own drivers, unset or 0 off. In memory only.
+int vk_caps_vec_index_bug(void);   // vk_caps.c
+
+enum { VX_TYPE_BOOL = 20, VX_TYPE_INT = 21, VX_TYPE_FLOAT = 22, VX_TYPE_VECTOR = 23, VX_TYPE_ARRAY = 28,
+       VX_TYPE_RTARRAY = 29, VX_TYPE_STRUCT = 30, VX_TYPE_POINTER = 32, VX_CONSTANT = 43, VX_FUNCTION = 54,
+       VX_VARIABLE = 59, VX_LOAD = 61, VX_ACCESS_CHAIN = 65, VX_IN_BOUNDS_ACCESS_CHAIN = 66, VX_COMPOSITE_EXTRACT = 81,
+       VX_SELECT = 169, VX_IEQUAL = 170, VX_SC_UNIFORM = 2 };
+
+static void patch_vec_index(GfxShader *s) {
+    static int on = -1;
+    static volatile int32_t n_logged;
+    if (on < 0) {
+        const char *e = cfg_get("NX2NAVI_VEC_INDEX_FIX");
+        on = e && *e ? (strcmp(e, "auto") ? *e != '0' : vk_caps_vec_index_bug()) : 0;
+        if (on) rt_log("gfx_shader: uniform vector components at computed indices are read whole and selected "
+                       "(NX2NAVI_VEC_INDEX_FIX=0 turns it off)");
+    }
+    uint32_t *w = s->spirv;
+    uint64_t n = s->words;
+    if (!on || n < 5) return;
+    uint32_t bound = w[3];
+    if (bound > (1u << 22)) return;
+    uint64_t *def = calloc(bound, sizeof *def);   // word index of the instruction defining each id
+    uint32_t *ptr_v = calloc(bound, sizeof *ptr_v);   // per vector type: its Uniform pointer type, if any
+    uint32_t *target = calloc(bound, sizeof *target);   // per access chain id to rewrite: the vector access chain's id
+    uint32_t *acv = calloc(bound, sizeof *acv);   // per access chain id to rewrite: the vector type
+    if (!def || !ptr_v || !target || !acv) goto out;
+    uint64_t first_fn = 0;
+    uint32_t bool_t = 0;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) goto out;
+        if (op == VX_FUNCTION && !first_fn) first_fn = i;
+        uint32_t rid = 0;
+        switch (op) {
+        // no result id (or none at word 2): debug, annotations, mode setting, stores, barriers, control flow
+        case 3: case 4: case 5: case 6: case 8: case 10: case 14: case 15: case 16: case 17: case 56: case 62: case 63:
+        case 71: case 72: case 73: case 74: case 75: case 99: case 224: case 225: case 228: case 246: case 247: case 248:
+        case 249: case 250: case 251: case 252: case 253: case 254: case 255: case 317: case 330: case 331: case 332:
+        case 4416: case 5294: case 5295: case 5632: case 5633: break;
+        case 7: case 11:   // OpString, OpExtInstImport: result at word 1
+        case VX_TYPE_BOOL: case VX_TYPE_INT: case VX_TYPE_FLOAT: case VX_TYPE_VECTOR: case VX_TYPE_ARRAY:
+        case VX_TYPE_RTARRAY: case VX_TYPE_STRUCT: case VX_TYPE_POINTER: rid = len >= 2 ? w[i + 1] : 0; break;
+        default:
+            if (op >= 19 && op <= 39) rid = len >= 2 ? w[i + 1] : 0;   // the other OpType*
+            else if (len >= 3) rid = w[i + 2];
+        }
+        if (op == VX_TYPE_BOOL && !bool_t) bool_t = w[i + 1];
+        if (op == VX_TYPE_POINTER && len == 4 && w[i + 2] == VX_SC_UNIFORM && w[i + 3] < bound && !ptr_v[w[i + 3]])
+            ptr_v[w[i + 3]] = w[i + 1];
+        if (rid && rid < bound && !def[rid]) def[rid] = i;
+        i += len;
+    }
+    if (!first_fn) goto out;
+#define VX_OP(id) ((id) < bound && def[id] ? w[def[id]] & 0xffff : 0)
+    // the access chains to rewrite and what they need
+    int found = 0;
+    uint32_t next = bound;
+    uint32_t need_ptr[64], need_ptr_v[64], nneed = 0;   // new Uniform pointer types: id, vector type
+    uint32_t cint[8][4] = {{0}}, cint_t[8] = {0}, ncint = 0;   // constants 0..3 per index type
+    for (uint64_t i = first_fn; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if ((op == VX_ACCESS_CHAIN || op == VX_IN_BOUNDS_ACCESS_CHAIN) && len >= 6) {
+            uint32_t rt = w[i + 1], id = w[i + 2], base = w[i + 3], nidx = len - 4, last = w[i + len - 1];
+            uint32_t vt = 0;
+            if (VX_OP(rt) == VX_TYPE_POINTER && w[def[rt] + 2] == VX_SC_UNIFORM && VX_OP(base) == VX_VARIABLE &&
+                VX_OP(last) != VX_CONSTANT && VX_OP(w[def[base] + 1]) == VX_TYPE_POINTER) {
+                uint32_t t = w[def[w[def[base] + 1]] + 3];   // the variable's pointee
+                int ok = 1;
+                for (uint32_t k = 0; k + 1 < nidx && ok; k++) {
+                    uint32_t top = VX_OP(t), ix = w[i + 4 + k];
+                    if (top == VX_TYPE_STRUCT) {
+                        if (VX_OP(ix) != VX_CONSTANT) { ok = 0; break; }
+                        uint32_t m = w[def[ix] + 3], slen = w[def[t]] >> 16;
+                        if (2 + m >= slen) { ok = 0; break; }
+                        t = w[def[t] + 2 + m];
+                    } else if (top == VX_TYPE_ARRAY || top == VX_TYPE_RTARRAY) {
+                        t = w[def[t] + 2];
+                    } else ok = 0;
+                }
+                uint32_t sc = w[def[rt] + 3];
+                if (ok && VX_OP(t) == VX_TYPE_VECTOR && w[def[t] + 2] == sc && w[def[t] + 3] >= 2 && w[def[t] + 3] <= 4 &&
+                    def[last] && (w[def[last]] >> 16) >= 3) {
+                    uint32_t it = w[def[last] + 1];   // the index's type
+                    if (VX_OP(it) == VX_TYPE_INT) vt = t;
+                    if (vt && !ptr_v[vt]) {
+                        if (nneed == 64) vt = 0;
+                        else need_ptr[nneed] = next++, need_ptr_v[nneed++] = vt, ptr_v[vt] = need_ptr[nneed - 1];
+                    }
+                    if (vt) {
+                        uint32_t c = 0;
+                        while (c < ncint && cint_t[c] != it) c++;
+                        if (c == ncint) {
+                            if (ncint == 8) vt = 0;
+                            else cint_t[ncint++] = it;
+                        }
+                    }
+                }
+            }
+            if (vt && id < bound) target[id] = next++, acv[id] = vt, found++;
+        }
+        i += len;
+    }
+    if (!found) goto out;
+    // constants 0..3 of each index type: existing ones where the module has them
+    for (uint64_t i = 5; i < first_fn;) {
+        uint32_t len = w[i] >> 16;
+        if ((w[i] & 0xffff) == VX_CONSTANT && len == 4 && w[i + 3] < 4)
+            for (uint32_t c = 0; c < ncint; c++)
+                if (cint_t[c] == w[i + 1] && !cint[c][w[i + 3]]) cint[c][w[i + 3]] = w[i + 2];
+        i += len;
+    }
+    uint32_t newc[8][4] = {{0}};
+    for (uint32_t c = 0; c < ncint; c++)
+        for (int v = 0; v < 4; v++)
+            if (!cint[c][v]) cint[c][v] = newc[c][v] = next++;
+    uint32_t new_bool = bool_t ? 0 : next++;
+    if (!bool_t) bool_t = new_bool;
+    // count the loads to size the output: each becomes 1 + 4 + 3 + 3 instructions of up to 5 words
+    uint64_t loads = 0;
+    for (uint64_t i = first_fn; i < n;) {
+        uint32_t len = w[i] >> 16;
+        if ((w[i] & 0xffff) == VX_LOAD && len >= 4 && w[i + 3] < bound && target[w[i + 3]]) loads++;
+        i += len;
+    }
+    uint32_t *o = malloc((n + 64 * 4 + 32 * 4 + 4 + (uint64_t)found * 16 + loads * 64) * sizeof *o);
+    if (!o) goto out;
+    uint64_t k = 0;
+    for (uint64_t i = 0; i < 5; i++) o[k++] = w[i];
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (i == first_fn) {   // the new declarations, last in the global section
+            for (uint32_t j = 0; j < nneed; j++)
+                o[k++] = 4u << 16 | VX_TYPE_POINTER, o[k++] = need_ptr[j], o[k++] = VX_SC_UNIFORM, o[k++] = need_ptr_v[j];
+            if (new_bool) o[k++] = 2u << 16 | VX_TYPE_BOOL, o[k++] = new_bool;
+            for (uint32_t c = 0; c < ncint; c++)
+                for (uint32_t v = 0; v < 4; v++)
+                    if (newc[c][v]) o[k++] = 4u << 16 | VX_CONSTANT, o[k++] = cint_t[c], o[k++] = newc[c][v], o[k++] = v;
+        }
+        for (uint32_t j = 0; j < len; j++) o[k++] = w[i + j];
+        if ((op == VX_ACCESS_CHAIN || op == VX_IN_BOUNDS_ACCESS_CHAIN) && len >= 6 && w[i + 2] < bound && target[w[i + 2]]) {
+            // the same chain without its last index: a pointer to the vector
+            o[k++] = (len - 1) << 16 | op, o[k++] = ptr_v[acv[w[i + 2]]], o[k++] = target[w[i + 2]];
+            for (uint32_t j = 3; j < len - 1; j++) o[k++] = w[i + j];
+        } else if (op == VX_LOAD && len >= 4 && w[i + 3] < bound && target[w[i + 3]]) {
+            k -= len;   // replaced
+            uint32_t st = w[i + 1], res = w[i + 2], ac = w[i + 3], vt = acv[ac], nc = w[def[vt] + 3];
+            uint32_t idx = w[def[ac] + (w[def[ac]] >> 16) - 1], it = w[def[idx] + 1], c = 0;
+            while (cint_t[c] != it) c++;
+            uint32_t vec = next++, e[4], sel = 0;
+            o[k++] = 4u << 16 | VX_LOAD, o[k++] = vt, o[k++] = vec, o[k++] = target[ac];
+            for (uint32_t m = 0; m < nc; m++)
+                e[m] = next++, o[k++] = 5u << 16 | VX_COMPOSITE_EXTRACT, o[k++] = st, o[k++] = e[m], o[k++] = vec, o[k++] = m;
+            sel = e[0];
+            for (uint32_t m = 1; m < nc; m++) {
+                uint32_t eq = next++, r = m + 1 == nc ? res : next++;
+                o[k++] = 5u << 16 | VX_IEQUAL, o[k++] = bool_t, o[k++] = eq, o[k++] = idx, o[k++] = cint[c][m];
+                o[k++] = 6u << 16 | VX_SELECT, o[k++] = st, o[k++] = r, o[k++] = eq, o[k++] = e[m], o[k++] = sel;
+                sel = r;
+            }
+        }
+        i += len;
+    }
+    o[3] = next;
+    free(s->spirv);
+    s->spirv = o, s->words = k;
+    if (plat_inc32(&n_logged) <= 4)
+        rt_log("gfx_shader: %d uniform vector component reads at computed indices now select the component", found);
+#undef VX_OP
+out:
+    free(def), free(ptr_v), free(target), free(acv);
+}
+
 static void reflect_stage(GfxShader *s) {
     const char *js = s->reflection;
     char stage[8];
@@ -1197,6 +1376,7 @@ static void reflect(GfxShader *s) {
     reflect_spirv(s);
     reflect_exact(s);
     patch_txd_transpose(s);
+    patch_vec_index(s);
 }
 
 // ---- use masks (see the cache key at the top)
@@ -1527,6 +1707,11 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const 
         memcpy(&magic0, control, 4);
         if (!shared && magic0 == 0x98761234u && !strcmp(stage, "cs")) memcpy(&shared, control + 0x64, 4);
         o += sprintf(o, "},\"shared\":%u", shared);
+        // Their local memory, bytes a thread, follows at +0x68. Without it the translator declares its 0x1000-byte
+        // default: one compute program of the game needs 4,752 bytes a thread and indexed past the end of its array.
+        uint32_t local = 0;
+        if (magic0 == 0x98761234u && !strcmp(stage, "cs")) memcpy(&local, control + 0x68, 4);
+        if (local && local <= (1u << 20)) o += sprintf(o, ",\"local_mem\":%u", local);
     }
     if (!strcmp(stage, "cs")) {
         uint32_t l[3] = {1, 1, 1};

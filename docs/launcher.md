@@ -55,7 +55,8 @@ Customize Launcher (on the home screen) makes the look the player's own:
   scheme's backdrop back.
 - Animations (on by default): the cursor glides from row to row, a new screen slides into place, sparks drift up
   over the backdrop and Navi bobs in the title band with a pulsing halo (`App.animate`). They move by the time that
-  passed, stand still while the window is hidden or minimised, and Off stops them all.
+  passed, stand still while the window is hidden or minimised or another window is in front (the game, when Hide
+  Launcher While Playing is off), and Off stops them all.
 - Sounds (Low by default; Off, Medium or High): two of the game's own interface sounds, the decide and cancel sounds
   of its menus, when a row is chosen or a choice changes and when the player goes back. The launcher decodes them
   from the player's built game or dump into `data/cache/sounds` (`gamefiles.extract_sounds`:
@@ -64,6 +65,11 @@ Customize Launcher (on the home screen) makes the look the player's own:
   it is silent until the player's game has been read. Moving the cursor makes no sound. They are played from memory
   (PlaySound on Windows; `pw-play`, `paplay` or `aplay` elsewhere).
 
+- Steam's library file for co-op (Windows, `launcher/steamlib.py`, [coop.md](coop.md)): before Play and before a start
+  from the Steam shortcut, when `steam_api64.dll` is not beside the game, the launcher copies one there: one a release
+  ships in its `bin` folder if it has one, else the newest one in the games of the player's Steam libraries that Valve
+  signed (WinVerifyTrust and the signer's name) and that has every call `runtime/steam.c` uses. Nothing is downloaded.
+  With no Steam or no suitable file the game starts as before and co-op says what is missing.
 - Add to Steam (Windows): the game in the player's Steam library as *The Legend of Zelda Ocarina of Time*, started
   from there without the launcher's window (`launcher/steam.py`). Its pictures are made from the player's game when
   the row is selected (`launcher/gameart.py`): Navi as the game's HUD draws her for the icon, the title screen's logo,
@@ -87,7 +93,9 @@ identity (`NX2navi.Launcher`), so the taskbar groups and pins it under NX2navi r
 Screens (`launcher/ui/app.py`): first run (dump, install folder, Desktop Shortcut, Check for Updates at Start,
 Update Channel, Begin Installation); the steps of an install, update or rebuild with their progress, the build log's
 last lines and Cancel, and after a failure Try Again and Copy Report; home (Play, Updates, Game Folder, Saves,
-Rebuild the Game, Customize Launcher, Settings); customize (Color Scheme, with Custom Background Color, Panel Color and
+Mods, Rebuild the Game, Customize Launcher, Settings); mods (Open Mods Folder, Add a Mod, Add a Mod Folder, one On/Off
+row for each mod, More Mods when they fill more than a page, Load Order, Back); load order (each mod with its place,
+left and right to move it); customize (Color Scheme, with Custom Background Color, Panel Color and
 Button Color, Background, with a picture set Background Dimming and Remove Background, Animations, Sounds, Add to Steam on
 Windows, Back); the colour picker (Hue, Saturation, Brightness, Hex Code, Reset, Done); saves (Export Save, Add Log and Settings, Export To, Import a Save, Import a Save Folder,
 Open Saves Folder, Back); settings (update check, Install Updates Automatically, Hide Launcher While Playing, Keep
@@ -98,6 +106,12 @@ Controls: the mouse (hover moves the cursor, a click selects); the keyboard (arr
 for updates); an XInput gamepad (d-pad or left stick, A, B, Y) while the window is in front.
 
 `python -m launcher --selftest --shots DIR` draws every screen with made-up states and saves a PNG of each.
+
+Run from a checkout, the launcher and the build use the Python that started it, which needs the packages of
+`tools/requirements-launcher.txt`. At startup the launcher checks that this Python can read zstd files
+(`toolchain.zstd_missing`: Python 3.14's `compression.zstd`, or the `zstandard` package). If it cannot, the first screen
+and the log say so and give the `pip install` line, and Gather Build Tools stops with the same message before it
+unpacks anything.
 
 ## The launcher's folder
 
@@ -336,6 +350,38 @@ next start", and Cancel the import drops it. The next start (the menu's Restart,
 copies the current save to `saves/backup <date time>` and makes the import the save before the game reads it
 (`runtime/fs_host.c` `import_pending`), and the menu says where the old save went. An import in the launcher replaces
 one still waiting from the menu.
+
+## Mods
+
+Mods (home, under Saves; `launcher/mods.py`) is where the player puts the mods they download. The game reads the game
+folder's `mods` folder (`runtime/mods.c`; `mods_dir` in nx2navi.ini names another): one folder per mod, holding a
+`romfs` folder with the game files it replaces, an `exefs` folder with code patches (`.ips`, `.pchtxt`) or a `cheats`
+folder, either at its top or in the Atmosphere layout (`atmosphere/contents/0400486024DEC000/romfs` and the others
+`tools/mod_files.py` lists).
+
+A mod goes in as it came. Play first puts the folder in order (`mods.prepare`): an archive (`.zip`, and `.7z` or
+`.rar` through Windows' own `tar`, which reads them on Windows 10 and 11) is unpacked into a folder of its name unless
+that folder is there already, and the archive stays; a mod folder whose files sit one or more folders down (an archive
+that held the mod's own folder) gets them moved up; a `romfs`, `romfslite`, `exefs` or `cheats` folder put straight into
+the mods folder becomes a mod of its own, *Unnamed mod*. An archive that would write outside its folder is refused.
+Nothing is deleted. Add a Mod and Add a Mod Folder do the same for an archive or folder the player picks, which is
+unpacked or copied into the mods folder under a free name; Open Mods Folder opens it.
+
+Each mod has an On/Off row; its description says what it changes (how many game files, code patches, cheats), which
+other mod changes the same files and which of the two wins, and why the game leaves it off when it does: a code module
+(`subsdk*`), a download with options to pick from (several folders that each hold a mod), a mod for another game or
+another version, or nothing the game reads. Load Order sets which mod wins a file two of them change: the higher one.
+The switches and the order are the game's own settings, `mods_disabled` and `mods_order` in nx2navi.ini, written as the
+game writes them; they apply at the game's next start, so they wait while it runs.
+
+**Mods that change the game's code.** The game is lifted from the console's code ahead of time, so code cheats and
+ExeFS patches cannot be applied while it runs: the build turns them into patch sets of the lifted code
+(`tools/cheats.py`, `tools/exefs_patches.py`) that the game switches on with their mod, and the Cheats tab of the
+game's menu switches each cheat. The lift step's key names those files, so a build lifts and compiles again when they
+change (only the changed parts compile, and the shaders stay prepared), and `build-cache/mod-code.json` records the
+files it took up. When an enabled mod brings code no build has seen, Play builds the game again first (a few minutes;
+the home's Mods row says "Build Waiting") and starts it after. A Play from Steam then opens the window for that build.
+Code mods are built from the game folder's own `mods` folder only.
 
 ## Importing a save folder
 

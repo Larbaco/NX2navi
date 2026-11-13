@@ -45,8 +45,8 @@ from other projects, with its license, is listed in [THIRD_PARTY_NOTICES.md](../
   order it logged them: a line waits for the queue's lock, and one that finds the queue full is written after
   everything queued before it. A fatal error, the crash report and the end of the process write the queue out first
   (`rt_log_sync`). `NX2NAVI_LOG_ASYNC=0` writes each line where it is logged.
-- Co-op (`coop.c`, `coop_proto.c`, [coop.md](coop.md)): a host thread with a UDP socket to a relay (`tools/coop_relay.py`),
-  rooms of up to 8 players and a channel for messages between them; it never holds a virtual core.
+- Co-op (`coop.c`, `steam.c`, `coop_game.c`, [coop.md](coop.md)): a host thread that owns the Steam library and a room of
+  up to four players; the game side reads Link and the game's flags at the present. It never holds a virtual core.
 - OS calls the host makes go through `runtime/platform/` (`platform.h`, `win32.c`).
 
 #### Threads and cores
@@ -100,9 +100,11 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   (`vk_exec_draw.c pool_sync`); slots that resolve alike share one lookup.
   Finalization is retained on registered slots independently of image-cache eviction: a stale CPU-backed descriptor
   cannot recreate an image from freed storage or follow newly reused CPU bytes. Registration makes it current again;
-  finalized descriptors may still follow live GPU-owned content. A finalize marks only the slots its own texture
-  object registered (by initialization serial): the game initializes and registers the next terrain heightmap at the
-  storage of the previous one before it finalizes that one (`vk_texture.c vk_texture_release`).
+  finalized descriptors may still follow live GPU-owned content, and sample their own image while it still holds
+  the texture (`vk_texture.c stale_kept`): the game finalizes ahead of the replay of its earlier frames. A finalize
+  marks only the slots its own texture object registered (by initialization serial): the game initializes and
+  registers the next terrain heightmap at the storage of the previous one before it finalizes that one
+  (`vk_texture.c vk_texture_release`).
 - Shaders: Ampere (SM86) code is lowered to Maxwell (`tools/xlate/AmpereLowering.cs`) and translated to SPIR-V by the
   pinned shader translator (`tools/vendor/ryujinx`, 1.3.2) with our patches (`tools/xlate/patches/`), built with .NET 10 NativeAOT as
   `nx2navi_xlate.exe` and run as separate processes. Translations are cached on disk; shaders and pipelines seen in
@@ -153,8 +155,10 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
     a village frame's 45 mesh draws are 45 passes cut, 90 to 135 dispatches and about 270 barriers more than with mesh
     shaders. The buffers (`mesh_fallback_mb`, 128 MiB) are reused by every draw, so they hold the largest draw, not
     a frame; a draw that emits more loses what does not fit, and the log says how much it needed.
-  - A program's modules and compute pipelines are made on a thread of their own at its first draw, which is skipped
-    until they are ready; they are not recorded for the next start, where the pipeline cache makes them quick.
+  - A program's modules and compute pipelines are made by worker threads at its first draw, which is skipped until
+    they are ready (`mesh_fallback_workers`, auto: one for each 4 logical processors, 1 to 4, so a place's programs,
+    which all arrive in its first frames, are not made one after the other); they are not recorded for the next start,
+    where the pipeline cache makes them quick.
     Not carried: the far shadow cascades' coarser shading rate, a draw's first workgroup other than 0, and more
     workgroups in one draw than one compute dispatch may have.
 - Pipelines: `VK_EXT_graphics_pipeline_library` where the driver has it: stage libraries compiled ahead, a fast link
@@ -185,8 +189,16 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   into the large one at a start once it reached `pipeline_cache_play_mb`, and by every preparation; the stage
   libraries the library warm builds in play go to the driver's own cache alone (`runtime/vk_pipeline.c`, "the play
   cache", `cache_save`).
-- The game's tensor-core upscaler is replaced by a decode-and-scale pass (`vk_tonemap.c`); `vk_fsr.c` runs AMD FSR 1
+- The game's tensor-core upscaler is replaced by a decode-and-scale pass (`vk_tonemap.c`); `NX2NAVI_NATIVE_TENSOR=1`
+  runs the game's own network programs instead (`vk_exec_draw.c` `native_tensor`, off by default). `vk_fsr.c` runs AMD FSR 1
   (EASU, RCAS) on the present when the window is larger than the picture.
+- Anti-aliasing (`vk_aa.c`, `NX2NAVI_AA`): the game anti-aliases with its own SMAA, three compute passes after the bloom
+  composite (edges, blending weights, composition into the scene target as square-rooted RGB9E5 words). `off`, `fxaa`
+  and `smaa` leave out the first two and replace the composition with `shaders/aa_post.comp` or SMAA at its Ultra preset
+  (`shaders/smaa_*.comp`); the game's passes are known by a hash of their guest code (`vk_exec_draw.c` `aa_dispatch`).
+  `taa` is DLSS or FSR at the scene's size with the game's SMAA. While DLSS or FSR runs (`dlaa`, any mode), the other
+  values still choose the pass: in the native modes it smooths the upscaler's picture after the bloom, in the scaling
+  modes it runs on the scene before the upscaler scales it.
 - HDR (`vk_hdr.c`): the game tonemaps its scene into a float target, upscales it, draws the HUD into a second float
   target and copies that into the 8-bit sRGB window texture it presents. With `NX2NAVI_HDR=1` the tonemap shader gets
   the function of `shaders/hdr_tonemap.frag` spliced in where its SDR curve clamps each channel, so the float picture
@@ -211,8 +223,9 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   whose size it uses, is made whole (`gfx_shader.c` `reflect_exact`). `auto` picks by the device-local budget.
 - Occlusion queries never block the CPU; a result that is not ready counts as visible.
 - Allocation: Vulkan Memory Allocator. Debugging: Vulkan validation layers, per-pass frame dumps (`NX2NAVI_DUMP`,
-  `vk_dump.c`), a sampling profiler (`NX2NAVI_PROFILE`, `tools/prof_report.py`) and a flight recorder
-  (`NX2NAVI_FLIGHT`). RenderDoc cannot capture, because it hides `VK_EXT_external_memory_host` from the application.
+  `vk_dump.c`), a sampling profiler (`NX2NAVI_PROFILE`, `tools/prof_report.py`), a flight recorder
+  (`NX2NAVI_FLIGHT`) and bug captures, which a player's F8 writes and a test run starts from (`bugcap.c`,
+  [bug-capture.md](bug-capture.md)). RenderDoc cannot capture, because it hides `VK_EXT_external_memory_host` from the application.
 
 Maxwell behaviour the back end has to match: [maxwell.md](maxwell.md).
 

@@ -9,11 +9,11 @@ missing and the stale ones before it compiles the runtime. Three kinds of source
     runtime/shaders/<name>.spvasm               SPIR-V assembly, assembled with spirv-as and checked with spirv-val
     tools/make_dlaa_mask.py, make_mvobj_fs.py   shaders assembled in Python (ASSEMBLED); they need no other tool
 
-One more kind of header is no shader: a file the runtime embeds (EMBEDDED: the menu's font) as a list of its bytes,
-for a compiler without #embed (runtime/ui/menu.cpp includes it there). It needs no tool.
+One more kind of header is no shader: a file the runtime embeds (EMBEDDED: the menu's font, the SMAA lookup textures) as
+a list of its bytes, for a compiler without #embed (runtime/ui/menu.cpp, runtime/vk_aa.c include them). It needs no tool.
 
-A compiled or assembled header records the SHA-256 of its source and is stale when that no longer matches; a Python
-one is stale when its text is not what its script gives. glslc, spirv-as and spirv-val come from MSYS2 UCRT64 on
+A compiled or assembled header records the SHA-256 of its source (with the files a GLSL source includes from its folder)
+and is stale when that no longer matches; a Python one is stale when its text is not what its script gives. glslc, spirv-as and spirv-val come from MSYS2 UCRT64 on
 Windows (packages mingw-w64-ucrt-x86_64-shaderc and mingw-w64-ucrt-x86_64-spirv-tools) and from PATH elsewhere
 (shaderc, spirv-tools). A folder that carries its headers ready-made (the build kit, tools/make_kit.py) needs none of
 them: nothing there is stale.
@@ -42,7 +42,8 @@ ASM_TARGET = 'vulkan1.3'
 # header name -> the script beside this one that assembles it; the script's HEADER is the header's text
 ASSEMBLED = {'dlaa_mask': 'make_dlaa_mask.py', 'mvobj_fs': 'make_mvobj_fs.py'}
 # a file below runtime/ the runtime embeds -> the header of its bytes, below runtime/ too (git ignores it)
-EMBEDDED = {'ui/fonts/Roboto-Medium.ttf': 'ui/roboto_ttf.h'}
+EMBEDDED = {'ui/fonts/Roboto-Medium.ttf': 'ui/roboto_ttf.h',
+            'third_party/smaa/AreaTex.bin': 'smaa_area_tex.h', 'third_party/smaa/SearchTex.bin': 'smaa_search_tex.h'}
 
 
 def embedded(src):
@@ -50,9 +51,26 @@ def embedded(src):
     return src.suffix not in STAGES and src.suffix not in (ASM, '.py')
 
 
+def included(src, seen=None):
+    """The files a GLSL source includes from its own folder (#include "name"), and theirs, in order of first use."""
+    seen = [] if seen is None else seen
+    for line in src.read_bytes().decode('latin-1').splitlines():   # the SMAA source is not UTF-8
+        words = line.strip().split('"')
+        if line.strip().startswith('#include') and len(words) >= 2:
+            inc = src.parent / words[1]
+            if inc.is_file() and inc not in seen:
+                seen.append(inc)
+                included(inc, seen)
+    return seen
+
+
 def source_hash(src):
     data = src.read_bytes()
-    return hashlib.sha256(data if embedded(src) else data.replace(b'\r\n', b'\n')).hexdigest()   # text: the same on a CRLF checkout
+    if embedded(src):
+        return hashlib.sha256(data).hexdigest()
+    if src.suffix in STAGES:   # a header goes stale with the files its source includes too
+        data += b''.join(inc.read_bytes() for inc in included(src))
+    return hashlib.sha256(data.replace(b'\r\n', b'\n')).hexdigest()   # text: the same on a CRLF checkout
 
 
 def bytes_header(src, runtime):

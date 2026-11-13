@@ -37,7 +37,7 @@ import tkinter.font as tkfont
 from pathlib import Path
 from tkinter import filedialog
 
-from .. import NAME, build, feed, gameini, gamefiles, jobs, saves, steam, versions, winsys
+from .. import NAME, build, feed, gameini, gamefiles, jobs, mods, saves, steam, steamlib, versions, winsys
 from ..context import Context
 from . import art, picture, sound
 
@@ -54,7 +54,9 @@ P = art.PALETTE                 # the colour scheme in use: art.set_theme change
 FRAME_MS = 15                   # between two steps of the animations; they move by the time that really passed
 SPARKS = 22                     # the dust drifting over the backdrop
 DEPTH = {'first_run': 0, 'home': 0, 'job': 1, 'saves': 1, 'settings': 1, 'customize': 1, 'uninstall': 2,
-         'color': 2}
+         'color': 2, 'mods': 1, 'mod_order': 2}
+MODS_PAGE = 7     # mods on a page of the Mods screen, beside its other rows
+ORDER_PAGE = 10   # ... of the Load Order screen
 # the Custom scheme's picker (draw_picker), logical pixels: its box (x, top, width, height), the colour square and
 # the hue bar (x0, y0, x1, y1)
 PICKER_BOX = (614, 100, 336, 452)
@@ -241,6 +243,9 @@ class App:
         self.save_message = ''   # the last import's result, shown in the import rows' descriptions
         self.export_message = ''   # the last Export Save result, shown in its description
         self.steam_message = ''   # the last Add to Steam result, shown in its description
+        self.mods_message = ''   # what the last change on the Mods screen did, shown in its descriptions
+        self.mods_page = 0       # the page of the Mods and Load Order screens
+        self.mods_failed = []    # the mods whose code a build before Play could not take in: Play no longer waits
         self.steam_busy = False   # Add to Steam is making the pictures or writing Steam's files
         self.pick = None   # the colour picker: {'slot', 'h', 's', 'v'} (HSV in 0..1) of the colour being picked
         self.pick_drag = None   # 'square' or 'bar' while the mouse drags on the picker
@@ -620,7 +625,7 @@ class App:
         return next((i for i, r in enumerate(self.rows_home()) if r.label == label), None)
 
     def back(self):
-        if self.screen in ('settings', 'uninstall', 'saves', 'customize', 'job', 'color'):
+        if self.screen in ('settings', 'uninstall', 'saves', 'customize', 'job', 'color', 'mods', 'mod_order'):
             self.sounds.play('back')
         if self.screen == 'color':
             self.pick_done()
@@ -630,6 +635,10 @@ class App:
             self.show('settings')
         elif self.screen == 'saves':
             self.show('home', self.home_row('Saves'))
+        elif self.screen == 'mods':
+            self.show('home', self.home_row('Mods'))
+        elif self.screen == 'mod_order':
+            self.show('mods', self.mods_back_focus())
         elif self.screen == 'customize':
             self.show('home', self.home_row('Customize Launcher'))
         elif self.screen == 'job' and self.job and self.job.result is None:
@@ -744,6 +753,8 @@ class App:
             self.ctx.log(f'the stub went back from {a.rolled_back} to {self.layout.version}')
             self.settings['rolled_back'] = versions.display(a.rolled_back)   # never installed again by itself
             self.settings.save()
+        if self.ctx.zstd_missing:   # told at once, not when Begin Installation stops at the build tools
+            self.message = self.ctx.zstd_missing
         for old in self.layout.root.glob('python.old*'):   # the Python an update replaced (launcher/native/nx2navi.c)
             shutil.rmtree(old, ignore_errors=True)
         if gd or self.settings.get('dump'):
@@ -761,6 +772,9 @@ class App:
             self.show('home')
             self.after_update_notice()
             if self.install_staged('a staged update waited for the launcher to start'):
+                return
+            if a.play:   # Play from Steam with a mod's code to build in first (play_only)
+                self.play()
                 return
             if self.settings.get('auto_check'):
                 self.check_now()
@@ -997,6 +1011,7 @@ class App:
                 desc=('Open the game folder. The game keeps your save in its profile folder, its settings in '
                       'nx2navi.ini and its logs in logs. Its saves folder holds saves to import and backups.',)),
             self.saves_row(gd),
+            self.mods_row(gd),
             Row('value', 'Rebuild the Game', rebuild_value, rebuild_style, on=self.start_rebuild,
                 desc=('Build the game again from the files of the last build. Only what changed is compiled. Use it '
                       'after changing build tools, or if the game stopped starting.',)),
@@ -1522,6 +1537,228 @@ class App:
             text = f'Save imported: {r["files"]} files from {r["source"].name}.'
         return text + (f' Your old save is in saves\\{r["backup"].name}.' if r['backup'] else '')
 
+    # ---- mods
+
+    def mod_list(self, gd, details=True):
+        """The game folder's mods in the game's load order ([] before the game is installed or when the folder cannot
+        be read)."""
+        if not gd or not Path(gd).is_dir():
+            return []
+        try:
+            return mods.scan(gd, details=details)
+        except OSError as e:
+            self.ctx.log(f'mods: {e}')
+            return []
+
+    def mods_row(self, gd):
+        """Mods: the screen of the game's mods; orange while a mod's code waits to be built into the game."""
+        found = self.mod_list(gd, details=False)
+        try:
+            waiting = mods.code_waiting(gd) if found else []
+        except OSError:
+            waiting = []
+        on = sum(1 for m in found if m.enabled)
+        desc = ('Mods change the game: its pictures, models, sounds, text or code. Put a mod you downloaded into the '
+                'mods folder, its .zip, .7z or .rar file as it is or its folder, or select Mods and then Add a Mod: '
+                'Play takes it in. Switch each mod on or off, and choose which wins where two change the same file.',)
+        if waiting:
+            desc += (f'{", ".join(waiting)} changes the game\'s code: Play first builds the game again with it, which '
+                     'takes a few minutes.',)
+        return Row('value', 'Mods', 'Build Waiting' if waiting else f'{on} On' if found else 'None',
+                   'orange_arrow' if waiting else 'arrow', on=lambda: self.show('mods'), desc=desc)
+
+    def mods_page_count(self, n, per):
+        return max(1, -(-n // per))
+
+    def rows_mods(self):
+        gd = self.settings.get('game_dir')
+        folder = mods.mods_dir(gd) if gd else Path('mods')
+        found = self.mod_list(gd)
+        over = mods.overlaps(found)
+        pages = self.mods_page_count(len(found), MODS_PAGE)
+        self.mods_page = max(0, min(pages - 1, self.mods_page))
+        msg = (self.mods_message,) if self.mods_message else ()
+        rows = [
+            Row('value', 'Open Mods Folder', str(folder), on=self.open_mods,
+                desc=msg + ('Open the mods folder: one folder for each mod. A mod you downloaded goes in as it came, '
+                            'an archive (.zip, .7z or .rar) or a folder; Play unpacks archives into folders of their '
+                            'own and moves a mod\'s files to where the game looks for them.',
+                            'To remove a mod, delete its folder and its archive, or switch it off here.')),
+            Row('value', 'Add a Mod', 'Choose a File', 'arrow', on=lambda: self.add_mod(folder=False),
+                desc=msg + ('Choose a mod you downloaded, a .zip, .7z or .rar file: it is unpacked into the mods '
+                            'folder, ready for the game\'s next start.',)),
+            Row('value', 'Add a Mod Folder', 'Choose a Folder', 'arrow', on=lambda: self.add_mod(folder=True),
+                desc=msg + ('Choose the folder of a mod (one with a romfs, exefs or cheats folder in it, or an '
+                            'atmosphere folder): it is copied into the mods folder.',)),
+        ]
+        if found:
+            rows.append(Row('divider'))
+        for m in found[self.mods_page * MODS_PAGE:(self.mods_page + 1) * MODS_PAGE]:
+            label = fit(self.f['label'], m.name, self.X(LABEL_W - 30))
+            if m.usable:
+                rows.append(Row('toggle', label, on=lambda v, m=m: self.switch_mod(m, v), get=lambda m=m: m.enabled,
+                                desc=lambda m=m: self.mod_desc(m, over)))
+            else:
+                rows.append(Row('value', label, 'Not Usable', 'salmon', on=lambda: None,
+                                desc=lambda m=m: self.mod_desc(m, over)))
+        if pages > 1:
+            rows.append(Row('enum', 'More Mods', get=lambda: f'Page {self.mods_page + 1} of {pages}',
+                            left=lambda: self.mods_turn(-1, 'mods'), right=lambda: self.mods_turn(1, 'mods'),
+                            desc=(f'{len(found)} mods, {MODS_PAGE} to a page: left and right turn the pages.',)))
+        if len(found) > 1:
+            rows.append(Row('value', 'Load Order', '', 'arrow', on=lambda: self.show('mod_order'),
+                            desc=('Where two mods change the same file, the one higher in the load order wins. Set '
+                                  'the order here.',)))
+        rows.append(Row('action', 'Back', on=lambda: self.show('home', self.home_row('Mods')), height=40,
+                        desc=('Back to the main menu.',)))
+        return rows
+
+    def mods_turn(self, d, screen):
+        self.mods_page += d
+        self.show(screen, next((i for i, r in enumerate(getattr(self, 'rows_' + screen)()) if r.label == 'More Mods'),
+                               None))
+
+    def mod_desc(self, m, over):
+        lines = [self.mods_message] if self.mods_message else []
+        if not m.usable:
+            lines.append(m.problem)
+        what = []
+        if m.files:
+            what.append(f'replaces {len(m.files):,} of the game\'s files' if len(m.files) > 1 else
+                        'replaces one of the game\'s files')
+        if m.patches:
+            what.append(f'patches the game\'s code ({m.patches} patch file{"s" if m.patches > 1 else ""})')
+        if m.cheat_file:
+            what.append('brings cheats, which the Cheats tab of the game\'s menu switches on and off')
+        if what:
+            lines.append('It ' + (', '.join(what[:-1]) + ' and ' + what[-1] if len(what) > 1 else what[0]) + '.')
+        if m.name == mods.STAND_INS:
+            lines.append('The launcher made it: stand-ins for game files its check found damaged, so that the game '
+                         'can load what needs them.')
+        if m.other_version:
+            lines.append(f'{m.other_version} of its code patch files are for another version of the game and are '
+                         'left out.')
+        for other, n, wins in over.get(m.name, [])[:3]:
+            lines.append(f'{n:,} of its files are in {other} too: {"this mod" if wins else other} wins, being higher '
+                         'in the load order.')
+        if m.waiting and m.enabled:
+            lines.append('Its code is not in the game yet: Play first builds the game again with it, which takes a '
+                         'few minutes.')
+        if m.usable:
+            lines.append('On: the game loads it at its next start. Off: it stays in the mods folder, unused.')
+        return {'title': m.name, 'text': lines}
+
+    def game_busy(self, gd):
+        return bool((self.game_proc and self.game_proc.poll() is None) or (gd and saves.game_running(gd)))
+
+    def switch_mod(self, m, on):
+        gd = self.settings.get('game_dir')
+        if self.game_busy(gd):
+            self.mods_message = 'Quit the game first: it reads the mods when it starts.'
+            return
+        try:
+            mods.set_enabled(gd, m.name, on)
+        except OSError as e:
+            self.mods_message = f'The game\'s settings file could not be written: {e}'
+            return
+        m.enabled, self.mods_message = bool(on), ''
+        self.ctx.log(f'mods: {m.name} {"on" if on else "off"}')
+
+    def open_mods(self):
+        gd = self.settings.get('game_dir')
+        if not gd or not Path(gd).is_dir():
+            self.mods_message = 'Install the game first.'
+            self.show('mods', self.focus)
+            return
+        try:
+            folder = mods.ensure_mods_dir(gd)
+        except OSError as e:
+            self.mods_message = f'The mods folder could not be made: {e}'
+            self.show('mods', self.focus)
+            return
+        self.open(folder)
+
+    def add_mod(self, folder):
+        gd = self.settings.get('game_dir')
+        if not gd or not Path(gd).is_dir():
+            self.mods_message = 'Install the game first.'
+        else:
+            if folder:
+                src = filedialog.askdirectory(parent=self.root, title='Choose the folder of the mod',
+                                              initialdir=str(Path.home() / 'Downloads'), mustexist=True)
+            else:
+                src = filedialog.askopenfilename(parent=self.root, title='Choose the mod',
+                                                 initialdir=str(Path.home() / 'Downloads'),
+                                                 filetypes=[('Mod', '*.zip *.7z *.rar'), ('All files', '*.*')])
+            if not src:
+                return
+            try:
+                target = mods.add(gd, src, log=self.ctx.log)
+            except (mods.ModError, OSError) as e:
+                self.mods_message = f'{Path(src).name} was not added: {e}.'
+            else:
+                added = next((m for m in self.mod_list(gd) if m.name == target.name), None)
+                self.mods_message = f'Added {target.name}.' + (f' {added.problem}' if added and not added.usable else
+                                                              ' It is on: the game loads it at its next start.')
+        self.show('mods', self.focus)
+
+    def rows_mod_order(self):
+        gd = self.settings.get('game_dir')
+        found = self.mod_list(gd, details=False)
+        pages = self.mods_page_count(len(found), ORDER_PAGE)
+        self.mods_page = max(0, min(pages - 1, self.mods_page))
+        rows = []
+        first = self.mods_page * ORDER_PAGE
+        for k, m in enumerate(found[first:first + ORDER_PAGE], first + 1):
+            rows.append(Row('enum', fit(self.f['label'], m.name, self.X(LABEL_W - 30)), get=lambda k=k: f'{k}',
+                            left=lambda m=m: self.order_move(m.name, -1), right=lambda m=m: self.order_move(m.name, 1),
+                            desc=lambda m=m, k=k: {'title': m.name, 'text': [
+                                f'Number {k} of {len(found)} in the load order{" (off)" if not m.enabled else ""}. '
+                                'Left moves it up: it wins over the mods below it where two change the same file. '
+                                'Right moves it down.'] + ([self.mods_message] if self.mods_message else [])}))
+        if pages > 1:
+            rows.append(Row('enum', 'More Mods', get=lambda: f'Page {self.mods_page + 1} of {pages}',
+                            left=lambda: self.mods_turn(-1, 'mod_order'), right=lambda: self.mods_turn(1, 'mod_order'),
+                            desc=(f'{len(found)} mods, {ORDER_PAGE} to a page: left and right turn the pages.',)))
+        rows.append(Row('action', 'Back', on=lambda: self.show('mods', self.mods_back_focus()), height=40,
+                        desc=('Back to the mods.',)))
+        return rows
+
+    def mods_back_focus(self):
+        return next((i for i, r in enumerate(self.rows_mods()) if r.label == 'Load Order'), None)
+
+    def order_move(self, name, d):
+        gd = self.settings.get('game_dir')
+        if self.game_busy(gd):
+            self.mods_message = 'Quit the game first: it reads the mods when it starts.'
+            return
+        try:
+            mods.move(gd, name, d)
+        except OSError as e:
+            self.mods_message = f'The game\'s settings file could not be written: {e}'
+            return
+        self.mods_message = ''
+        names = [m.name for m in self.mod_list(gd, details=False)]
+        at = names.index(name) if name in names else 0
+        self.mods_page = at // ORDER_PAGE
+        self.show('mod_order', at % ORDER_PAGE)
+
+    def mods_before_play(self, gd):
+        """Put the mods folder in order (mods.prepare) and say whether the game must be built again for a mod's code
+        first: the mods that wait for it, [] when none do."""
+        try:
+            for line in mods.prepare(gd, log=self.ctx.log):
+                self.mods_message = line
+                if 'was not unpacked' in line:   # on the home screen too, when the launcher comes back
+                    self.message = line
+        except OSError as e:
+            self.ctx.log(f'mods: the mods folder could not be put in order: {e}')
+        try:
+            return mods.code_waiting(gd) if build.can_rebuild(gd) else []
+        except OSError as e:
+            self.ctx.log(f'mods: {e}')
+            return []
+
     def update_desc(self):
         r = self.release
         nv, mine = versions.display(r.version), versions.display(self.layout.version)
@@ -1598,7 +1835,8 @@ class App:
         if self.screen == 'home':
             self.show('home', self.focus)
 
-    def play(self):
+    def play(self, built=False):
+        """built: the build for the mods' code (ModsRebuildJob) just ended, so the game starts without asking again."""
         gd = self.settings.get('game_dir')
         exe = Path(gd) / 'ocarina.exe'
         if not exe.is_file():
@@ -1611,6 +1849,20 @@ class App:
             self.message = 'The game is already running.'
             self.render()
             return
+        waiting = [] if built else self.mods_before_play(gd)
+        if waiting and waiting != self.mods_failed:
+            # a mod's code cheats or ExeFS patches the game was not built with: built in first (tools/make_game.py
+            # lift), then the game starts (job_finished). After a build that failed for the same mods the game
+            # starts without them, so that a build that cannot finish never keeps the player from the game.
+            self.ctx.log(f'play: the game is built again first for the code of {", ".join(waiting)}')
+            job = jobs.ModsRebuildJob(self.ctx, gd)
+            job.waiting = waiting
+            self.run_job(job, 'home')
+            self.message = f'Building the game with the code of {", ".join(waiting)}; it starts after.'
+            return
+        if waiting:
+            self.ctx.log(f'play: without the code of {", ".join(waiting)}, whose build did not finish')
+        steamlib.ensure(gd, self.ctx.layout.app / 'bin', log=self.ctx.log)   # co-op's Steam library file, beside the game
         try:
             self.game_proc = winsys.start_game(exe)
         except OSError as e:
@@ -1914,6 +2166,14 @@ class App:
                 self.message = 'The update is ready: start NX2navi again to finish it.'
             elif j.after == 'staged':
                 self.message = 'The update was downloaded; a checkout keeps running from the repository.'
+            elif j.after == 'play':   # the mods' code is built in (play): the game starts
+                if not self.settings.get('keep_cache'):
+                    self.drop_build_cache()
+                self.message, self.mods_failed = '', []
+                self.show('home', self.home_row('Play'))
+                self.play(built=True)
+                return
+            self.mods_failed = []
             if not self.settings.get('keep_cache') and j.kind in ('install', 'update', 'rebuild'):
                 self.drop_build_cache()
             if j.kind == 'install':
@@ -1930,8 +2190,10 @@ class App:
             if j.kind == 'install' and self.settings.get('auto_check'):
                 self.check_now()
         elif j.result == 'cancelled':
+            self.mods_failed = getattr(j, 'waiting', self.mods_failed)
             self.show(self.job_back)
         else:
+            self.mods_failed = getattr(j, 'waiting', self.mods_failed)
             self.show('job')
 
     def drop_build_cache(self):
@@ -1994,14 +2256,16 @@ class App:
     def animate(self):
         """One step of everything that moves: the cursor on its way to the focused row and its breath, the screen
         sliding into place, the sparks and Navi. Each moves by the time since the last step (the timer comes when
-        Tk gets to it, 16 to 50 ms apart), at most a tenth of a second's worth. With Animations off, and while the
-        window is hidden or minimised (the game is running), nothing moves and the timer runs slowly."""
+        Tk gets to it, 16 to 50 ms apart), at most a tenth of a second's worth. With Animations off, while the
+        window is hidden or minimised, and while another window is in front, nothing moves and the timer runs slowly.
+        The last covers a launcher left open behind the game (Hide Launcher While Playing off): drawing every 15 ms
+        took about 0.6 of a CPU core from the game for a window nobody saw."""
         moving = False
         try:
             now = time.perf_counter()
             dt = min(0.1, max(0.0, now - self.anim_last))
             self.anim_last = now
-            moving = self.animated() and self.root.state() == 'normal'
+            moving = self.animated() and self.root.state() == 'normal' and winsys.in_front(self.root)
             if moving:
                 self.anim_t += dt
                 self.step_slide(dt)
@@ -2445,6 +2709,17 @@ def play_only(ctx):
     if saves.game_running(gd):
         ctx.log('play from Steam: the game is already running')
         return 0
+    try:
+        for line in mods.prepare(gd, log=ctx.log):
+            pass
+        waiting = mods.code_waiting(gd) if build.can_rebuild(gd) else []
+    except OSError as e:
+        ctx.log(f'play from Steam: mods: {e}')
+        waiting = []
+    if waiting:   # the window builds the mods' code in, then starts the game (App.start with --play)
+        ctx.log(f'play from Steam: the game is built again first for the code of {", ".join(waiting)}')
+        return None
+    steamlib.ensure(gd, ctx.layout.app / 'bin', log=ctx.log)   # co-op's Steam library file, beside the game
     try:
         proc = winsys.start_game(exe)
     except OSError as e:

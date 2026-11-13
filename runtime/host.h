@@ -25,8 +25,8 @@ void rt_log_raw(const char *p, size_t n);
 const char *rt_log_path(void);                  // the log file, NULL when this run writes none
 void rt_log_sync(void);                         // writes the queued log lines now; later lines are written as they are made
 enum { RT_TRACE_SVC = 1, RT_TRACE_HOSTCALL = 2, RT_TRACE_IPC = 4, RT_TRACE_FS = 8, RT_TRACE_GFX = 16, RT_TRACE_PERF = 32,
-       RT_TRACE_SCHED = 64, RT_TRACE_AUDIO = 128, RT_TRACE_PRESENT = 256, RT_TRACE_COOP = 512 };
-extern unsigned rt_trace;                       // from NX2NAVI_TRACE=svc,host,ipc,fs,gfx,perf,sched,audio,present,coop (or all)
+       RT_TRACE_SCHED = 64, RT_TRACE_AUDIO = 128, RT_TRACE_PRESENT = 256 };
+extern unsigned rt_trace;                       // from NX2NAVI_TRACE=svc,host,ipc,fs,gfx,perf,sched,audio,present (or all)
 // prof_win.c: NX2NAVI_PROFILE=<path> sampling profiler; NX2NAVI_TRACE=perf frame timing (waits of the render thread)
 // PERF_TEX: texture uploads on the render thread (deswizzle, decode, staging), PERF_ASTC included
 enum { PERF_PACE, PERF_FENCE, PERF_DRAIN, PERF_PIPE, PERF_XLATE, PERF_TEX, PERF_ASTC, PERF_N };
@@ -99,6 +99,7 @@ void perf_lock_hold(void *site, uint64_t ns);   // a lock held ns from site (vk_
 extern void (*perf_rec_waits)(uint64_t *full_ns, uint64_t *drain_ns);   // set by the back end (vk_rec.c totals)
 void perf_present(uint64_t frame);
 void perf_cpu_start(void);   // the process's logical processors (NX2NAVI_CACHE_DIE, NX2NAVI_ONE_PER_CORE), at start
+int perf_cpu_on_cache_die(void);   // 1 while the process runs on the die with the largest L3 cache alone (perf.c cpu_placement)
 void perf_summary_flush(void);                  // prints the frame-time summary of the running period (exit); the 60 s lines come from perf_present
 void gfx_exit_log(void);                        // back end's lines for the exit summary (weak no-op in prof_win.c)
 void perf_gpu_wait(uint64_t t0);                // a wait for a GPU fence ended (any thread; the render thread's also counts as PERF_FENCE)
@@ -219,6 +220,8 @@ uint64_t mem_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, uint64
 uint64_t mem_written_peek(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max);
                                                            // the same without the reset: the bits stay for the next
                                                            // mem_written_pages (verify checks only)
+int mem_watched(uint64_t addr, uint64_t size);             // [addr, addr+size) lies inside one of those two ranges, so
+                                                           // one mem_written_pages call can answer for all of it
 int mem_freeze(uint64_t a);                                // makes the 2 MiB region at a (2 MiB aligned, watched,
                                                            // committed PAGE_READWRITE) read-only until a write or
                                                            // mem_thaw thaws it; 1 frozen (or already), 0 refused
@@ -240,8 +243,11 @@ void mem_freeze_stats(uint64_t *frozen, uint64_t *freezes, uint64_t *fault_thaws
 int mem_lazy_enable(void (*fetch)(uint64_t h0, uint64_t h1, uint64_t off, uint64_t size),
                     int (*clean)(uint64_t lo, uint64_t hi, void *ctx));
 uint64_t mem_lazy_arm(uint64_t a, uint64_t n, uint64_t h0, uint64_t h1, uint64_t off, void *ctx);
-int mem_lazy_skip(uint64_t a, uint64_t n, uint64_t out[][2], int max);
+int mem_lazy_skip(uint64_t a, uint64_t n, uint64_t h0, int64_t delta, uint64_t out[][2], int max);
 int mem_lazy_armed(uint64_t a, uint64_t n);
+// Copies the ranges src[i] = {address, bytes} of guest memory whose pages read without a fault to dst[i], ok[i] set.
+int mem_copy_readable(uint8_t *const *dst, const uint64_t (*src)[2], int n, uint8_t *ok);
+int mem_lazy_touches(uint64_t a, uint64_t n);   // 0: the CPU can read [a, a + n) without a fault now
 void mem_lazy_window(int open);
 void mem_lazy_release(uint64_t a, uint64_t n);
 void mem_lazy_report(uint64_t frame, uint64_t skipped);
@@ -384,12 +390,15 @@ void *rt_patch_page(void);                                 // the page the patch
 void frame_step_init(void);                                // after rt_patches_init: the real-time step's first value
 int frame_step_realtime(void);                             // the real-time step is on: presents ignore the interval
 uint64_t frame_step_cap_ns(void);                          // with the real-time step: the shortest frame in ns
+int frame_step_movie_hz(void);                             // the movie rate frame_step_cap_ns paces at; 0: no movie
 int ov_movie_live(void);                                   // ov_movie2.c: a movie plays (frame_rate.c movie_cap_hz)
 int frame_limit_adjustable(void);                         // the frame limit setting changes the rate (always)
 int frame_free_running(void);                             // no fps60/realtime patch set: the game steps by the clock
 double frame_step_limit_hz(void);                         // the frame rate the limit gives (overlay); 0 unknown
 double frame_step_game_hz(void);                          // the rate the game draws at under the limit; 0 unknown
+void frame_rate_day_host(Cpu *c);                         // the time of day's seconds a frame (set ostep, page +0xf60)
 float frame_step_frames(void);                            // the 60 Hz frames the game steps per update (set ostep), else 1
+void frame_step_flight(float *page, float *game, uint64_t *presents);   // flight.c: the step at a host present
 // rtss_limit.c: RivaTuner Statistics Server takes the frame limit where it runs
 void rtss_limit_want(int64_t mhz);                        // the pacer's limit in millihertz: >0, 0 none, -1 keep RTSS out
 int rtss_limit_active(void);                              // RTSS limits to the wanted rate: the pacer holds no frames

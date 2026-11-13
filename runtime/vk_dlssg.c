@@ -306,7 +306,11 @@ void vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext) {
         memcpy(k.view_to_clip, c.view_to_clip, 64), memcpy(k.clip_to_view, c.clip_to_view, 64);
         memcpy(k.clip_to_prev_clip, c.clip_to_prev_clip, 64), memcpy(k.prev_clip_to_clip, c.prev_clip_to_clip, 64);
         memcpy(k.pos, c.pos, 12), memcpy(k.up, c.up, 12), memcpy(k.right, c.right, 12), memcpy(k.fwd, c.fwd, 12);
-        k.znear = 0.1f, k.zfar = 1e8f, k.fov_y = c.fov_y, k.aspect = c.aspect;   // Ocarina's projection (vk_ffx.cpp)
+        // the frame's own near and far planes (vk_dlaa.c proj_planes); nx2navi_dlssg.dll tells Streamline the depth is
+        // not inverted, which holds for every projection the game has shown (0 near, 1 far)
+        k.znear = c.znear, k.zfar = c.zfar, k.fov_y = c.fov_y, k.aspect = c.aspect;
+        static int told;
+        if (c.inverted && !told++) rt_log("dlssg: the scene's depth is inverted, which Streamline is not told");
         k.jitter[0] = jx, k.jitter[1] = jy;
         k.mv_scale[0] = 1.0f / (float)d.width, k.mv_scale[1] = 1.0f / (float)d.height;   // render pixels
         k.reset = reset;

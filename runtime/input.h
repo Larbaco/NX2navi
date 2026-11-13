@@ -69,7 +69,7 @@ void input_map_snapshot(struct InputMap *m);
 int input_capture(int reset, int *id);
 // The character on a punctuation key (KEY_MINUS..KEY_GRAVE) in the keyboard layout in use, 0 for another key.
 uint32_t input_key_char(int key);
-// F8, the flight recorder's key (no KEY_ id), held while the game window is in front.
+// F8, the bug capture's key (bugcap.c; no KEY_ id), held while the game window is in front.
 int input_flight_key(void);
 // Insert, the frame dump's key (vk_dump.c, NX2NAVI_DUMP=key), held. On Windows also while another window is in front:
 // a player on a gamepad often leaves the focus elsewhere. Unbound in the game's default layout.

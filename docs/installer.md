@@ -203,7 +203,9 @@ bin/                  nx2navi_xlate, hactool, ninja, libSDL3.so.0
 - The setup's temp folder is `.setup-temp` inside the install folder (`--temp` changes it): the AppImage is mounted
   read-only, and a Steam Deck's `/home` is often too full for the generated C while the game goes to the SD card.
 - The game keeps Mesa's shader cache in `mesa-cache` beside `nx2navi` unless `MESA_SHADER_CACHE_DIR` is set, for the
-  same reason: RADV fills its default folder in `~/.cache` up to 1 GB. With NVIDIA's driver, its cache goes to
+  same reason: RADV fills its default folder in `~/.cache` up to 1 GB. In that folder the limit is 8 GB unless
+  `MESA_SHADER_CACHE_MAX_SIZE` is set, since the shader preparation and the stage libraries built in play do not fit
+  in 1 GB. With NVIDIA's driver, its cache goes to
   `nvidia-cache` beside it unless `__GL_SHADER_DISK_CACHE_PATH` is set, with a limit of 8 GiB unless
   `__GL_SHADER_DISK_CACHE_SIZE` is set: the default limit of 1 GiB is smaller than what the shader preparation builds.
   When that folder cannot be made or written, the driver keeps its own folder and limit.

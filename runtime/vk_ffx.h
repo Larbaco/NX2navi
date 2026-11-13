@@ -9,6 +9,14 @@ typedef struct {
     int storage;     // created with VK_IMAGE_USAGE_STORAGE_BIT (FSR writes it)
 } VkFfxImage;
 
+// The scene camera FSR takes, from the frame's projection (vk_dlaa.c proj_planes): the vertical field of view in
+// radians, the near and far planes' view distances (far: VK_DLAA_FAR_INFINITE, 1e8, for a projection without a far
+// plane) and the metres in one unit of view space. A field of 0 is not known, and FSR then gets 1 radian, 0.1, 1e8 and
+// 1.
+typedef struct { float fov_y, znear, zfar, meters; } VkFfxCamera;
+// vk_dlaa.c: the share (0..1) of the extra sharpening FSR 3.1 gets at a render width w of an output width ow
+float vk_dlaa_fsr3_boost(uint32_t w, uint32_t ow);
+
 int vk_ffx_load(void);   // 1 when the library is there with its entry points (loaded once)
 // Whether FSR 3.1 upscaling can run in this build, for the settings menu: after vk_ffx_load ran, what it found; before,
 // whether the library file is there, asked once without loading it. 0 where the build has no FSR 3.1 to load.
@@ -17,10 +25,10 @@ int vk_ffx_available(void);
 // rest below), not only an upscaler.
 int vk_ffx_framegen_available(void);
 // Records FSR 3.1 into cb: color (the scene light, render size), depth (D32F), mv (R16G16F, render pixels, current to
-// previous), out (the output size, RGBA16F, storage). jx, jy: the jitter the scene took, render pixels. fov_y in
-// radians (0: unknown). 0 on failure (the caller falls back as it does when DLSS fails).
+// previous), out (the output size, RGBA16F, storage). jx, jy: the jitter the scene took, render pixels. cam: the
+// frame's camera. 0 on failure (the caller falls back as it does when DLSS fails).
 int vk_ffx_upscale(VkCommandBuffer cb, const VkFfxImage *color, const VkFfxImage *depth, const VkFfxImage *mv,
-                   const VkFfxImage *out, float jx, float jy, int reset, float dt_ms, float fov_y);
+                   const VkFfxImage *out, float jx, float jy, int reset, float dt_ms, const VkFfxCamera *cam);
 void vk_ffx_release(void);   // before the device goes away
 // FSR 3.1's contexts that no upscale used in the last `recent` calls, destroyed with the device idle (the caller waited
 // for it): room for an FSR 4 context whose creation failed. Their count.
@@ -36,7 +44,8 @@ int vk_ffx4_available(void);      // the libraries are there and list a 4.x vers
                                   // device, from any thread (0 before the device exists)
 const char *vk_ffx4_name(void);   // "AMD FSR 4.1.2" once vk_ffx4_available found it
 int vk_ffx4_upscale(VkCommandBuffer cb, const VkFfxImage *color, const VkFfxImage *depth, const VkFfxImage *mv,
-                    const VkFfxImage *out, float jx, float jy, int reset, float dt_ms, float fov_y);   // as vk_ffx_upscale
+                    const VkFfxImage *out, float jx, float jy, int reset, float dt_ms,
+                    const VkFfxCamera *cam);   // as vk_ffx_upscale
 void vk_ffx4_release(void);
 int vk_ffx4_failed(void);         // it failed three times in a row: FSR 3.1 serves until vk_ffx4_retry
 void vk_ffx4_retry(void);         // the menu chose FSR 4 again: try it anew after such failures

@@ -491,7 +491,9 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (menu_window_msg(h, m, w, l, &input_res)) return input_res;
     switch (m) {
     case WM_KEYDOWN:
-        if (w == VK_F11 && !(l & (1 << 30))) {   // bit 30: auto-repeat
+        // bit 30: auto-repeat. Not with Ctrl or Shift held: overlays and capture tools take such F11 shortcuts for their
+        // own (Alt+F11 comes as WM_SYSKEYDOWN)
+        if (w == VK_F11 && !(l & (1 << 30)) && GetKeyState(VK_CONTROL) >= 0 && GetKeyState(VK_SHIFT) >= 0) {
             input_cursor_suspend(1);
             toggle_fullscreen(h);
             input_cursor_suspend(0);

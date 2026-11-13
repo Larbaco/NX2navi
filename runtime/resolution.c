@@ -381,10 +381,10 @@ void res_init(void) {
 double wide_dlss_share(void);   // widescreen.c: the mode's share of the picture (1 DLAA), 0 off
 
 // DLSS upscaling: textures are sampled for the output's resolution, not the scene's (NVIDIA's DLSS guide: a mip bias
-// of log2(render / output)), so their detail survives the scaling. 0 without a DLSS mode. Without the output and scene
-// patch sets (Ocarina) the scene's share is widescreen.c's, which follows the mode and the upscaler while the game runs;
-// R.dlss_k stays the mode at start there (res_dlss_mode moves it only once res_init has switched the sets on). vk_dlaa.c
-// dlss_mode asks again at every mode change.
+// of log2(render / output), and -1 more with the jitter, which vk_dlaa.c dlss_mode adds), so their detail survives the
+// scaling. 0 without a DLSS mode. Without the output and scene patch sets (Ocarina) the scene's share is widescreen.c's,
+// which follows the mode and the upscaler while the game runs; R.dlss_k stays the mode at start there (res_dlss_mode
+// moves it only once res_init has switched the sets on). vk_dlaa.c dlss_mode asks again at every mode change.
 float res_dlss_lod_bias(void) {
     decide();
     double k = res_adjustable() ? R.dlss_k : wide_dlss_share();

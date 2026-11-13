@@ -291,8 +291,9 @@ def main():
         recs += [(LIST_PRIORITY, r) for r in extra]
         (out / SEED_KEYS).write_bytes(plist[1])
         n_keys = len(pipeline_list.read_keys(plist[1])[3])
-        print(f'pipeline list: {n_keys} pipelines; of the {len(plist[0])} shader variants they name, {len(extra)} join the '
-              f'seed, {absent} are of shaders {a.version} does not have, the others are in it already', flush=True)
+        print(f'pipeline list: {n_keys} pipelines; of its {len(plist[0])} shader variants (the ones they name and the '
+              f'compute variants), {len(extra)} join the seed, {absent} are of shaders {a.version} does not have, the '
+              'others are in it already', flush=True)
     recs.sort(key=lambda r: r[0])   # stable: list order within a priority
     with open(out / 'seed-programs.bin', 'wb') as f:
         f.write(b'NX2NSPRG' + struct.pack('<II', 1, 0))

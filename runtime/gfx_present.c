@@ -86,10 +86,10 @@ void gfx_window_closed(void) {
     // The window closed while the boot still built its pipelines: not the driver crash the marker is there to catch.
     // Left in place, the next start took it for one and every later start skipped the prebuild (vk_pipeline.c pm_skipped).
     vk_pipeline_prewarm_marker_clear();
-    vk_pipeline_save();
+    vk_pipeline_save_exit();
     prof_write();   // plat_exit runs no atexit handlers
     rtss_limit_restore();   // RivaTuner Statistics Server's profile as it was
-    coop_shutdown();   // LEAVE and BYE to the room, before the process ends
+    coop_shutdown();   // leaves the room, before the process ends
     fs_save_flush();   // last: the game's threads still run until plat_exit, and a Commit after this one is refused
     if (restart) {
         cfg_setenv("NX2NAVI_REEXEC", NULL);   // the new process counts its own address-space retries (memory.c)
@@ -140,6 +140,41 @@ static VkImageView g_sc_view[MAX_IMAGES];   // colour attachment views for the m
 static VkSemaphore g_render_done[MAX_IMAGES];
 static VkCommandPool g_pool;
 static VkCommandBuffer g_cb[FRAMES];
+
+// The GPU timeline (NX2NAVI_TRACE=perf, vk.h vk_gtl_note): a timestamp pair per present slot around the present's command
+// buffer, read once the slot's fence is waited for again. Its gap before it shows a wait for the acquired image (the
+// submission waits on the acquire semaphore) as idle time with work queued before presents.
+static VkQueryPool pts_pool;
+static int pts_state;                       // 0 not set up, 1 on, -1 off
+static uint8_t pts_on[FRAMES];              // the slot's pair was written by its last present
+static uint64_t pts_sub[FRAMES];            // when that present went to the queue
+
+static void pts_begin(VkCtx *c, VkCommandBuffer cb, unsigned slot) {
+    pts_on[slot] = 0;
+    if (!(rt_trace & RT_TRACE_PERF) || pts_state < 0) return;
+    if (!pts_state) {
+        VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                                    .queryCount = 2 * FRAMES};
+        pts_state = c->props.limits.timestampComputeAndGraphics &&
+                    vkCreateQueryPool(c->device, &qi, NULL, &pts_pool) == VK_SUCCESS ? 1 : -1;
+        if (pts_state < 0) return;
+    }
+    vkCmdResetQueryPool(cb, pts_pool, 2 * slot, 2);
+    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, pts_pool, 2 * slot);
+    pts_on[slot] = 1;
+}
+
+static void pts_end(VkCommandBuffer cb, unsigned slot) {
+    if (pts_on[slot]) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pts_pool, 2 * slot + 1);
+}
+
+static void pts_read(VkCtx *c, unsigned slot) {   // the slot's fence was waited for: its last present is done
+    if (!pts_on[slot]) return;
+    pts_on[slot] = 0;
+    uint64_t t[2];
+    if (vkGetQueryPoolResults(c->device, pts_pool, 2 * slot, 2, sizeof t, t, sizeof t[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+        vk_gtl_note(GTL_PRESENT, pts_sub[slot], t[0], t[1]);
+}
 static VkFence g_fence[FRAMES];
 static VkSemaphore g_acquire[FRAMES];
 static unsigned g_frame;
@@ -640,6 +675,65 @@ int vk_present_captured(const uint8_t **px, int *w, int *h, VkFormat *fmt) {
 static float g_pic[4];   // gfx_picture_rect
 static volatile int32_t g_pic_ok;
 
+// ---- vk_present_grab (vk.h): one presented frame's pixels for a bug capture. The request is taken by the next
+// present (g_pl held), which copies the read-back buffer and calls back; the PNG is made by the caller's own thread.
+static void (*volatile g_grab_cb)(VkGrab *g, void *ctx);
+static void *g_grab_ctx;
+
+int vk_present_grab(void (*cb)(VkGrab *g, void *ctx), void *ctx) {
+    plat_rmutex_lock(&g_pl);
+    int ok = !g_grab_cb;
+    if (ok) g_grab_ctx = ctx, g_grab_cb = cb;
+    plat_rmutex_unlock(&g_pl);
+    return ok;
+}
+
+void vk_present_grab_cancel(void) {
+    plat_rmutex_lock(&g_pl);
+    g_grab_cb = NULL;
+    plat_rmutex_unlock(&g_pl);
+}
+
+void vk_present_grab_rgba(const VkGrab *g, uint8_t *out) {
+    size_t n = (size_t)g->w * (size_t)g->h * 4;
+    if (g->hdr) {
+        vk_hdr_to_srgb8(g->px, out, n / 4, g->a2r);
+        return;
+    }
+    for (size_t i = 0; i < n; i += 4) {
+        out[i] = g->px[i + (g->bgra ? 2 : 0)];
+        out[i + 1] = g->px[i + 1];
+        out[i + 2] = g->px[i + (g->bgra ? 0 : 2)];
+        out[i + 3] = 255;
+    }
+}
+
+void vk_present_grab_free(VkGrab *g) {
+    if (g) free(g->px);
+    free(g);
+}
+
+// The present that took the request: the read-back buffer holds this frame (g_cap_ptr, the fence waited for).
+static void grab_deliver(int image_w, int image_h) {
+    void (*cb)(VkGrab *g, void *ctx) = g_grab_cb;
+    void *ctx = g_grab_ctx;
+    g_grab_cb = NULL;
+    size_t n = (size_t)g_cap_w * (size_t)g_cap_h * 4;
+    VkGrab *g = calloc(1, sizeof *g);
+    if (g && (g->px = malloc(n))) {
+        memcpy(g->px, g_cap_ptr, n);
+        g->w = g_cap_w, g->h = g_cap_h;
+        g->bgra = g_sc_fmt == VK_FORMAT_B8G8R8A8_UNORM || g_sc_fmt == VK_FORMAT_B8G8R8A8_SRGB;
+        g->hdr = g_sc_hdr != 0, g->a2r = g_sc_fmt == VK_FORMAT_A2R10G10B10_UNORM_PACK32;
+        g->image_w = image_w, g->image_h = image_h, g->scaler = g_scaler;
+        if (__atomic_load_n(&g_pic_ok, __ATOMIC_ACQUIRE)) memcpy(g->pic, g_pic, sizeof g->pic);
+    } else {
+        free(g);
+        g = NULL;
+    }
+    cb(g, ctx);   // NULL: no memory for the copy
+}
+
 // The captured swapchain image as a PNG (the menu's test hook), RGBA with opaque alpha. From an HDR10 swapchain the
 // log also gets the luminance in nits of the picture's rectangle (vk_hdr_luminance_stats: the black floor of a dark
 // scene, for one), and <path>.pq10 keeps the raw pixels: "PQ10", width, height, 1 when A2R10G10B10 (u32 each), then
@@ -907,8 +1001,18 @@ static VkImage hudless_record(VkCommandBuffer cb, unsigned slot, int w, int h, c
     VkImageView pv;
     uint32_t pw, ph;
     VkFormat pf;
-    if (!(vk_fg_active() || ng_running()) || !vk_dlaa_fg_hudless(&pic, &pv, &pw, &ph, &pf) || (int)pw != w || (int)ph != h)
+    if (!(vk_fg_active() || ng_running()) || !vk_dlaa_fg_hudless(&pic, &pv, &pw, &ph, &pf) || !pw || !ph || w <= 0 || h <= 0)
         return VK_NULL_HANDLE;
+    // The upscaler's output can be smaller than the presented picture: the scene is 75% of it in handheld mode
+    // (widescreen.c, 1440x810 in a 1920x1080 picture) and the game's last passes scale it up with the HUD. Taken only
+    // at the same size, as before, that frame had no HUD-less picture and was not generated: 5 of 3600 frames generated
+    // in handheld mode on an RX 580 (2026-11-11). The crop is taken at the same place of the smaller picture.
+    int prect[4] = {rect[0], rect[1], rect[2], rect[3]};
+    if ((int)pw != w || (int)ph != h) {
+        prect[0] = (int)((int64_t)rect[0] * pw / w), prect[1] = (int)((int64_t)rect[1] * ph / h);
+        prect[2] = (int)((int64_t)rect[2] * pw / w), prect[3] = (int)((int64_t)rect[3] * ph / h);
+        if (prect[2] <= 0 || prect[3] <= 0) return VK_NULL_HANDLE;
+    }
     VkCtx *c = vk_ctx();
     if (g_hl && (g_hl_w != g_sc_ext.width || g_hl_h != g_sc_ext.height || g_hl_fmt != g_sc_fmt)) {
         vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();
@@ -945,7 +1049,7 @@ static VkImage hudless_record(VkCommandBuffer cb, unsigned slot, int w, int h, c
     }
     // the steps' per-slot views of their source: a slot of its own (the presented picture's views stay valid for this
     // command buffer); with HDR the PQ encode as for the presented float picture
-    put_picture(cb, slot + FRAMES, pic, pf, w, h, rect, g_hl, to, general);
+    put_picture(cb, slot + FRAMES, pic, pf, (int)pw, (int)ph, prect, g_hl, to, general);
     sync_barrier(cb, g_hl, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                  VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                  VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
@@ -1373,6 +1477,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         rt_log("gfx: present fence wait timed out");
         goto out;
     }
+    pts_read(c, slot);   // the GPU timeline (vk_gtl_note): this slot's last present is done
     uint32_t idx = 0;
     // NGX frame generation: the frame is composed into ng.bb and the presenter shows it (ng_show); no acquire here
     const int ngp = ng_ready();
@@ -1449,7 +1554,8 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
             next_ns = plat_now_ns() + (uint64_t)(every * 1e9);
         }
     }
-    int cap = (g_capture || menu_shot) && ensure_capture_buffer();
+    int grab = src && g_grab_cb;   // a bug capture asked for this frame (vk_present_grab)
+    int cap = (g_capture || menu_shot || grab) && ensure_capture_buffer();
     int thumb = src && g_th_n && ensure_thumbs();
 
     VkCommandBuffer cb = g_cb[slot];
@@ -1457,6 +1563,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     vkBeginCommandBuffer(cb, &bi);
+    pts_begin(c, cb, slot);
     uint64_t crumb = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     vk_crumb(cb, VK_CRUMB_PRESENT, crumb);
     VkImage dst = ngp ? ng.bb.img : g_sc_img[idx];
@@ -1549,6 +1656,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     const int via_ng = ng_count >= 0;
     if (!via_ng) sync_barrier(cb, dst, last, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, last_stage, last_write, VK_PIPELINE_STAGE_2_NONE, 0);
     vk_crumb(cb, VK_CRUMB_PRESENT_END, crumb);
+    pts_end(cb, slot);
     vkEndCommandBuffer(cb);
 
     VkSemaphoreSubmitInfo wait = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_acquire[slot],
@@ -1572,8 +1680,10 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         if (ng_n > 2) ng_wait_signaled(ng_n - 2);
     }
     vk_queue_lock();
+    pts_sub[slot] = plat_now_ns();
     r = vkQueueSubmit2(c->gfx_queue, 1, &si, g_fence[slot]);
     vk_queue_unlock();
+    if (r != VK_SUCCESS) pts_on[slot] = 0;
     if (r == VK_SUCCESS && via_ng) {   // the presenter shows the generated frames, then this one
         ng.n = ng_n;
         ng_hand(idx, ng_count, ng_set, ng_n);
@@ -1604,6 +1714,11 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         g_cap_h = (int)g_sc_ext.height;
         g_cap_valid = 1;
         if (menu_shot) save_capture(menu_shot);
+        if (grab) grab_deliver(cw, ch);
+    } else if (grab) {   // no read-back buffer: the request ends without pixels
+        void (*cb)(VkGrab *g, void *ctx) = g_grab_cb;
+        g_grab_cb = NULL;
+        cb(NULL, g_grab_ctx);
     }
 out:
     plat_rmutex_unlock(&g_pl);

@@ -376,10 +376,14 @@ static uint32_t *convert(const uint32_t *w, uint64_t words, const MeshFbInfo *m,
         DO(&c, OpStore, fake_wg, E(&c, OpCompositeConstruct, c.t_v3uint, j, k0, k0));
         uint32_t at = mul(&c, g, K(&c, slot_words));
         uint32_t room = E(&c, OpULessThanEqual, c.t_bool, add(&c, at, K(&c, slot_words)), E(&c, OpArrayLength, c.t_uint, mesh_buf, 0));
-        // the primitive count starts at 0: a mesh program that emits nothing never writes it
-        uint32_t mg = if_begin(&c, first);
-        DO(&c, OpStore, SHARED(count_word), k0);
-        if_end(&c, mg);
+        // The whole stage buffer starts at 0: the vertex lines, the primitive count and the vertex indices. Workgroup
+        // memory is undefined at the start, a mesh program need not write every vertex it has room for or every index
+        // byte (nor its count when it emits nothing), and the slot below is copied whole and drawn: what an earlier
+        // workgroup left there became vertices and primitives. The payload area after it is copied in next.
+        Loop z = loop_begin(&c, counter, tid, K(&c, slot_words), threads);
+        DO(&c, OpStore, SHARED(z.i), k0);
+        loop_end(&c, &z);
+        uint32_t mg;
         if (m->has_task) {
             uint32_t pw = m->payload_bytes / 4;
             if (pw > task_words) pw = task_words;
@@ -579,9 +583,11 @@ uint32_t *meshfb_vs(const MeshFbInfo *m, uint32_t out_mask, const uint8_t out_ty
         for (int g = 0; g < 32; g++) {
             if (!loc_var[g]) continue;
             int t = out_type[g] < 3 ? out_type[g] : 0;
+            // A component outside the program's output map reads as Maxwell gives an unwritten one: (0, 0, 0, 1), the w
+            // as the bits of 1.0f whatever the type, as vk_pipeline.c spirv_add_outputs pads a missing output.
             uint32_t comp[4];
             for (int k = 0; k < 4; k++) {
-                uint32_t word_k = gen[g][k] ? gen[g][k] : k0;
+                uint32_t word_k = gen[g][k] ? gen[g][k] : k == 3 ? K(&c, 0x3f800000) : k0;
                 comp[k] = t == 2 ? word_k : E(&c, OpBitcast, t_scalar[t], word_k);
             }
             DO(&c, OpStore, loc_var[g], E(&c, OpCompositeConstruct, t_v4[t], comp[0], comp[1], comp[2], comp[3]));

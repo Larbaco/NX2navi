@@ -28,7 +28,8 @@ void rt_patch_switch(int set, int on) { (void)set, (void)on; }
 void *rt_patch_page(void) { return page; }
 void rt_log(const char *fmt, ...) { (void)fmt; }
 double gfx_window_refresh_hz(void) { return 144; }
-int ov_movie_live(void) { return 0; }
+static int movie;   // a movie plays (frame_rate.c movie_cap_hz)
+int ov_movie_live(void) { return movie; }
 int vk_fg_generating(void) { return 0; }
 float dbg_speed_factor(void) { return 1.0f; }   // the debug menu's game speed: normal
 int vk_fg_active(void) { return 0; }
@@ -127,6 +128,21 @@ int main(int argc, char **argv) {
     float f = 0;
     for (int i = 0; i < 12; i++) f = present(2 * p240);
     CHECK(f > 0.49f, "240 -> 120 fps: %.4f frames after 12", f);
+
+    // A movie started at 240 fps: exactly one frame from its first update, late and short frames included, as the game
+    // shows one picture per update; at its end the step follows the frame limit again within 12 frames.
+    set_limit("unlimited");
+    for (int i = 0; i < 300; i++) present(p240);
+    movie = 1;
+    for (int i = 0; i < 600; i++) {
+        float g = present(i % 120 == 7 ? 0.070 : i % 120 == 8 ? 0.004 : p60);
+        CHECK(g == 1.0f, "movie, frame %d: %.6f frames", i, g);
+    }
+    CHECK(frame_step_movie_hz() == 60, "the movie's rate: %d", frame_step_movie_hz());
+    movie = 0;
+    float after = 0;
+    for (int i = 0; i < 12; i++) after = present(p240);
+    CHECK(fabsf(after - 0.25f) < 0.002f, "after the movie: %.4f frames", after);
 
     // A frame longer than 1/15 s slows the game down; the step never leaves 1/480..1/15 s.
     set_limit("unlimited");

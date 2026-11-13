@@ -18,6 +18,10 @@ const OvNvState *ov_nv_state(void);                        // ov_gfx.c
 
 // ---- window, vsync, focus (gfx_present.c and the window back end, gfx_wsys.h; vk_device.c). Host threads only; never run guest code.
 void gfx_window_start(void);                               // window thread, Vulkan device, swapchain; idempotent
+// NX2NAVI_GPU_TIMELINE=<frame> (vk_sync.c "frame timeline"): an event of the frames it records, at CPU time t (0: now)
+// with two values; gfx_tl_present counts the presented frames and writes the record to the log when it is complete.
+void gfx_tl_note(int kind, uint64_t t, uint64_t a, uint64_t b);
+void gfx_tl_present(void);
 void gfx_vsync_bind(uint64_t system_event);                // nn::vi vsync event; signalled at 60 Hz
 uint64_t gfx_vsync_ticks(void);                            // ticks since start
 uint64_t gfx_vsync_time_ns(uint64_t tick);                 // kern_now_ns() time of a tick (pacing)
@@ -156,6 +160,10 @@ typedef struct {
     // As fence_wait, but only until the GPU has executed the submission's own commands: its write-backs to guest
     // memory and its fence's side effects may follow (vk_sync.c exec_tl). The same as fence_wait where there is no split.
     int  (*exec_wait)(uint64_t value, uint64_t timeout_ns);
+    // The game's own wait for a fence (nvnSyncWait): fence_wait, or where the back end knows the rest of the value's
+    // GPU work reads nothing the game can change and hands it nothing, until its results are there (vk_sync.c
+    // vk_sync_game_wait).
+    int  (*game_wait)(uint64_t value, uint64_t timeout_ns);
     uint64_t (*fence_done)(void);                          // highest value whose side effects are written
     // Queues the present and returns at once; the host present goes out at at_ns (kern_now_ns clock), at once when that
     // has passed or at_ns is 0.

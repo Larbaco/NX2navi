@@ -489,7 +489,7 @@ static void mem_barrier(VkCommandBuffer cb, VkPipelineStageFlags2 src, VkAccessF
 static struct { VkBuffer buf; VmaAllocation alloc; VkDeviceSize size; VkCommandBuffer cb; VkDevice dev; uint64_t big_ns; } S;
 static uint64_t n_scratch_new, n_scratch_reuse;
 
-// NX2NAVI_ASTC_SCRATCH_KEEP=1 (default 0 until a play test measured it): the scratch outlives its upload batch. Every
+// NX2NAVI_ASTC_SCRATCH_KEEP=1 (the default): the scratch outlives its upload batch. Every
 // batch goes to gfx_queue, so the reuse barrier at the start of the next batch's first chunk (vk_astc_record) orders it
 // after the earlier batches' copies and dispatches, as it does between two textures of one batch; it then also waits
 // for their writes (WAW). With
@@ -497,6 +497,8 @@ static uint64_t n_scratch_new, n_scratch_reuse;
 // old one (324 in one Kokiri Forest to Hyrule Field run), and one that found no room in a VMA block allocated a new
 // block on the replay thread during an area load (8-19 ms per block on NVIDIA, vk_headroom.c). A scratch grown past
 // SCRATCH_MIN for a large texture goes back to SCRATCH_MIN once no texture needed more for SCRATCH_SHRINK_NS.
+// On a Kakariko walk at 1440p (2026-11-11) the scratch was made 3 times instead of 60, the walk allocated device memory
+// 265 times instead of 342, and NX2NAVI_ASTC=check found 0 of 1920 textures differing from the CPU decode.
 // 0: a scratch per batch.
 #define SCRATCH_SHRINK_NS 5000000000ull
 static int scratch_keep(void) {

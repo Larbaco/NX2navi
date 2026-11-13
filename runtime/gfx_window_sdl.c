@@ -186,7 +186,9 @@ static void handle(const SDL_Event *e) {
     menu_sdl_event(e);
     switch (e->type) {
     case SDL_EVENT_KEY_DOWN:
-        if (e->key.scancode == SDL_SCANCODE_F11 && !e->key.repeat) {
+        // not with a modifier held: overlays and capture tools take Ctrl, Shift or Alt+F11 for their own
+        if (e->key.scancode == SDL_SCANCODE_F11 && !e->key.repeat &&
+            !(e->key.mod & (SDL_KMOD_CTRL | SDL_KMOD_SHIFT | SDL_KMOD_ALT | SDL_KMOD_GUI))) {
             set_fullscreen(!is_fullscreen());
             cfg_set("NX2NAVI_FULLSCREEN", is_fullscreen() ? "1" : "0");   // the menu shows it; the next start keeps it
             cfg_save();

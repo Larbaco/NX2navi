@@ -12,7 +12,11 @@ Steps, each skipped when a run before finished it for the same inputs (state in 
   3. romfs    every RomFS file, checked against the container's sha256, into one image -> <out>/romfs/romfs.bin and
               index.json (16-byte aligned, in the byte order of the paths). When the lift and the compile follow, it
               runs on a thread of its own beside them: only the RomFS index and romfs.c wait for the image
-  4. lift     recomp/gen.py with recomp/patches-v111.txt -> <out>/build-cache/lift, plus the two SDK bring-up fixes
+  4. lift     recomp/gen.py with recomp/patches-v111.txt -> <out>/build-cache/lift, plus the two SDK bring-up fixes.
+              The code cheats and ExeFS patch files of the mods in <out>/mods (tools/mod_files.py) become patch sets
+              first (tools/cheats.py, tools/exefs_patches.py), which the game switches on with their mod; the step's
+              key names those files, and build-cache/mod-code.json records the ones it took up (the launcher
+              rebuilds the game before it starts when a mod brings others, launcher/mods.py)
   5. compile  the lifted C and runtime/ with MSYS2's clang, linked into <out>/ocarina.exe; the MSYS2 DLLs it loads,
               the shader translator and romfs-index.bin beside it
   6. shaders  every shader in the game files (tools/prepare_shaders.py, default bind state) translated, and each one's
@@ -84,6 +88,7 @@ from pathlib import Path
 KIT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(KIT / 'tools'))
 import nup  # noqa: E402
+import mod_files  # noqa: E402
 import prompt_art  # noqa: E402
 
 TITLE_ID = 0x0400486024DEC000
@@ -99,7 +104,10 @@ OWN_KEY_STEPS = ('prompts', 'scan')
 # (a step that runs, a later step that reads nothing it writes): the later step is not made to run again. The lift
 # reads only the unpacked ExeFS (step_key), so the RomFS step leaves it alone: an install that was cut short while the
 # image was still being packed, the lift beside it already done, packs the image again but does not lift again.
-UNAFFECTED = {('romfs', 'lift')}
+# The shaders step's key names the lift and the compile it depends on without the mods' code (step_key): a lift and a
+# compile that run for a mod's code cheats or ExeFS patches leave the shaders prepared, as they leave the game's
+# shaders as they were, and one that runs for anything else (another kit) changes that key and prepares them again.
+UNAFFECTED = {('romfs', 'lift'), ('lift', 'shaders'), ('compile', 'shaders')}
 # The Python packages tools/pad_prompts.py imports (pip name: import name), checked before a build with button art.
 PROMPT_PACKAGES = {'zstandard': 'zstandard', 'fonttools': 'fontTools', 'pillow': 'PIL'}
 # The line tools/pad_prompts.py prints for each overlay folder it wrote.
@@ -151,7 +159,7 @@ RUNTIME_LIB = 'libnx2navirt.a'
 FFX4_DLLS = ('amd_fidelityfx_loader_vk.dll', 'amd_fidelityfx_upscaler_vk.dll')   # AMD's FSR SDK 2.4, for FSR 4
 FFX4_FG_DLL = 'amd_fidelityfx_framegeneration_vk.dll'   # ... and its frame generation, with the two above
 RUNTIME_PATTERNS = ('*.c', '*.cpp', 'platform/*.c', 'ui/*.cpp', 'third_party/imgui/*.cpp',
-                    'third_party/imgui/backends/*.cpp', 'third_party/monocypher/*.c')
+                    'third_party/imgui/backends/*.cpp')
 INCLUDE = re.compile(r'^[ \t]*#[ \t]*include[ \t]+"([^"]+)"', re.M)
 
 # Runs a script the way `python script.py` does, with the script's folder first on sys.path. The launcher's
@@ -517,12 +525,35 @@ def lift_digest():
     return h.hexdigest()
 
 
-def step_lift(out, cache):
-    """gen.py into build-cache/lift. The folder is kept: gen.py rewrites only the chunks whose text changed and
-    removes the ones it no longer writes."""
-    lift = cache / 'lift'
-    cmd = py_cmd(KIT / 'recomp' / 'gen.py', '--exefs', out / 'exefs', '--out', lift,
-                 '--patches', KIT / 'recomp' / 'patches-v111.txt')
+# The mods' code (tools/mod_files.py): the tools that make patch sets of it, the patch file each writes, the status
+# file the runtime reads in build-cache next to the exe (runtime/cheats.c, runtime/mods.c) and what the log calls it
+MOD_STAGES = (('cheats.py', 'patches-cheats.txt', 'cheats.status', 'code cheats'),
+              ('exefs_patches.py', 'patches-exefs.txt', 'exefs.status', 'ExeFS patches'))
+# build-cache/: {"<mod>/<path>": sha256} of the files the last lift took up, built in or refused (the status files say
+# which): the launcher builds the game again before Play only for files no build has seen (launcher/mods.py)
+MOD_RECORD = 'mod-code.json'
+
+
+def mod_code(out):
+    """{"<mod>/<path in the mod>": sha256} of the code cheats and ExeFS patch files of <out>/mods for main's build."""
+    return mod_files.code_record(out / 'mods', mod_files.main_build_id(out / 'exefs' / 'main'))
+
+
+def mod_digest(out):
+    """The mods' part of the lift's key: '' without mod code (the key of a game without mods stays what it was), else
+    the files by name and content and the tools that turn them into patch sets."""
+    code = mod_code(out)
+    if not code:
+        return ''
+    h = hashlib.sha256(json.dumps(code, sort_keys=True).encode())
+    for tool in ('cheats.py', 'exefs_patches.py', 'mod_files.py'):
+        h.update(sha256_file(KIT / 'tools' / tool).encode() if (KIT / 'tools' / tool).is_file() else b'no tool')
+    return h.hexdigest()
+
+
+def run_lifter(out, lift, patches):
+    """gen.py with the patch file into lift; its exit code."""
+    cmd = py_cmd(KIT / 'recomp' / 'gen.py', '--exefs', out / 'exefs', '--out', lift, '--patches', patches)
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8',
                          errors='replace', bufsize=1)
     for line in p.stdout:
@@ -531,8 +562,52 @@ def step_lift(out, cache):
         m = EMITTED.search(line)
         if m:
             emit('progress', step='lift', done=int(m.group(1)), total=int(m.group(2)), unit='chunks')
-    if p.wait():
-        fail('the code generator failed (see above)')
+    return p.wait()
+
+
+def mod_patches(out, cache, plain):
+    """The patch file with the mods' code cheats and ExeFS patches added (plain when there are none), the status files
+    written, and the mods' code. Each status file goes first: without it the runtime takes every such file as not
+    built. The files are the player's downloads, so one the tools refuse costs its stage, never the build."""
+    patches, done = plain, []
+    code = mod_code(out)
+    for tool, written, status, what in MOD_STAGES:
+        (cache / status).unlink(missing_ok=True)
+        if not code:
+            continue
+        cmd = py_cmd(KIT / 'tools' / tool, '--exefs', out / 'exefs', '--mods', out / 'mods', '--patches', patches,
+                     '--out', cache / written, '--status', cache / status)
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8',
+                           errors='replace')
+        for line in r.stdout.splitlines():
+            say(f'  {line}')
+        if r.returncode:
+            (cache / status).unlink(missing_ok=True)
+            say(f'  the mods\' {what} could not be built in (see above): the game is built without them')
+        else:
+            patches = cache / written
+            done.append(status)
+    return patches, done, code
+
+
+def step_lift(out, cache):
+    """gen.py into build-cache/lift. The folder is kept: gen.py rewrites only the chunks whose text changed and
+    removes the ones it no longer writes. The mods' code cheats and ExeFS patches go in as patch sets (mod_patches);
+    should the lifter refuse those, the game is lifted without them."""
+    lift = cache / 'lift'
+    plain = KIT / 'recomp' / 'patches-v111.txt'
+    (cache / MOD_RECORD).unlink(missing_ok=True)
+    patches, done, code = mod_patches(out, cache, plain)
+    if run_lifter(out, lift, patches):
+        if patches == plain:
+            fail('the code generator failed (see above)')
+        say('  the code generator refused the mods\' code: the game is lifted without it')
+        for status in done:
+            (cache / status).unlink(missing_ok=True)
+        if run_lifter(out, lift, plain):
+            fail('the code generator failed (see above)')
+    if code:
+        (cache / MOD_RECORD).write_text(json.dumps(code, indent=1, sort_keys=True), encoding='utf-8')
     for mod, old, new in LIFT_FIXES:
         hits = [p for p in sorted((lift / mod).glob('*.c')) if old in p.read_text(encoding='utf-8')]
         if len(hits) != 1 or hits[0].read_text(encoding='utf-8').count(old) != 1:
@@ -1350,10 +1425,35 @@ def fast_clang(msys, clang, env):
     return fast if mine and clang_ident(fast, env) == mine else None
 
 
+def guest_opt_ini(out):
+    """NX2NAVI_GUEST_OPT from nx2navi.ini next to the exe (the low-end GPU rows of the menu's Game tab write it there)
+    when the environment does not set it: the next build of the game folder out takes it. Only while low_end_gpu = 1
+    is in the file too: the mode's settings count only with the mode on (runtime/cfg.c LOWEND_ONLY)."""
+    if os.environ.get('NX2NAVI_GUEST_OPT', '').strip():
+        return
+    found, low = '', False
+    try:
+        for line in (Path(out) / 'nx2navi.ini').read_text(encoding='utf-8', errors='replace').splitlines():
+            key, eq, value = line.partition('=')
+            key = key.strip().lower()
+            value = value.split('#')[0].split(';')[0].strip().strip('"')
+            if eq and key in ('guest_opt', 'nx2navi_guest_opt') and value:
+                found = value
+            if eq and key in ('low_end_gpu', 'nx2navi_low_end_gpu'):
+                low = value not in ('', '0')
+    except OSError:
+        pass
+    if found and low:
+        os.environ['NX2NAVI_GUEST_OPT'] = found
+
+
 def runtime_cmd(clang, clangxx, inc, level=0, fast=None, msys=None, first=()):
     """fast: fast_clang's compiler for the lifted code, with msys as its sysroot. first: include flags that go
     ahead of inc for the runtime's sources only (vulkan_headers); the lifted code includes none of those headers,
-    and its command, which is part of its objects' keys, stays as it was."""
+    and its command, which is part of its objects' keys, stays as it was. NX2NAVI_GUEST_OPT (an environment variable,
+    or guest_opt in nx2navi.ini) 2 builds the lifted code at -O2; by default -O1: the game's own threads run it and
+    bound the frame on a slower CPU; the build takes several times longer."""
+    guest_opt = '-O2' if os.environ.get('NX2NAVI_GUEST_OPT', '').strip() == '2' else '-O1'   # -O1 unless guest_opt = 2
     def cmd_for(src, dst):
         cpp = src.suffix in ('.cpp', '.cxx')
         # the lifted code at -O1 (its size makes -O2 slow to build), the runtime at -O2; neither may assume strict
@@ -1365,7 +1465,7 @@ def runtime_cmd(clang, clangxx, inc, level=0, fast=None, msys=None, first=()):
         cc = [str(fast), f'--sysroot={msys}'] if guest and fast else [str(clangxx if cpp else clang)]
         # -fdeclspec: third_party/ffx_api/ffx_api.h declares its entry points __declspec(dllexport) unconditionally
         declspec = ['-fdeclspec'] if cpp and not WIN else []
-        return [*cc, '-c', '-std=gnu++17' if cpp else '-std=gnu11', '-O1' if guest else '-O2',
+        return [*cc, '-c', '-std=gnu++17' if cpp else '-std=gnu11', guest_opt if guest else '-O2',
                 *march, '-fno-strict-aliasing', '-w', *declspec, *([] if guest else first), *inc, '-o', str(dst), str(src)]
     return cmd_for
 
@@ -1559,6 +1659,15 @@ def xlate_source():
     fail(f'{XLATE_NAME} is missing: build it with tools/build_xlate.py')
 
 
+def xlate_id():
+    """The shader translator's id file's sha256 for the shaders step's key, 'missing' without a translator: the key is
+    worked out before the steps run (steps_to_run), and the shaders step itself says what is missing when it runs."""
+    for d in (KIT / 'bin', KIT / 'build' / 'xlate'):
+        if (d / XLATE_NAME).is_file():
+            return sha256_file(d / 'nx2navi_xlate.id')
+    return 'missing'
+
+
 # The x86-64 level the lifted code was compiled for, beside the objects (lifted_level).
 LIFTED_BUILD = 'lifted-build.json'
 LIFTED_OBJECTS = ('main_', 'sdk_', 'subsdk0_')   # the objects of the lifted code, by the module their names start with
@@ -1597,6 +1706,20 @@ def retune_due(obj, msys):
         return True
 
 
+def write_runtime_map(full, dst):
+    """The linker's map (the build cache's, which tools/prof_report.py reads) without the lines of the lifted game
+    functions (f_<hex>): the runtime's and the libraries' symbols, a few MiB, next to the exe to send with a crash log
+    or a NX2NAVI_PROFILE profile of the render thread."""
+    lifted = re.compile(r'\bf_[0-9a-f]{4,}\b')   # any line naming a lifted function: its symbol or its section
+    try:
+        with open(full, encoding='utf-8', errors='replace') as i, open(dst, 'w', encoding='utf-8') as o:
+            for line in i:
+                if not lifted.search(line):
+                    o.write(line)
+    except OSError:
+        pass
+
+
 def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
     """romfs_job: the RomFS step still running beside this one (a first build). Everything that does not include
     romfs_config.h compiles meanwhile; the RomFS index and the few files that include it follow once it is done.
@@ -1623,6 +1746,9 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
     cid, cid_old = compiler_ids(clang, env)   # fast_clang's compiler writes the same objects: not part of the key
     now = cpu_level(clang, env)
     level = lifted_level(obj, now, update)
+    guest_opt_ini(out)
+    if os.environ.get('NX2NAVI_GUEST_OPT', '').strip() == '2':   # runtime_cmd's guest_opt
+        say('  lifted code at -O2 (NX2NAVI_GUEST_OPT): a long build')
     if level == now:
         say(f'  the lifted code is built for x86-64-v{level}, this processor\'s level' if level else
             '  the lifted code is built for generic x86-64: the processor\'s level could not be read')
@@ -1710,7 +1836,7 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
     stamp = [[o.name, o.stat().st_size, o.stat().st_mtime_ns] for o in objs]
     if prebuilt:
         stamp.append([prebuilt[0].name, prebuilt[0].stat().st_size, sha256_file(prebuilt[0])])
-    link_key = sha256_bytes(json.dumps([LINK_LIBS, ld, cid] + stamp).encode())
+    link_key = sha256_bytes(json.dumps([LINK_LIBS, ld, cid, 'map'] + stamp).encode())
     state_link = cache_dir / 'link.key'
     if exe.is_file() and state_link.is_file() and state_link.read_text(encoding='utf-8') == link_key:
         say(f'  {EXE_NAME} is current, not linked again')
@@ -1730,6 +1856,7 @@ def step_compile(out, cache_dir, msys, jobs, romfs_job=None, update=False):
         except PermissionError:
             tmp.unlink(missing_ok=True)
             fail(f'{exe} is in use: close the game and try again')
+        write_runtime_map(cache_dir / 'ocarina.map', out / 'nx2navi.map')   # next to the exe, to send with a crash log
         state_link.write_text(link_key, encoding='utf-8')
     copy_if_changed(gen / 'romfs-index.bin', out / 'romfs-index.bin')
     xlate = xlate_source()
@@ -2208,10 +2335,12 @@ def step_scan(out):
 
 
 def step_key(step, identity, out=None):
-    """What a step's output depends on. exefs and romfs: the game files only; lift: the unpacked ExeFS and the
-    lifter; compile: the lift, the runtime sources, this script and the processor (cpu_tag); prompts: the game files,
-    the kit's button art, the version of the tools that draw it (PROMPT_TOOLS), the bind_ lines of nx2navi.ini, and
-    whether every folder it writes is still there; scan: the game files, the check's version (SCAN_TOOL) and whether its report is still there."""
+    """What a step's output depends on. exefs and romfs: the game files only; lift: the unpacked ExeFS, the lifter and
+    the mods' code cheats and ExeFS patches (mod_digest); compile: the lift, the runtime sources, this script and the
+    processor (cpu_tag); shaders: the compile without the mods' code, the preparing script and the translator;
+    prompts: the game files, the kit's button art, the version of the tools that draw it (PROMPT_TOOLS), the bind_
+    lines of nx2navi.ini, and whether every folder it writes is still there; scan: the game files, the check's version
+    (SCAN_TOOL) and whether its report is still there."""
     if step in ('exefs', 'romfs'):
         return f'{step}-1|{identity}'
     if step == 'scan':
@@ -2223,17 +2352,21 @@ def step_key(step, identity, out=None):
         written = all((out / f / 'manifest.tsv').is_file() for f in prompt_art.OVERLAYS)
         return (f'prompts-1|{identity}|{tree_digest(prompt_art_dir(), ("**/*.png",))}|{PROMPT_TOOLS}|{binds}'
                 f'|{"written" if written else "missing"}')
-    lift = f'lift|{exefs_digest(out)}|{lift_digest()}'
+    base = f'lift|{exefs_digest(out)}|{lift_digest()}'
+    mods = mod_digest(out) if step in ('lift', 'compile') else ''
+    lift = f'{base}|mods {mods}' if mods else base
     if step == 'lift':
         return lift
-    compile_key = (f'compile|{lift}|{tree_digest(KIT / "runtime", ("**/*",))}|{sha256_file(Path(__file__))}|{kit_version()}'
-                   f'|cpu {cpu_tag()}')
+
+    def compile_of(lift):
+        return (f'compile|{lift}|{tree_digest(KIT / "runtime", ("**/*",))}|{sha256_file(Path(__file__))}'
+                f'|{kit_version()}|cpu {cpu_tag()}')
     if step == 'compile':
-        return compile_key
-    # shaders: the built game and the translator that prepared them, the one xlate_source finds (the kit's bin/, or a
-    # source checkout's build/xlate/)
-    return (f'shaders-1|{compile_key}|{sha256_file(KIT / "tools" / "prepare_shaders.py")}'
-            f'|{sha256_file(xlate_source() / "nx2navi_xlate.id")}')
+        return compile_of(lift)
+    # shaders: the built game without the mods' code (UNAFFECTED) and the translator that prepared them, the one
+    # xlate_source finds (the kit's bin/, or a source checkout's build/xlate/)
+    return (f'shaders-1|{compile_of(base)}|{sha256_file(KIT / "tools" / "prepare_shaders.py")}'
+            f'|{xlate_id()}')
 
 
 def out_path(arg):
@@ -2397,6 +2530,10 @@ def build_main():
                     for later in STEPS[STEPS.index(name):]:
                         if later == name or not ({name, later} & set(OWN_KEY_STEPS) or (name, later) in UNAFFECTED):
                             state['steps'].pop(later, None)
+                if name == 'lift':
+                    # The generator writes layout.json before the sources. A retry must finish an interrupted lift
+                    # even if the layout is back and the previous lift key still matches its inputs.
+                    save()
                 say(f'{name}:')
                 emit('step', step=name, state='start')
                 if name in ('shaders', 'prompts', 'scan') and romfs_job:   # they read the RomFS image
