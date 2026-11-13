@@ -478,6 +478,7 @@ typedef struct {
 // stutter_map.c cause_short and tools/stutter_map.py read these names, in this order.
 enum { FT_C_PIPE, FT_C_XLATE, FT_C_TEX, FT_C_FENCE, FT_C_PACE, FT_C_HANDOFF, FT_C_REPLAY, FT_C_CENSUS, FT_C_REPORT,
        FT_C_OTHER, FT_C_N };
+_Static_assert(FT_C_N == STUTTER_CAUSES, "stutter_map.c cause_short and its counts follow FT_C_*");
 static const char *const ft_cause_name[FT_C_N] = { "pipeline", "translation", "texture", "fence", "pacing", "hand-off",
                                                    "replay", "census", "report", "unattributed" };
 static uint64_t census_part_ns;   // present thread: the census walks since the last present (census_check)

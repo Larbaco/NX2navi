@@ -22,6 +22,9 @@ void stutter_miss(int shader, int mesh, const uint8_t *vi, const uint8_t *fi, ui
 void stutter_ready(int mesh, const uint8_t *vi, const uint8_t *fi, double ms, int recorded, int fresh, int fast);
 // Every present (perf.c ft_frame): d the frame's interval, part the time it went to by cause (names[i], n of them;
 // the last one is the part nothing recorded explains), cause the one the frame is charged to.
+// STUTTER_CAUSES: the number of causes, perf.c's FT_C_N (perf.c asserts it), which stutter_map.c cause_short and the
+// areas' counts are sized by; n is that many.
+#define STUTTER_CAUSES 10
 void stutter_frame(uint64_t frame, uint64_t now, uint64_t d, const uint64_t *part, const char *const *names, int n,
                    int cause);
 void stutter_report(const char *tag);   // the map so far; every 5 minutes of play, at a focus loss in play and at exit

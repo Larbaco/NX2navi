@@ -18,13 +18,13 @@
 // 96 ms after an area load (2026-11-13) each counted as a change of pace before, as each was followed by one as long.
 //
 // What a hitch went to comes from the frame-time summary's split (perf.c ft_frame: pipeline, translation, texture,
-// fence, pacing, hand-off, replay, census, report, unattributed), with the draws that met a pipeline or a shader missing between the previous
-// present and this one (stutter_miss, from the replay thread). Each hitch gets a "stutter:" line, at most
-// SM_LINES_PER_S a second and SM_LINES_MAX in all; the counts go on past that. Every SM_REPORT_NS of play, when the
-// window loses the focus in play (perf.c session_report) and at exit,
-// "stutter map" lines rank the areas by their hitches and the pipelines by the time draws lost to them, each with
-// whether this install had recorded it before (the pipeline list or an earlier run) and whether one of its shaders was
-// translated in play rather than prepared.
+// fence, pacing, hand-off, replay, census, report, unattributed), with the draws that met a pipeline or a shader
+// missing between the previous present and this one (stutter_miss, from the replay thread). Each hitch gets a
+// "stutter:" line, at most SM_LINES_PER_S a second and SM_LINES_MAX in all; the counts go on past that. Every
+// SM_REPORT_NS of play, when the window loses the focus in play (perf.c session_report) and at exit, "stutter map"
+// lines rank the areas by their hitches and the pipelines by the time draws lost to them, each with whether this
+// install had recorded it before (the pipeline list or an earlier run) and whether one of its shaders was translated
+// in play rather than prepared.
 //
 // Threads: stutter_area runs on the game's loading threads, stutter_miss on the replay thread, stutter_ready on the
 // pipeline workers (under vk_pipeline.c's P.lock; sm_lock is taken inside it and never takes it), stutter_frame and
@@ -42,7 +42,7 @@
 int stutter_map_on;
 
 #define SM_AREAS 128                       // areas kept by name; later ones share the last slot
-#define SM_CAUSES 10                       // perf.c's FT_C_N
+#define SM_CAUSES STUTTER_CAUSES           // perf.c's FT_C_N, which perf.c asserts
 #define SM_LOAD_NS 3000000000ull           // after an area load, frames count as the load's for this long
 #define SM_HITCH_MIN_NS 12000000.0         // a hitch is at least this long...
 #define SM_HITCH_ANY_NS 25000000ull        // ...and any frame over this is one
