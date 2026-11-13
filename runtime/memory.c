@@ -71,8 +71,8 @@ static int reserve_at(uint64_t at, uint64_t size, int watch) { return plat_mem_r
 // every commit, decommit and protection change here. A region stays thawed for FRZ_HOLD_MS after a mem_thaw: a file
 // read still in flight writes its buffer later. Nothing writes guest memory under frz_lock. It is not a leaf: lz_lock
 // and vm_lock come inside it, a strict thaw's page calls run under it (thaw_pages_vm), and a fetch of lazily written
-// pages (lazy_gone_locked, lazy_piece_locked: vk_memory.c lazy_fetch) takes the queue lock and waits for the GPU under
-// it. So no holder of the queue lock may touch guest memory or take frz_lock.
+// pages (lazy_gone_locked, lazy_piece_fetch_locked: vk_memory.c lazy_fetch) takes the queue lock and waits for the GPU
+// under it. So no holder of the queue lock may touch guest memory or take frz_lock.
 #define FRZ_SHIFT 21
 #define FRZ_SIZE (1ull << FRZ_SHIFT)
 #define FRZ_HOLD_MS 5000u
@@ -334,14 +334,28 @@ static void lazy_push_locked(LzSeg s) {
     lzs[lz_n++] = s;
 }
 
-// frz_lock held exclusively. A fault at a in segment i: the LZ_CHUNK piece around a goes (its bytes come down first
-// when the mirror's are newer, then its pages are read-write again) and is held; what is left of the segment on
-// either side stays armed. Returns the piece's size.
-static uint64_t lazy_piece_locked(int i, uint64_t a, int write) {
-    LzSeg s = lzs[i];
+// A fault at a in segment i: the LZ_CHUNK piece around a goes (its bytes come down first when the mirror's are newer,
+// then its pages are read-write again) and is held; what is left of the segment on either side stays armed. In two
+// steps, as a whole segment goes (lazy_fault): the piece leaves the list under lz_lock (lazy_piece_take_locked), and
+// its fetch and page calls run without that lock (lazy_piece_fetch_locked), which the replay asks at every draw that
+// writes a mirrored pool (mem_lazy_skip) and at the end of every part.
+typedef struct { LzSeg s; uint64_t c0, c1; } LzPiece;   // the segment the piece came from, and the piece [c0, c1)
+
+// frz_lock held exclusively and lz_lock held: the piece leaves the list, the segment's rest on either side goes back.
+static LzPiece lazy_piece_take_locked(int i, uint64_t a) {
+    LzSeg s = lazy_take_locked(i);
     uint64_t c0 = a & ~(LZ_CHUNK - 1), c1 = c0 + LZ_CHUNK;
     if (c0 < s.lo) c0 = s.lo;
     if (c1 > s.hi) c1 = s.hi;
+    if (c0 > s.lo) lazy_push_locked((LzSeg){s.lo, c0, s.h0, s.h1, s.delta, s.stale});
+    if (c1 < s.hi) lazy_push_locked((LzSeg){c1, s.hi, s.h0, s.h1, s.delta, s.stale});
+    return (LzPiece){s, c0, c1};
+}
+
+// frz_lock held exclusively, lz_lock not: the piece's bytes and its access come back, and it is held. Returns its size.
+static uint64_t lazy_piece_fetch_locked(LzPiece p, uint64_t a, int write) {
+    LzSeg s = p.s;
+    uint64_t c0 = p.c0, c1 = p.c1;
     if (s.stale && lz_fetch) {
         uint64_t t0 = plat_now_ns();
         __atomic_store_n(&lz_fetch_now, c1 - c0, __ATOMIC_RELAXED);
@@ -356,9 +370,6 @@ static uint64_t lazy_piece_locked(int i, uint64_t a, int write) {
         if (plat_mem_state(x, c1, &y) == PLAT_PROT_NONE && !plat_mem_protect(x, y - x, PLAT_PROT_RW))
             rt_fatal("memory: giving back the lazily written pages %#llx+%#llx failed", (unsigned long long)x,
                      (unsigned long long)(y - x));
-    lzs[i] = lzs[--lz_n];
-    if (c0 > s.lo) lazy_push_locked((LzSeg){s.lo, c0, s.h0, s.h1, s.delta, s.stale});
-    if (c1 < s.hi) lazy_push_locked((LzSeg){c1, s.hi, s.h0, s.h1, s.delta, s.stale});
     lazy_flags_locked(s.lo, s.hi);
     lz_faults[write != 0]++, lz_pieces++, lz_piece_bytes += c1 - c0;
     uint32_t now = (uint32_t)plat_now_ms();
@@ -662,9 +673,10 @@ static int lazy_fault(uint64_t a, int write) {
             }
         }
         if (reader) lz_heavy_ms[r] = now | 1;
-        if (lz_chunk && !reader) {   // the piece leaves the list and the rest goes back into it under lz_lock
-            out = lazy_piece_locked(i, a, write != 0);
+        if (lz_chunk && !reader) {   // the piece leaves the list under lz_lock; its pages come back without it
+            LzPiece piece = lazy_piece_take_locked(i, a);
             plat_mutex_unlock(&lz_lock);
+            out = lazy_piece_fetch_locked(piece, a, write != 0);
             if (k >= 0) lz_note[k].hold = lazy_hot_locked(a >> LZ_CHUNK_SHIFT, 1)->back;
         } else {   // the segment leaves the list under lz_lock; its pages come back without it
             LzSeg s = lazy_take_locked(i);
