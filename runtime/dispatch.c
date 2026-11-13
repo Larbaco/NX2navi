@@ -59,9 +59,27 @@ void rt_fatal_notes(void) {
 
 __attribute__((weak)) void fs_save_crash_wait(void) {}   // fs_host.c; builds without it (the unit checks) have no saves
 
+// One end for a failed run. The platform layer calls the crash handler on every thread that faults, without
+// waiting for the others (platform/win32.c crash_veh, crash_filter), and a fatal error can come beside a crash from
+// the same bad state (an allocation that failed here, a null pointer read there). The later end cut the first report
+// where it was, together with its wait for a save Commit and RivaTuner's restore, and its own FATAL line and exit
+// code replaced the first (the launcher shows the last FATAL). Another thread now waits until the first end is done;
+// it logs nothing, since it may hold the log queue's lock, which the first report only tries. A first report that
+// hangs still ends: after 30 s the waiting thread ends the process with the crash report's code.
+static volatile uint32_t ending_tid;   // the thread that reports, 0 before one does
+
+int rt_ending_enter(void) {
+    uint32_t me = plat_thread_id(), was = 0;
+    if (__atomic_compare_exchange_n(&ending_tid, &was, me, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return 1;
+    if (was == me) return 0;
+    for (int i = 0; i < 3000; i++) plat_sleep_ms(10);
+    plat_terminate(71);
+}
+
 // The fatal line, the report's notes and what has to be flushed, then the exit with `code`.
 static void fatal_end(int code, const char *fmt, va_list ap) __attribute__((noreturn));
 static void fatal_end(int code, const char *fmt, va_list ap) {
+    if (!rt_ending_enter()) plat_terminate(code);   // a fatal error inside this thread's own report: no second one
     rt_log_sync();   // main.c: the lines queued for the log thread, then these, written here
     rt_log_raw("FATAL: ", 7);
     rt_vlogf(fmt, ap);

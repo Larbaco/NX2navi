@@ -315,8 +315,9 @@ static volatile int32_t mode_done;
 static int mode_rc;
 
 static void crash_handler(const PlatCrash *x) {
-    static volatile int32_t busy;
-    if (plat_xchg32(&busy, 1)) plat_exit(71);
+    // shared with the fatal error's end (dispatch.c rt_ending_enter): another thread's fault or fatal error waits there
+    // while this report is written; a fault inside this thread's own report ends the process at once
+    if (!rt_ending_enter()) plat_exit(71);
     if (__atomic_load_n(&mode_done, __ATOMIC_ACQUIRE) && x->module) {
         rt_log("exit: %s (%#x) in %s while the process was ending, after its work was done and saved%s: the run ends "
                "with its own code %d", x->what, x->code, *x->module ? x->module : "code outside every module",

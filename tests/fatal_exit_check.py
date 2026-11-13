@@ -4,6 +4,10 @@ ExitProcess makes (a driver's detach that faulted there turned the end into a cr
 checks statically that no runtime file outside the platform layer ends the process with _Exit, and that the fatal
 error's end and the lost device's (runtime/vk_device.c lost_wait_exit) end with plat_terminate. No game files, no GPU.
 
+Two failures at once end once: two threads that fault, a fault while a fatal error is reported and a fatal error
+while a crash is: the first report is written whole, the process ends with its code, and the second adds no line
+(runtime/dispatch.c rt_ending_enter, which runtime/main.c crash_handler calls first).
+
 Usage: fatal_exit_check.py
 """
 import os
@@ -62,12 +66,25 @@ def static_checks():
             bad += 1
     print(f'static: no _Exit outside the platform layer, fatal_end and lost_wait_exit end with plat_terminate: '
           f'{"FAILED" if bad else "ok"}', flush=True)
-    return bad
+    # the crash handler's guard is the one the stand-in in tests/fatal_exit_check.c runs
+    main_c = (RT / 'main.c').read_text(encoding='utf-8')
+    body = re.sub(r'//[^\n]*', '', function(main_c, 'static void crash_handler(const PlatCrash *x)'))
+    first = body[body.index('{') + 1:].strip().split('\n')[0].strip()
+    ok = first == 'if (!rt_ending_enter()) plat_exit(71);'
+    print(f'static: main.c crash_handler starts with the shared guard: {"ok" if ok else "FAIL (" + first + ")"}',
+          flush=True)
+    return bad + (not ok)
 
 
 CASES = [
     # mode, exit code, lines that must be there, lines that must not
     ('fatal', 70, ['FATAL: the test\'s fatal error 1'], ['detach:']),
+    # two faults at once: the first report whole, the second thread waits (dispatch.c rt_ending_enter)
+    ('crash_crash', 71, ['report line 1', 'report line 2', 'report line 3'], ['detach:', 'FATAL:']),
+    # a fault while rt_fatal reports: its FATAL line and notes whole, no crash report, rt_fatal's code
+    ('fatal_crash', 70, ['FATAL: the test\'s fatal error 1', 'fatal note: end'], ['report line', 'detach:']),
+    # rt_fatal on another thread while a crash is reported: the report whole, the crash report's code
+    ('crash_fatal', 71, ['report line 1', 'report line 2', 'report line 3'], ['FATAL:', 'detach:']),
 ]
 
 
