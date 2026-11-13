@@ -53,6 +53,7 @@ typedef void (*UpdateFn)(void);
 static PlatMutex lock = PLAT_MUTEX_INIT;   // the hooks calls and the state below
 static _Atomic int64_t want = RTSS_UNSET;  // millihertz from the pacer: >0 a limit, 0 none; RTSS_OUT_* kept out
 static _Atomic int64_t active_for = RTSS_UNSET;   // the want RTSS holds the game to now; RTSS_UNSET none
+static _Atomic int64_t movie_mhz;          // a movie's rate while one plays (rtss_limit_movie), 0 none
 static _Atomic int failed;                 // RTSS_FAIL_*: RTSS is out of it for the rest of the run (S.fail)
 static _Atomic int closed;                 // rtss_limit_restore ran: nothing reaches the profile any more
 static _Atomic int two;                    // kept out, and RTSS limits the game by a setting of its own (watch)
@@ -188,7 +189,7 @@ static int apply(void *ctx, int64_t mhz, int first, int clear) {
         return RTSS_WROTE_REFUSED;
     }
     update_profiles();
-    if (!mhz) rt_log("frame rate: RivaTuner Statistics Server's profile %s has no limit (unlimited)", profile);
+    if (!mhz) rt_log("frame rate: RivaTuner Statistics Server's profile %s has no limit", profile);
     else if ((int64_t)limit * 1000 == mhz * denominator)
         rt_log("frame rate: RivaTuner Statistics Server's profile %s limits to %.3f fps", profile, mhz / 1000.0);
     else   // rounded to whole frames by an RTSS without FramerateLimitDenominator: the log says what RTSS holds
@@ -362,7 +363,7 @@ static void worker(void *arg) {
             plat_mutex_unlock(&lock);
             continue;
         }
-        RtssIn in = {.want = w};
+        RtssIn in = {.want = w, .movie_mhz = atomic_load(&movie_mhz)};
         rtss_map(&in.app);
         if (in.app.running != was_running || in.app.listed != was_listed) {
             if (!in.app.running) rt_log("frame rate: RivaTuner Statistics Server is installed but not running");
@@ -395,6 +396,8 @@ void rtss_limit_want(int64_t mhz) {
         !plat_thread_spawn(worker, NULL, "rtss", 0))
         rt_log("frame rate: the RivaTuner Statistics Server thread did not start");
 }
+
+void rtss_limit_movie(int hz) { atomic_store_explicit(&movie_mhz, (int64_t)hz * 1000, memory_order_relaxed); }
 
 int rtss_limit_active(void) {
     if (atomic_load_explicit(&closed, memory_order_relaxed)) return 0;
@@ -431,6 +434,7 @@ void rtss_limit_restore(void) {
 
 #else
 void rtss_limit_want(int64_t mhz) { (void)mhz; }
+void rtss_limit_movie(int hz) { (void)hz; }
 int rtss_limit_active(void) { return 0; }
 int rtss_limit_state(void) { return 0; }
 void rtss_limit_restore(void) {}

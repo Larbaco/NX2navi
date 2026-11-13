@@ -151,6 +151,7 @@ typedef struct {
     RtssOps ops;
     int running, listed;
     uint32_t t0, t1, frames;
+    int64_t movie_mhz;   // a movie plays at this rate (rtss_limit_movie)
 } Run;
 static void run_init(Run *r) {
     memset(r, 0, sizeof *r);
@@ -161,7 +162,7 @@ static void run_init(Run *r) {
 }
 // One poll for want, as rtss_limit.c worker makes it: the hooks library loads on the first poll that wants it and stays.
 static RtssOut step_ex(Run *r, int64_t want, int current) {
-    RtssIn in = {.want = want, .current = current};
+    RtssIn in = {.want = want, .current = current, .movie_mhz = r->movie_mhz};
     in.app = (RtssApp){r->running, r->running && r->listed, r->t0, r->t1, r->frames};
     if (r->st.loaded) in.hooks = 1;
     else if (rtss_wants_hooks(&r->s, &in)) in.hooks = r->st.no_library ? 0 : (r->st.loaded = 1);
@@ -326,15 +327,39 @@ static void churn(void) {
     CHECK(r.st.applies == 11 && r.st.put_backs == 10, "%d writes, %d put backs", r.st.applies, r.st.put_backs);
 }
 
-// A movie under RTSS: the want follows the movie's rate, and each start and end is a write.
+// A movie under RTSS: the want stays the play limit and the game's pacer holds the movie. At a limit of 144 the profile
+// keeps 144 through it, with no write; under the movie's rate (40) the profile has no limit for the movie's length, so
+// RTSS cannot space out the frames that catch up after a late one, and gets 40 back at its end.
 static void movie(void) {
     Run r;
     run_init(&r);
     step(&r, 144000);
-    RtssOut o = step(&r, 60000);
-    CHECK(o.act == RTSS_DO_APPLY && o.holds, "the movie's 60 written");
+    r.movie_mhz = 60000;
+    RtssOut o = step(&r, 144000);
+    CHECK(o.act == RTSS_DO_NOTHING && !o.holds && o.why == RTSS_WHY_MOVIE, "a movie at 144: no write, the pacer's");
+    for (int i = 0; i < 10; i++) o = step(&r, 144000);
+    CHECK(!o.holds && o.why == RTSS_WHY_MOVIE && r.st.applies == 1, "through the movie");
+    char t[128];
+    rtss_why_text(t, sizeof t, &o, r.s.fail);
+    CHECK(!strcmp(t, "a movie plays: the game keeps its pictures on time"), "%s", t);
+    r.movie_mhz = 0;
     o = step(&r, 144000);
-    CHECK(o.act == RTSS_DO_APPLY && o.holds && r.st.applies == 3, "144 written again at its end");
+    CHECK(o.act == RTSS_DO_NOTHING && o.holds && o.why == RTSS_WHY_HOLDS && r.st.applies == 1, "held again after it");
+    run_init(&r);
+    step(&r, 40000);
+    r.movie_mhz = 60000;
+    o = step(&r, 40000);
+    CHECK(o.act == RTSS_DO_APPLY && o.mhz == 0 && !o.holds && o.why == RTSS_WHY_MOVIE && r.st.holds == 0,
+          "a movie at 40: no limit in the profile");
+    o = step(&r, 40000);
+    CHECK(o.act == RTSS_DO_NOTHING && r.st.applies == 2, "once");
+    r.movie_mhz = 0;
+    o = step(&r, 40000);
+    CHECK(o.act == RTSS_DO_APPLY && o.mhz == 40000 && o.holds && r.st.holds == 40000 && r.st.applies == 3,
+          "40 back at its end");
+    CHECK(rtss_target(60000, 60000) == 60000 && rtss_target(59940, 60000) == 0 && rtss_target(0, 60000) == 0 &&
+              rtss_target(144000, 0) == 144000 && rtss_target(RTSS_OUT_LOWLAT, 60000) == RTSS_OUT_LOWLAT,
+          "rtss_target");
 }
 
 // No want yet: nothing at all. The hooks library that does not load fails the run. (A run whose exit put the profile
@@ -384,13 +409,14 @@ static void two(void) {
 // otherwise; never 0.
 static void pace_period(void) {
     const uint64_t p60 = 16666667, ceiling = 4166667, now = 50000000000ull;
-    CHECK(rtss_pace_period(1, now, now - 10000000, p60, ceiling) == ceiling, "holds, a host present 10 ms ago");
-    CHECK(rtss_pace_period(1, now, now - RTSS_HOLD_IDLE_NS + 1, p60, ceiling) == ceiling, "just under 200 ms");
-    CHECK(rtss_pace_period(1, now, now - RTSS_HOLD_IDLE_NS, p60, ceiling) == p60, "200 ms with no host present");
-    CHECK(rtss_pace_period(1, now, 0, p60, ceiling) == p60, "no host present yet");
-    CHECK(rtss_pace_period(0, now, now - 10000000, p60, ceiling) == p60, "RTSS does not hold");
-    CHECK(rtss_pace_period(1, now, now + 1000, p60, ceiling) == ceiling, "a host present stored after now was read");
-    CHECK(rtss_pace_period(1, now, now - 10000000, ceiling, ceiling) == ceiling, "a limit at the ceiling");
+    CHECK(rtss_pace_period(1, 0, now, now - 10000000, p60, ceiling) == ceiling, "holds, a host present 10 ms ago");
+    CHECK(rtss_pace_period(1, 0, now, now - RTSS_HOLD_IDLE_NS + 1, p60, ceiling) == ceiling, "just under 200 ms");
+    CHECK(rtss_pace_period(1, 0, now, now - RTSS_HOLD_IDLE_NS, p60, ceiling) == p60, "200 ms with no host present");
+    CHECK(rtss_pace_period(1, 0, now, 0, p60, ceiling) == p60, "no host present yet");
+    CHECK(rtss_pace_period(0, 0, now, now - 10000000, p60, ceiling) == p60, "RTSS does not hold");
+    CHECK(rtss_pace_period(1, 0, now, now + 1000, p60, ceiling) == ceiling, "a host present stored after now was read");
+    CHECK(rtss_pace_period(1, 0, now, now - 10000000, ceiling, ceiling) == ceiling, "a limit at the ceiling");
+    CHECK(rtss_pace_period(1, 60, now, now - 10000000, p60, ceiling) == p60, "a movie: its period and slots");
 }
 
 int main(void) {

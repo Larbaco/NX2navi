@@ -82,6 +82,7 @@ enum {
     RTSS_WHY_REFUSED,       // RTSS refused this limit
     RTSS_WHY_NEWER,         // the want changed while the poll ran: nothing decided, the next poll takes the new one
     RTSS_WHY_UNSET,         // no want yet
+    RTSS_WHY_MOVIE,         // a movie plays: the game's pacer holds it at its rate and keeps its slots
 };
 
 // What the worker keeps between polls.
@@ -96,19 +97,27 @@ typedef struct {
 
 // One poll's view.
 typedef struct {
-    int64_t want;   // the want the poll read
-    int current;    // the want is still that one when the poll decides
-    int hooks;      // RTSS's hooks library: 1 loaded, 0 failed to load, -1 not tried (rtss_wants_hooks)
+    int64_t want;        // the want the poll read
+    int current;         // the want is still that one when the poll decides
+    int hooks;           // RTSS's hooks library: 1 loaded, 0 failed to load, -1 not tried (rtss_wants_hooks)
+    int64_t movie_mhz;   // the rate of a movie that plays (rtss_limit_movie), 0 none
     RtssApp app;
 } RtssIn;
 
 typedef struct {
     int act;        // RTSS_DO_*
-    int64_t mhz;    // the want decided for
+    int64_t mhz;    // the value decided for: the profile's (rtss_target) for a limit, the want for a kept-out one
     int holds;      // RTSS holds the game to it: the game's own limiter stands aside
     int why;        // RTSS_WHY_*
     double fps;     // RTSS's frame rate of the game, when the frame count check gave up on it
 } RtssOut;
+
+// What the profile gets for a want w >= 0 (the play limit: frame_rate.c frame_step_cap_ns wants it through a movie
+// too) while a movie plays at movie_mhz: w, so that a movie no longer rewrites the profile at its start and end; but no
+// limit (0) while the movie runs faster than w (a limit of 30, 40 or 45). The game's pacer holds every movie at its
+// rate and keeps its slots through a late frame (nvn_api_obj.c pace); RTSS at the movie's rate or below would space out
+// the frames that catch up, and the picture would fall behind the sound at each late frame for good.
+static inline int64_t rtss_target(int64_t w, int64_t movie_mhz) { return w > 0 && movie_mhz > w ? 0 : w; }
 
 // The hooks library is loaded only on a poll that may write the profile: a limit is wanted, RTSS is not out of it for
 // the run, and it runs. A poll of a kept-out want never loads it; a later limit does.
@@ -118,10 +127,11 @@ static inline int rtss_wants_hooks(const RtssState *s, const RtssIn *in) {
 
 // The decision of one poll, in this order: no want does nothing; a kept-out want puts back what this run wrote (once
 // the hooks are loaded); a failure lasts the run; RTSS not running leaves the profile for its return; a library that
-// did not load fails the run; a refused limit stays with the game; a new limit goes into the profile at once, and RTSS
-// holds it as soon as it lists the game. On an unchanged limit RTSS's own frame count is checked: more than
-// RTSS_CHECK_SLACK times the limit for RTSS_CHECK_POLLS polls in a row puts the profile back for the run. After the
-// exit put the profile back (rtss_limit_restore) no poll decides: rtss_limit.c worker skips it under the lock.
+// did not load fails the run; a refused limit stays with the game; a new limit (rtss_target) goes into the profile at
+// once, and RTSS holds it as soon as it lists the game. On an unchanged limit RTSS's own frame count is checked: more
+// than RTSS_CHECK_SLACK times the limit for RTSS_CHECK_POLLS polls in a row puts the profile back for the run. While a
+// movie plays the game's pacer holds it (rtss_target). After the exit put the profile back (rtss_limit_restore) no poll
+// decides: rtss_limit.c worker skips it under the lock.
 static inline RtssOut rtss_decide(RtssState *s, const RtssIn *in) {
     int64_t w = in->want;
     RtssOut o = {RTSS_DO_NOTHING, w, 0, RTSS_WHY_NOT_LISTED, 0};
@@ -133,17 +143,19 @@ static inline RtssOut rtss_decide(RtssState *s, const RtssIn *in) {
     if (s->fail) return o.why = RTSS_WHY_FAILED, o;
     if (!in->app.running) return o.why = RTSS_WHY_NOT_RUNNING, o;
     if (in->hooks == 0) return s->fail = RTSS_FAIL_LIBRARY, o.why = RTSS_WHY_FAILED, o;
-    if (w == s->refused) return o.why = RTSS_WHY_REFUSED, o;
+    int64_t t = o.mhz = rtss_target(w, in->movie_mhz);
+    if (t == s->refused) return o.why = RTSS_WHY_REFUSED, o;
     o.holds = in->app.listed;
     o.why = o.holds ? RTSS_WHY_HOLDS : RTSS_WHY_NOT_LISTED;
-    if (w != s->applied) {   // the result of the write may still undo the hold (rtss_written)
+    if (in->movie_mhz) o.holds = 0, o.why = RTSS_WHY_MOVIE;
+    if (t != s->applied) {   // the result of the write may still undo the hold (rtss_written)
         o.act = RTSS_DO_APPLY;
         s->over = 0;
         return o;
     }
     if (!in->current) return o.holds = 0, o.why = RTSS_WHY_NEWER, o;   // these frames are not the new want's
     double fps = rtss_fps(&in->app);
-    if (!in->app.listed || w == 0 || fps <= w / 1000.0 * RTSS_CHECK_SLACK) s->over = 0;
+    if (!in->app.listed || t == 0 || fps <= t / 1000.0 * RTSS_CHECK_SLACK) s->over = 0;
     else if (++s->over == RTSS_CHECK_POLLS) {
         s->fail = RTSS_FAIL_NOT_LIMITING;
         o.act = RTSS_DO_PUT_BACK, o.holds = 0, o.why = RTSS_WHY_FAILED, o.fps = fps;
@@ -208,6 +220,7 @@ static inline void rtss_why_text(char *out, size_t n, const RtssOut *o, int fail
     else if (o->why == RTSS_WHY_FAILED) snprintf(out, n, "%s", rtss_fail_text(fail));
     else if (o->why == RTSS_WHY_NOT_RUNNING) snprintf(out, n, "RivaTuner Statistics Server is not running");
     else if (o->why == RTSS_WHY_REFUSED) snprintf(out, n, "RivaTuner Statistics Server refused this limit");
+    else if (o->why == RTSS_WHY_MOVIE) snprintf(out, n, "a movie plays: the game keeps its pictures on time");
     else snprintf(out, n, "RivaTuner Statistics Server has not hooked the game yet");
 }
 
@@ -216,15 +229,17 @@ static inline void rtss_why_text(char *out, size_t n, const RtssOut *o, int fail
 
 // The period the pacer keeps (now_ns and hosted_ns are kern_now_ns times; hosted_ns of the newest host present,
 // gfx_present.c gfx_window_hosted_ns, 0 before the first). The limit's own period while RTSS does not hold the game,
-// before the first host present, and once no host present went out for RTSS_HOLD_IDLE_NS: a minimised window or a
+// while a movie plays (from its first frame: the pacer keeps the movie's slots, which RTSS does not know, and the
+// worker's next poll gives the movie to the pacer for its length, rtss_target), before the first host present, and
+// once no host present went out for RTSS_HOLD_IDLE_NS: a minimised window or a
 // frame hold (vk_backend.c frame_hold) gives RTSS nothing to hold, and a pacer that held nothing then let the quick menu
 // run at the 640-700 fps that read address 0 (frame_rate.c LIMIT_FREE_MAX_HZ). While RTSS holds, the ceiling's period
 // and never 0: the frames RTSS lets through come further apart than that, so pace() waits for none of them, and it
 // still holds the game's frames to the ceiling the game's code needs.
-static inline uint64_t rtss_pace_period(int holds, uint64_t now_ns, uint64_t hosted_ns, uint64_t period,
+static inline uint64_t rtss_pace_period(int holds, int movie, uint64_t now_ns, uint64_t hosted_ns, uint64_t period,
                                         uint64_t ceiling) {
     uint64_t idle = now_ns > hosted_ns ? now_ns - hosted_ns : 0;
-    if (!holds || !hosted_ns || idle >= RTSS_HOLD_IDLE_NS) return period;
+    if (!holds || movie || !hosted_ns || idle >= RTSS_HOLD_IDLE_NS) return period;
     return ceiling < period ? ceiling : period;
 }
 

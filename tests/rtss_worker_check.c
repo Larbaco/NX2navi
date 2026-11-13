@@ -726,19 +726,40 @@ static void churn_run(void) {
     CHECK(rtss_limit_active(), "RTSS limits after the last want of a limit");
 }
 
-// A movie at 60 under a limit of 144: the want follows the movie, and each start and end is a write.
+// A movie at 60 under a limit of 144: the want stays 144 (frame_rate.c frame_step_cap_ns) and RTSS's profile keeps it
+// with no write, while the game's pacer holds the movie at its rate; RTSS holds the game again at its end.
 static void movie_run(void) {
     app_set(1, 0xA, 1000, 2000, 144);
     ask(144000);
     poll();
     long s0 = saves;
-    ask(60000);
-    poll();
-    CHECK(own.limit == 60 && rtss_limit_active(), "RTSS holds the movie's 60");
+    rtss_limit_movie(60);
     ask(144000);
     poll();
-    show("after one movie");
-    CHECK(own.limit == 144 && saves - s0 == 2, "two writes for one movie");
+    show("a movie at 60");
+    CHECK(own.limit == 144 && !rtss_limit_active() && saves == s0, "the profile keeps 144; the game's pacer holds it");
+    CHECK(logged("the game's own limiter (a movie plays: the game keeps its pictures on time)"), "logged");
+    rtss_limit_movie(0);
+    poll();
+    show("after the movie");
+    CHECK(own.limit == 144 && rtss_limit_active() && saves == s0, "RTSS holds again, no write for the movie");
+}
+
+// The same under a limit of 40: the profile has no limit while the movie plays, so RTSS cannot space out the frames the
+// pacer sends at once after a late one, and gets 40 back at its end.
+static void movie_low_run(void) {
+    app_set(1, 0xA, 1000, 2000, 40);
+    ask(40000);
+    poll();
+    long s0 = saves;
+    rtss_limit_movie(60);
+    poll();
+    show("a movie at 60 with the limit at 40");
+    CHECK(own.exists && own.limit == 0 && !rtss_limit_active(), "no limit in the profile during the movie");
+    rtss_limit_movie(0);
+    poll();
+    show("after the movie");
+    CHECK(own.limit == 40 && rtss_limit_active() && saves - s0 == 2, "40 back: two writes for the movie");
 }
 
 static const struct { const char *name; void (*run)(void); } scenarios[] = {
@@ -768,6 +789,7 @@ static const struct { const char *name; void (*run)(void); } scenarios[] = {
     {"library_run", library_run},
     {"churn_run", churn_run},
     {"movie_run", movie_run},
+    {"movie_low_run", movie_low_run},
 };
 
 int main(int argc, char **argv) {

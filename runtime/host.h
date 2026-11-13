@@ -466,7 +466,8 @@ void frame_step_flight(float *page, float *game, uint64_t *presents);   // fligh
 // rtss_limit.c: RivaTuner Statistics Server takes the frame limit where it runs
 void rtss_limit_want(int64_t mhz);                        // the pacer's limit in millihertz: >0, 0 none; or why RTSS is
                                                            // kept out (rtss_decide.h RTSS_OUT_*)
-int rtss_limit_active(void);                              // RTSS limits to the wanted rate: the pacer holds no frames
+void rtss_limit_movie(int hz);                            // the rate of a movie that plays, 0 none: the pacer holds it
+int rtss_limit_active(void);                              // RTSS limits to the wanted rate: the pacer keeps the ceiling
 int rtss_limit_state(void);                               // menu: 1 RTSS limits, 2 its profile is read-only, 3 it let the
                                                            // game run past its limit, 4 kept out while a limit set in
                                                            // RTSS itself holds the game too

@@ -17,7 +17,7 @@ uint64_t rt_guest_start_ns;
 const char *cfg_get(const char *key) {
     if (!strcmp(key, "NX2NAVI_FPS_LIMIT")) return limit;
     if (!strcmp(key, "NX2NAVI_STEP_STEADY")) return steady;
-    if (!strcmp(key, "NX2NAVI_RTSS")) return "0";
+    if (!strcmp(key, "NX2NAVI_RTSS")) return "1";
     return NULL;
 }
 unsigned cfg_version(void) { return version; }
@@ -38,7 +38,10 @@ static int fg_mult = 1;   // frames on screen per game frame
 int vk_dlssg_multiplier(void) { return fg_mult; }
 int vk_dlssg_active(void) { return fg_mult > 1; }
 int vk_lowlat_on(void) { return 0; }
-void rtss_limit_want(int64_t millihz) { (void)millihz; }
+static int64_t rtss_want;          // the newest want (rtss_limit.c)
+static int rtss_movie;             // the newest movie rate RTSS was told of
+void rtss_limit_want(int64_t millihz) { rtss_want = millihz; }
+void rtss_limit_movie(int hz) { rtss_movie = hz; }
 static int rtss_holds;              // RivaTuner Statistics Server holds the game to the want (rtss_limit.c)
 static uint64_t kern_ns, hosted;    // kern_now_ns, and its time at the newest host present (0: none yet)
 int rtss_limit_active(void) { return rtss_holds; }
@@ -302,6 +305,24 @@ int main(int argc, char **argv) {
             hosted = cases[i].hosted_ago ? kern_ns - cases[i].hosted_ago : 0;
             double hz = 1e9 / (double)frame_step_cap_ns();
             CHECK(fabs(hz - cases[i].hz) < 0.01, "%s: paces at %.3f fps, not %.0f", cases[i].what, hz, cases[i].hz);
+        }
+        // A movie while RTSS holds 144: RTSS keeps the play limit (no rewrite of its profile at the movie's start and
+        // end) and the pacer holds the movie's 60 with its slots; at 40 the want stays 40 too (rtss_decide.h rtss_target
+        // decides what the profile gets).
+        hosted = kern_ns - 10000000;
+        static const struct { const char *l; int64_t want; } movies[] = {{"144", 144000}, {"40", 40000}};
+        for (unsigned i = 0; i < 2; i++) {
+            set_limit(movies[i].l);
+            movie = 1;
+            double hz = 1e9 / (double)frame_step_cap_ns();
+            CHECK(fabs(hz - 60) < 0.01 && rtss_want == movies[i].want && rtss_movie == 60,
+                  "a movie at a limit of %s under RTSS: paces at %.3f fps, wants %lld, movie %d", movies[i].l, hz,
+                  (long long)rtss_want, rtss_movie);
+            movie = 0;
+            hz = 1e9 / (double)frame_step_cap_ns();
+            CHECK(fabs(hz - 240) < 0.01 && rtss_want == movies[i].want && !rtss_movie,
+                  "after the movie at %s: paces at %.3f fps, wants %lld, movie %d", movies[i].l, hz,
+                  (long long)rtss_want, rtss_movie);
         }
         rtss_holds = 0, hosted = kern_ns = 0;
     }
