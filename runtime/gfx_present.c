@@ -75,6 +75,7 @@ void gfx_window_focus_changed(int in) {
     plat_local_time(&t);
     rt_log("gfx: window %s the focus at %04d-%02d-%02d %02d:%02d:%02d local time", in ? "gained" : "lost",
            t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
+    if (!in) perf_focus_lost();   // the session's reports, in case the process is ended from outside next (perf.c)
 }
 
 // The window was closed: the process ends with it, once a save Commit still running in the background is

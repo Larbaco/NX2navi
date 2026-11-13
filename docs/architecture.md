@@ -283,8 +283,8 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   tables, the texture cache and its decode temporaries, the log queue, the flight recorder), the data of the driver's
   pipeline caches (asked once a minute on the autosave thread) and the rest;
   `mem: growth` names what grew by more than 64 MiB since the report before and since the first report in play. Every
-  ten minutes of play and at exit, `mem: growth ranking` ranks the categories by their growth since play began and
-  marks those that only climbed (`mem_growth.h`).
+  two minutes of play, when the window loses the focus in play and at exit, `mem: growth ranking` ranks the categories
+  by their growth since play began and marks those that only climbed (`mem_growth.h`).
 - Released textures by age: the game releases a texture when what uses it leaves the view and takes it back when that
   returns; the cache keeps the released image so that the take-back finds it. In play the take-backs came within a
   minute of the release or never, so a released texture goes once it has gone unused for a hold of three minutes, six

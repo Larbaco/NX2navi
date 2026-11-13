@@ -5153,6 +5153,30 @@ class WhilePlayingTest(Tmp):
         self.assertEqual(app.last_fatal(self.tmp), '')
         self.assertEqual(app.last_fatal(''), '')
 
+    def test_an_end_with_code_0_is_logged_and_noted_without_the_games_exit_line(self):
+        """A run ended with code 0 goes into launcher.log; when the game's log has no line of the game's own end (the
+        window's close, its ExitProcess, a FATAL line), the end is noted in that log too."""
+        try:
+            from launcher.ui import app
+        except ImportError as e:
+            self.skipTest(f'no window toolkit: {e}')
+        a, log = self.ended(0, '[host] log: x\n[host] gfx: window closed; exiting\n[host] perf: after it\n')
+        a.ctx.log.assert_called_once_with('the game ended with code 0')
+        self.assertNotIn('[launcher]', log.read_text(encoding='utf-8'))
+        a, log = self.ended(0, '[host] log: x\n[host] perf: frame 39660: the last line of play\n')
+        a.ctx.log.assert_called_once_with('the game ended with code 0, and its log has no line of its own end')
+        text = log.read_text(encoding='utf-8')
+        self.assertIn("[launcher] the game ended with code 0 (the log has no line of the game's own end", text)
+        self.assertIs(app.log_has_own_exit(self.tmp), False)   # the note ends the search for the next run
+        log.write_text('FATAL: x\n', encoding='utf-8')
+        self.assertIs(app.log_has_own_exit(self.tmp), True)
+        log.write_text('[host] guest ExitProcess at main+0x10; exiting\n', encoding='utf-8')
+        self.assertIs(app.log_has_own_exit(self.tmp), True)
+        log.unlink()
+        self.assertIsNone(app.log_has_own_exit(self.tmp))
+        a, _ = self.ended(0, None)   # no log: logged as an end with code 0, nothing noted
+        a.ctx.log.assert_called_once_with('the game ended with code 0')
+
     def test_the_fatal_line_is_looked_for_in_the_logs_end(self):
         try:
             from launcher.ui import app

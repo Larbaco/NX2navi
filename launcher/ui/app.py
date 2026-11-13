@@ -167,6 +167,33 @@ def last_fatal(game_dir):
     return ''
 
 
+# The lines the game writes when it ends on its own: the window's close (runtime/gfx_present.c gfx_window_closed), the
+# game's own exit (runtime/svc.c, ExitProcess), a timed run's end (runtime/boot.c), a fatal error and the crash report's
+# line for a fault on the way out (runtime/main.c).
+OWN_EXIT_LINES = ('gfx: window closed', 'guest ExitProcess', 'boot: frames', 'FATAL: ', 'exit: ')
+
+
+def log_has_own_exit(game_dir):
+    """Whether the end of logs/nx2navi.log holds a line of the game's own end (OWN_EXIT_LINES) for its latest run; None
+    when the log cannot be read. A line this launcher added for an earlier run's end (note_exit_in_log) ends the
+    search."""
+    if not game_dir:
+        return None
+    try:
+        with open(Path(game_dir) / 'logs' / 'nx2navi.log', 'rb') as f:
+            f.seek(max(0, f.seek(0, 2) - FATAL_TAIL))
+            lines = f.read().decode('utf-8', 'replace').splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if line.startswith('[launcher] the game ended'):
+            return False
+        body = line.split('] ', 1)[1] if line.startswith('[') and '] ' in line else line
+        if body.startswith(OWN_EXIT_LINES):
+            return True
+    return False
+
+
 def note_exit_in_log(game_dir, text):
     """Adds the exit code to the end of the game's log, so a log a player sends shows how the run ended even when the
     process died before it could write a line itself."""
@@ -1910,6 +1937,7 @@ class App:
             self.root.after(1000, self.watch_game)
             return
         code = self.game_proc.returncode if self.game_proc else 0
+        started = self.game_proc is not None
         self.game_proc = None
         self.root.deiconify()
         self.root.lift()
@@ -1927,6 +1955,15 @@ class App:
                 self.ctx.log(f'the game ended with code {text}')
                 self.message = f'The game ended with code {text}. Its log is logs\\nx2navi.log in the game folder.'
             note_exit_in_log(self.game_dir(), text)
+        elif started:
+            # A run this launcher started that ended with code 0 is logged too, and when the game's log has no line of
+            # its own end, the end goes into that log: a session of 2026-11-13 stopped in play with code 0, no FATAL
+            # line and none of the game's exit lines, and nothing said how it had ended.
+            if log_has_own_exit(self.game_dir()) is False:
+                self.ctx.log('the game ended with code 0, and its log has no line of its own end')
+                note_exit_in_log(self.game_dir(), "0 (the log has no line of the game's own end before this one)")
+            else:
+                self.ctx.log('the game ended with code 0')
         if self.install_staged('the game exited'):
             return
         self.show('home', self.focus)

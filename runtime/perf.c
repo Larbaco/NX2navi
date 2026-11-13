@@ -53,9 +53,15 @@ void perf_gpu_busy(uint64_t ns) { plat_add64(&gpu_busy_total, (int64_t)ns); }
 
 uint64_t perf_gpu_busy_total(void) { return (uint64_t)__atomic_load_n(&gpu_busy_total, __ATOMIC_RELAXED); }
 
+// Registered before the handlers below, so it runs after them (atexit's order is the reverse): a process that ends
+// through exit() rather than plat_exit, whose log sync this is, gets the lines of the frame-time summary, the stutter
+// map and everything queued before them into the log instead of losing them with the log thread's queue.
+static void log_sync_at_exit(void) { rt_log_sync(); }
+
 void prof_start(void) {
     flight_init();
     stutter_map_init();
+    atexit(log_sync_at_exit);
     atexit(perf_summary_flush);   // boot.c's _exit path goes through prof_write instead
     perf_base = (rt_trace & RT_TRACE_PERF) || flight_on;
     perf_on = perf_base || overlay == 2;
@@ -586,6 +592,33 @@ static void ft_report(uint64_t now, const char *tag) {
 }
 
 __attribute__((weak)) void gfx_exit_log(void) {}
+__attribute__((weak)) void vk_mem_rank_log(const char *when) { (void)when; }
+
+// The session's reports when the window loses the focus in play: the frame-time summary of the period so far (which
+// starts a new period), the stutter map and the memory report's growth ranking, at most every SESSION_REPORT_GAP_NS.
+// They are written at the exit too (perf_summary_flush, vk_mem_exit_log), but a process ended from outside, or by a
+// path that skips them, leaves none: a session of 2026-11-13 ended 8 s after its window lost the focus, after 7 minutes
+// of play, with no ranking (one every 10 minutes then) and no map of its last minute. gfx_present.c
+// gfx_window_focus_changed asks for them; the present thread writes them at its next present (perf_present). Formatting
+// only: no device call, no wait.
+#define SESSION_REPORT_GAP_NS 60000000000ull
+static volatile int32_t session_due;
+
+void perf_focus_lost(void) {
+    if (frame_step_world_us() >= 0) plat_xchg32(&session_due, 1);   // in play: the loaded save's world clock runs
+}
+
+static void session_report(uint64_t now) {
+    static uint64_t last;
+    if (last && now - last < SESSION_REPORT_GAP_NS) return;
+    last = now;
+    if (summary_t0) {
+        ft_report(now, "at focus loss");
+        summary_t0 = now;
+    }
+    stutter_report("at focus loss");
+    vk_mem_rank_log("at focus loss, after");
+}
 // The renderer's per-frame texture work (vk_texture.c): closes the frame's sums; d is the frame's interval.
 __attribute__((weak)) void vk_texstat_frame(uint64_t frame, uint64_t d) { (void)frame, (void)d; }
 
@@ -891,6 +924,7 @@ void perf_present(uint64_t frame) {
     uint64_t now = kern_now_ns(), d = last ? now - last : 0;
     prof_sampler_frame(frame, now, last ? d : 0);
     uint64_t rep = ft_frame(frame, now, d);   // d is 0 on the first present: it only starts the period
+    if (__atomic_load_n(&session_due, __ATOMIC_RELAXED) && plat_xchg32(&session_due, 0)) session_report(now);
     ab_b += rt_ab();
     cpu_placement();
     reserve_sweep(frame);

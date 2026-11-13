@@ -21,4 +21,4 @@ void stutter_ready(int mesh, const uint8_t *vi, const uint8_t *fi, double ms, in
 // the last one is the part nothing recorded explains), cause the one the frame is charged to.
 void stutter_frame(uint64_t frame, uint64_t now, uint64_t d, const uint64_t *part, const char *const *names, int n,
                    int cause);
-void stutter_report(const char *tag);   // the map so far; every 10 minutes of play and at exit
+void stutter_report(const char *tag);   // the map so far; every 5 minutes of play, at a focus loss in play and at exit

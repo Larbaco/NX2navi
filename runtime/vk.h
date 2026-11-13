@@ -499,6 +499,7 @@ void vk_mem_lost_report(void);                    // a line with the video memor
 float vk_mem_device_used_mb(void);                // device-local memory this process holds (the driver's budget
                                                   // figure), MB; -1 without VK_EXT_memory_budget. Any thread.
 void vk_mem_stage_log(const char *stage);         // one line after a boot stage: device memory, process commit
+void vk_mem_rank_log(const char *when);           // the growth ranking now, "when" leading its minutes of play
 void vk_mem_exit_log(void);                       // at the process's end: the memory report's growth ranking of the
                                                   // session (vk_memory.c growth_take), once it reached play
 // VRAM in use and its budget, summed over the DEVICE_LOCAL heaps. exact 1: VK_EXT_memory_budget (the whole process),

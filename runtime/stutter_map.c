@@ -15,7 +15,8 @@
 // What a hitch went to comes from the frame-time summary's split (perf.c ft_frame: pipeline, translation, texture,
 // fence, pacing, replay, unattributed), with the draws that met a pipeline or a shader missing between the previous
 // present and this one (stutter_miss, from the replay thread). Each hitch gets a "stutter:" line, at most
-// SM_LINES_PER_S a second and SM_LINES_MAX in all; the counts go on past that. Every SM_REPORT_NS of play and at exit,
+// SM_LINES_PER_S a second and SM_LINES_MAX in all; the counts go on past that. Every SM_REPORT_NS of play, when the
+// window loses the focus in play (perf.c session_report) and at exit,
 // "stutter map" lines rank the areas by their hitches and the pipelines by the time draws lost to them, each with
 // whether this install had recorded it before (the pipeline list or an earlier run) and whether one of its shaders was
 // translated in play rather than prepared.
@@ -49,7 +50,7 @@ int stutter_map_on;
 #define SM_RING 256                        // draws that met something missing, between two presents
 #define SM_LINES_MAX 4000
 #define SM_LINES_PER_S 5
-#define SM_REPORT_NS 600000000000ull       // the map every 10 minutes of play
+#define SM_REPORT_NS 300000000000ull       // the map every 5 minutes of play
 #define SM_TOP_AREAS 40
 #define SM_TOP_PIPES 40
 

@@ -5415,7 +5415,9 @@ uint64_t vk_mem_give_back(void) {
 // their locks (a fraction of a millisecond, once a report), the C runtime heap's summary. Nothing is counted per frame.
 #define IDLE_MIN 10                              // pipelines no lookup reached for this many minutes count as unused
 #define GROWTH_STEP (64ull << 20)                // growth_take names a category that grew by more than this
-#define RANK_EVERY_NS (600ull * 1000000000ull)   // the ranking's period in play
+// the ranking's period in play: every 2 minutes, as a session ended without its exit lines after 7 minutes of play had
+// no ranking at all with one every 10 (2026-11-13); a ranking is one line of figures the book already holds
+#define RANK_EVERY_NS (120ull * 1000000000ull)
 #define HEAP_SLOW_NS 2000000ull                  // a heap summary that took longer is not asked for again
 
 typedef struct {
@@ -5605,6 +5607,13 @@ static void growth_take(uint64_t frame, const uint64_t v[G_N]) {
 void vk_mem_exit_log(void) {
     plat_mutex_lock(&grow_lock);
     if (gbook.play) rank_log_locked("at exit, after", plat_now_ns());
+    plat_mutex_unlock(&grow_lock);
+}
+
+// The same ranking at a moment of the caller's (perf.c session_report, when the window loses the focus).
+void vk_mem_rank_log(const char *when) {
+    plat_mutex_lock(&grow_lock);
+    if (gbook.play) rank_log_locked(when, plat_now_ns());
     plat_mutex_unlock(&grow_lock);
 }
 
