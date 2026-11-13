@@ -929,8 +929,11 @@ static void vk_be_guest_read(uint64_t addr, uint64_t size) {
 // event wait returns its value with its remainder held for a later replay, so the game may take a wait for that value
 // as the whole submission done and reuse what the held part still reads. How often that happens decides whether the
 // value should be signalled only after the remainder (audit finding F-2-05). The count is unlocked: a diagnostic.
+// A wait for value 0 is left out: the window acquire's sync stands for no submission (nvn_api_obj.c
+// nvnWindowAcquireTexture gives it fence 0), and such waits were half of the lines in two sessions of 2026-11-13.
 static uint64_t synced_n, synced_held;
 static void synced_held_count(uint64_t fence) {
+    if (!fence) return;
     synced_n++;
     int held = vk_exec_held();
     if (!held) return;
