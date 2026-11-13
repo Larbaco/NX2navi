@@ -643,10 +643,12 @@ A change to how `pipeline-cache.bin` is read (`runtime/vk_cache_file.h`, `runtim
 through it: measured and read whole without a size limit, refused by its real size under one. No game files, no GPU;
 about 2 GB of memory for a few seconds.
 
-A change to how `pipeline-binaries.bin` is indexed (`runtime/vk_pipeline.c` `pb_index`, `pb_init`) passes
-`python tests\pb_torn_check.py`, which cuts the record layout and the index walk out of `vk_pipeline.c` and walks files
-of whole records, with a last record cut short at many lengths and with a malformed record: the whole records before
-it are indexed and the walk ends where they end, which is where `pb_init` cuts the file back to. No game files, no GPU.
+A change to how `pipeline-binaries.bin` is indexed or cut back (`runtime/vk_pipeline.c` `pb_index`, `pb_keep`,
+`pb_init`) passes `python tests\pb_torn_check.py`, which cuts the record layout, the index walk and `pb_keep` out of
+`vk_pipeline.c` and walks files of whole records, with a last record cut short at many lengths and with a malformed
+record: the whole records before it are indexed and the walk ends where they end, `pb_keep` cuts the file back to
+there, a second walk reaches the end of what is left, and a record appended after the cut is read back. No game files,
+no GPU.
 
 A change to the layout of `shader-prepared.bin` (`runtime/prp_file.h`, `runtime/gfx_shader.c`
 `gfx_shader_prepare_seed`, `tools/make_game.py` `prepared_from`) passes `python tests\prp_file_check.py`, which builds

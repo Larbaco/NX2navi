@@ -1,8 +1,11 @@
-"""Check the index walk of pipeline-binaries.bin (runtime/vk_pipeline.c pb_index, NX2NAVI_PIPE_BINARIES=1). pb_init
-keeps the whole records of a file that ends inside one (the process ended during an append, or a disk filled) and
-cuts the file back to them; the walk must say where the last whole record ends. The check cuts the file's record
-layout and pb_hash, pb_find, pb_insert and pb_index out of vk_pipeline.c, writes files of whole records, one with a
-torn last record and one with a malformed record in the middle, and checks the offset and the index it gives.
+"""Check how pipeline-binaries.bin keeps its whole records (runtime/vk_pipeline.c pb_index and pb_keep,
+NX2NAVI_PIPE_BINARIES=1). pb_init keeps the whole records of a file that ends inside one (the process ended during an
+append, or a disk filled) or holds a malformed one, and cuts the file back to them; the walk must say where the last
+whole record ends, and pb_keep must cut the file there. The check cuts the file's record layout and pb_hash, pb_find,
+pb_insert, pb_index and pb_keep out of vk_pipeline.c, writes files of whole records, one with a torn last record and
+one with a malformed record in the middle, and checks the offset and the index the walk gives, the length pb_keep
+leaves on the disk, that a second walk reaches the end of the cut file, and that a record appended after the cut is
+read back. plat_file_truncate is a stand-in that cuts the file with the C library.
 
 No GPU, no game files, any Python. Needs the Vulkan headers of MSYS2 UCRT64 (vulkan/vulkan.h).
 
@@ -48,6 +51,30 @@ static uint64_t fnv(uint64_t h, const void *p, size_t n) {
     return h;
 }
 #define FNV0 0xcbf29ce484222325ull
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
+static int logs, truncate_fails;
+static char last_log[512];
+void rt_log(const char *fmt, ...) {
+    logs++;
+    snprintf(last_log, sizeof last_log, "%s", fmt);
+}
+int plat_file_truncate(const char *path, uint64_t size) {   /* platform.h's, with the C library */
+    if (truncate_fails) return 0;
+#ifdef _WIN32
+    int fd = _open(path, _O_RDWR | _O_BINARY);
+    if (fd < 0) return 0;
+    int ok = _chsize_s(fd, (__int64)size) == 0;
+    _close(fd);
+    return ok;
+#else
+    return truncate(path, (off_t)size) == 0;
+#endif
+}
 '''
 
 MAIN = r'''
@@ -117,6 +144,56 @@ int main(int argc, char **argv) {
     fclose(f);
     assert(walk(path, &len) == (uint64_t)at && len > (uint64_t)at && PB.n == 1);
 
+    /* pb_keep on a torn file: cut back to its whole records and logged; a second walk reaches the end of what is left,
+       and a record appended there is read back with the three. */
+    f = fopen(path, "wb");
+    fwrite(&hd, sizeof hd, 1, f);
+    put(f, PB_BLOB, 1, 1000), put(f, PB_BLOB, 2, 3), put(f, PB_PIPE, 3, 4 + 16 + PB_KEY);
+    put(f, PB_BLOB, 4, 500);
+    fclose(f);
+    uint64_t torn = whole + 4 + PB_HEAD + 500 - 77;
+    assert(plat_file_truncate(path, torn));
+    uint64_t good = walk(path, &len);
+    assert(len == torn && good == whole);
+    logs = 0;
+    assert(pb_keep(path, good, len) == whole && logs == 1 && strstr(last_log, "ends inside a record"));
+    assert(walk(path, &len) == len && len == whole && PB.n == 3);
+    f = fopen(path, "ab");
+    put(f, PB_BLOB, 5, 64);
+    fclose(f);
+    assert(walk(path, &len) == len && len == whole + 4 + PB_HEAD + 64 && PB.n == 4);
+
+    /* pb_keep on a malformed record in the middle: cut back to the record before it; the walk then reaches the end. */
+    f = fopen(path, "wb");
+    fwrite(&hd, sizeof hd, 1, f);
+    put(f, PB_BLOB, 1, 1000);
+    at = ftell(f);
+    put(f, 7, 2, 3);
+    put(f, PB_PIPE, 3, 4 + 16 + PB_KEY);
+    fclose(f);
+    good = walk(path, &len);
+    logs = 0;
+    assert(good == (uint64_t)at && pb_keep(path, good, len) == (uint64_t)at && logs == 1);
+    assert(walk(path, &len) == len && len == (uint64_t)at && PB.n == 1);
+
+    /* pb_keep on whole records: the file as it is, nothing logged. When the file cannot be cut: 0 (start empty), the
+       file untouched. */
+    f = fopen(path, "ab");
+    put(f, PB_BLOB, 2, 3);
+    fclose(f);
+    good = walk(path, &len);
+    logs = 0;
+    assert(good == len && pb_keep(path, good, len) == len && logs == 0);
+    f = fopen(path, "ab");
+    fputc(1, f);
+    fclose(f);
+    good = walk(path, &len);
+    truncate_fails = 1;
+    assert(good == len - 1 && pb_keep(path, good, len) == 0 && logs == 0);
+    truncate_fails = 0;
+    uint64_t len2;
+    assert(walk(path, &len2) == good && len2 == len);
+
     /* The header alone: nothing indexed, the walk ends at the header. */
     f = fopen(path, "wb");
     fwrite(&hd, sizeof hd, 1, f);
@@ -124,7 +201,8 @@ int main(int argc, char **argv) {
     assert(walk(path, &len) == sizeof hd && len == sizeof hd && PB.n == 0);
 
     reset();
-    printf("pipeline binaries index: whole records kept, a torn last record and a malformed one end the walk there\n");
+    printf("pipeline binaries index: whole records kept, a torn last record and a malformed one end the walk there, "
+           "and the file is cut back to its whole records\n");
     return 0;
 }
 '''

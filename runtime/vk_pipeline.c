@@ -336,6 +336,18 @@ static uint64_t pb_index(FILE *f, uint64_t len) {
     return good;
 }
 
+// The length of the file at path (len bytes) to go on with after pb_index found its whole records ending at good: len
+// when they fill it. When it ends inside a record (the process ended during an append, or a disk filled) or holds a
+// malformed one, the records from there on are dropped and the file is cut back to good, so that appends go on after
+// the whole records before it. 0 when it cannot be cut, and the file starts empty.
+static uint64_t pb_keep(const char *path, uint64_t good, uint64_t len) {
+    if (good == len) return len;
+    if (!plat_file_truncate(path, good)) return 0;
+    rt_log("vk_pipeline: pipeline binaries: %s ends inside a record or holds a malformed one at byte %llu; %llu bytes "
+           "from there dropped", path, (unsigned long long)good, (unsigned long long)(len - good));
+    return good;
+}
+
 // Opens pipeline-binaries.bin and indexes its records (cache_load, before P.cache).
 static void pb_init(VkCtx *c) {
     if (!c->has_pipeline_binary || !P.cache_path[0]) return;
@@ -372,17 +384,13 @@ static void pb_init(VkCtx *c) {
         else good = pb_index(f, len);
         fclose(f);
     }
-    // A file that ends inside a record (the process ended during an append, or a disk filled): the whole records
-    // before it stay, and the file is cut back to them so that appends go on from there. Only when it cannot be cut
-    // does it start empty.
-    if (f && !why && good != len) {
-        if (plat_file_truncate(PB.path, good)) {
-            rt_log("vk_pipeline: pipeline binaries: %s was cut short (a record half written); %llu bytes after the last "
-                   "whole record dropped", PB.path, (unsigned long long)(len - good));
-            len = good;
-        } else {
-            why = "cut short (a record half written), and it cannot be cut back to its whole records";
-        }
+    // A file that ends inside a record (the process ended during an append, or a disk filled) or holds a malformed
+    // record: the whole records before it stay, and the file is cut back to them so that appends go on from there.
+    // Only when it cannot be cut does it start empty.
+    if (f && !why) {
+        uint64_t kept = pb_keep(PB.path, good, len);
+        if (kept) len = kept;
+        else why = "ends inside a record or holds a malformed one, and it cannot be cut back to its whole records";
     }
     if (why || !f) {   // start empty: the index is dropped and the file rewritten
         if (f) rt_log("vk_pipeline: pipeline binaries: %s %s (%.0f MB); starting empty", PB.path, why, len / 1048576.0);
