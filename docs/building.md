@@ -721,6 +721,11 @@ which builds the header alone: a walk before, after or around a frame, one still
 replay part first, capped by the overlap and the parts, and 100,000 random frames in which the census part never passes
 the frame and the parts keep their sum. No GPU, no game files.
 
+A change to how the on/off switches read their value (`runtime/perf.c` `rt_knob`) passes `python tests\rt_knob_check.py`,
+which cuts the function out of the file with its warning table and builds it with stand-ins for the settings and the
+log: 0, 1 and ab read as before without a line, and any other value reads as 1 and is logged once per switch. No game
+files.
+
 The lifter (`recomp/`) and the CPU headers (`runtime/cpu.h`, `runtime/simd.h`) are checked against Unicorn. Every lifter
 change passes these, all run with `.venv`:
 

@@ -939,12 +939,32 @@ int rt_ab(void) {
     return k == 1 || k == 2;
 }
 
+// rt_knob reads "0" as off, "ab" as the A/B blocks and anything else as on, so "off", "false" or "0 ; a note" turn a
+// switch on. A value other than 0, 1 and ab is logged once per switch; the names are string literals, so the table
+// holds their pointers (a full table logs no more). The value is still read as on: taking such words as off would
+// change what a written setting does.
+#define KNOB_WARNED 32
+static const char *knob_warned[KNOB_WARNED];
+
+static void knob_warn(const char *name, const char *key, const char *value) {
+    for (int i = 0; i < KNOB_WARNED; i++) {
+        const char *cur = __atomic_load_n(&knob_warned[i], __ATOMIC_ACQUIRE);
+        if (!cur && __atomic_compare_exchange_n(&knob_warned[i], &cur, name, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            rt_log("cfg: %s = '%s' is not 0, 1 or ab: read as 1", key, value);
+            return;
+        }
+        if (cur == name) return;   // logged already (another thread may have taken this slot for it just now)
+    }
+}
+
 int rt_knob(const char *name, const char *def) {
     char key[64];
     snprintf(key, sizeof key, "NX2NAVI_%s", name);
     const char *e = cfg_get(key);
     if (!e || !*e) e = def;
-    return !strcmp(e, "ab") ? 2 : strcmp(e, "0") != 0;
+    if (!strcmp(e, "ab")) return 2;
+    if (strcmp(e, "0") && strcmp(e, "1")) knob_warn(name, key, e);
+    return strcmp(e, "0") != 0;
 }
 
 // NX2NAVI_ONE_PER_CORE=1: the process keeps the first logical processor of each physical core, so busy threads (the
