@@ -557,12 +557,13 @@ static uint8_t *flatten_recording(const uint8_t *p, size_t n) {
 // memory (cmd_t.ctl is accounting only), so the 16 bytes at a copy's control position are whatever the game left
 // there, and a fingerprint of them that no longer matches says the game wrote there since. A reuse that writes the
 // same bytes (zeros, often) is not seen: the counts are a lower bound.
-// The "nvn copy sweep" thread does every read of guest memory, at its lowest priority: a recording thread taking the
-// fingerprint at EndRecording could fault into the lazy heap (an untouched control block) and wait there. Every
-// RETIRE_PERIOD_MS it fingerprints the copies made since its last pass (a queue copy_add fills, under retire_lock),
-// then visits up to RETIRE_BATCH of the copies it knows, from a cursor, and counts those no submission used for
-// COPY_IDLE_MINS whose bytes changed or whose memory is gone. It takes copy_lock shared only, RETIRE_CHUNK lookups at a
-// time; a copy that is no longer live (retired, or its handle reused: made_at and bytes differ) leaves its records.
+// The "nvn copy sweep" thread does every read of guest memory, at normal priority (retire_main says why): a recording
+// thread taking the fingerprint at EndRecording could fault into the lazy heap (an untouched control block) and wait
+// there. Every RETIRE_PERIOD_MS it fingerprints the copies made since its last pass (a queue copy_add fills, under
+// retire_lock), then visits up to RETIRE_BATCH of the copies it knows, from a cursor, and counts those no submission
+// used for COPY_IDLE_MINS whose bytes changed or whose memory is gone. It takes copy_lock shared only, RETIRE_CHUNK
+// lookups at a time; a copy that is no longer live (retired, or its handle reused: made_at and bytes differ) leaves its
+// records.
 #define RETIRE_PERIOD_MS 5000
 #define RETIRE_BATCH 4096
 #define RETIRE_CHUNK 64
@@ -677,9 +678,15 @@ static void retire_pass(void) {
     }
 }
 
+// The sweep runs at normal priority, as the threads it shares locks with: nearly every step of a pass holds one they
+// take (copy_lock shared, which copy_add, release_copies and the submission take exclusive; retire_lock, which
+// retire_queue takes on the recording thread; memory.c's lock through mem_read_hold and lz_lock through
+// mem_lazy_touches). A holder below their priority, preempted by any thread above its own (the pipeline workers at
+// BELOW_NORMAL are enough), would keep the recording and submitting threads waiting until the scheduler's starvation
+// boost ran it again, seconds later. A pass is at most RETIRE_BATCH lookups and 16-byte reads every RETIRE_PERIOD_MS.
 static void retire_main(void *arg) {
     (void)arg;
-    plat_thread_priority(PLAT_PRIO_LOWEST);
+    plat_thread_priority(PLAT_PRIO_NORMAL);   // set, not inherited from the recording thread that started it
     for (;;) {
         plat_sleep_ms(RETIRE_PERIOD_MS);
         retire_pass();

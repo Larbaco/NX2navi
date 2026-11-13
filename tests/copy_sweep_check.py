@@ -9,7 +9,9 @@ table of live copies and stub guest memory, and checks that
     without a read;
   - a retired copy, or one whose handle a new copy took, leaves its records and the counts;
   - the visits go on where the last pass stopped: two passes over 5000 copies look each up at least once and none
-    more than twice.
+    more than twice;
+  - the sweep thread does not lower its priority below normal (retire_main), as nearly every step of a pass holds a lock
+    the recording and submitting threads take.
 
 No game files. Usage: python tests/copy_sweep_check.py [--cc <clang>]
 """
@@ -151,6 +153,12 @@ def main():
         env['PATH'] = str(MSYS_BIN) + os.pathsep + env.get('PATH', '')
     src = (ROOT / 'runtime' / 'nvn_api_cmd.c').read_text(encoding='utf-8')
     body = cut(src, '// ---------- recording copies whose control memory the game reused', '\nstatic void retire_main(')
+    sweep = cut(src, '\nstatic void retire_main(', '\n}\n')
+    lowered = [p for p in ('PLAT_PRIO_IDLE', 'PLAT_PRIO_LOWEST', 'PLAT_PRIO_BELOW_NORMAL') if p in sweep]
+    if lowered:
+        print(f'FAIL: retire_main lowers the sweep thread\'s priority ({", ".join(lowered)}); it holds locks the '
+              'recording and submitting threads take')
+        return 1
     with tempfile.TemporaryDirectory(prefix='nx2navi-copy-sweep-') as tmp:
         c = Path(tmp) / 'check.c'
         c.write_text(HARNESS % body, encoding='utf-8')
