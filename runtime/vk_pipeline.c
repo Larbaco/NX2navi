@@ -4754,12 +4754,14 @@ static double now_ms(void) { return (double)plat_now_ns() / 1e6; }
 // by themselves: how many became usable through a fast link, and after how long.
 #define READY_SLOW_MS 50.0
 #define READY_LOGS 48
-static void ready_note(Pipe *p, int fast) {
+static void ready_note(Pipe *p, int fast, const VkPipeState *s) {
     // A pipeline goes into pipeline-keys.bin once a draw can use it, so at its fast link too: recorded only when its
     // optimised build had finished (job_build), the pipelines met in the last seconds of a session were lost. A session
     // of 2026-11-13 met 46 late pipelines in adult Kokiri Forest and ended about 2 s later; 23 of them never reached the
     // file, and with it the shared pipeline list (tools/pipeline_list.py merge). keys_note takes each record once.
-    if (fast && p->job && !p->job->prebuild) keys_note(&p->job->s);
+    // s is the state the caller built p from: a job whose optimised build failed is gone (job_build clears p->job and
+    // records nothing) before a queued fast link makes p usable, and that link is recorded from s.
+    if (fast && (p->job ? !p->job->prebuild : 1)) keys_note(p->job ? &p->job->s : s);
     if (!p->t_miss) return;
     double ms = (double)(plat_now_ns() - p->t_miss) / 1e6;
     p->t_miss = 0;
@@ -4813,7 +4815,7 @@ static void u_run(LibJob *lj) {
             VkPipeline f = gpl_link(&lj->s, &lj->k, lj->l, 1, &final);   // releases P.lock while linking
             if (f && !p->info.pipeline) {
                 p->fast = p->info.pipeline = f;
-                ready_note(p, 1);
+                ready_note(p, 1, &lj->s);
                 job_lower(p->job);   // its job now only does the optimised build
             } else if (f) {
                 vkDestroyPipeline(P.device, f, NULL);   // the job published one meanwhile
@@ -4881,7 +4883,7 @@ static void lib_worker(void *arg) {
         VkPipeline f = gpl_link(&j->s, &j->k, p->lay, 1, &final);   // releases P.lock while building
         if (f && !p->info.pipeline) {
             p->fast = p->info.pipeline = f, P.g.wlinks++, P.g.flinks++;
-            ready_note(p, 1);
+            ready_note(p, 1, &j->s);
             plat_cond_broadcast(&done_cv);
         } else if (f) {
             vkDestroyPipeline(P.device, f, NULL);
@@ -5166,7 +5168,7 @@ static void job_build(Job *j, int lowrun) {
     VkPipeline pipe = create_graphics(&j->s, &j->k, j->l, j->fs_off);
     plat_mutex_lock(&P.lock);
     if (pipe || !j->p->fast) __atomic_store_n(&j->p->info.pipeline, pipe, __ATOMIC_SEQ_CST);   // a failed optimised build keeps the fast-linked one
-    ready_note(j->p, 0);
+    ready_note(j->p, 0, &j->s);
     if (pipe && j->p->fast) P.g.swaps++, j->p->optimised = 1, fast_retire(j->p);
     j->p->building = 0;
     j->p->job = NULL;
@@ -5250,7 +5252,7 @@ static void pipe_worker(void *arg) {
             j->p->fast_tried = 1;
             if (f && !j->p->info.pipeline) {
                 j->p->fast = j->p->info.pipeline = f, P.g.wlinks++;
-                ready_note(j->p, 1);
+                ready_note(j->p, 1, &j->s);
                 plat_cond_broadcast(&done_cv);
                 j->low = 1, j->worker = -1, P.g.requeued++;
                 j->prev = NULL, j->next = A.low;
@@ -5679,7 +5681,7 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
         if (final) p->fast_tried = 1;
         if (f && !p->info.pipeline) {
             p->fast = p->info.pipeline = f;
-            ready_note(p, 1);
+            ready_note(p, 1, s);
             job_lower(p->job);
             plat_cond_broadcast(&done_cv);
         } else if (f) {
@@ -5763,7 +5765,7 @@ static void warm_builder(void *arg) {
         VkPipeline pipe = create_graphics(&j->s, &j->k, j->l, j->fs_off);
         plat_mutex_lock(&P.lock);
         if (pipe || !j->p->fast) __atomic_store_n(&j->p->info.pipeline, pipe, __ATOMIC_SEQ_CST);   // a failed optimised build keeps the fast-linked one
-        ready_note(j->p, 0);
+        ready_note(j->p, 0, &j->s);
         if (pipe && j->p->fast) P.g.swaps++, j->p->optimised = 1, fast_retire(j->p);
         j->p->building = 0;
         j->p->job = NULL;
