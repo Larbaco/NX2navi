@@ -1,10 +1,13 @@
 """Check runtime/gfx_shader.c's carry refusal: a previous translator's translation whose texture pool array has the
-earlier length (32768, vk.h VK_POOL_TEX_CARRIED) is never served, because its clamp draws every texture numbered from
-32768 up with slot 32767. The check cuts pool_short, carry_usable, carry_load, carry_find and carry_find_iid out of
-gfx_shader.c, compiles them against stand-ins for the disk and memory caches, and walks the lookups: a refused entry
-is freed and the lookup goes on to the next previous identity, the owned branch (gfx_shader_load_private) frees it as
-well, and entries with the current length, the sampler pool or no pool are served as before. pool_short_note, which
-counts the shaders of the earlier length that enter the memory cache for vk_texture.c's warning, counts those only.
+earlier length (32768, vk.h VK_POOL_TEX_CARRIED) is not served while the current translator may translate the shader,
+because its clamp draws every texture numbered from 32768 up with slot 32767. The check cuts pool_short, carry_usable,
+carry_load, carry_find, carry_find_iid and carry_last out of gfx_shader.c, compiles them against stand-ins for the disk
+and memory caches, and walks the lookups: a refused entry is freed and the lookup goes on to the next previous identity,
+the owned branch (gfx_shader_load_private) frees it as well, and entries with the current length, the sampler pool or no
+pool are served as before. carry_last, which runs once the current translator has failed the shader, serves the refused
+translation after all and puts it in the memory cache, where the memory lookup finds it. pool_short_note, which counts
+the shaders of the earlier length that enter the memory cache for vk_texture.c's warning, counts those only, and logs
+only one that is not carried.
 
 No GPU, no game files, any Python.
 
@@ -75,6 +78,9 @@ static void iid_of(const uint8_t h[32], const GfxShaderAnswers *a, const UseMask
 static int use_lookup(const uint8_t id[32], const uint8_t h[32], UseMask *m) { return 1; }
 static GfxShader *mem_find(const uint8_t key[32]) { return mem && mem->keyj == key[0] ? mem : NULL; }
 static GfxShader *mem_insert(GfxShader *s) { mem = s; return s; }
+static void key_hex(const uint8_t key[32], char out[65]) {
+    for (int i = 0; i < 32; i++) snprintf(out + 2 * i, 3, "%02x", key[i]);
+}
 static void shader_free(GfxShader *s) { frees++, live--; free(s->res[GFX_RES_TEX]); free(s); }
 static GfxShader *disk_load(const uint8_t key[32], const uint8_t *iid) {
     int j = key[0];
@@ -111,7 +117,7 @@ int main(void) {
     /* The earlier length: refused, freed, nothing served; counted once, logged once. */
     reset();
     disk_len[0] = 32768;
-    assert(!carry_find(h, &a, 1, 1));
+    assert(!carry_find(h, &a, 1, 1, 0));
     assert(loads == 1 && frees == 1 && live == 0 && !mem);
     assert(C.refused == 1 && logs == 1 && strstr(last_log, "texture pool"));
     assert(!carry_find_iid(iid, 1, NULL));
@@ -120,14 +126,14 @@ int main(void) {
     /* The lookup goes on to the next previous identity, whose translation has the current length. */
     reset();
     disk_len[0] = 32768, disk_len[1] = 40960;
-    GfxShader *s = carry_find(h, &a, 1, 1);
+    GfxShader *s = carry_find(h, &a, 1, 1, 0);
     assert(s && s->pool_len == 40960 && s->carried == 2 && mem == s);
     assert(C.refused == 1 && frees == 1 && live == 1);
 
     /* The current length, a shader with only the sampler pool and bound textures: served as before. */
     reset();
     disk_len[0] = 40960;
-    s = carry_find(h, &a, 1, 1);
+    s = carry_find(h, &a, 1, 1, 0);
     assert(s && s->carried == 1 && C.refused == 0 && logs == 0);
     reset();
     disk_len[0] = -1;   /* no texture pool array */
@@ -137,7 +143,7 @@ int main(void) {
     /* A stage mismatch is still refused for its own reason, before the pool is looked at. */
     reset();
     disk_len[0] = 32768, disk_stage[0] = 2;
-    assert(!carry_find(h, &a, 1, 1) && C.refused == 0 && frees == 1);
+    assert(!carry_find(h, &a, 1, 1, 0) && C.refused == 0 && frees == 1);
 
     /* The owned branch (gfx_shader_load_private): refused and freed, or handed over with *owned 1. */
     reset();
@@ -151,10 +157,32 @@ int main(void) {
     assert(s && owned && s->carried == 2 && !mem && C.refused == 1 && live == 1);
     shader_free(s);
 
+    /* The last resort (carry_last, after the current translator failed the shader): the refused translation serves
+       and enters the memory cache, from which the memory lookup (disk 0) serves it from then on; logged. */
+    reset();
+    disk_len[0] = 32768;
+    uint8_t key[32] = {0x5a};
+    assert(!carry_find(h, &a, 1, 1, 0) && C.refused == 1 && !mem && live == 0);
+    int logs0 = logs;
+    s = carry_last(key, h, &a, 1);
+    assert(s && s->pool_len == 32768 && s->carried == 1 && mem == s && live == 1 && C.refused == 1);
+    assert(logs == logs0 + 1 && strstr(last_log, "current translator failed"));
+    assert(carry_find(h, &a, 1, 0, 0) == s && loads == 2);
+    /* A usable translation found there is served as well, unlogged; none: NULL; another stage: still refused. */
+    reset();
+    disk_len[0] = 40960;
+    s = carry_last(key, h, &a, 1);
+    assert(s && s->pool_len == 40960 && logs == 0);
+    reset();
+    assert(!carry_last(key, h, &a, 1) && loads == 0);
+    reset();
+    disk_len[0] = 32768, disk_stage[0] = 2;
+    assert(!carry_last(key, h, &a, 1) && frees == 1 && live == 0 && !mem);
+
     /* Memory only (disk 0) never reads the disk. */
     reset();
     disk_len[0] = 32768;
-    assert(!carry_find(h, &a, 1, 0) && !carry_find_iid(iid, 0, NULL) && loads == 0);
+    assert(!carry_find(h, &a, 1, 0, 0) && !carry_find_iid(iid, 0, NULL) && loads == 0);
 
     /* pool_short_note (what mem_insert calls for every shader entering the memory cache): only shaders with a pool
        array of the earlier length count, the first is logged, gfx_shader_pool_short_seen gives the count. */
@@ -168,13 +196,17 @@ int main(void) {
     GfxShader *none = disk_load(k, NULL);
     pool_short_note(cur), pool_short_note(none);
     assert(gfx_shader_pool_short_seen() == 0 && logs == 0);
+    old->carried = 1;   /* served by carry_last, which logs it: counted, not logged as the translator in use */
+    pool_short_note(old);
+    assert(gfx_shader_pool_short_seen() == 1 && logs == 0);
+    old->carried = 0;
     pool_short_note(old), pool_short_note(old);
-    assert(gfx_shader_pool_short_seen() == 2 && logs == 1 && strstr(last_log, "older than this runtime"));
+    assert(gfx_shader_pool_short_seen() == 3 && logs == 1 && strstr(last_log, "older than this runtime"));
     shader_free(cur), shader_free(old), shader_free(none);
 
     reset();
     printf("carry pool check: earlier-length pool translations refused and freed, the lookup goes on, others served; "
-           "shaders of the earlier length in use counted\n");
+           "a refused one serves once the current translator failed; shaders of the earlier length in use counted\n");
     return 0;
 }
 '''

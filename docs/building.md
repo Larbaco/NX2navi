@@ -654,9 +654,10 @@ the header alone, checks the parse of both versions and has `make_game.py` read 
 files, no GPU.
 
 A change to which translations of a previous translator are served (`runtime/gfx_shader.c` `carry_usable`,
-`carry_load`, `carry_find_iid`) passes `python tests\carry_pool_check.py`, which cuts the carry lookups out of
-`gfx_shader.c` and runs them against stand-in caches: a translation whose texture pool array has the earlier length
-(32768) is freed and the lookup goes on, one with the current length or no pool is served. No game files, no GPU.
+`carry_load`, `carry_find_iid`, `carry_last`) passes `python tests\carry_pool_check.py`, which cuts the carry lookups
+out of `gfx_shader.c` and runs them against stand-in caches: a translation whose texture pool array has the earlier
+length (32768) is freed and the lookup goes on, one with the current length or no pool is served, and once the current
+translator has failed the shader the refused translation serves from the memory cache. No game files, no GPU.
 
 A change to how the translator children are read and restarted (`runtime/platform/win32.c` `plat_child_read`,
 `runtime/gfx_shader.c` `child_exchange_raw`, `svc_request`) passes `python tests\child_timeout_check.py`, which builds

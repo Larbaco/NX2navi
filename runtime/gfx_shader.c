@@ -30,7 +30,8 @@
 // translator thus keeps that translation for the rest of the session, deliberately: no pipeline is built a second
 // time for it, and the pass below needs no way to swap shaders under the renderer. A shader first met after the pass
 // translated it gets the new translation. A translation that indexes the texture pool with the earlier translator's
-// length is never served (carry_usable): its clamp would draw the textures numbered past that length with another.
+// length is not served (carry_usable): its clamp would draw the textures numbered past that length with another. It
+// serves only once the current translator has failed the shader (carry_last), as the last resort.
 // The background pass (gfx_shader_carry_start, after the boot prewarm) translates every stored input that has a
 // previous translator's entry again under the current identity, on a translator child of its own that runs at idle
 // priority, outside the pool, and waits while on-demand translations are queued or running. It writes cache files only;
@@ -1993,13 +1994,16 @@ static int pool_short(const GfxShader *s) {
     return 0;
 }
 
-// Shaders that entered the memory cache with a texture pool array of the earlier length (mem_insert). carry_usable
-// keeps the carried ones out, so these come from a translator in use that is older than the runtime's pool (a dev
-// build pointed at an old one, or an install whose translator was not rebuilt). Counted, the first logged;
-// vk_texture.c vk_texture_register names the count when the game registers a texture they cannot reach.
-static volatile int32_t n_pool_short;
+// Shaders that entered the memory cache with a texture pool array of the earlier length (mem_insert), all counted;
+// vk_texture.c vk_texture_register names the count when the game registers a texture they cannot reach. carry_usable
+// keeps the carried ones out except as the last resort (carry_last, which logs those), so the first one that is not
+// carried is logged: it comes from a translator in use that is older than the runtime's pool (a dev build pointed at
+// an old one, or an install whose translator was not rebuilt).
+static volatile int32_t n_pool_short, pool_short_said;
 static void pool_short_note(const GfxShader *s) {
-    if (!pool_short(s) || plat_inc32(&n_pool_short) != 1) return;
+    if (!pool_short(s)) return;
+    plat_inc32(&n_pool_short);
+    if (s->carried || plat_inc32(&pool_short_said) != 1) return;
     rt_log("gfx_shader: a shader of the translator in use indexes the texture pool with %d entries: it reads slot %d "
            "for every texture numbered from %d up; the translator is older than this runtime (tools/build_xlate.py "
            "builds the current one)", POOL_TEX_SHORT, POOL_TEX_SHORT - 1, POOL_TEX_SHORT);
@@ -2010,24 +2014,26 @@ uint32_t gfx_shader_pool_short_seen(void) { return (uint32_t)__atomic_load_n(&n_
 // Whether previous identity j's translation s may serve. One that indexes the texture pool with the earlier length is
 // not used: the lookup goes on to the next previous identity and then to a translation under the current one (the boot
 // prewarm translates the shaders it names on the boot screen, others are translated at first use). Served, it would
-// keep the clamp for the whole session (see "Carry" at the top). Counted for gfx_shader_record_flush; the first logged.
+// keep the clamp for the whole session (see "Carry" at the top). Only when the current translator fails the shader
+// does it serve after all (carry_last). Counted for gfx_shader_record_flush; the first logged.
 static int carry_usable(const GfxShader *s, int j) {
     if (!pool_short(s)) return 1;
     if (plat_inc64(&C.refused) == 1) {
         const uint8_t *id = C.prev[j];
         rt_log("gfx_shader: carry: translations of a previous translator (%02x%02x%02x%02x) that index the texture pool "
                "with %d entries are not used (textures numbered from %d up would read slot %d); those shaders are "
-               "translated again", id[0], id[1], id[2], id[3], POOL_TEX_SHORT, POOL_TEX_SHORT, POOL_TEX_SHORT - 1);
+               "translated again, and one the current translator fails keeps it", id[0], id[1], id[2], id[3],
+               POOL_TEX_SHORT, POOL_TEX_SHORT, POOL_TEX_SHORT - 1);
     }
     return 0;
 }
 
 // Previous identity j's entry `key` from the disk cache into the memory cache; NULL when the cache has no valid one.
-// stage (GFX_STAGE_*, -1 any): an entry of another stage than the request's is not used, nor one carry_usable refuses.
-// Every entry passes disk_load's checks (whole SPIR-V, a .res.json naming its stage, both from the pack or both loose),
-// which matters most for compute shaders: the replay thread dispatches one the moment it has it (vk_exec_draw.c
-// shader_for).
-static GfxShader *carry_load(const uint8_t key[32], const uint8_t iid[32], int stage, int j) {
+// stage (GFX_STAGE_*, -1 any): an entry of another stage than the request's is not used, nor one carry_usable refuses
+// unless short_ok (carry_last, after the current translator failed the shader). Every entry passes disk_load's checks
+// (whole SPIR-V, a .res.json naming its stage, both from the pack or both loose), which matters most for compute
+// shaders: the replay thread dispatches one the moment it has it (vk_exec_draw.c shader_for).
+static GfxShader *carry_load(const uint8_t key[32], const uint8_t iid[32], int stage, int j, int short_ok) {
     GfxShader *s = disk_load(key, iid);
     if (!s) return NULL;
     if (stage >= 0 && s->stage != stage) {
@@ -2037,7 +2043,7 @@ static GfxShader *carry_load(const uint8_t key[32], const uint8_t iid[32], int s
         shader_free(s);
         return NULL;
     }
-    if (!carry_usable(s, j)) {
+    if (!short_ok && !carry_usable(s, j)) {
         shader_free(s);
         return NULL;
     }
@@ -2047,7 +2053,8 @@ static GfxShader *carry_load(const uint8_t key[32], const uint8_t iid[32], int s
 
 // A previous translator's translation of (code hash, answers) for a stage, newest identity first: from the memory cache
 // only (disk 0), or from the memory cache and then the disk cache (disk 1). NULL when none has one or carry is off.
-static GfxShader *carry_find(const uint8_t h[32], const GfxShaderAnswers *a, int stage, int disk) {
+// short_ok: as carry_load's.
+static GfxShader *carry_find(const uint8_t h[32], const GfxShaderAnswers *a, int stage, int disk, int short_ok) {
     if (!carry_on()) return NULL;
     for (int j = 0; j < C.n_prev; j++) {
         UseMask m;
@@ -2056,7 +2063,7 @@ static GfxShader *carry_find(const uint8_t h[32], const GfxShaderAnswers *a, int
         iid_of(h, a, &m, iid);
         key_of_input_id(C.prev_eff[j], iid, key);
         GfxShader *s = mem_find(key);
-        if (s || (disk && (s = carry_load(key, iid, stage, j)))) return s;
+        if (s || (disk && (s = carry_load(key, iid, stage, j, short_ok)))) return s;
     }
     return NULL;
 }
@@ -2073,7 +2080,7 @@ static GfxShader *carry_find_iid(const uint8_t iid[32], int disk, int *owned) {
             if (s) return s;
             continue;
         }
-        if (!owned) s = carry_load(key, iid, -1, j);
+        if (!owned) s = carry_load(key, iid, -1, j, 0);
         else if ((s = disk_load(key, iid))) {
             if (carry_usable(s, j)) s->carried = (uint8_t)(j + 1), *owned = 1;
             else shader_free(s), s = NULL;
@@ -2081,6 +2088,22 @@ static GfxShader *carry_find_iid(const uint8_t iid[32], int disk, int *owned) {
         if (s) return s;
     }
     return NULL;
+}
+
+// The current translator failed the shader of cache key `key` (code hash h): a previous translator's translation that
+// carry_usable refused serves after all, the last resort. Drawn with the clamp, only the textures numbered from 32768 up
+// are wrong, where without it every draw of the shader would be skipped, or a compute dispatch left out, for the whole
+// session. It enters the memory cache, so the lookups' memory step serves it from then on. NULL when none has one.
+static GfxShader *carry_last(const uint8_t key[32], const uint8_t h[32], const GfxShaderAnswers *a, int stage) {
+    static volatile int32_t n_logged;
+    GfxShader *s = carry_find(h, a, stage, 1, 1);
+    if (s && pool_short(s) && plat_inc32(&n_logged) <= 4) {
+        char hex[65];
+        key_hex(key, hex);
+        rt_log("gfx_shader: carry: the current translator failed %s; its previous translation (texture pool of %d "
+               "entries) serves", hex, POOL_TEX_SHORT);
+    }
+    return s;
 }
 
 // Whether the cache holds a previous translator's entry of input iid.
@@ -2378,18 +2401,19 @@ static int failed_slot(const uint8_t key[32], int insert) {
 // The lookup order with carry (see "Carry" at the top): the current key in memory, a previous translator's entry in
 // memory, the current key on disk, a previous translator's entry on disk. A key whose translation failed skips the
 // last: that lookup found nothing usable before the translation, and a refused entry (carry_usable) would otherwise be
-// read from the disk again at every call (a compute shader's at every dispatch, vk_exec_draw.c shader_for).
+// read from the disk again at every call (a compute shader's at every dispatch, vk_exec_draw.c shader_for). When the
+// translation fails, a refused entry serves after all (carry_last); it is in memory then, so the key is not marked.
 static const GfxShader *get_one(const Req *r, int stage, const uint8_t *control, const uint8_t *code,
                                 const GfxShaderAnswers *a) {
     GfxShader *s = mem_find(r->key);
-    if (s || (s = carry_find(r->code_hash, a, stage, 0))) return plat_inc64(&n_hits), s;
+    if (s || (s = carry_find(r->code_hash, a, stage, 0, 0))) return plat_inc64(&n_hits), s;
     paths();
     if (!cache_dir[0]) return fail("no cache directory", NULL);
     if (r->final && (s = disk_load(r->key, r->iid))) return plat_inc64(&n_hits), mem_insert(s);
     if (failed_slot(r->key, 0)) return NULL;
-    if ((s = carry_find(r->code_hash, a, stage, 1))) return plat_inc64(&n_hits), s;
+    if ((s = carry_find(r->code_hash, a, stage, 1, 0))) return plat_inc64(&n_hits), s;
     const GfxShader *t = translate(r, stage, control, code, a);
-    if (!t) failed_slot(r->key, 1);
+    if (!t && !(t = carry_last(r->key, r->code_hash, a, stage))) failed_slot(r->key, 1);
     return t;
 }
 
@@ -2666,7 +2690,8 @@ static const GfxShader *translate(const Req *r, int stage, const uint8_t *contro
 // ---- background translation (gfx_shader_get_async)
 // svc_runtime_limit() workers, one per translator child. A job owns copies of the control section and the code, so the
 // guest may free or rewrite its program while the job waits. A key stays in X.waits while its job is queued or running,
-// and for good when the translation failed, so a failing shader is not sent again on every draw.
+// and for good when the translation failed and no previous translation serves instead (carry_last), so a failing shader
+// is not sent again on every draw.
 typedef struct XJob {
     struct XJob *next;
     int stage;
@@ -2747,14 +2772,15 @@ static void xlate_worker(void *arg) {
         XJob *j = X.head;
         if (!(X.head = j->next)) X.tail = NULL;
         plat_mutex_unlock(&X.lock);
-        const GfxShader *s = translate(&j->r, j->stage, j->control, j->code, &j->a);
+        const GfxShader *t = translate(&j->r, j->stage, j->control, j->code, &j->a), *s = t;
+        if (!s) s = carry_last(j->r.key, j->r.code_hash, &j->a, j->stage);   // in memory: get_async_one's first lookup
         plat_mutex_lock(&X.lock);
         XWait **w = wait_slot(j->r.key), *e = *w;
         if (e && s) *w = e->next, free(e);
         else if (e) e->failed = 1;
         plat_mutex_unlock(&X.lock);
         plat_cond_broadcast(&X.done);
-        if (s) plat_inc64(&n_async);
+        if (t) plat_inc64(&n_async);
         free(j->control), free(j->code), free(j);
     }
     return;
@@ -2771,7 +2797,7 @@ static void load_worker(void *arg) {
         if (!(X.lhead = j->next)) X.ltail = NULL;
         plat_mutex_unlock(&X.lock);
         GfxShader *d = j->r.final ? disk_load(j->r.key, j->r.iid) : NULL;
-        const GfxShader *s = d ? mem_insert(d) : carry_find(j->r.code_hash, &j->a, j->stage, 1);
+        const GfxShader *s = d ? mem_insert(d) : carry_find(j->r.code_hash, &j->a, j->stage, 1, 0);
         plat_mutex_lock(&X.lock);
         if (s) {
             XWait **w = wait_slot(j->r.key), *e = *w;
@@ -2835,7 +2861,7 @@ const GfxShader *gfx_shader_get_async(int stage, const uint8_t *control, const u
 static const GfxShader *get_async_one(Req r, int stage, const uint8_t *control, const uint8_t *code,
                                       const GfxShaderAnswers *a, int *pending) {
     GfxShader *s = mem_find(r.key);
-    if (s || (s = carry_find(r.code_hash, a, stage, 0))) return plat_inc64(&n_hits), s;   // get_one's order
+    if (s || (s = carry_find(r.code_hash, a, stage, 0, 0))) return plat_inc64(&n_hits), s;   // get_one's order
     plat_mutex_lock_shared(&X.lock);
     XWait *w = *wait_slot(r.key);
     int failed = w && w->failed;
@@ -2847,7 +2873,7 @@ static const GfxShader *get_async_one(Req r, int stage, const uint8_t *control, 
     if (read) {
         uint64_t t0 = plat_now_ns();
         GfxShader *d = r.final ? disk_load(r.key, r.iid) : NULL;
-        s = d ? mem_insert(d) : carry_find(r.code_hash, a, stage, 1);
+        s = d ? mem_insert(d) : carry_find(r.code_hash, a, stage, 1, 0);
         load_spent(plat_now_ns() - t0);
         if (s) return plat_inc64(&n_hits), s;
     }
@@ -2879,9 +2905,10 @@ static const GfxShader *get_async_one(Req r, int stage, const uint8_t *control, 
     if (raced) return *pending = 1, NULL;
     if (!read) {                                           // no worker or out of memory: everything here
         GfxShader *d = r.final ? disk_load(r.key, r.iid) : NULL;
-        if ((s = d ? mem_insert(d) : carry_find(r.code_hash, a, stage, 1))) return plat_inc64(&n_hits), s;
+        if ((s = d ? mem_insert(d) : carry_find(r.code_hash, a, stage, 1, 0))) return plat_inc64(&n_hits), s;
     }
-    return translate(&r, stage, control, code, a);
+    const GfxShader *t = translate(&r, stage, control, code, a);
+    return t ? t : carry_last(r.key, r.code_hash, a, stage);
 }
 
 const GfxShader *gfx_shader_await(int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size,
@@ -3395,8 +3422,9 @@ void gfx_shader_record_flush(int force) {
     if (force && served != __atomic_exchange_n(&C.served_logged, served, __ATOMIC_RELAXED))   // the saves and the exit
         rt_log("gfx_shader: carry: %lld shaders served from a previous translator this session", (long long)served);
     if (force && refused != __atomic_exchange_n(&C.refused_logged, refused, __ATOMIC_RELAXED))
-        rt_log("gfx_shader: carry: a previous translator's translation was not used %lld times this session (texture "
-               "pool of %d entries)", (long long)refused, POOL_TEX_SHORT);
+        rt_log("gfx_shader: carry: a previous translator's translation was passed over %lld times this session "
+               "(texture pool of %d entries; it serves only where the current translator failed)", (long long)refused,
+               POOL_TEX_SHORT);
     if (!RC.on || (!force && now - last < 2000)) return;
     last = now;
     // The files are written outside RC.lock, which the render thread takes to record a new answer.
