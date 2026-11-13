@@ -34,7 +34,8 @@ static void crash(const PlatCrash *x) {
     // main.c crash_handler's first call while the boot builds pipelines: vk_pipeline_crash_note writes a file
     static const char text[] = "the process faulted while the boot built pipelines\n";
     int wrote = plat_file_write(file, text, sizeof text - 1);
-    log2k("report line 1: %s (%#x), the file written: %d\n", x->what, x->code, wrote);
+    log2k("report line 1: %s (%#x) on thread %s, the file written: %d\n", x->what, x->code,
+          plat_thread_name() ? plat_thread_name() : "(unnamed)", wrote);
     log2k("report line 2: %d host frames\n", x->nframes);
     void *f[62];
     USHORT n = RtlCaptureStackBackTrace(0, 62, f, NULL);

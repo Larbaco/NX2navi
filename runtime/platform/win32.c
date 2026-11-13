@@ -34,7 +34,11 @@ struct PlatThread {
     PlatThreadFn fn;
     void *arg;
     volatile int32_t state;   // 0 running and owned by its maker, 1 detached, 2 its function has returned
+    char name[32];
 };
+
+static __thread char thread_name[32];   // plat_thread_name: copied at the start, as a detached thread's struct may go
+const char *plat_thread_name(void) { return thread_name[0] ? thread_name : NULL; }
 
 // What a thread made here keeps for itself is given back when its function returns: the handles below (the sleep
 // timer of plat_wait_ns, the events of plat_file_pread and plat_file_pwrite), what the other files keep per thread
@@ -58,6 +62,7 @@ void plat_stack_guarantee(void) {
 static DWORD WINAPI thread_main(LPVOID p) {
     PlatThread *t = p;
     plat_stack_guarantee();
+    memcpy(thread_name, t->name, sizeof thread_name);
     t->fn(t->arg);
     plat_thread_end_run();
     thread_handles_close();
@@ -74,6 +79,7 @@ PlatThread *plat_thread_new_ex(PlatThreadFn fn, void *arg, const char *name, siz
     if (!t) return NULL;
     t->fn = fn;
     t->arg = arg;
+    if (name) snprintf(t->name, sizeof t->name, "%s", name);
     t->h = CreateThread(NULL, stack ? stack : PLAT_STACK_DEFAULT, thread_main, t,
                         CREATE_SUSPENDED | STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     if (!t->h) { free(t); return NULL; }

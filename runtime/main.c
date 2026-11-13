@@ -331,6 +331,15 @@ static int foreign_hook(const char *module) {
            strstr(low, "reshade") || strstr(low, "obs-vulkan") || strstr(low, "nvspcap");
 }
 
+// What the crash report says of the faulting module. A fault on the thread that hands the frame limit to RivaTuner
+// Statistics Server (rtss_limit.c, the "rtss" thread) is in the game's own calls of RTSS's library or around them,
+// whatever module it is in (the one such crash faulted in ntdll): the note names that and the setting that keeps the
+// game from calling it. On other threads RTSS's library is its overlay, which RTSS put there: foreign_hook's note.
+enum { CRASH_NOTE_NONE, CRASH_NOTE_FOREIGN, CRASH_NOTE_RTSS };
+static int crash_module_note(const char *module, int on_rtss_thread) {
+    return on_rtss_thread ? CRASH_NOTE_RTSS : foreign_hook(module) ? CRASH_NOTE_FOREIGN : CRASH_NOTE_NONE;
+}
+
 // Set when main_run has returned: the mode's work is done and saved, and all that still runs is the C runtime's exit
 // and, inside ExitProcess, the detach call of every library in the process, the graphics driver's and those other
 // programs put there. A fault in one of them is not a failure of the run. On one PC an injector's Vulkan layer faulted
@@ -363,9 +372,16 @@ static void crash_handler(const PlatCrash *x) {
         rt_logf(", %s address %#llx", x->access == 1 ? "writing" : x->access == 8 ? "executing" : "reading",
                 (unsigned long long)x->addr);
     rt_log_raw("\n", 1);
-    if (foreign_hook(x->module))
+    const char *thread = plat_thread_name();
+    int on_rtss = thread && !strcmp(thread, "rtss");
+    int module_note = crash_module_note(x->module, on_rtss);
+    if (module_note == CRASH_NOTE_FOREIGN)
         rt_logf("  %s is not part of the game: a recording, overlay or capture program put it into the game. Close that "
                 "program or turn off its Vulkan capture, then start the game again\n", x->module);
+    else if (module_note == CRASH_NOTE_RTSS)
+        rt_logf("  the fault is on the thread that hands the frame limit to RivaTuner Statistics Server (rtss_limit.c), "
+                "in the game's calls of its library or around them; rtss = 0 in nx2navi.ini keeps the game from calling "
+                "it\n");
     // what the thread was doing (a pipeline build names its shaders): the stderr note crash_veh writes misses the log
     const char *note = plat_crash_context_get();
     if (note) rt_logf("  the thread was %s\n", note);
@@ -399,7 +415,9 @@ static void crash_handler(const PlatCrash *x) {
     rt_fatal_notes();   // the card, its driver and the memory settings in effect (vk_device.c fatal_note)
     kern_free_cores_note();
     fs_save_crash_wait();   // a save the game already reported as done finishes first (bounded; fs_host.c)
-    rtss_limit_restore();   // after the report: RivaTuner Statistics Server's profile as it was
+    // after the report: RivaTuner Statistics Server's profile as it was; not from its own thread, which holds the lock
+    // the restore would try for a second
+    if (!on_rtss) rtss_limit_restore();
     rt_rumble_stop_bounded();   // a controller on HD rumble stops (dispatch.c: 300 ms at most, SDL may be the crash)
     fflush(stderr);
     prof_sampler_write();   // NX2NAVI_PROFILE: what was sampled until the crash (it gives up after 2 s if the sampler hangs)

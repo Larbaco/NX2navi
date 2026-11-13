@@ -22,6 +22,9 @@ typedef void (*PlatThreadFn)(void *arg);
 #define PLAT_STACK_GUARANTEE 32768
 void plat_stack_guarantee(void);
 PlatThread *plat_thread_new(PlatThreadFn fn, void *arg, const char *name);
+// The name the calling thread was made with here (plat_thread_new, plat_thread_spawn), NULL for a thread made
+// elsewhere; kept in the thread itself, so the crash report can read it with any lock held.
+const char *plat_thread_name(void);
 // The same with the stack size given: stack bytes reserved for the thread (0: PLAT_STACK_DEFAULT). The default is the
 // same on every OS, so a thread that fits on Windows fits elsewhere.
 #define PLAT_STACK_DEFAULT (16u << 20)

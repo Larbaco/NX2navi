@@ -54,7 +54,10 @@ def main():
                            timeout=60)
         lines = [f'report line {i}' for i in (1, 2, 3)]
         missing = [x for x in lines if x not in p.stdout]
-        ok = p.returncode == 71 and not missing and 'stack overflow' in p.stdout and 'the file written: 1' in p.stdout
+        # platform.h plat_thread_name, which the crash report reads: the spawned thread's name; the fiber runs on the
+        # main thread, which the platform layer did not make
+        named = ('on thread deep' if mode == 'thread' else 'on thread (unnamed)') in p.stdout
+        ok = p.returncode == 71 and not missing and 'stack overflow' in p.stdout and 'the file written: 1' in p.stdout and named
         print(f'a stack overflow on a {mode}: exit code {p.returncode & 0xffffffff:#x} (want 0x47), '
               f'{3 - len(missing)} of 3 report lines: {"ok" if ok else "FAIL"}', flush=True)
         if not ok:

@@ -1,7 +1,8 @@
 """The crash report's test for a module another program put into the game (runtime/main.c foreign_hook): the Vulkan
 layers, hooks and overlays of recorders, overlays and capture tools are named as theirs; the game's own libraries and
-the drivers are not, nor the validation layer the game loads itself (NX2NAVI_VK_VALIDATION). Builds foreign_hook, cut
-out of main.c, into a test program. No game files.
+the drivers are not, nor the validation layer the game loads itself (NX2NAVI_VK_VALIDATION). A fault on the thread that
+sets RivaTuner Statistics Server's limit gets the RTSS note whatever the module (main.c crash_module_note). Builds those
+functions, cut out of main.c, into a test program. No game files.
 
 Usage: python tests/foreign_hook_check.py [path to clang]"""
 import os
@@ -43,8 +44,13 @@ def function(signature):
 
 def main():
     names = FOREIGN + OWN
-    src = ('#include <ctype.h>\n#include <stdio.h>\n#include <string.h>\n' + function('static int foreign_hook(')
+    enum = source[source.index('enum { CRASH_NOTE_NONE'):]
+    enum = enum[:enum.index('\n') + 1]
+    src = ('#include <ctype.h>\n#include <stdio.h>\n#include <string.h>\n' + function('static int foreign_hook(') + '\n'
+           + enum + function('static int crash_module_note(')
            + '\nint main(int argc, char **argv) {\n    for (int i = 1; i < argc; i++) printf("%d\\n", foreign_hook(argv[i]));\n'
+           '    printf("%d %d %d %d\\n", crash_module_note("RTSSHooks64.dll", 1), crash_module_note("ntdll.dll", 1),\n'
+           '           crash_module_note("RTSSHooks64.dll", 0), crash_module_note("amdvlk64.dll", 0));\n'
            '    return 0;\n}\n')
     work = ROOT / 'build' / 'test' / 'foreign_hook'
     work.mkdir(parents=True, exist_ok=True)
@@ -62,7 +68,12 @@ def main():
             bad += 1
         print(f'{name or "(outside every module)"}: {"another program" if g == "1" else "not foreign"}'
               f'{"" if g == want else " FAIL"}')
-    if len(got) != len(names):
+    notes = got[len(names):]
+    ok = notes == ['2', '2', '1', '0']
+    print(f'crash note: on the RTSS thread (RTSSHooks64.dll, ntdll.dll) the RTSS note, elsewhere RTSSHooks64.dll foreign, '
+          f'a driver none: {"ok" if ok else "FAIL " + str(notes)}')
+    bad += not ok
+    if len(got) != len(names) + 4:
         bad += 1
     print(f'foreign_hook_check: {"FAILED" if bad else "ok"}')
     return 1 if bad else 0

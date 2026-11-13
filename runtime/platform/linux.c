@@ -109,8 +109,12 @@ static void alt_stack(void) {
 static __thread cpu_set_t cpu_rest;
 static __thread int cpu_rest_set;
 
+static __thread char thread_name[16];   // plat_thread_name: copied at the start, as a detached thread's struct may go
+const char *plat_thread_name(void) { return thread_name[0] ? thread_name : NULL; }
+
 static void *thread_main(void *p) {
     PlatThread *t = p;
+    memcpy(thread_name, t->name, sizeof thread_name);
     alt_stack();
     __atomic_store_n(&t->tid, (int32_t)syscall(SYS_gettid), __ATOMIC_RELEASE);
     if (t->name[0]) pthread_setname_np(pthread_self(), t->name);
