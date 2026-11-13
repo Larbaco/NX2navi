@@ -562,8 +562,8 @@ static uint8_t *flatten_recording(const uint8_t *p, size_t n) {
 // there. Every RETIRE_PERIOD_MS it fingerprints the copies made since its last pass (a queue copy_add fills, under
 // retire_lock), then visits up to RETIRE_BATCH of the copies it knows, from a cursor, and counts those no submission
 // used for COPY_IDLE_MINS whose bytes changed or whose memory is gone. It takes copy_lock shared only, RETIRE_CHUNK
-// lookups at a time; a copy that is no longer live (retired, or its handle reused: made_at and bytes differ) leaves its
-// records.
+// lookups at a time. Each handle has one record: a copy that is no longer live (retired, or its handle reused: made_at
+// and bytes differ) leaves its record at its visit, and a new copy with a known handle replaces the older record.
 #define RETIRE_PERIOD_MS 5000
 #define RETIRE_BATCH 4096
 #define RETIRE_CHUNK 64
@@ -577,6 +577,7 @@ static retire_new *retire_q;
 static uint32_t retire_qn, retire_qcap;
 static retire_rec *retire_recs;                   // the sweep thread's own
 static uint32_t retire_nrec, retire_cap, retire_cursor;
+static nvn_hmap retire_at = {.klen = 8};          // handle -> 1 + its record's index; the sweep thread's own
 static volatile int64_t retire_changed_n, retire_changed_b, retire_gone_n, retire_gone_b;
 
 // 16 bytes of guest memory at lo as a fingerprint: odd, FP_GONE or FP_UNKNOWN. An untouched page of the lazy heap reads
@@ -631,6 +632,17 @@ static void retire_queue(uint64_t handle, uint64_t lo, uint64_t made_at, uint64_
     plat_mutex_unlock(&retire_lock);
 }
 
+// Drops record i (sweep thread): it leaves the counts and the last record takes its place.
+static void retire_drop(uint32_t i) {
+    retire_rec *r = &retire_recs[i];
+    retire_count(r->state, r->bytes, -1);
+    nvn_hm_del(&retire_at, &r->handle);
+    if (i != --retire_nrec) {
+        *r = retire_recs[retire_nrec];
+        nvn_hm_put(&retire_at, &r->handle, (void *)(uintptr_t)(i + 1));
+    }
+}
+
 // One pass of the sweep thread: the new copies' fingerprints, then up to RETIRE_BATCH visits from the cursor.
 static void retire_pass(void) {
     plat_mutex_lock(&retire_lock);
@@ -639,14 +651,20 @@ static void retire_pass(void) {
     retire_q = NULL, retire_qn = retire_qcap = 0;
     plat_mutex_unlock(&retire_lock);
     for (uint32_t i = 0; i < qn; i++) {
+        // A record that already holds this handle is of an older copy the game has retired since: a copy released by
+        // AddControlMemory and recorded again before the next submission can get the same block, size and made_at
+        // back, and both records would then count the one live copy.
+        void *at = nvn_hm_get(&retire_at, &q[i].handle);
+        if (at) retire_drop((uint32_t)(uintptr_t)at - 1);
         if (retire_nrec == retire_cap) {
             uint32_t cap = retire_cap ? retire_cap * 2 : 1024;
             retire_rec *v = realloc(retire_recs, cap * sizeof *v);
             if (!v) break;   // the rest go uncounted
             retire_recs = v, retire_cap = cap;
         }
-        retire_recs[retire_nrec++] =
+        retire_recs[retire_nrec] =
             (retire_rec){q[i].handle, q[i].lo, q[i].made_at, q[i].bytes, ctl_fingerprint(q[i].lo), RS_NONE};
+        nvn_hm_put(&retire_at, &q[i].handle, (void *)(uintptr_t)(++retire_nrec));
     }
     free(q);
     uint64_t min = copy_minute();
@@ -671,7 +689,7 @@ static void retire_pass(void) {
         for (uint32_t k = n; k-- > 0;) {
             retire_rec *r = &retire_recs[c + k];
             retire_visit(r, live[k], used[k], min);
-            if (!live[k]) *r = retire_recs[--retire_nrec];
+            if (!live[k]) retire_drop(c + k);
         }
         retire_cursor = c + n;
         todo -= n;

@@ -8,6 +8,8 @@ table of live copies and stub guest memory, and checks that
   - a lazily armed range is never read (unknown, not counted), and an untouched page of the lazy heap is taken as zeros
     without a read;
   - a retired copy, or one whose handle a new copy took, leaves its records and the counts;
+  - a copy released and recorded again before the next submission, with the same handle, made_at and size, keeps one
+    record, fingerprinted as its control bytes are now, so the one copy is not counted twice;
   - the visits go on where the last pass stopped: two passes over 5000 copies look each up at least once and none
     more than twice;
   - the sweep thread does not lower its priority below normal (retire_main), as nearly every step of a pass holds a lock
@@ -31,6 +33,7 @@ HARNESS = r'''
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "nvn_hmap.h"
 typedef int PlatMutex;
 #define PLAT_MUTEX_INIT 0
 static void plat_mutex_lock(PlatMutex *m) { (void)m; }
@@ -104,6 +107,15 @@ int main(void) {
           "changed: copies 2 and 5 (%%lld, %%lld bytes)", (long long)ld(&retire_changed_n), (long long)ld(&retire_changed_b));
     CHECK(ld(&retire_gone_n) == 1 && ld(&retire_gone_b) == 3000, "gone: copy 3 (%%lld)", (long long)ld(&retire_gone_n));
     CHECK(reads_armed == 0, "the armed range stays unread");
+    // Copy 2 released and recorded again before the next submission, over its changed control bytes: the same handle,
+    // made_at and size come back. Its older record goes, and the new copy is fingerprinted as the bytes are now.
+    retire_queue(2, (uint64_t)(uintptr_t)ctl[2], copies[2].made_at, copies[2].bytes);
+    retire_pass();
+    CHECK(retire_nrec == 6, "a copy recorded again with a known handle keeps one record (%%u records)", retire_nrec);
+    CHECK(ld(&retire_changed_n) == 1 && ld(&retire_changed_b) == 5000,
+          "the older record of copy 2 leaves the changed count (%%lld, %%lld bytes)", (long long)ld(&retire_changed_n),
+          (long long)ld(&retire_changed_b));
+    CHECK(ld(&retire_gone_n) == 1, "copy 3 stays gone (%%lld)", (long long)ld(&retire_gone_n));
     // Copy 2 used again: it leaves the changed count. Copy 3 retired (AddControlMemory again): it leaves its records.
     // Copy 5's handle taken by a new copy: the old record goes, the new one is fingerprinted.
     copies[2].used_min = 106;
@@ -163,7 +175,8 @@ def main():
         c = Path(tmp) / 'check.c'
         c.write_text(HARNESS % body, encoding='utf-8')
         exe = Path(tmp) / ('check.exe' if win else 'check')
-        subprocess.check_call([cc, '-O2', '-Wall', '-Wno-unused-function', str(c), '-o', str(exe)], env=env)
+        subprocess.check_call([cc, '-O2', '-Wall', '-Wno-unused-function', '-I', str(ROOT / 'runtime'), str(c), '-o',
+                               str(exe)], env=env)
         return subprocess.call([str(exe)])
 
 
