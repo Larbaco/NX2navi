@@ -53,6 +53,7 @@ static PlatMutex lock = PLAT_MUTEX_INIT;   // the hooks calls and the state belo
 static _Atomic int64_t want = -2;          // millihertz from the pacer: >0 a limit, 0 none, -1 RTSS kept out; -2 unset
 static _Atomic int active;                 // RTSS limits this process now
 static _Atomic int failed;                 // FAIL_*: RTSS is out of it for the rest of the run
+static _Atomic int closed;                 // rtss_limit_restore ran: nothing reaches the profile any more
 static int started;
 static char dll_path[MAX_PATH], profile[MAX_PATH], rtss_dir[MAX_PATH];
 static HMODULE dll;
@@ -249,6 +250,10 @@ static void worker(void *arg) {
         int64_t w = atomic_load(&want);
         if (w == -2) continue;
         plat_mutex_lock(&lock);
+        if (atomic_load(&closed)) {   // a want read before rtss_limit_restore must not reach the profile after it
+            plat_mutex_unlock(&lock);
+            continue;
+        }
         int hooked;
         double fps;
         int run = rtss_running(&hooked, &fps), f = atomic_load(&failed);
@@ -320,6 +325,7 @@ static void start(void) {
 }
 
 void rtss_limit_want(int64_t mhz) {
+    if (atomic_load_explicit(&closed, memory_order_relaxed)) return;   // the exit put the profile back
     if (!started && mhz < 0) return;   // kept out from the start, for the whole run (both reasons need a restart)
     if (!started) start();
     // a new limit: the game's own limiter holds it until the worker had RTSS apply it, up to POLL_MS later (a movie's
@@ -327,21 +333,28 @@ void rtss_limit_want(int64_t mhz) {
     if (atomic_exchange(&want, mhz) != mhz) atomic_store(&active, 0);
 }
 
-int rtss_limit_active(void) { return atomic_load_explicit(&active, memory_order_relaxed); }
+int rtss_limit_active(void) {
+    return !atomic_load_explicit(&closed, memory_order_relaxed) && atomic_load_explicit(&active, memory_order_relaxed);
+}
 
 int rtss_limit_state(void) {
+    if (atomic_load_explicit(&closed, memory_order_relaxed)) return 0;
     int f = atomic_load_explicit(&failed, memory_order_relaxed);
     if (atomic_load(&want) >= 0 && (f == FAIL_READONLY || f == FAIL_NOT_LIMITING)) return f == FAIL_READONLY ? 2 : 3;
     return rtss_limit_active() && atomic_load(&want) > 0;
 }
 
 void rtss_limit_restore(void) {
+    // The game presents on after this call (the rest of the exit runs first), so from here the game's own limiter holds
+    // the frames left and no want reaches the profile again: the worker would otherwise write the game's limit back into
+    // the profile just put back, and the next run would take it for the player's own. Set before the check below, so
+    // that an exit before the first limit, or while RTSS was kept out, also stops a later want from starting the worker.
+    atomic_store(&closed, 1);
     if (!started || !*profile) return;
     // the exit may come from a crash on any thread: give up after a second rather than wait on a lock held there
     for (int i = 0; i < 100; i++) {
         if (plat_mutex_trylock(&lock)) {
             if (dll) put_back();
-            atomic_store(&want, -2);   // the worker leaves the profile alone from now on
             plat_mutex_unlock(&lock);
             return;
         }
