@@ -822,10 +822,13 @@ A change to the SM86 tensor lowering (`tools/xlate/AmpereLowering.cs` Hmma, Ldsm
 vector file and what is checked). `tests\maxwell_warp_emu_selftest.py` checks the emulator itself. No game files.
 
 A change to how the packaging scripts check the translator they ship (`tools/build_xlate.py` `source_identity`,
-`check_built`; `make_launcher.py`, `make_release.py`, `make_appimage.py`, `make_kit.py`) passes
-`python tests\xlate_package_check.py`: a folder whose `nx2navi_xlate.id` names this checkout's sources passes, a
-missing file, another identity and a folder built before a patch changed are refused, `build_xlate.py` writes no `.id`
-without a build, and each script stops before its slow steps. It needs git on PATH; no game files.
+`check_built`; `make_launcher.py`, `make_release.py`, `make_appimage.py`, `make_kit.py`; `tools/xlate_smoke.py`
+`pool_check`) passes `python tests\xlate_package_check.py`: a folder whose `nx2navi_xlate.id` names this checkout's
+sources passes, a missing file, another identity and a folder built before a patch changed are refused,
+`build_xlate.py` writes no `.id` without a build, each script stops before its slow steps, and on Windows
+`make_launcher.py` also refuses an exe that does not run beside a matching `.id`. It needs git on PATH; no game files.
+`tools\xlate_smoke.py --exe <nx2navi_xlate.exe>` checks a translator's texture pool length against
+`tools/xlate/Program.cs` `TexturePoolLength`: one older than its sources fails it.
 
 ## Reverse engineering (optional)
 

@@ -193,11 +193,18 @@ def check_xlate(xlate):
     4d051299) after tools/xlate/Program.cs had raised the texture pool to 40960 slots, so their translations still
     clamped every pool handle to slot 32767 and the ground went see-through after some area loads (issues #569 and
     #824). A missing translator, or one whose nx2navi_xlate.id differs from this checkout's sources
-    (build_xlate.check_built), stops the build; main runs this before anything is resolved, downloaded or deleted."""
+    (build_xlate.check_built), stops the build; main runs this before anything is resolved, downloaded or deleted.
+    On Windows the exe itself is asked too, as the .id says nothing of the exe beside it: a translator that declares
+    the texture pool with another length than its sources, or does not run, stops the build (xlate_smoke.pool_check)."""
     import build_xlate
     reason = build_xlate.check_built(xlate, 'nx2navi_xlate.exe')
     if reason:
         sys.exit(reason)
+    if os.name == 'nt':
+        import xlate_smoke
+        reason = xlate_smoke.pool_check(xlate / 'nx2navi_xlate.exe')
+        if reason:
+            sys.exit(f'{xlate / "nx2navi_xlate.exe"}: {reason}')
     have = (xlate / 'nx2navi_xlate.id').read_text(encoding='ascii').strip()
     print(f'translator identity {have[:16]}: built from this checkout\'s sources')
 

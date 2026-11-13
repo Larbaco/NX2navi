@@ -7,7 +7,10 @@ tools/make_appimage.py):
   make_release.py compared before) equals its .id;
 - build_xlate.py has no option that writes an .id beside an exe it did not build (--id-only is gone);
 - make_launcher.check_xlate, make_release.check_translator and make_kit stop on a foreign translator, make_kit before
-  it downloads or deletes anything; make_launcher and make_appimage run the check before their slow steps.
+  it downloads or deletes anything; make_launcher and make_appimage run the check before their slow steps;
+- tools/xlate_smoke.py pool_check, which make_launcher.check_xlate runs on the exe on Windows: spirv_clamps reads the
+  array lengths and the UMin clamps of a module made here, pool_check refuses an exe that does not run, check_xlate
+  refuses such an exe beside a matching .id, and a translator built here (build/xlate) passes when there is one.
 
 Needs git on PATH (prepare_sources applies the patches with it) and tools/vendor. No game files; any Python 3.10+.
 
@@ -16,7 +19,9 @@ Usage: xlate_package_check.py
 import contextlib
 import inspect
 import io
+import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -26,6 +31,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / 'tools'))
 import build_xlate  # noqa: E402
+import xlate_smoke  # noqa: E402
 
 EXE = 'nx2navi_xlate.exe'
 
@@ -38,6 +44,39 @@ def folder(base, name, ident, exe=True):
     if ident is not None:
         (d / 'nx2navi_xlate.id').write_text(ident + '\n', encoding='ascii')
     return d
+
+
+def spirv(*instructions):
+    """A SPIR-V module of these instructions, each (opcode, operand words...), after a five-word header."""
+    words = [0x07230203, 0x00010300, 0, 100, 0]
+    for op, *ops in instructions:
+        words += [(len(ops) + 1) << 16 | op, *ops]
+    return struct.pack(f'<{len(words)}I', *words)
+
+
+def pool_checks(base):
+    name = struct.unpack('<4I', b'GLSL.std.450\0\0\0\0')
+    module = spirv((11, 1, *name), (43, 2, 3, 40960), (43, 2, 4, 40959), (43, 2, 5, 7), (28, 6, 2, 3),
+                   (12, 2, 7, 1, 38, 5, 4), (12, 2, 8, 1, 37, 5, 3), (12, 2, 9, 99, 38, 5, 5))
+    assert xlate_smoke.spirv_clamps(module) == ([40960], [7, 40959]), xlate_smoke.spirv_clamps(module)
+    print('spirv_clamps: array lengths and the GLSL.std.450 UMin constants only')
+    if os.name != 'nt':
+        return
+    stand_in = folder(base, 'stand_in', build_xlate.source_identity())
+    why = xlate_smoke.pool_check(stand_in / EXE)
+    assert why and 'does not run' in why, why
+    why = refused(make_launcher_check(), stand_in)
+    assert why and 'does not run' in why, why
+    built = ROOT / 'build' / 'xlate' / EXE
+    if built.is_file() and not build_xlate.check_built(built.parent, EXE):
+        assert xlate_smoke.pool_check(built) is None, xlate_smoke.pool_check(built)
+        print('pool_check: the translator built here passes')
+    print('pool_check: an exe that does not run is refused, also by make_launcher.check_xlate beside a matching .id')
+
+
+def make_launcher_check():
+    import make_launcher
+    return make_launcher.check_xlate
 
 
 def refused(fn, *args):
@@ -102,9 +141,11 @@ def main():
 
         # The packaging scripts, with the fresh identity computed once.
         build_xlate.source_identity = lambda: want
+        pool_checks(base)
         import make_launcher
         import make_release
         import make_kit
+        xlate_smoke.pool_check = lambda exe: None   # the stand-in exes do not run: pool_checks covers the real one
         assert refused(make_launcher.check_xlate, good) is None
         for bad in (other, stale, no_exe):
             assert refused(make_launcher.check_xlate, bad)
