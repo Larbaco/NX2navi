@@ -1633,9 +1633,11 @@ static void rel_append(Tex *e) {
 
 static Tex *sweep_at;   // where sweep_released goes on
 static Tex *aged_at;    // where drop_aged goes on
+static Tex *press_at;   // where sweep_pressure's walk of the released entries goes on
 static void rel_unlink(Tex *e) {
     if (sweep_at == e) sweep_at = e->rel_next;
     if (aged_at == e) aged_at = e->rel_next;
+    if (press_at == e) press_at = e->rel_next;
     ru_unlink(e);
     rel_bytes -= e->bytes;
     if (e->rel_prev) e->rel_prev->rel_next = e->rel_next;
@@ -2473,6 +2475,7 @@ static void sweep_hard(void) {   // tex_lock held
 // draws that read their pools over PCIe brought the game to 11-20 fps, while no texture had been asked to go.
 #define VRAM_PRESSURE_DEFAULT 80
 #define PRESSURE_STEP 32
+#define EVICT_LOOK 1024   // released entries one pressure check looks at (sweep_pressure)
 static int vram_pressure = -1;
 static uint64_t n_pressure_drops;
 
@@ -2841,11 +2844,18 @@ static void drop_aged(void) {   // tex_lock held
 // Its request stands as the use the mirror fits at (room_level) for ROOM_CHECKS checks or until the use is down there
 // (sweep_pressure): taken as bytes to free at the one check that read it, a request for 205 MiB got the EVICT_STEP
 // textures of that check, 26 MiB, or nothing when the check fell before evict_wait, and was gone.
+// A walk of the whole table that finds no candidate is not made again for EVICT_EMPTY_WAIT submissions (two pressure
+// checks; idle_empty_wait, which only evict_idle reads, so that evict_disused still runs): under a standing pressure
+// or mirror request with nothing idle, every eighth submission walked every texture again. An entry turns idle only
+// after IDLE_ROUNDS pool walks, so the wait delays an eviction by a few submissions at most.
 #define EVICT_STEP 64
+#define EVICT_EMPTY_WAIT 16
 #define ROOM_CHECKS 64
 static int tex_evict = -1;
 static uint64_t evict_wait;                       // vk_sync_fence_done value the next eviction waits for
+static uint64_t idle_empty_wait;                  // vk_sync_issued value the next walk of evict_idle waits for
 static uint64_t n_evict, n_evict_bytes;           // since the last perf line
+static uint64_t n_evict_empty, ns_evict_empty;    // empty walks of evict_idle and their time, as long
 static int evict_logs;
 static volatile int64_t room_wanted;               // bytes refused VRAM mirrors asked for (vk_texture_want_room)
 static uint64_t room_level;                        // tex_lock: the device-local use at which those mirrors fit
@@ -2858,7 +2868,8 @@ void vk_texture_want_room(uint64_t bytes) {
 }
 
 static uint64_t evict_idle(uint64_t want, uint64_t used, uint64_t budget, int why) {   // tex_lock held; returns the bytes freed
-    if (vk_sync_fence_done() < evict_wait) return 0;
+    if (vk_sync_fence_done() < evict_wait || vk_sync_issued() < idle_empty_wait) return 0;
+    uint64_t t0 = kern_now_ns();
     Tex *v[EVICT_STEP];
     int nv = 0;
     uint64_t now = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
@@ -2872,6 +2883,11 @@ static uint64_t evict_idle(uint64_t want, uint64_t used, uint64_t budget, int wh
         if (nv < EVICT_STEP) nv++;
         memmove(v + at + 1, v + at, sizeof *v * (size_t)(nv - 1 - at));
         v[at] = e;
+    }
+    if (!nv) {   // the walk of the whole table found nothing: none again for EVICT_EMPTY_WAIT submissions
+        idle_empty_wait = vk_sync_issued() + EVICT_EMPTY_WAIT;
+        n_evict_empty++, ns_evict_empty += kern_now_ns() - t0;
+        return 0;
     }
     uint64_t freed = 0;
     int n = 0;
@@ -3386,14 +3402,26 @@ static void sweep_pressure(void) {   // tex_lock held
         // Village, the Graveyard, Death Mountain Trail and Kokiri Forest dropped 82,288 under the pressure and the card
         // stayed over its budget throughout; with this rule 34,699 went, a fifth fewer textures were made again, the
         // render thread waited a third less on textures, and 4 draws met a texture gone where 11 had.
+        // Each check looks at up to EVICT_LOOK entries from where the last one stopped (press_at; rel_unlink moves it
+        // off an entry that leaves), and starts from the oldest again at the first entry released less than
+        // STALE_FRAMES ago or at the list's end: a walk from the head passed every entry it could not drop, up to
+        // RELEASED_HARD of them, at every check.
         uint64_t freed = 0, now = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
-        for (Tex *e = rel_head, *next; e && dropped < PRESSURE_STEP && now - e->rel_frame >= STALE_FRAMES; e = next) {
-            next = e->rel_next;
-            if (!comes_back_intact(e) || !idle(e, now)) continue;
-            freed += e->bytes;
-            drop_tex(e, DROP_VRAM);
-            dropped++, n_pressure_drops++;
+        Tex *e = press_at ? press_at : rel_head;
+        for (int n = 0; n < EVICT_LOOK && dropped < PRESSURE_STEP; n++) {
+            if (!e || now - e->rel_frame < STALE_FRAMES) {   // the rest is younger: from the oldest next time
+                e = NULL;
+                break;
+            }
+            Tex *next = e->rel_next;
+            if (comes_back_intact(e) && idle(e, now)) {
+                freed += e->bytes;
+                drop_tex(e, DROP_VRAM);
+                dropped++, n_pressure_drops++;
+            }
+            e = next;
         }
+        press_at = e;
         if (tex_evict && freed < over) freed += evict_idle(over - freed, used, budget, DROP_IDLE_VRAM);
         if (tex_evict && freed < over) evict_disused(over - freed);
     }
@@ -5214,20 +5242,22 @@ void vk_texture_new_submit(void) {
         n_checks = 0;
         rt_log("perf: frame %llu: released textures kept %d (%.0f MiB of own memory), dropped past the size limit %llu, "
                "under VRAM pressure %llu, under commit pressure %llu (made again soon after %llu, checks pausing those drops %llu; "
-               "%llu checks went on to live textures with the released ones still above their bound); idle live textures evicted %llu (%.1f MiB); "
-               "unsampled ones evicted %llu (%.1f MiB), retiring %d (%.1f MiB), freed %llu, taken back while retiring "
+               "%llu checks went on to live textures with the released ones still above their bound); idle live textures evicted %llu (%.1f MiB; "
+               "%llu walks found none, %.2f ms); unsampled ones evicted %llu (%.1f MiB), retiring %d (%.1f MiB), freed %llu, taken back while retiring "
                "%llu, back %llu, held %u (marks read %u); images reused %llu, made %llu, pool bindings not tried %llu, "
                "superseded taken back %llu; render targets overwritten at another address %llu, dropped unused %llu",
                (unsigned long long)f * 60, nreleased, rel_bytes / 1048576.0, (unsigned long long)n_cap_drops,
                (unsigned long long)n_pressure_drops, (unsigned long long)n_commit_drops,
                (unsigned long long)n_commit_back, (unsigned long long)n_commit_held,
                (unsigned long long)n_commit_past, (unsigned long long)n_evict, n_evict_bytes / 1048576.0,
+               (unsigned long long)n_evict_empty, ns_evict_empty / 1e6,
                (unsigned long long)n_disuse, n_disuse_bytes / 1048576.0, nretiring, retiring_bytes / 1048576.0,
                (unsigned long long)n_retire_freed, (unsigned long long)n_retire_cancel,
                (unsigned long long)n_disuse_back, holds.n, marks_reads, (unsigned long long)n_reused,
                (unsigned long long)n_reuse_new, (unsigned long long)n_bind_skips, (unsigned long long)n_restarts,
                (unsigned long long)n_overwritten, (unsigned long long)n_over_drops);
         n_cap_drops = n_pressure_drops = n_commit_drops = n_commit_past = n_evict = n_evict_bytes = 0;
+        n_evict_empty = ns_evict_empty = 0;
         n_commit_back = n_commit_held = 0;
         n_disuse = n_disuse_bytes = n_disuse_back = n_retire_freed = n_retire_cancel = 0;
         n_reused = n_reuse_new = n_bind_skips = n_restarts = n_overwritten = n_over_drops = 0;
