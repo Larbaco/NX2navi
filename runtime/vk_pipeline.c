@@ -5282,7 +5282,8 @@ static void workers_drain(void) {
     A.low = A.low_tail = NULL;
     for (LibJob *j = U.head, *n; j; j = n) {   // queued library jobs too: their entries read as failed builds
         n = j->next;
-        j->b->job = NULL, j->b->building = 0;
+        if (j->b) j->b->job = NULL, j->b->building = 0;   // a draw's fast link (link_queue) names its pipeline, not a library
+        if (j->p) j->p->link_queued = 0;
         free(j);
     }
     U.head = U.tail = NULL;
