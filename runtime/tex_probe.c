@@ -398,7 +398,7 @@ static int test_import(pool_t *pool) {
     vmaDestroyBuffer(c->vma, sb, sa);
 
     // generations: written after `since` -> 1, then 0, explicit host write -> 1
-    uint32_t g0, g1, g2, g3;
+    uint64_t g0, g1, g2, g3;
     vk_mem_changed(a, pool->size, 0, &g0);
     m[0x8000] = 1;
     GCHECK(vk_mem_changed(a + 0x8000, 0x1000, g0, &g1) == 1, "a CPU write after a generation is not seen");
@@ -421,7 +421,7 @@ static int test_snap_runs(uint8_t *h) {
     uint64_t base = (uintptr_t)h;
     GCHECK(!(base & 0x1fffff), "the heap at %#llx does not start on a 2 MiB region", (unsigned long long)base);
     int left = -1;
-    uint32_t g0, now;
+    uint64_t g0, now;
     vk_texture_new_submit();
     uint32_t ep = vk_texture_epoch();
     vk_mem_gen_lock();

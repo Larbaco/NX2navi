@@ -60,7 +60,7 @@ typedef struct PoolRec {
     volatile int32_t used;                // resolved at least once: the GPU may still read it at finalize
     // NX2NAVI_TRACE=perf dirty census (vk_mem_dirty_submit), replay thread under the submit lock only:
     uint32_t bound_sub;                // last submit that bound it as a buffer (dirty_sub), 0 never
-    uint32_t synced_gen;               // page generation its lazy-mirror count covers; DIRTY_UNSYNCED until scanned
+    uint64_t synced_gen;               // page generation its lazy-mirror count covers; DIRTY_UNSYNCED until scanned
     uint8_t bufbound;                  // ever bound as a vertex, index, uniform, storage or indirect buffer
     uint8_t untracked;                 // the last dirty scan found no write watch over it
     // VRAM mirror (POOL_IMPORT, "VRAM mirror" below). mstate and mbuf change on the replay thread only.
@@ -86,7 +86,7 @@ typedef struct PoolRec {
     uint8_t twin;                      // MS_ON: the table's writes reach guest memory too (twin_wanted); 0: the mirror only
     uint32_t vd_wrote_sub, vd_use_sub; // verify mode: the last submission that bound it written / used its mirror
     uint64_t vd_wrote_n;               // verify mode: written bindings of it so far
-    uint32_t mgen;                     // gen_lock: every page write stamped up to this generation is in the mirror
+    uint64_t mgen;                     // gen_lock: every page write stamped up to this generation is in the mirror
                                        // (or in a copy queued before its next use)
     FlushRange fl[FLUSH_RANGES + 1];   // flush_lock: nvnMemoryPoolFlushMappedRange pages not copied yet (flush_add)
     int fl_n;                          // flush_lock: ranges in fl; read without the lock to skip an empty list
@@ -96,7 +96,7 @@ typedef struct PoolRec {
     // Shadow storage (POOL_IMPORT in shadow mode, "shadow storage" below): buf is a host-visible copy of the guest pages.
     VmaAllocation salloc;
     uint8_t *smap;                     // its mapping; offsets as in buf (from import_lo)
-    uint32_t sgen;                     // gen_lock: every page write stamped up to this generation is in the shadow
+    uint64_t sgen;                     // gen_lock: every page write stamped up to this generation is in the shadow
     uint64_t sborn;                    // the value of the first submission that can have used the shadow (shadow_pool)
     volatile uint8_t stouched;         // on the touched list: the GPU may use it in the submission being recorded
     uint32_t stab_i;                   // shadow_lock: 1 + its index in stab (the table's shadows), 0 when not there
@@ -1160,49 +1160,52 @@ int vk_mem_vram_live(uint64_t *used, uint64_t *budget) {
 // ---------------------------------------------------------------- page write generations
 // Two-level table over the guest address space (below 2^39): 256 MiB chunks of 65,536 page generations, allocated
 // when a page of the chunk is first stamped. 0 = never stamped.
+// Generations are 64 bits and never run out (at 336 a frame and 240 fps, 2^64 lasts millions of years). At 32 bits,
+// 336 a frame (the most measured, 0.10.0) and 240 fps ran them out after about 15 h of play, and past the wrap a stamp
+// from before it compared newer than every later check and one made after it older: textures and pool mirrors missed
+// the CPU's writes, and pages nothing wrote read as written at every check. Below 2^32 every value and every compare
+// is what it was at 32 bits.
 #define GEN_CHUNK_SHIFT 28
 #define GEN_PAGE_SHIFT 12
 #define GEN_CHUNKS (RT_ADDRESS_LIMIT >> GEN_CHUNK_SHIFT)
 #define GEN_PER_CHUNK (1u << (GEN_CHUNK_SHIFT - GEN_PAGE_SHIFT))
-static uint32_t *gen_chunk[GEN_CHUNKS];
-static uint32_t gen_now;                 // last generation handed out
+static uint64_t *gen_chunk[GEN_CHUNKS];
+static uint64_t gen_now;                 // last generation handed out (gen_lock; read without it atomically)
 static PlatMutex gen_lock = PLAT_MUTEX_INIT;
 static uint64_t gen_pages[1024];
+// lazy_clean, cpu_wrote_since, verify_cb and vk_mem_sizes read generations without gen_lock: 64-bit loads and stores
+// must be single instructions on every target.
+_Static_assert(__atomic_always_lock_free(sizeof(uint64_t), 0), "64-bit page generations need lock-free atomics");
 
-// Generations are 32 bits, and nothing compares them across a wrap: past it a stamp from before reads as newer than
-// every later check, and a stamp of 0 as never stamped, so textures and pool mirrors the CPU writes can miss a write
-// and every check reads as a write. At about 181 a frame that comes after about 110 h of play at 60 fps, 27 h at 240.
-// Only trace=perf's "mem: sizes" counted them, so gen_next, which hands each one out, logs where the session stands at
-// 0xC0000000, 0xD0000000, 0xE0000000 and 0xF0000000, and the wrap itself (gen_mark): five lines at most.
-static void gen_mark(uint32_t g) {   // gen_lock held exclusively; the log takes no lock of this file
+// When the count reaches 2^32, where the 32-bit generations of earlier versions ran out, the log says so once, with
+// the frame, the hours of play and the rate, so a long session's log shows how far it got. gen_lock held exclusively;
+// the log takes no lock of this file.
+static void gen_mark(uint64_t g) {
     uint64_t frames = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
-    double secs = rt_guest_start_ns ? (double)(kern_now_ns() - rt_guest_start_ns) / 1e9 : 0, all = 4294967296.0;
-    if (!g) {
-        rt_log("mem: page generations ran out at frame %llu after %.1f h: from here on textures and pool mirrors the "
-               "CPU writes can show old content and every check uploads again; restart the game",
-               (unsigned long long)frames, secs / 3600);
-        return;
-    }
-    rt_log("mem: page generations: %u of 4294967295 handed out at frame %llu (%.0f a frame); at this rate they run out "
-           "in about %.1f h of play, after which textures and pool mirrors the CPU writes can miss a write and every "
-           "check reads as a write: restart the game before then", g, (unsigned long long)frames,
-           frames ? g / (double)frames : 0.0, secs > 0 ? (all - g) * secs / g / 3600 : 0.0);
+    double secs = rt_guest_start_ns ? (double)(kern_now_ns() - rt_guest_start_ns) / 1e9 : 0;
+    rt_log("mem: page generations reached %llu at frame %llu after %.1f h of play (%.0f a frame); before 0.10.2 they "
+           "were 32 bits and ran out here, after which textures and pool mirrors could miss the CPU's writes",
+           (unsigned long long)g, (unsigned long long)frames, secs / 3600, frames ? (double)g / (double)frames : 0.0);
 }
-static inline uint32_t gen_next(void) {   // gen_lock held exclusively
-    uint32_t g = ++gen_now;
-    if (__builtin_expect(!(g & 0x0fffffffu) && (g >= 0xc0000000u || !g), 0)) gen_mark(g);
+
+// gen_lock held exclusively: the only place a generation is handed out. The store is atomic: vk_mem_sizes and
+// verify_cb read gen_now without gen_lock.
+static inline uint64_t gen_next(void) {
+    uint64_t g = gen_now + 1;
+    if (__builtin_expect(g == 1ull << 32, 0)) gen_mark(g);
+    __atomic_store_n(&gen_now, g, __ATOMIC_RELAXED);
     return g;
 }
 // The newest generation stamped on any page of each 2 MiB region (the write-watch snapshot regions below): the mirror
 // sync skips regions with nothing newer than its pool's mirror.
 #define REG_SHIFT 21
-static uint32_t reg_max[RT_ADDRESS_LIMIT >> REG_SHIFT];
+static uint64_t reg_max[RT_ADDRESS_LIMIT >> REG_SHIFT];
 // The same two tables without the stamps of a mirror's own write-back (vk_gpu_written_back): what the CPU and the host
 // paths wrote. The mirror sync reads these, so the bytes a mirror wrote back into guest memory are not copied up into it
 // again at its next sync: the storage buffers the game's compute shaders write went down and came back up every frame,
 // 20 MiB a frame over PCIe in Kokiri Forest (2026-11-09).
-static uint32_t *cgen_chunk[GEN_CHUNKS];
-static uint32_t creg_max[RT_ADDRESS_LIMIT >> REG_SHIFT];
+static uint64_t *cgen_chunk[GEN_CHUNKS];
+static uint64_t creg_max[RT_ADDRESS_LIMIT >> REG_SHIFT];
 
 // Every write-watch query of the generation table (gen_lock held exclusively): calls, bytes and time since the last
 // mirror summary, all consumers together; the queries that found written pages (they also flush TLBs) apart.
@@ -1269,35 +1272,38 @@ static uint32_t *fcand;                       // gen_lock: regions to try at the
 static int nfcand, cfcand;
 static uint64_t n_frz_refused;                // gen_lock: candidates mem_freeze refused
 
-static uint32_t *slot_in(uint32_t **tab, uint64_t page_addr, int create) {
+static uint64_t *slot_in(uint64_t **tab, uint64_t page_addr, int create) {
     uint64_t ci = page_addr >> GEN_CHUNK_SHIFT;
     if (ci >= GEN_CHUNKS) return NULL;
     if (!tab[ci]) {
         if (!create) return NULL;
-        tab[ci] = calloc(GEN_PER_CHUNK, sizeof(uint32_t));
-        if (!tab[ci]) rt_fatal("vk: out of memory for page generations");
+        uint64_t *p = calloc(GEN_PER_CHUNK, sizeof *p);
+        if (!p) rt_fatal("vk: out of memory for page generations");
+        // published with release: lazy_clean and cpu_wrote_since load the chunk pointers without gen_lock
+        __atomic_store_n(&tab[ci], p, __ATOMIC_RELEASE);
     }
     return &tab[ci][(page_addr >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)];
 }
 
-static uint32_t *gen_slot(uint64_t page_addr, int create) { return slot_in(gen_chunk, page_addr, create); }
+static uint64_t *gen_slot(uint64_t page_addr, int create) { return slot_in(gen_chunk, page_addr, create); }
 
 // gen_lock held exclusively; g is the newest generation handed out. back: a mirror's write-back, which leaves the
-// CPU-side tables alone.
-static void stamp_page_as(uint64_t a, uint32_t g, int back) {
-    uint32_t *s = gen_slot(a, 1);
+// CPU-side tables alone. The slots are stored atomically: lazy_clean, cpu_wrote_since and verify_cb read them
+// without gen_lock.
+static void stamp_page_as(uint64_t a, uint64_t g, int back) {
+    uint64_t *s = gen_slot(a, 1);
     if (!s) return;
-    *s = g;
+    __atomic_store_n(s, g, __ATOMIC_RELAXED);
     reg_max[a >> REG_SHIFT] = g;
     reg_last[a >> REG_SHIFT] = ww_ep;
     if (back) return;
-    uint32_t *c = slot_in(cgen_chunk, a, 1);
-    if (c) *c = g, creg_max[a >> REG_SHIFT] = g;
+    uint64_t *c = slot_in(cgen_chunk, a, 1);
+    if (c) __atomic_store_n(c, g, __ATOMIC_RELAXED), creg_max[a >> REG_SHIFT] = g;
 }
 
-static void stamp_page(uint64_t a, uint32_t g) { stamp_page_as(a, g, 0); }
+static void stamp_page(uint64_t a, uint64_t g) { stamp_page_as(a, g, 0); }
 
-static void stamp_range(uint64_t lo, uint64_t hi, uint32_t g) {
+static void stamp_range(uint64_t lo, uint64_t hi, uint64_t g) {
     for (uint64_t a = lo; a < hi; a += 1ull << GEN_PAGE_SHIFT) stamp_page(a, g);
 }
 
@@ -1309,11 +1315,11 @@ void vk_guest_written(uint64_t addr, uint64_t size) {
     plat_mutex_unlock(&gen_lock);
 }
 
-int vk_mem_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now) {
+int vk_mem_changed(uint64_t addr, uint64_t size, uint64_t since, uint64_t *now) {
     if (!size) { *now = since; return 0; }
     uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;
     plat_mutex_lock(&gen_lock);
-    uint32_t g = gen_next();
+    uint64_t g = gen_next();
     int tracked = 1, frozen = 1;
     for (uint64_t a = lo & ~((1ull << REG_SHIFT) - 1); a < hi && frozen; a += 1ull << REG_SHIFT) frozen = mem_frozen(a);
     while (!frozen) {
@@ -1324,7 +1330,7 @@ int vk_mem_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now) 
     }
     int changed = 0;
     for (uint64_t a = lo; tracked && a < hi && !changed; a += 1ull << GEN_PAGE_SHIFT) {
-        uint32_t *s = gen_slot(a, 0);
+        uint64_t *s = gen_slot(a, 0);
         if (s && *s > since) changed = 1;
     }
     plat_mutex_unlock(&gen_lock);
@@ -1346,7 +1352,7 @@ static uint64_t n_snap_checks, n_snap_calls, n_snap_untracked;
 // gen_lock held exclusively. Queries the regions r0..r1 that were not snapped in epoch, one query per run of them;
 // returns the number of queries.
 static uint64_t snap_regions(uint64_t r0, uint64_t r1, uint32_t epoch) {
-    uint32_t g = 0;
+    uint64_t g = 0;
     uint64_t calls = 0;
     for (uint64_t r = r0; r <= r1;) {
         if (snap_at[r] == epoch) { r++; continue; }
@@ -1419,7 +1425,7 @@ static void snap_widen(uint64_t lo, uint64_t hi, uint64_t *r0, uint64_t *r1) {
     plat_mutex_unlock_shared(&pool_lock);
 }
 
-int vk_mem_changed_snap(uint64_t addr, uint64_t size, uint32_t since, uint32_t epoch, uint32_t *now) {
+int vk_mem_changed_snap(uint64_t addr, uint64_t size, uint64_t since, uint32_t epoch, uint64_t *now) {
     if (!size) { *now = since; return 0; }
     uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;
     uint64_t r0 = lo >> SNAP_SHIFT, r1 = (hi - 1) >> SNAP_SHIFT;
@@ -1443,7 +1449,7 @@ int vk_mem_changed_snap(uint64_t addr, uint64_t size, uint32_t since, uint32_t e
         if (reg_max[r] <= since) continue;
         uint64_t a = r << REG_SHIFT > lo ? r << REG_SHIFT : lo, b = (r + 1) << REG_SHIFT < hi ? (r + 1) << REG_SHIFT : hi;
         for (; a < b && !changed; a += 1ull << GEN_PAGE_SHIFT) {
-            uint32_t *s = gen_slot(a, 0);
+            uint64_t *s = gen_slot(a, 0);
             if (s && *s > since) changed = 1;
         }
     }
@@ -1461,7 +1467,7 @@ void vk_mem_gen_unlock_shared(void) { plat_mutex_unlock_shared(&gen_lock); }
 void vk_mem_gen_lock(void) { plat_mutex_lock(&gen_lock); }
 void vk_mem_gen_unlock(void) { plat_mutex_unlock(&gen_lock); }
 
-int vk_mem_unchanged_why_locked(uint64_t addr, uint64_t size, uint32_t since, uint32_t epoch) {
+int vk_mem_unchanged_why_locked(uint64_t addr, uint64_t size, uint64_t since, uint32_t epoch) {
     if (!size || !epoch) return 4;
     uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;
     uint64_t r0 = lo >> SNAP_SHIFT, r1 = (hi - 1) >> SNAP_SHIFT;
@@ -1474,7 +1480,7 @@ int vk_mem_unchanged_why_locked(uint64_t addr, uint64_t size, uint32_t since, ui
     return 0;
 }
 
-int vk_mem_unchanged_locked(uint64_t addr, uint64_t size, uint32_t since, uint32_t epoch) {
+int vk_mem_unchanged_locked(uint64_t addr, uint64_t size, uint64_t since, uint32_t epoch) {
     return !vk_mem_unchanged_why_locked(addr, size, since, epoch);
 }
 
@@ -1561,7 +1567,7 @@ void vk_mem_snap_stats(uint64_t *checks, uint64_t *calls, uint64_t *untracked) {
 // - lazy: pages stamped after the pool's previous count, in pools the previous submit bound (upload when bound);
 // - first use: the size of a pool the first time it is bound (a mirror copies the whole pool then).
 // Classes: CPU_CACHED, CPU_UNCACHED, other (CPU_NO_ACCESS). Logged as `mem: dirty` every 60 frames.
-#define DIRTY_UNSYNCED UINT32_MAX
+#define DIRTY_UNSYNCED UINT64_MAX
 #define DIRTY_GAP 0x100000ull   // pools closer than this share one query (the gap's pages are stamped too)
 #define DIRTY_WIN 60
 enum { DC_CACHED, DC_UNC, DC_OTHER, DC_N };
@@ -1569,7 +1575,8 @@ typedef struct {
     uint64_t eager[DC_N], lazy[DC_N], first[DC_N];
     uint64_t submits, queries, scan_ns, sub_max, frames;
 } DirtyAcc;
-static uint32_t dirty_sub = 1, dirty_gen;   // submit lock: the current submit number, generation of the last scan
+static uint32_t dirty_sub = 1;             // submit lock: the current submit number
+static uint64_t dirty_gen;                 // submit lock: the generation of the last scan
 static uint64_t first_pending[DC_N], ever_n[DC_N], ever_bytes[DC_N];   // submit lock
 static PoolRec **dlist;                     // submit lock: the buffer-bound pools of a scan
 static int dcap;
@@ -1597,7 +1604,7 @@ static uint64_t page_lo(const PoolRec *r) { return r->lo & ~0xfffull; }
 static uint64_t page_hi(const PoolRec *r) { return (r->lo + r->size + 0xfff) & ~0xfffull; }
 
 // gen_lock held exclusively. 0: the range is not write-watched.
-static int query_stamp(uint64_t lo, uint64_t hi, uint32_t g) {
+static int query_stamp(uint64_t lo, uint64_t hi, uint64_t g) {
     for (;;) {
         uint64_t n = ww_query(lo, hi - lo);
         if (n == UINT64_MAX) return 0;
@@ -1998,7 +2005,7 @@ static void shadow_sync_pool(PoolRec *r, uint32_t epoch, int cpu) {
         s_queries += snap_regions(r0, r1, epoch);
         for (uint64_t k = r0; k <= r1 && tracked; k++) tracked = !snap_untracked[k];
     } else {   // outside the snapshot regions, or before the first guest submission: one query per unfrozen run
-        uint32_t g = gen_next();
+        uint64_t g = gen_next();
         for (uint64_t a = lo; a < hi;) {
             uint64_t b = (a | ((1ull << REG_SHIFT) - 1)) + 1;
             if (b > hi) b = hi;
@@ -2010,7 +2017,7 @@ static void shadow_sync_pool(PoolRec *r, uint32_t epoch, int cpu) {
         }
     }
     s_q_ticks += qpc() - t0;
-    uint32_t since = r->sgen;
+    uint64_t since = r->sgen;
     r->sgen = gen_now;
     if (!tracked) {   // nothing tells which pages changed: all of them
         s_untracked++;
@@ -2022,7 +2029,7 @@ static void shadow_sync_pool(PoolRec *r, uint32_t epoch, int cpu) {
         uint64_t a = k << REG_SHIFT, b = a + (1ull << REG_SHIFT);
         if (a < lo) a = lo;
         if (b > hi) b = hi;
-        const uint32_t *ch = (cpu ? cgen_chunk : gen_chunk)[a >> GEN_CHUNK_SHIFT];   // a 2 MiB region lies in one chunk
+        const uint64_t *ch = (cpu ? cgen_chunk : gen_chunk)[a >> GEN_CHUNK_SHIFT];   // a 2 MiB region lies in one chunk
         if ((cpu ? creg_max : reg_max)[k] <= since || !ch) {
             if (run) shadow_copy(r, run, a), run = 0;
             continue;
@@ -2086,8 +2093,8 @@ static int shadow_bulk_write(void) {
 // such a page may have come after a CPU write it should have come before ("The game must not get ahead of the
 // write-backs" above); a page of which the CPU wrote other bytes counts too.
 // No gen_lock, as lazy_clean: a stamp that lands meanwhile only blurs a count.
-static int cpu_wrote_since(uint64_t pg, uint32_t sgen) {
-    const uint32_t *ch = __atomic_load_n(&cgen_chunk[pg >> GEN_CHUNK_SHIFT], __ATOMIC_ACQUIRE);
+static int cpu_wrote_since(uint64_t pg, uint64_t sgen) {
+    const uint64_t *ch = __atomic_load_n(&cgen_chunk[pg >> GEN_CHUNK_SHIFT], __ATOMIC_ACQUIRE);
     if (ch && __atomic_load_n(&ch[(pg >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)], __ATOMIC_RELAXED) > sgen) return 1;
     uint64_t p[1], n = mem_written_peek(pg, SB_PAGE, p, 1);
     return n && n != UINT64_MAX;
@@ -2168,7 +2175,7 @@ static void table_wb_cb(void *arg) {
     s_tab_wb += moved, s_tab_wb_seen += seen, s_tab_wb_jobs++;
     if (nwrote) {
         plat_mutex_lock(&gen_lock);
-        uint32_t g = gen_next();
+        uint64_t g = gen_next();
         for (int i = 0; i < nwrote; i++) stamp_page_as(wrote[i], g, back);
         plat_mutex_unlock(&gen_lock);
     }
@@ -2184,7 +2191,7 @@ static void gpu_written(uint64_t addr, uint64_t size, int back) {
     uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;
     back = back && wb_no_reup();   // read before gen_lock: its first call logs
     plat_mutex_lock(&gen_lock);
-    uint32_t g = gen_next();
+    uint64_t g = gen_next();
     for (uint64_t a = lo; a < hi; a += 1ull << GEN_PAGE_SHIFT) stamp_page_as(a, g, back);
     plat_mutex_unlock(&gen_lock);
 }
@@ -2340,7 +2347,7 @@ void vk_mem_dirty_submit(void) {
         if (r->kind == POOL_IMPORT && r->bufbound) dlist[n++] = r;
     }
     plat_mutex_lock(&gen_lock);
-    uint32_t g = gen_next(), since = dirty_gen;
+    uint64_t g = gen_next(), since = dirty_gen;
     dirty_gen = g;
     for (int i = 0; i < n;) {   // one query per run of pools (sorted by address)
         uint64_t lo = page_lo(dlist[i]), hi = page_hi(dlist[i]);
@@ -2361,7 +2368,7 @@ void vk_mem_dirty_submit(void) {
         int k = dc_class(r);
         ln[k]++, lb[k] += r->size;
         int fresh = r->synced_gen == DIRTY_UNSYNCED, lz = !fresh && r->bound_sub == prev;
-        uint32_t ls = r->synced_gen;
+        uint64_t ls = r->synced_gen;
         if (fresh || r->bound_sub == prev) r->synced_gen = g;
         if (r->untracked) { untracked += r->size; continue; }
         if (fresh) continue;   // counted as first use
@@ -2372,10 +2379,10 @@ void vk_mem_dirty_submit(void) {
         for (uint64_t a = lo; a < hi;) {
             uint64_t ci = a >> GEN_CHUNK_SHIFT, ce = (ci + 1) << GEN_CHUNK_SHIFT;
             if (ce > hi) ce = hi;
-            const uint32_t *ch = ci < GEN_CHUNKS ? gen_chunk[ci] : NULL;
+            const uint64_t *ch = ci < GEN_CHUNKS ? gen_chunk[ci] : NULL;
             if (ch)
                 for (uint64_t x = a; x < ce; x += 1ull << GEN_PAGE_SHIFT) {
-                    uint32_t v = ch[(x >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)];
+                    uint64_t v = ch[(x >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)];
                     ne += v > since;
                     nl += lz && v > ls;
                 }
@@ -2955,7 +2962,7 @@ static void mirror_create(PoolRec *r) {
     mrep.sync_queries += snap_regions(r0, r1, mepoch);
     int untracked = 0;
     for (uint64_t k = r0; k <= r1; k++) untracked |= snap_untracked[k];
-    r->mgen = gen_now;   // the whole-range copy below holds every write observed so far
+    __atomic_store_n(&r->mgen, gen_now, __ATOMIC_RELEASE);   // the whole-range copy below holds every write so far
     plat_mutex_unlock(&gen_lock);
     if (untracked) return refuse(r, MR_UNTRACKED, "its range is not write-watched");
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = n, .usage = pool_usage(c),
@@ -3106,7 +3113,7 @@ static void mirror_sync(PoolRec *r) {
         plat_mutex_lock(&gen_lock);
         mrep.sync_queries += snap_regions(r0, r1, mepoch);
     }
-    uint32_t since = r->mgen;
+    uint64_t since = r->mgen;
     int untracked = 0;
     for (uint64_t k = r0; k <= r1; k++) {
         untracked |= snap_untracked[k];
@@ -3114,7 +3121,7 @@ static void mirror_sync(PoolRec *r) {
         uint64_t a = k << SNAP_SHIFT, b = a + (1ull << SNAP_SHIFT);
         if (a < lo) a = lo;
         if (b > hi) b = hi;
-        const uint32_t *ch = cgen_chunk[a >> GEN_CHUNK_SHIFT];   // a 2 MiB region lies in one chunk
+        const uint64_t *ch = cgen_chunk[a >> GEN_CHUNK_SHIFT];   // a 2 MiB region lies in one chunk
         if (!ch) continue;
         for (uint64_t x = a; x < b; x += 1ull << GEN_PAGE_SHIFT)
             if (ch[(x >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)] > since) {
@@ -3122,7 +3129,7 @@ static void mirror_sync(PoolRec *r) {
                 r->st_pages += 1ull << GEN_PAGE_SHIFT, r->hot_bytes += 1ull << GEN_PAGE_SHIFT, r->hot_up += 1ull << GEN_PAGE_SHIFT;
             }
     }
-    r->mgen = gen_now;
+    __atomic_store_n(&r->mgen, gen_now, __ATOMIC_RELEASE);   // lazy_clean reads it without gen_lock
     if (excl) plat_mutex_unlock(&gen_lock);
     else plat_mutex_unlock_shared(&gen_lock);
     if (__atomic_load_n(&r->fl_n, __ATOMIC_ACQUIRE)) {
@@ -3181,7 +3188,7 @@ void vk_mem_shadow_table_read(void) {
 static int shadow_pool_clean(const PoolRec *r, uint32_t epoch, int cpu) {
     uint64_t r0 = r->import_lo >> SNAP_SHIFT, r1 = (r->import_hi - 1) >> SNAP_SHIFT;
     if (!epoch || r1 >= SNAP_REGIONS) return 0;
-    const uint32_t *mx = cpu ? creg_max : reg_max;
+    const uint64_t *mx = cpu ? creg_max : reg_max;
     for (uint64_t k = r0; k <= r1; k++)
         if (snap_at[k] != epoch || snap_untracked[k] || mx[k] > r->sgen) return 0;
     return 1;
@@ -3543,7 +3550,7 @@ static void swb_run(uint64_t a, uint64_t b) {
     if (b <= a || !shadow_write_back(a, b - a) || nvn_gpu_only(a)) return;
     int back = wb_no_reup();
     plat_mutex_lock(&gen_lock);
-    uint32_t g = gen_next();
+    uint64_t g = gen_next();
     for (uint64_t x = a & ~0xfffull; x < b; x += 1ull << GEN_PAGE_SHIFT) stamp_page_as(x, g, back);
     plat_mutex_unlock(&gen_lock);
 }
@@ -3755,9 +3762,9 @@ static void lazy_fetch(uint64_t h0, uint64_t h1, uint64_t off, uint64_t size) {
 // No lock: the pages are inaccessible, so nothing stamps them meanwhile; the mirror's mgen only grows.
 static int lazy_clean(uint64_t lo, uint64_t hi, void *ctx) {
     const PoolRec *r = ctx;
-    uint32_t mgen = __atomic_load_n(&r->mgen, __ATOMIC_ACQUIRE);
+    uint64_t mgen = __atomic_load_n(&r->mgen, __ATOMIC_ACQUIRE);
     for (uint64_t a = lo; a < hi; a += 1ull << GEN_PAGE_SHIFT) {
-        const uint32_t *ch = __atomic_load_n(&cgen_chunk[a >> GEN_CHUNK_SHIFT], __ATOMIC_ACQUIRE);
+        const uint64_t *ch = __atomic_load_n(&cgen_chunk[a >> GEN_CHUNK_SHIFT], __ATOMIC_ACQUIRE);
         if (ch && __atomic_load_n(&ch[(a >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)], __ATOMIC_RELAXED) > mgen) return 0;
     }
     uint64_t p[1];
@@ -4336,14 +4343,14 @@ void vk_mem_mirror_prologue(VkCommandBuffer cb) {
 }
 
 // ---- verify mode
-typedef struct { PoolRec *r; uint64_t off, len, dst; uint32_t mgen; } VSample;
+typedef struct { PoolRec *r; uint64_t off, len, dst, mgen; } VSample;
 typedef struct { uint32_t sub; int n; VkBuffer buf; VmaAllocation alloc; const uint8_t *map; VSample s[VERIFY_SAMPLES]; } VJob;
 static int ver_i;
 static uint64_t ver_off;
 
 // The CPU wrote the page since the mirror's sync that mgen records: stamped later, or its write-watch bit is set.
-static int page_dirty(uint64_t a, uint32_t mgen) {
-    uint32_t *s = gen_slot(a, 0);
+static int page_dirty(uint64_t a, uint64_t mgen) {
+    uint64_t *s = gen_slot(a, 0);
     if (s && __atomic_load_n(s, __ATOMIC_RELAXED) > mgen) return 1;
     uint64_t p[1];
     return mem_written_peek(a, 1ull << GEN_PAGE_SHIFT, p, 1) != 0;   // UINT64_MAX (not watched) counts as written
@@ -4382,13 +4389,15 @@ static void verify_cb(void *arg) {   // completion thread
                 rt_log("mem: verify mismatch: pool %#llx+%#llx (%s) offset %#llx: bytes %#x..%#x of the page differ, "
                        "mirror %02x guest %02x at the first (submission %u)", (unsigned long long)r->lo,
                        (unsigned long long)r->size, f, (unsigned long long)(a - r->lo), k, e, m[k], g[k], j->sub);
-                const uint32_t *gs = gen_slot(a & ~((1ull << GEN_PAGE_SHIFT) - 1), 0);
+                const uint64_t *gs = gen_slot(a & ~((1ull << GEN_PAGE_SHIFT) - 1), 0);
                 char mh[100], gh[100];
                 for (int b = 0; b < 16; b++) snprintf(mh + 3 * b, 4, "%02x ", m[b]), snprintf(gh + 3 * b, 4, "%02x ", g[b]);
                 rt_log("mem: verify mismatch detail: written binds %llu, last %u; used %u; written back %u; gpa record %u; "
-                       "page cpu stamp %u (synced to %u, now %u); mirror %s| guest %s",
-                       (unsigned long long)r->vd_wrote_n, r->vd_wrote_sub, r->vd_use_sub, wb, r->gpa_rec, gs ? *gs : 0,
-                       s->mgen, gen_now, mh, gh);
+                       "page cpu stamp %llu (synced to %llu, now %llu); mirror %s| guest %s",
+                       (unsigned long long)r->vd_wrote_n, r->vd_wrote_sub, r->vd_use_sub, wb, r->gpa_rec,
+                       (unsigned long long)(gs ? __atomic_load_n(gs, __ATOMIC_RELAXED) : 0),
+                       (unsigned long long)s->mgen, (unsigned long long)__atomic_load_n(&gen_now, __ATOMIC_RELAXED),
+                       mh, gh);
             }
         }
     }
@@ -6266,6 +6275,6 @@ void vk_mem_sizes(PerfSizes *s) {
     perf_size(s, "free staging arena chunks", arena_n, ARENA_KEEP, arena_n * ARENA_CHUNK);
     perf_size(s, "write-back snapshot pool", snap_n, SNAP_POOL_N, snap_b);
     perf_size(s, "shadow base copies", sb, 0, sb * SB_PAGE);
-    // the page generations handed out so far (gen_now, 32 bits, no wrap handling): how fast a session uses them up
+    // the page generations handed out so far (gen_now, 64 bits: they do not run out)
     perf_size(s, "page generations handed out", (uint64_t)__atomic_load_n(&gen_now, __ATOMIC_RELAXED), 0, PERF_SIZE_NONE);
 }

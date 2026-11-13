@@ -53,7 +53,7 @@ typedef struct Tex {
     uint64_t blk_mem, blk_size;   // where alloc lies (own_memory): the device memory handle and size of its block
     uint8_t blk_type, blk_own;    // that memory's type; blk_own: memory of its own, not a part of one of VMA's blocks
     VmaAllocation bound_to;       // the pool memory it is bound into
-    uint32_t wgen;                // page generation of the last upload check
+    uint64_t wgen;                // page generation of the last upload check
     uint32_t checked;             // submit_epoch of the last check from a draw binding
     uint32_t use_round;           // look_round when a lookup last reached it (touch)
     uint64_t use_frame;           // gfx_counters.frames then
@@ -72,7 +72,7 @@ typedef struct Tex {
     int last_ch;                  // last vk_mem_changed result of make_fresh: 1 written, 0 clean, -1 not tracked
     struct Tex *next_at;          // other entries at the same storage address
     uint8_t gpu_dirty;            // mirrored, and the GPU wrote the image after the last write-back to the storage
-    uint32_t gpu_gen;             // page generation when the GPU write that set gpu_dirty was recorded
+    uint64_t gpu_gen;             // page generation when the GPU write that set gpu_dirty was recorded
     uint64_t gpu_seq;             // order of that GPU write among all of them (gpu_writes)
     uint64_t gpu_fence;           // fence of the submission that made that write (0: not recorded in one)
     uint64_t run_frame;           // mirrored: the frame of the newest GPU write
@@ -1661,7 +1661,7 @@ static void rel_unlink(Tex *e) {
 // to 8,192 released entries, they stay listed, and since stays as it was at their release, so each one whose regions
 // took a write later missed the region check at every submission from then on: 1,000 to 6,300 entries a check in
 // Kakariko and Castle Town, a third to a half of the list.
-typedef struct { Tex *e; uint64_t addr, size; uint32_t since; uint8_t ok, rel; } PEnt;   // ok: uploaded as of since
+typedef struct { Tex *e; uint64_t addr, size, since; uint8_t ok, rel; } PEnt;   // ok: uploaded as of since
 static PEnt *pent;
 static int npent, cpent, *pq, cpq;
 static uint64_t n_pool_checks, n_pool_skips, n_pool_rel;
@@ -2069,7 +2069,7 @@ static int commit_drops_held(void) {
 // shutdown.
 static int wb_wanted(const Tex *e);
 static void wb_cfg_init(void);
-static int storage_rewritten(const Tex *e, uint32_t since, uint32_t *now);
+static int storage_rewritten(const Tex *e, uint64_t since, uint64_t *now);
 static void write_back_n(Tex **v, int n);
 static uint64_t n_drop_wb;   // entries written back before their drop since the last perf line
 
@@ -2077,7 +2077,7 @@ static void drop_tex(Tex *e, int why) {
     flight_ev(e, FLIGHT_TEX_DROP, (uint32_t)why, 0);
     if (why == DROP_COMMIT || why == DROP_IDLE_COMMIT) commit_drop_note(e);
     if (e->gpu_dirty && why != DROP_OVERWRITTEN && why != DROP_SHUTDOWN) {
-        uint32_t now;
+        uint64_t now;
         wb_cfg_init();
         if (storage_rewritten(e, e->gpu_gen, &now) == 1) e->gpu_dirty = 0;
         else if (wb_wanted(e)) write_back_n(&e, 1), n_drop_wb++;
@@ -2459,7 +2459,7 @@ static void sweep_hard(void) {   // tex_lock held
         wb_cfg_init();
         for (int i = 0; i < k; i++) {
             Tex *e = walk[out[i]];
-            uint32_t t;
+            uint64_t t;
             if (!e->gpu_dirty) continue;
             if (storage_rewritten(e, e->gpu_gen, &t) == 1) e->gpu_dirty = 0;
             else if (wb_wanted(e)) wbv[m++] = e;
@@ -4089,7 +4089,7 @@ static volatile int32_t n_kept;
 // slots used in turn, and the CPU reads them a frame later. One slot's rect target shares its page with data the CPU
 // writes every frame: without the copy its renders were never written back, the game read a zero rect every other
 // frame and the target's name label blinked. NX2NAVI_WB_EXACT=0 restores the page-only decision.
-static int storage_rewritten(const Tex *e, uint32_t since, uint32_t *now) {
+static int storage_rewritten(const Tex *e, uint64_t since, uint64_t *now) {
     uint64_t lo = (e->pub.addr + 0xfff) & ~0xfffull, hi = (e->pub.addr + e->t.L.size) & ~0xfffull;
     if (hi <= lo) lo = e->pub.addr, hi = e->pub.addr + e->t.L.size;
     int ch = vk_mem_changed(lo, hi - lo, since, now);
@@ -4131,7 +4131,7 @@ static void make_fresh(Tex *e) {
         upload(e);
         return;
     }
-    uint32_t now;
+    uint64_t now;
     int ch = vk_mem_changed(e->pub.addr, size, e->wgen, &now);
     e->wgen = now;
     e->last_ch = ch;
@@ -4144,7 +4144,7 @@ static void make_fresh(Tex *e) {
 static void make_fresh_snap(Tex *e) {
     if (!from_storage(e) || e->pub.gpu_owned || (e->sfill && e->released)) return;
     if (!e->uploaded && up_wait(e)) return;
-    uint32_t now;
+    uint64_t now;
     n_checks++;
     int ch = vk_mem_changed_snap(e->pub.addr, e->t.L.size, e->uploaded ? e->wgen : 0, submit_epoch, &now);
     e->wgen = now;
@@ -4190,7 +4190,7 @@ static int alias_compatible(const Tex *e, const Tex *src, const char **why) {
 static int alias_has_gpu_content(const Tex *src) {
     if (!src->pub.gpu_owned) return 0;
     if (!src->pub.mirrored) return 1;
-    uint32_t now;
+    uint64_t now;
     return src->gpu_dirty && !storage_rewritten(src, src->gpu_gen, &now);
 }
 
@@ -4360,7 +4360,7 @@ static void start_at(Tex *e, const TexKey *k, int taken_back) {
     // split fill: e is to start with its storage's bytes; msrc: the released CPU-written entry whose image holds them
     // (destroyed after the copy), msrc_gpu: it holds what the GPU wrote instead, msrc_gen: the storage's generation
     int fill = !taken_back && tex_alias && split_wants(&e->t, &e->f), msrc_gpu = 0;
-    uint32_t msrc_gen = 0;
+    uint64_t msrc_gen = 0;
     Tex *msrc = NULL;
     const char *why = "no live texture with GPU content";   // for the log of an alias left empty
     const Tex *other = NULL;
@@ -4381,7 +4381,7 @@ static void start_at(Tex *e, const TexKey *k, int taken_back) {
                 }
                 gone++;
                 const char *no;
-                uint32_t gen = 0;
+                uint64_t gen = 0;
                 int gpu = alias_has_gpu_content(p);
                 if (fill && !msrc && (gpu || (p->uploaded && !p->pub.gpu_owned &&
                                               !vk_mem_changed(p->pub.addr, p->t.L.size, p->wgen, &gen))) &&
@@ -4588,7 +4588,7 @@ static Tex *entry_of(const tex_t *t) {
 void vk_texture_debug(const VkTexImage *img, uint32_t *uploads, int *last_change, int *pages_written) {
     lock();
     const Tex *e = (const Tex *)img;   // pub is the first member
-    uint32_t now;
+    uint64_t now;
     *uploads = e->n_up;
     *last_change = e->last_ch;
     *pages_written = e->pub.mirrored && e->uploaded ? vk_mem_changed(e->pub.addr, e->t.L.size, e->wgen, &now) : 0;
@@ -5705,7 +5705,7 @@ void vk_texture_write_back(uint64_t addr, uint64_t size) {
     if (!hit) rt_fatal("vk: out of memory for a texture write-back");
     int n = owned_dirty(addr, size, hit), k = 0;   // owned[] cannot change while tex_lock is held
     for (int i = 0; i < n; i++) {
-        uint32_t now;
+        uint64_t now;
         if (storage_rewritten(hit[i], hit[i]->gpu_gen, &now) == 1) hit[i]->gpu_dirty = 0;
         else hit[k++] = hit[i];
     }
@@ -5778,7 +5778,7 @@ void vk_texture_write_back_small(uint64_t fence) {
     if (later) __atomic_store_n(&small_pending, 1, __ATOMIC_RELEASE);
     int k = 0;
     for (int i = 0; i < n; i++) {
-        uint32_t now;
+        uint64_t now;
         if (storage_rewritten(hit[i], hit[i]->gpu_gen, &now) == 1) hit[i]->gpu_dirty = 0;
         else hit[k++] = hit[i];
     }

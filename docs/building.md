@@ -755,9 +755,17 @@ every copy returns, a heap page nothing touched yet reads zero and stays reserve
 left out. Windows only, no game files.
 
 A change to the page write generations (`runtime/vk_memory.c`, from its "page write generations" banner to its "dirty
-census" banner: `gen_next`, `gen_mark`) passes `python tests\gen_wrap_check.py`, which builds that part of the file
-alone: the lines logged as the 32-bit generations near their wrap, and the four comparisons known to answer wrong across
-it. No GPU, no game files.
+census" banner, and the readers of its tables `cpu_wrote_since`, `shadow_pool_clean`, `lazy_clean`, `page_dirty`)
+passes `python tests\gen_wrap_check.py`, which builds those parts of the file alone and runs the generations across
+2^32 (where 32-bit generations wrapped), 2^40 and 2^63: texture checks, the snapshot path and the region check, the
+CPU-side tables, and mirror and shadow cleanliness answer as below the boundary, and one line is logged when the count
+reaches 2^32. No GPU, no game files.
+
+A change to `runtime/vk_memory.c`, `runtime/vk_texture.c` or `runtime/tex_probe.c` passes
+`python tests\gen_width_check.py`, which compiles the three files with the build's flags and `-Wshorten-64-to-32`,
+`-Wformat` and `-Wincompatible-pointer-types` as errors: the page write generations are 64 bits, and a local, field or
+format left at 32 bits would bring their wrap back without a word. Any narrowing in these files takes an explicit cast.
+It needs the shader headers (`tools/build_shaders.py`); no GPU, no game files.
 
 A change to which frames FSR 3.1 frame generation is told are camera cuts (`runtime/vk_fg_reset.h`, `runtime/vk_fg.cpp`
 `generate` and `vk_fg_frame`) passes `python tests\fg_reset_check.py`, which builds the header alone and checks that each

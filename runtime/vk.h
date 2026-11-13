@@ -527,11 +527,11 @@ int vk_mem_lookup(uint64_t addr, uint64_t size, VkMemSpan *out);
 uint64_t vk_mem_gen(void);
 // Page write generations over guest memory (mem_written_pages plus vk_guest_written). Returns 1 when a page of the
 // range was written after generation `since`, 0 when not, -1 when the range is not write-watched (treat as written);
-// *now is the generation to pass next time.
-int vk_mem_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now);
+// *now is the generation to pass next time. Generations are 64 bits and do not wrap; 0 is never handed out.
+int vk_mem_changed(uint64_t addr, uint64_t size, uint64_t since, uint64_t *now);
 // The same answer from per-epoch write-watch snapshots of 2 MiB regions: no system call once the regions were queried in
 // this epoch (a guest submission). For checks that may see writes made during the epoch one epoch late.
-int vk_mem_changed_snap(uint64_t addr, uint64_t size, uint32_t since, uint32_t epoch, uint32_t *now);
+int vk_mem_changed_snap(uint64_t addr, uint64_t size, uint64_t since, uint32_t epoch, uint64_t *now);
 void vk_mem_snap_stats(uint64_t *checks, uint64_t *calls, uint64_t *untracked);   // since the last call
 
 // Upload batch: one command buffer on gfx_queue that texture uploads and texel copies record into. begin/end bracket
@@ -801,10 +801,10 @@ int vk_texture_slot_retry_locked(int id);
 // have changed), 0 when a closer look is due (vk_mem_changed_snap).
 void vk_mem_gen_lock_shared(void);
 void vk_mem_gen_unlock_shared(void);
-int vk_mem_unchanged_locked(uint64_t addr, uint64_t size, uint32_t since, uint32_t epoch);
+int vk_mem_unchanged_locked(uint64_t addr, uint64_t size, uint64_t since, uint32_t epoch);
 // The same check's reason when it fails: 1 a region without this epoch's snapshot yet, 2 one untracked, 3 one written
 // since, 4 nothing to check (no size, beyond the regions); 0 unchanged.
-int vk_mem_unchanged_why_locked(uint64_t addr, uint64_t size, uint32_t since, uint32_t epoch);
+int vk_mem_unchanged_why_locked(uint64_t addr, uint64_t size, uint64_t since, uint32_t epoch);
 // The lock exclusively, for the snapshot of the regions of [addr, addr+size) that have none in epoch yet (the number of
 // write-watch queries it took).
 void vk_mem_gen_lock(void);
