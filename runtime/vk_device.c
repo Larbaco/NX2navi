@@ -435,7 +435,9 @@ static void fatal_note(void) {
 // NX2NAVI_TRACE=perf: every device memory allocation VMA makes, timed as the "device memory allocations" work mark
 // (perf.c mark_text). An area's first visit made 78 of them, 4.4 GB, in a frame of 421 ms of which about 180 ms
 // showed in no mark; vk_headroom.c measured 8-19 ms per 256 MiB block. VMA takes this one function from the
-// allocator's create info and the others from its static table (vk_vma.cpp VMA_STATIC_VULKAN_FUNCTIONS).
+// allocator's create info and the others from its static table (vk_vma.cpp VMA_STATIC_VULKAN_FUNCTIONS). A failed
+// attempt counts too, with its time and 0 bytes: VMA may then try again with a smaller block, and the failed call held
+// the frame as well, so the mark's count can pass the number of allocations made.
 static VkResult VKAPI_PTR timed_alloc(VkDevice d, const VkMemoryAllocateInfo *ai, const VkAllocationCallbacks *cb,
                                       VkDeviceMemory *m) {
     uint64_t t0 = perf_mark_begin();
