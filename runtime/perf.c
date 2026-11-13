@@ -11,6 +11,7 @@
 #include "gfx.h"
 #include "host.h"
 #include "nvn_api.h"
+#include "perf_census.h"
 #include "perfmon.h"
 #include "prof.h"
 #include "stutter_map.h"
@@ -329,10 +330,13 @@ static void hc_report(uint64_t frame) {
     plat_event_set(&hc_ev);
 }
 
-// The memory lines of a segment's end or a settled scene: the back end's (vk_mem_snapshot), then the sizes.
+// The memory lines of a segment's end or a settled scene: the back end's (vk_mem_snapshot), then the sizes. Their
+// time on the presenting thread delays the next frame: its "report" part.
 static void mem_snapshot(uint64_t frame) {
+    uint64_t t0 = kern_now_ns();
     vk_mem_snapshot(frame);
     sizes_log(frame);
+    perf_report_part(kern_now_ns() - t0);
 }
 __attribute__((weak)) int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact) {
     (void)used, (void)budget, (void)exact;
@@ -469,14 +473,34 @@ typedef struct {
 // The replay's part is its time without the pipeline, translation and texture waits, which all happen inside it: with
 // them in, every frame that waited 900 ms for a pipeline was charged to "replay", the larger number, and a log
 // could not tell a pipeline stall from a slow replay.
-// "census" is the address-space walk of NX2NAVI_MEM_CENSUS (census_check), which runs on the presenting thread after a
-// present: its time is charged to the next frame, which it delays. "hand-off" is the wait for the present thread to
-// take the previous picture (PERF_HANDOFF): its own pacing and its present call, an overlay's frame limiter included.
+// "census" is the address-space walk of NX2NAVI_MEM_CENSUS: census_check's on the presenting thread after a present,
+// whose time is charged to the next frame, which it delays, and the part of a frame vk_memory.c census_main's walk on
+// its own thread overlapped (perf_census.h census_charge). "report" is the memory report's time on the presenting
+// thread (vk_memory.c vk_mem_census every 600 frames with the perf trace, every 3600 without; the snapshots and sizes
+// lines here), charged to the next frame too. "hand-off" is the wait for the present thread to take the previous
+// picture (PERF_HANDOFF): its own pacing and its present call, an overlay's frame limiter included.
 // stutter_map.c cause_short and tools/stutter_map.py read these names, in this order.
-enum { FT_C_PIPE, FT_C_XLATE, FT_C_TEX, FT_C_FENCE, FT_C_PACE, FT_C_HANDOFF, FT_C_REPLAY, FT_C_CENSUS, FT_C_OTHER, FT_C_N };
+enum { FT_C_PIPE, FT_C_XLATE, FT_C_TEX, FT_C_FENCE, FT_C_PACE, FT_C_HANDOFF, FT_C_REPLAY, FT_C_CENSUS, FT_C_REPORT,
+       FT_C_OTHER, FT_C_N };
 static const char *const ft_cause_name[FT_C_N] = { "pipeline", "translation", "texture", "fence", "pacing", "hand-off",
-                                                   "replay", "census", "unattributed" };
+                                                   "replay", "census", "report", "unattributed" };
 static uint64_t census_part_ns;   // present thread: the census walks since the last present (census_check)
+static volatile int64_t report_part_ns;   // the memory report's time since the last present (perf_report_part), any thread
+static volatile uint64_t walk_t0, walk_t1;   // census_main's last walk (perf_census_walk); walk_t1 0 while it runs
+static volatile uint64_t census_walked = UINT64_MAX;   // the frame census_check walked last
+
+void perf_census_walk(int begin) {
+    if (begin) {
+        __atomic_store_n(&walk_t1, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&walk_t0, kern_now_ns(), __ATOMIC_RELEASE);
+    } else {
+        __atomic_store_n(&walk_t1, kern_now_ns(), __ATOMIC_RELEASE);
+    }
+}
+
+void perf_report_part(uint64_t ns) { plat_add64(&report_part_ns, (int64_t)ns); }
+
+uint64_t perf_census_walked_frame(void) { return __atomic_load_n(&census_walked, __ATOMIC_ACQUIRE); }
 static struct {
     uint64_t t0, frames, sum, over25, over50, over100;
     uint32_t hist[FT_BINS];
@@ -753,8 +777,10 @@ static uint64_t ft_frame(uint64_t frame, uint64_t now, uint64_t d) {
     int best = FT_C_OTHER;
     uint64_t census_ns = census_part_ns;
     census_part_ns = 0;
+    int64_t report_ns = __atomic_load_n(&report_part_ns, __ATOMIC_RELAXED) ? plat_xchg64(&report_part_ns, 0) : 0;
     if (d > 25000000ull || (stutter_map_on && d >= 12000000ull)) {
         part[FT_C_CENSUS] = census_ns < d ? census_ns : d;
+        part[FT_C_REPORT] = report_ns <= 0 ? 0 : (uint64_t)report_ns < d ? (uint64_t)report_ns : d;
         part[FT_C_PIPE] = frame_ns[PERF_PIPE];
         part[FT_C_XLATE] = frame_ns[PERF_XLATE];
         part[FT_C_TEX] = frame_ns[PERF_TEX];
@@ -767,6 +793,8 @@ static uint64_t ft_frame(uint64_t frame, uint64_t now, uint64_t d) {
         uint64_t known = 0;
         for (int c = 0; c < FT_C_OTHER; c++) known += part[c];
         part[FT_C_OTHER] = d > known ? d - known : 0;
+        uint64_t w0 = __atomic_load_n(&walk_t0, __ATOMIC_ACQUIRE), w1 = __atomic_load_n(&walk_t1, __ATOMIC_ACQUIRE);
+        census_charge(now, d, w0, w1, &part[FT_C_REPLAY], &part[FT_C_OTHER], &part[FT_C_CENSUS]);
         for (int c = 0; c < FT_C_N; c++)
             if (part[c] > part[best]) best = c;
         if (part[best] * 4 < d) best = FT_C_OTHER;   // no recorded part explains a quarter of the frame
@@ -853,6 +881,9 @@ static void census_check(uint64_t frame, uint64_t prv, const PerfGpu *g) {
     uint64_t host = host_commit(prv, g), t0 = kern_now_ns();
     int grown = host >= census_high + (1ull << 30) && (!census_ns || t0 - census_ns >= CENSUS_GAP_NS);
     if (frame % 3600 && !grown) return;
+    // This frame's memory report (vk_memory.c heap_log, after this present) leaves out its own walk: one is enough,
+    // and the second, 100-240 ms on census_main's thread, delayed the frames after it once more.
+    __atomic_store_n(&census_walked, frame, __ATOMIC_RELEASE);
     uint64_t wc = 0;
     if (prof_commit_census(frame, &wc)) perf_note_wc(wc, g->have_vram ? g->vram_used : 0);   // one walk for both lines
     else mem_guest_census(frame);
@@ -1108,5 +1139,9 @@ void perf_present(uint64_t frame) {
     sum = max = n = ab_b = 0;
     memset(wait_ns, 0, sizeof wait_ns);
     win_start = now;
-    if (frame % 600 == 0) sizes_log(frame), hc_report(frame);   // beside vk_memory.c's 600-frame memory lines
+    if (frame % 600 == 0) {   // beside vk_memory.c's 600-frame memory lines, and like them the next frame's "report"
+        uint64_t s0 = kern_now_ns();
+        sizes_log(frame), hc_report(frame);
+        perf_report_part(kern_now_ns() - s0);
+    }
 }

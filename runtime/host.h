@@ -128,6 +128,14 @@ extern void (*perf_gpu_stats)(PerfGpu *out);
 // commit census). perf_wc_recent: the last such figure when it is at most max_age_ns old, else 0.
 void perf_note_wc(uint64_t wc, uint64_t vram_used);
 int perf_wc_recent(uint64_t max_age_ns, uint64_t *wc, uint64_t *vram_used);
+// The frame-time summary's "census" and "report" parts (perf.c ft_frame). perf_census_walk(1) and (0) bracket a walk of
+// the address space on another thread (vk_memory.c census_main): a frame that overlapped it has that much moved to
+// "census". perf_report_part adds the time the memory report took on the presenting thread (vk_memory.c
+// vk_mem_census), any thread, to the next present's "report". perf_census_walked_frame: the frame whose present walked
+// the address space itself (perf.c census_check), UINT64_MAX before any, so a report of that frame skips its own walk.
+void perf_census_walk(int begin);
+void perf_report_part(uint64_t ns);
+uint64_t perf_census_walked_frame(void);
 // The performance overlay (perfmon.c): mode 0 off, 1 fps, 2 full. While it is on, perf_present hands every frame to
 // perfmon_frame; full also takes the event counts (perf_count) and the GPU timestamps as NX2NAVI_TRACE=perf does.
 void perf_set_overlay(int mode);

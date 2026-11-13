@@ -1003,6 +1003,7 @@ void vk_mem_census(uint64_t frame) {
         rt_log("mem: the report of frame %llu took %.2f ms on the presenting thread: vram lines %.2f ms, holes %.2f ms, "
                "owners and the rest %.2f ms", (unsigned long long)frame, qpc_ms(h2 - r0), qpc_ms(rv), qpc_ms(h1 - h0),
                qpc_ms(h2 - h1));
+        perf_report_part(h2 - r0);   // the next frame's "report" part (perf.c ft_frame), not unattributed
     }
     if (vk_texture_compact_due()) compact_look();   // NX2NAVI_TEX_COMPACT: 0 at once with the setting off
     if ((rt_trace & RT_TRACE_PERF) && frame % 60 == 0)
@@ -4558,10 +4559,17 @@ static void census_main(void *arg) {
     free(arg);
     const double M = 1048576.0;
     uint64_t priv = 0, wc = 0, wcn = 0, now;
+    // perf.c ft_frame charges the frames the walk overlapped to "census"; the line gives the walk's span on the run's
+    // clock (kern_now_ns) so that it can be set beside the frames it held up
+    perf_census_walk(1);
+    uint64_t w0 = kern_now_ns();
     int have = plat_mem_census(&priv, &wc, &wcn);
+    uint64_t w1 = kern_now_ns();
+    perf_census_walk(0);
     if (have) {
-        rt_log("mem: process frame %llu: private %.0f MiB, write-combined %.0f MiB in %llu allocations",
-               (unsigned long long)j.frame, priv / M, wc / M, (unsigned long long)wcn);
+        rt_log("mem: process frame %llu: private %.0f MiB, write-combined %.0f MiB in %llu allocations; the walk %.3f s "
+               "to %.3f s, %.1f ms", (unsigned long long)j.frame, priv / M, wc / M, (unsigned long long)wcn, w0 / 1e9,
+               w1 / 1e9, (w1 - w0) / 1e6);
         uint64_t used = 0, budget = 0;
         int exact = 0;
         if (!vk_mem_vram(&used, &budget, &exact)) used = 0;
@@ -4625,9 +4633,10 @@ static void heap_log(VkCtx *c, uint64_t frame, const VmaBudget *vb) {
     // The address-space walk of the census (plat_mem_census, 100-240 ms of VirtualQuery) runs on its own thread, but
     // it holds the process's address-space lock, which the game's threads take at every page fault and every
     // VirtualAlloc: the present after each walk arrived 65-120 ms late. NX2NAVI_MEM_CENSUS=1 asks for it.
+    // Not when this frame's present walked already (perf.c census_check, every 3600 frames and on commit growth).
     static int census_on = -1;
     if (census_on < 0) census_on = cfg_bool("NX2NAVI_MEM_CENSUS");
-    if (!census_on || plat_xchg32(&census_busy, 1)) return;
+    if (!census_on || perf_census_walked_frame() == frame || plat_xchg32(&census_busy, 1)) return;
     CensusJob *j = malloc(sizeof *j);
     if (j) *j = (CensusJob){c, frame};
     if (!j || !plat_thread_spawn(census_main, j, "mem census", 0)) free(j), plat_xchg32(&census_busy, 0);

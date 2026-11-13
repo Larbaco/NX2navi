@@ -19,7 +19,7 @@ void rt_log(const char *fmt, ...) {
 
 // perf.c's causes, in its order (FT_C_*); the frames below are charged to the last, unattributed
 static const char *const names[] = {"pipeline", "translation", "texture", "fence", "pacing", "hand-off", "replay",
-                                    "census", "unattributed"};
+                                    "census", "report", "unattributed"};
 #define OTHER (SM_CAUSES - 1)
 _Static_assert(sizeof names / sizeof *names == SM_CAUSES, "names follows perf.c's FT_C_* list");
 static uint64_t frame_no;

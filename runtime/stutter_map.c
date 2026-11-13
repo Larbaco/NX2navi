@@ -18,7 +18,7 @@
 // 96 ms after an area load (2026-11-13) each counted as a change of pace before, as each was followed by one as long.
 //
 // What a hitch went to comes from the frame-time summary's split (perf.c ft_frame: pipeline, translation, texture,
-// fence, pacing, hand-off, replay, census, unattributed), with the draws that met a pipeline or a shader missing between the previous
+// fence, pacing, hand-off, replay, census, report, unattributed), with the draws that met a pipeline or a shader missing between the previous
 // present and this one (stutter_miss, from the replay thread). Each hitch gets a "stutter:" line, at most
 // SM_LINES_PER_S a second and SM_LINES_MAX in all; the counts go on past that. Every SM_REPORT_NS of play, when the
 // window loses the focus in play (perf.c session_report) and at exit,
@@ -42,7 +42,7 @@
 int stutter_map_on;
 
 #define SM_AREAS 128                       // areas kept by name; later ones share the last slot
-#define SM_CAUSES 9                        // perf.c's FT_C_N
+#define SM_CAUSES 10                       // perf.c's FT_C_N
 #define SM_LOAD_NS 3000000000ull           // after an area load, frames count as the load's for this long
 #define SM_HITCH_MIN_NS 12000000.0         // a hitch is at least this long...
 #define SM_HITCH_ANY_NS 25000000ull        // ...and any frame over this is one
@@ -365,9 +365,9 @@ void stutter_frame(uint64_t frame, uint64_t now, uint64_t d, const uint64_t *par
 }
 
 // In the order of perf.c's causes (FT_C_*); "hand-off" is the wait for the present thread to take the previous picture,
-// "census" NX2NAVI_MEM_CENSUS's walk of the address space.
+// "census" NX2NAVI_MEM_CENSUS's walk of the address space, "report" the memory report on the presenting thread.
 static const char *const cause_short[SM_CAUSES] = {"pipeline", "translation", "texture", "fence", "pacing", "hand-off",
-                                                   "replay", "census", "unattributed"};
+                                                   "replay", "census", "report", "unattributed"};
 
 static int area_cmp(const void *x, const void *y) {
     const Area *a = &areas[*(const int *)x], *b = &areas[*(const int *)y];

@@ -715,6 +715,12 @@ of `runtime/perf.c` `perf_present`) or to how `tools/perf_summary.py` reads them
 with them and checks the present percentiles, the present thread's averages and the hand-off share the tool prints,
 and that the lines of older logs, without those fields, still parse. Any Python, no game files.
 
+A change to what the frame-time summary charges to an address-space walk of `NX2NAVI_MEM_CENSUS`
+(`runtime/perf_census.h` `census_charge`, `runtime/perf.c` `ft_frame`) passes `python tests\census_charge_check.py`,
+which builds the header alone: a walk before, after or around a frame, one still running, the charge taken from the
+replay part first, capped by the overlap and the parts, and 100,000 random frames in which the census part never passes
+the frame and the parts keep their sum. No GPU, no game files.
+
 The lifter (`recomp/`) and the CPU headers (`runtime/cpu.h`, `runtime/simd.h`) are checked against Unicorn. Every lifter
 change passes these, all run with `.venv`:
 
