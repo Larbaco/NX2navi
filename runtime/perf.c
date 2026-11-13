@@ -57,6 +57,7 @@ uint64_t perf_gpu_busy_total(void) { return (uint64_t)__atomic_load_n(&gpu_busy_
 // through exit() rather than plat_exit, whose log sync this is, gets the lines of the frame-time summary, the stutter
 // map and everything queued before them into the log instead of losing them with the log thread's queue.
 static void log_sync_at_exit(void) { rt_log_sync(); }
+static void hc_start(void);
 
 void prof_start(void) {
     flight_init();
@@ -65,6 +66,7 @@ void prof_start(void) {
     atexit(perf_summary_flush);   // boot.c's _exit path goes through prof_write instead
     perf_base = (rt_trace & RT_TRACE_PERF) || flight_on;
     perf_on = perf_base || overlay == 2;
+    hc_start();
     if (prof_sampler_start()) atexit(prof_write);   // a --seconds run ends in _exit: boot.c calls prof_write itself first
 }
 
@@ -240,6 +242,75 @@ static void sizes_log(uint64_t frame) {
         for (int i = 0; i < 7 && groups[g].fn[i]; i++) groups[g].fn[i](&s);
         sizes_flush(&s);
     }
+}
+
+// ---- NX2NAVI_HANDLE_CENSUS=1 with NX2NAVI_TRACE=perf: the process's OS handles by kind (platform.h plat_handle_census)
+// at the 600-frame report, when their count (the sizes line's "process handles") grew by HC_GROWTH or more since the
+// last census. In a session of 2026-11-13 that count rose at every area load, 683 to 1095 in 11 minutes, and never
+// fell, while the guest's handles stayed at 116-122: this says which kind grows. The census reads the system's whole
+// handle table (2-5 ms and a buffer of a few MiB), so it runs on one thread of its own, started with the trace and
+// woken by the report; a new thread per census would add its own Thread handle to what it counts.
+#define HC_GROWTH 16
+#define HC_KINDS 64
+static PlatEvent hc_ev;
+static volatile uint64_t hc_frame;   // the report's frame, for the line
+static int hc_on;
+
+static int hc_cmp(const void *x, const void *y) {
+    const PlatHandleKind *a = x, *b = y;
+    return a->n < b->n ? 1 : a->n > b->n ? -1 : strcmp(a->name, b->name);
+}
+
+static void hc_main(void *arg) {
+    (void)arg;
+    static PlatHandleKind now[HC_KINDS], last[HC_KINDS];
+    int n_last = -1;
+    uint32_t count_last = 0, total_last = 0;
+    for (;;) {
+        plat_event_wait(&hc_ev);
+        uint64_t frame = __atomic_load_n(&hc_frame, __ATOMIC_RELAXED);
+        uint32_t count = plat_handle_count();
+        if (n_last >= 0 && count < count_last + HC_GROWTH) continue;
+        uint64_t t0 = kern_now_ns();
+        int n = plat_handle_census(now, HC_KINDS);
+        if (n < 0) {
+            rt_log("mem: handles frame %llu: the census by kind failed; not tried again", (unsigned long long)frame);
+            return;
+        }
+        double ms = (kern_now_ns() - t0) / 1e6;
+        qsort(now, (size_t)n, sizeof *now, hc_cmp);
+        uint32_t total = 0;
+        for (int i = 0; i < n; i++) total += now[i].n;
+        char line[1600];
+        int o = snprintf(line, sizeof line, "mem: handles frame %llu: %u in all", (unsigned long long)frame, total);
+        if (n_last >= 0) o += snprintf(line + o, sizeof line - (size_t)o, " (%+d since the last census)", (int)(total - total_last));
+        o += snprintf(line + o, sizeof line - (size_t)o, ":");
+        for (int i = 0; i < n && o < (int)sizeof line - 80; i++) {
+            o += snprintf(line + o, sizeof line - (size_t)o, "%s %s %u", i ? "," : "", now[i].name, now[i].n);
+            if (n_last < 0) continue;
+            int64_t was = 0;
+            for (int k = 0; k < n_last; k++)
+                if (!strcmp(last[k].name, now[i].name)) was = last[k].n;
+            if (now[i].n != was) o += snprintf(line + o, sizeof line - (size_t)o, " (%+lld)", (long long)now[i].n - was);
+        }
+        if (o < (int)sizeof line - 40) snprintf(line + o, sizeof line - (size_t)o, "; the census took %.1f ms", ms);
+        rt_log("%s", line);
+        memcpy(last, now, (size_t)n * sizeof *now);
+        n_last = n, count_last = count, total_last = total;
+    }
+}
+
+static void hc_start(void) {
+    if (!(rt_trace & RT_TRACE_PERF) || !cfg_bool("NX2NAVI_HANDLE_CENSUS")) return;
+    plat_event_init(&hc_ev, 0, 0);
+    hc_on = plat_thread_spawn(hc_main, NULL, "handle census", 0);
+}
+
+// The 600-frame report (perf_present): wakes the census thread, which decides whether the count grew enough.
+static void hc_report(uint64_t frame) {
+    if (!hc_on) return;
+    __atomic_store_n(&hc_frame, frame, __ATOMIC_RELAXED);
+    plat_event_set(&hc_ev);
 }
 
 // The memory lines of a segment's end or a settled scene: the back end's (vk_mem_snapshot), then the sizes.
@@ -1012,5 +1083,5 @@ void perf_present(uint64_t frame) {
     sum = max = n = ab_b = 0;
     memset(wait_ns, 0, sizeof wait_ns);
     win_start = now;
-    if (frame % 600 == 0) sizes_log(frame);   // beside vk_memory.c's 600-frame memory lines
+    if (frame % 600 == 0) sizes_log(frame), hc_report(frame);   // beside vk_memory.c's 600-frame memory lines
 }

@@ -533,6 +533,12 @@ A change to what a host thread gives back when it ends (`runtime/platform/win32.
 sleep, read a file and end, half joined and half detached; the end hook runs once on each, and on Windows the process
 holds as many handles afterwards as before (each thread's sleep timer and read event are closed). No game files.
 
+A change to the census of the process's handles by kind (`runtime/platform/win32.c` `plat_handle_census`, which
+`NX2NAVI_HANDLE_CENSUS` logs) passes `python tests\handle_census_check.py`, which builds the platform layer alone: 20
+events and 5 sections made show as Event +20 and Section +5, the total stays within 2 of the process's handle count,
+the figures go back once they are closed, and the kinds past the room given are summed in the last entry. Windows
+only. No game files.
+
 A file a detached thread writes piece by piece (the flight recorder's dump, `runtime/flight.c` `dump_main`) goes
 through `runtime/part_file.h`: it is written as `<name>.part` and renamed when complete, because the window's close
 ends the process under such a thread and a file cut short there would read as a whole one. A file made in memory

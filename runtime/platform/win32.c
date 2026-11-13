@@ -2188,6 +2188,106 @@ uint32_t plat_handle_count(void) {
     return GetProcessHandleCount(GetCurrentProcess(), &n) ? (uint32_t)n : 0;
 }
 
+// plat_handle_census: the system's handle table (NtQuerySystemInformation, class 64, the extended handle information)
+// filtered by this process's id, and the object types' names from NtQueryObject's ObjectTypesInformation, whose entries
+// carry the type index the table uses (Windows 8.1 and later). The table holds every process's handles; a census took
+// 1.5-4.7 ms over 3.6 MiB of it on the development PC.
+typedef struct {
+    PVOID object;
+    ULONG_PTR pid, handle;
+    ULONG access;
+    USHORT backtrace, type;
+    ULONG attributes, reserved;
+} HcEntry;
+typedef struct {
+    ULONG_PTR n, reserved;
+    HcEntry e[1];
+} HcTable;
+typedef struct {
+    USHORT len, max;
+    PWSTR buf;
+} HcName;
+typedef struct {   // one entry of ObjectTypesInformation; its name's characters follow it
+    HcName name;
+    ULONG totals[13];   // object and handle counts, pool use, their high-water marks, invalid attributes: not read
+    GENERIC_MAPPING mapping;
+    ULONG valid_access;
+    BOOLEAN security, maintain;
+    UCHAR index;
+    CHAR reserved;
+    ULONG pool, paged, nonpaged;
+} HcType;
+
+static void hc_type_names(char names[256][32]) {
+    typedef LONG(NTAPI * Qo)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    Qo qo = nt ? (Qo)(void *)GetProcAddress(nt, "NtQueryObject") : NULL;
+    if (!qo) return;
+    size_t cap = 1u << 16;
+    uint8_t *buf = NULL;
+    LONG st = -1;
+    for (int tries = 0; tries < 6; tries++, cap *= 2) {
+        uint8_t *b = realloc(buf, cap);
+        if (!b) break;
+        buf = b;
+        ULONG need = 0;
+        st = qo(NULL, 3, buf, (ULONG)cap, &need);   // ObjectTypesInformation
+        if (st != (LONG)0xC0000004L) break;          // not STATUS_INFO_LENGTH_MISMATCH: done, or failed
+    }
+    if (st >= 0 && buf) {
+        ULONG count = *(ULONG *)buf;
+        const uint8_t *p = buf + sizeof(void *), *end = buf + cap;   // the count, then entries at pointer alignment
+        for (ULONG i = 0; i < count && p + sizeof(HcType) <= end; i++) {
+            const HcType *t = (const HcType *)p;
+            WideCharToMultiByte(CP_UTF8, 0, t->name.buf, t->name.len / 2, names[t->index], 31, NULL, NULL);
+            p += sizeof(HcType) + ((t->name.max + sizeof(void *) - 1) & ~(sizeof(void *) - 1));
+        }
+    }
+    free(buf);
+}
+
+int plat_handle_census(PlatHandleKind *out, int max) {
+    typedef LONG(NTAPI * Qsi)(ULONG, PVOID, ULONG, PULONG);
+    static char names[256][32];
+    static int named;
+    static void *table;
+    static size_t cap;
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    Qsi qsi = nt ? (Qsi)(void *)GetProcAddress(nt, "NtQuerySystemInformation") : NULL;
+    if (!qsi || max <= 0) return -1;
+    if (!named) hc_type_names(names), named = 1;
+    LONG st = -1;
+    for (int tries = 0; tries < 6; tries++) {
+        if (!table && !(table = malloc(cap = 4u << 20))) return -1;
+        ULONG need = 0;
+        st = qsi(64, table, (ULONG)cap, &need);   // SystemExtendedHandleInformation
+        if (st != (LONG)0xC0000004L) break;       // the table outgrew the buffer: a larger one
+        size_t want = need > cap ? need + (1u << 20) : cap * 2;
+        void *b = realloc(table, want);
+        if (!b) return -1;
+        table = b, cap = want;
+    }
+    if (st < 0) return -1;
+    uint32_t count[256] = {0};
+    const HcTable *t = table;
+    ULONG_PTR pid = GetCurrentProcessId();
+    for (ULONG_PTR i = 0; i < t->n && offsetof(HcTable, e) + (i + 1) * sizeof(HcEntry) <= cap; i++)
+        if (t->e[i].pid == pid) count[t->e[i].type & 255]++;
+    int n = 0;
+    for (int k = 0; k < 256; k++) {
+        if (!count[k]) continue;
+        if (n == max) {   // no room: the last entry takes the rest
+            snprintf(out[max - 1].name, sizeof out[0].name, "%s", "(more kinds)");
+            out[max - 1].n += count[k];
+            continue;
+        }
+        if (names[k][0]) snprintf(out[n].name, sizeof out[0].name, "%s", names[k]);
+        else snprintf(out[n].name, sizeof out[0].name, "type %d", k);
+        out[n++].n = count[k];
+    }
+    return n;
+}
+
 // The UCRT's malloc takes its memory from the heap _get_heap_handle names (the process heap); HeapSummary sums it. The
 // other heaps are only counted: one made with HEAP_NO_SERIALIZE has no lock to take.
 void plat_heap_info(PlatHeapInfo *h) {

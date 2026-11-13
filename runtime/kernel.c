@@ -2447,7 +2447,8 @@ int kern_svc(Cpu *c, uint32_t imm) {
 }
 
 // NX2NAVI_TRACE=perf "mem: sizes" (perf.c): guest threads, the handle table, the system-event table and fibers, each
-// against its fixed size (the tables are fatal when full).
+// against its fixed size (the tables are fatal when full). Beside the guest's handles, the OS handles of the process
+// (platform.h plat_handle_count): they grew at every area load of a session while the guest's stayed flat.
 void kern_sizes(PerfSizes *s) {
     uint64_t threads = 0, handles = 0, fibers = 0, ses;
     plat_mutex_lock_shared(&G);
@@ -2462,6 +2463,7 @@ void kern_sizes(PerfSizes *s) {
     plat_mutex_unlock_shared(&g_fiber_lock);
     perf_size(s, "guest threads", threads, 0, PERF_SIZE_NONE);
     perf_size(s, "handles", handles, MAX_H, PERF_SIZE_NONE);
+    perf_size(s, "process handles", plat_handle_count(), 0, PERF_SIZE_NONE);
     perf_size(s, "system events", ses, sizeof g_se / sizeof *g_se, PERF_SIZE_NONE);
     perf_size(s, "fibers", fibers, FIBER_MAX, PERF_SIZE_NONE);
 }

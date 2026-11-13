@@ -1012,6 +1012,10 @@
 # (the "commit census" lines). Each walk holds the address-space lock for 100-260 ms and delays the next frame by as
 # much, so they are off unless asked for: leave it off in a run whose smoothness is judged.
 # mem_census = 0
+# 1: with trace = perf, the process's handles counted by kind (events, sections, threads, files...) at the 600-frame
+# report when their number grew by 16 or more since the last count (the "mem: handles" line). It reads the system's
+# whole handle table on a thread of its own, 2-5 ms each time, and keeps a few MB for it. Read at start.
+# handle_census = 0
 # The memory the game is taken to need, in MB of commit (RAM plus page file not yet promised to a program). When less
 # is free at the start, the log gets a warning line: short of memory the game stutters, loses textures or stops with
 # an out-of-memory or lost-device error. The default is what the game took in play at 3840x2160 on an RTX 5090; the

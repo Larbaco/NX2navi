@@ -2257,6 +2257,47 @@ uint32_t plat_handle_count(void) {
     return n ? n - 1 : 0;   // less the descriptor of this walk
 }
 
+// plat_handle_census: each descriptor's link, by kind: "socket:[N]" and "pipe:[N]" by their prefix, an anonymous
+// inode by its kind ("anon_inode:[eventfd]" is eventfd), a device by its /dev folder, any other path as file.
+int plat_handle_census(PlatHandleKind *out, int max) {
+    DIR *d = max > 0 ? opendir("/proc/self/fd") : NULL;
+    if (!d) return -1;
+    int n = 0, self = dirfd(d);
+    for (struct dirent *e; (e = readdir(d));) {
+        if (e->d_name[0] == '.' || atoi(e->d_name) == self) continue;
+        char link[64], target[256], kind[32];
+        snprintf(link, sizeof link, "/proc/self/fd/%s", e->d_name);
+        ssize_t len = readlink(link, target, sizeof target - 1);
+        if (len < 0) continue;   // closed meanwhile
+        target[len] = 0;
+        if (!strncmp(target, "/dev/", 5)) {
+            size_t k = strcspn(target + 5, "/");
+            snprintf(kind, sizeof kind, "/dev/%.*s", (int)(k < 20 ? k : 20), target + 5);
+        } else if (target[0] == '/') {
+            snprintf(kind, sizeof kind, "%s", "file");
+        } else if (!strncmp(target, "anon_inode:", 11)) {
+            const char *k = target + 11 + (target[11] == '[');
+            snprintf(kind, sizeof kind, "%.*s", (int)strcspn(k, "]"), k);
+        } else {
+            snprintf(kind, sizeof kind, "%.*s", (int)strcspn(target, ":"), target);
+        }
+        int i = 0;
+        while (i < n && strcmp(out[i].name, kind)) i++;
+        if (i == n) {
+            if (n == max) {   // no room: the last entry takes the rest
+                i = max - 1;
+                snprintf(out[i].name, sizeof out[i].name, "%s", "(more kinds)");
+            } else {
+                snprintf(out[n].name, sizeof out[n].name, "%s", kind);
+                out[n++].n = 0;
+            }
+        }
+        out[i].n++;
+    }
+    closedir(d);
+    return n;
+}
+
 // glibc's mallinfo2 (2.33 and later) sums every arena: arena is what the arenas took with brk and mmap, hblkhd the
 // blocks mmapped one by one, uordblks what the arenas handed out. Other C libraries leave the figures unknown.
 void plat_heap_info(PlatHeapInfo *h) {

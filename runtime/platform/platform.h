@@ -538,6 +538,13 @@ int plat_page_file_managed(void);
 void plat_process_memory(uint64_t *resident, uint64_t *private_bytes);
 // The handles (Windows) or file descriptors (Linux) this process holds; 0 when unknown.
 uint32_t plat_handle_count(void);
+// The same by kind: Windows the object type of each handle (Event, Section, Thread, File...), Linux what each file
+// descriptor's link names (socket, pipe, an anon_inode kind, a /dev folder, file). Fills out with up to max kinds,
+// unsorted, and returns how many, -1 on failure; the kinds past max are counted in the last entry, named "(more
+// kinds)". Never opens, duplicates or names a handle. Windows reads the system's whole handle table into a buffer of a
+// few MiB kept between calls: one thread calls it at a time.
+typedef struct { char name[32]; uint32_t n; } PlatHandleKind;
+int plat_handle_census(PlatHandleKind *out, int max);
 // The C runtime's malloc heap in bytes, for the memory report (vk_memory.c system_log): what it took from the system
 // (committed) and what of that it handed out (used), and how many other heaps the process has (Windows: those DLLs made
 // with HeapCreate, the graphics driver's among them; their sizes are not asked, as a heap made without serialization
