@@ -2633,7 +2633,9 @@ static int pb_images(VkCommandBuffer cb, uint32_t w, uint32_t h) {
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 2,
                            .pImageMemoryBarriers = ib};
     vkCmdPipelineBarrier2(cb, &di);
-    PB.w = w, PB.h = h;
+    // used again: pb_destroy above cleared it with the old images, and idle_release took the new ones, which this frame
+    // uses, for 600 presents unused and freed them at the next present, without a wait for the GPU
+    PB.w = w, PB.h = h, PB.used = D.presents;
     rt_log("dlaa: prebloom: the passes after the upscaler draw at %ux%u (two B10G11R11 images, %.0f MiB)", w, h,
            2.0 * w * h * 4 / 1048576.0);
     return 1;
