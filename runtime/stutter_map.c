@@ -13,7 +13,8 @@
 // stutter in play. An area load is the game's (stutter_area) or the texture pool's (stutter_load: the pool makes an
 // area's textures, vk_exec_draw.c pool_loading), which comes without the game's when it streams the next area in.
 // Consecutive long frames are one episode, a hitch counted once with their summed time: a change of pace is a run of
-// more than SM_EPISODE_MAX long frames none of which stands out from the ones after it. Three frames of 87, 91 and
+// more than SM_EPISODE_MAX long frames none of which stands out from the ones after it, and an episode ends at its
+// last frame that stood out once more than SM_EPISODE_MAX such frames follow that one. Three frames of 87, 91 and
 // 96 ms after an area load (2026-11-13) each counted as a change of pace before, as each was followed by one as long.
 //
 // What a hitch went to comes from the frame-time summary's split (perf.c ft_frame: pipeline, translation, texture,
@@ -110,6 +111,8 @@ static struct {
     Cand first;
     uint64_t last, total;   // the last frame in it; the frames' summed intervals
     int n, hitch, open;     // frames in it; one of them stood out from the frames after it (or was over the sure line)
+    uint64_t hit_last, hit_total;   // the episode up to its last frame that stood out: that frame, the summed intervals
+    int hit_n;                      // and the frames to it (0: none stood out)
 } ep;
 static int pace_run;        // more than SM_EPISODE_MAX long frames, none standing out: a new pace, until it ends
 static uint64_t pace_last;
@@ -279,8 +282,12 @@ static void episode_close(uint64_t now) {
 }
 
 // A candidate the SM_AFTER frames after it have been seen for: it stands out (a hitch) or the frames after it are as
-// long (paced). It joins the episode of the frame before it, or starts one. An episode of more than SM_EPISODE_MAX
-// frames none of which stood out is a change of pace: they and the paced frames right after them are left out.
+// long (paced). It joins the episode of the frame before it, or starts one. More than SM_EPISODE_MAX paced frames
+// after the episode's last frame that stood out (or from its start, when none did) are a change of pace: they and the
+// paced frames right after them are left out, and an episode with a frame that stood out ends at that frame and is
+// counted. At 40 fps or less every frame is over SM_HITCH_ANY_NS and so a candidate: without the cut at the last frame
+// that stood out, the first hitch took in every frame after it until the rate rose, and a 30 fps session counted one
+// hitch seconds long in place of its five.
 static void cand_decide(const Cand *c, uint64_t now) {
     int paced = c->d <= SM_HITCH_SURE_NS && (double)c->after_max * SM_AFTER_RATIO >= (double)c->d;
     if (pace_run) {
@@ -291,12 +298,19 @@ static void cand_decide(const Cand *c, uint64_t now) {
         pace_run = 0;
     }
     if (ep.open && c->frame == ep.last + 1) {
-        ep.last = c->frame, ep.total += c->d, ep.n++, ep.hitch |= !paced;
-        if (!ep.hitch && ep.n > SM_EPISODE_MAX) paced_out += (uint64_t)ep.n, ep.open = 0, pace_run = 1, pace_last = c->frame;
+        ep.last = c->frame, ep.total += c->d, ep.n++;
+        if (!paced) ep.hitch = 1, ep.hit_n = ep.n, ep.hit_last = c->frame, ep.hit_total = ep.total;
+        if (ep.n - ep.hit_n > SM_EPISODE_MAX) {
+            paced_out += (uint64_t)(ep.n - ep.hit_n);
+            if (ep.hitch) ep.n = ep.hit_n, ep.last = ep.hit_last, ep.total = ep.hit_total, episode_close(now);
+            else ep.open = 0;
+            pace_run = 1, pace_last = c->frame;
+        }
         return;
     }
     if (ep.open) episode_close(now);
     ep.first = *c, ep.last = c->frame, ep.total = c->d, ep.n = 1, ep.hitch = !paced, ep.open = 1;
+    ep.hit_n = !paced, ep.hit_last = c->frame, ep.hit_total = paced ? 0 : c->d;
 }
 
 void stutter_frame(uint64_t frame, uint64_t now, uint64_t d, const uint64_t *part, const char *const *names, int n,

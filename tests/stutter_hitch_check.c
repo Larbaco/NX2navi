@@ -75,6 +75,22 @@ int main(void) {
     frames(1, 60.0), frames(30, 7.0);
     expect("a spike right after the pool's load (play)", areas[1].hitch, 0);
     expect("a spike right after the pool's load (load)", areas[1].load_hitch, 2);
+    // At 30 fps every frame is over SM_HITCH_ANY_NS and so a candidate: a hitch followed by the steady frames ends at
+    // itself, not at the end of the slow run (an episode of 301 frames, 10 s long, before)
+    stutter_area("Lake Hylia");
+    clock_ns += 10000000000ull;
+    frames(200, 7.0);
+    frames(1, 150.0), frames(300, 33.3);
+    expect("150 ms then 300 frames at 30 fps", areas[2].hitch, 1);
+    expect("150 ms then 300 frames at 30 fps (worst)", areas[2].worst_ns, 150000000ull);
+    frames(200, 7.0);   // the end of the slow run stands out from the frames after it: one more
+    stutter_area("Gerudo Valley");
+    clock_ns += 10000000000ull;
+    frames(200, 33.3);   // a steady 30 fps with a 120 ms hitch every 60 frames: each counts
+    for (int k = 0; k < 5; k++) frames(1, 120.0), frames(59, 33.3);
+    expect("five hitches at 30 fps", areas[3].hitch, 5);
+    expect("five hitches at 30 fps (worst)", areas[3].worst_ns, 120000000ull);
+    expect("five hitches at 30 fps (their time)", areas[3].cause_ns[7], 600000000ull);
     if (!logged) printf("FAIL nothing was logged\n"), fails++;
     if (fails) return 1;
     printf("stutter_hitch_check: all checks passed\n");
