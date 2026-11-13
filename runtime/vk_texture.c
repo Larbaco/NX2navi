@@ -2540,13 +2540,14 @@ static uint64_t released_cap_bytes(void) {
     if (!released_cap) {
         const char *s = cfg_get("NX2NAVI_TEX_RELEASED_MB");
         long long mb;
-        int by_vram = 0;
+        const char *by = "";   // which term set the bound, for the line below
         if (s && *s) mb = atoll(s);
         else {
             float used, total, proc;
             plat_mem_info(&used, &total, &proc);
             mb = total > 0 ? (long long)(total / 32) : 1024;
             mb = mb < 512 ? 512 : mb > 2048 ? 2048 : mb;
+            by = ", a thirty-second of the installed memory (512 MiB to 2 GiB)";
             // By the card too: a quarter of its budget where the PC has an eighth of its memory to match, up to
             // RELEASED_CAP_MAX_MB. The game lets go of the textures of what leaves the view and takes them back when
             // it returns; walking through a village the released ones passed 1 GiB within two or three minutes, and
@@ -2559,13 +2560,15 @@ static uint64_t released_cap_bytes(void) {
             if (vk_mem_vram(&vused, &vbudget, &exact) && total > 0) {
                 long long by_card = (long long)(vbudget >> 22), by_ram = (long long)(total / 8);   // a quarter, in MiB
                 long long more = by_card < by_ram ? by_card : by_ram;
-                if (more > RELEASED_CAP_MAX_MB) more = RELEASED_CAP_MAX_MB;
-                if (more > mb) mb = more, by_vram = 1;
+                const char *more_by = by_card <= by_ram ? ", a quarter of the video memory budget"
+                                                        : ", an eighth of the installed memory";
+                if (more > RELEASED_CAP_MAX_MB) more = RELEASED_CAP_MAX_MB, more_by = ", the largest the rule by the card gives";
+                if (more > mb) mb = more, by = more_by;
             }
         }
         released_cap = mb > 0 ? (uint64_t)mb << 20 : UINT64_MAX;
         if (mb > 0) rt_log("vk: released textures keep at most %lld MiB of their own memory%s (NX2NAVI_TEX_RELEASED_MB)", mb,
-                           by_vram ? ", a quarter of the video memory budget" : "");
+                           by);
         else rt_log("vk: released textures: no size limit");
     }
     return released_cap;
