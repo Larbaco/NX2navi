@@ -988,8 +988,21 @@ void vk_mem_census(uint64_t frame) {
     __atomic_store_n(&span_frame, frame, __ATOMIC_RELAXED);
     if (dmabuf_on && frame % 60 == 0) span_gc(frame, 0);
     static uint64_t window_start;
-    if ((rt_trace & RT_TRACE_PERF) && frame % 600 == 0) vram_log(frame), mirror_pool_log(frame);
-    if (frame && frame % ((rt_trace & RT_TRACE_PERF) ? 600 : HOLES_PERIOD) == 0) holes_log(frame), owner_log(frame);
+    // The report runs here, on the presenting thread, so its time is timed: the 600-frame frames of a session with
+    // NX2NAVI_TRACE=perf carried 10-17 ms nothing else accounted for (2026-11-13), and the walks of the texture
+    // entries, the pipelines and the C runtime heap's summary all happen in it.
+    uint64_t r0 = qpc(), rv = 0;
+    if ((rt_trace & RT_TRACE_PERF) && frame % 600 == 0) vram_log(frame), mirror_pool_log(frame), rv = qpc() - r0;
+    if (frame && frame % ((rt_trace & RT_TRACE_PERF) ? 600 : HOLES_PERIOD) == 0) {
+        uint64_t h0 = qpc();
+        holes_log(frame);
+        uint64_t h1 = qpc();
+        owner_log(frame);
+        uint64_t h2 = qpc();
+        rt_log("mem: the report of frame %llu took %.2f ms on the presenting thread: vram lines %.2f ms, holes %.2f ms, "
+               "owners and the rest %.2f ms", (unsigned long long)frame, qpc_ms(h2 - r0), qpc_ms(rv), qpc_ms(h1 - h0),
+               qpc_ms(h2 - h1));
+    }
     if (vk_texture_compact_due()) compact_look();   // NX2NAVI_TEX_COMPACT: 0 at once with the setting off
     if ((rt_trace & RT_TRACE_PERF) && frame % 60 == 0) outside_watch(frame), up_ts_log(frame), vk_gtl_log(frame, 60);
     if ((rt_trace & RT_TRACE_PERF) && !vk_mirror_on) dirty_frame(frame);
@@ -5641,8 +5654,8 @@ static void beyond_log(VkCtx *c, uint64_t frame, const VkPhysicalDeviceMemoryBud
 // with DLSS's share as its statistics report it. Then the host-visible allocations (staging above all) and the
 // process's system memory with the game's own heap. Then the released textures' reuse (vk_texture_reuse_log).
 // A category that only climbs from line to line over a long session is a leak. The figures are sums the owners keep
-// already, one driver query, VMA's budget query and one walk of the texture entries (vk_texture_census): well under a
-// millisecond once a minute, at the present that logs.
+// already, one driver query, VMA's budget query and one walk of the texture entries (vk_texture_census), at the present
+// that logs; vk_mem_census logs what the report took.
 static void owner_log(uint64_t frame) {
     VkCtx *c = vk_ctx();
     if (!c || !c->vma) return;
