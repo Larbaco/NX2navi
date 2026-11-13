@@ -28,8 +28,9 @@
 //
 // NX2NAVI_RTSS=0 keeps RTSS out of it. Frame generation keeps it out too (RTSS counts every presented frame, the
 // generated ones included), and so does a driver's low latency (vk_lowlat.c), which holds the frames where they start.
-// Kept out, the thread never loads the hooks library: it only reads RTSS's own settings for the game, to tell when they
-// limit it a second time (watch).
+// While RTSS is kept out the thread does not load the hooks library and only reads RTSS's own settings for the game, to
+// tell when they limit it a second time (watch); a later limit (frame generation or low latency switched off) loads it
+// and hands RTSS the limit as usual, and NX2NAVI_RTSS=0 keeps the thread read-only for the run.
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -233,7 +234,7 @@ static void set_active(int64_t w, int on, const char *why) {
 
 // RTSS's own settings for the game, read from its profile file as RTSS keeps it: Profiles\<exe>.cfg, else
 // Profiles\Global, and a key the game's profile lacks from Global. The system's ini reader does it, so no call goes into
-// RTSS's hooks library, which a run that keeps RTSS out never loads. The files are read again only when the time
+// RTSS's hooks library, which a poll of a kept-out want never loads. The files are read again only when the time
 // either was written changes. Worker thread only, while RTSS lists the game (watch).
 static RtssSettings settings;
 static char settings_file[MAX_PATH + 16];   // which file they came from, as Profiles\<name>
@@ -334,8 +335,9 @@ static int find_rtss(void) {
     if (first >= 0)
         rt_log("frame rate: RivaTuner Statistics Server found in %s; it takes the frame limit while it runs", dir);
     else
-        rt_log("frame rate: RivaTuner Statistics Server found in %s; kept out (%s), so its thread only reads RTSS's own "
-               "settings for the game, to tell when RTSS limits it a second time", dir, rtss_out_text(first));
+        rt_log("frame rate: RivaTuner Statistics Server found in %s; kept out (%s), and while it is kept out its thread "
+               "only reads RTSS's own settings for the game, to tell when RTSS limits it a second time", dir,
+               rtss_out_text(first));
     return 1;
 }
 

@@ -268,9 +268,10 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   not run or has not hooked the game, for a limit RTSS refuses, and for the rest of the run when the profile cannot be
   written (no administrator rights), the hooks library does not load, or RTSS's own frame count of the game stays
   above 1.2 times the limit for six polls; the menu names the first and the last of these. Frame generation, the
-  driver's low latency and `NX2NAVI_RTSS=0` keep RTSS out (`RTSS_OUT_*`): the profile gets back what it held, and a
-  run kept out from its first present never loads the hooks library, its thread only reading RTSS's own settings for
-  the game. While RTSS lists the game the log names those settings (limit, frame time limit, scanline sync, display
+  driver's low latency and `NX2NAVI_RTSS=0` keep RTSS out (`RTSS_OUT_*`): the profile gets back what it held before
+  the run changed it, and while RTSS is kept out its thread does not load the hooks library and only reads RTSS's own
+  settings for the game; a later limit (frame generation or low latency switched off) loads it and hands RTSS the limit
+  as usual, and `NX2NAVI_RTSS=0` keeps the thread read-only for the run. While RTSS lists the game the log names those settings (limit, frame time limit, scanline sync, display
   sync, Reflex sleep, passive wait) once per change. Every orderly exit puts the profile back as it was before the run
   (`rtss_limit_restore`), and no want reaches it after that; a kill, the device-lost watchdog or a crash inside the
   crash handler leaves the game's limit in the profile, and the next run takes it for the player's own.

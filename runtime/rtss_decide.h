@@ -113,7 +113,7 @@ typedef struct {
 } RtssOut;
 
 // The hooks library is loaded only on a poll that may write the profile: a limit is wanted, RTSS is not out of it for
-// the run, and it runs. A kept-out run never loads it.
+// the run, and it runs. A poll of a kept-out want never loads it; a later limit does.
 static inline int rtss_wants_hooks(const RtssState *s, const RtssIn *in) {
     return in->want >= 0 && !s->fail && in->app.running;
 }
