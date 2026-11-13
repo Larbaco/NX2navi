@@ -63,11 +63,13 @@ unsigned rt_trace;
 // (NX2NAVI_TRACE can write that much). Lines from before log_open wait in a static buffer: mem_init runs first so that
 // nothing else lands in the guest address space, and an earlier open would put the CRT's heap there.
 // The end of the run still reaches a file past its cap: once the process is ending (rt_log_ending at the start of an
-// orderly end, gfx_present.c rt_exit_begin, and of the frame-time summary, perf.c perf_summary_flush; rt_log_sync at a
-// fatal error and in the crash report), up to LOG_END_RESERVE more bytes are written, counted on their own. A
+// orderly end, gfx_present.c rt_exit_begin, of the frame-time summary, perf.c perf_summary_flush, of a fatal error,
+// dispatch.c fatal_end, of the crash report, crash_handler, of the lost device's watchdog, vk_device.c lost_wait_exit,
+// and in plat_exit, log_sync_ending), up to LOG_END_RESERVE more bytes are written, counted on their own. A
 // trace = perf session reaches the cap in about 90 minutes, and every line after it, the exit summary, "frametime:
 // exit", the stutter map and FATAL lines included, went to stderr only, which a game started from the launcher or
-// Explorer does not keep.
+// Explorer does not keep. rt_log_sync alone does not open the reserve: a bug capture calls it in play
+// (bugcap.c write_log_tail), and the play's lines after it would fill the reserve before the end came.
 #define LOG_KEEP 5
 #define LOG_CAP (64ull << 20)
 #define LOG_END_RESERVE (4ull << 20)
@@ -79,8 +81,8 @@ static char g_log_early[32768];
 static size_t g_log_early_n;
 static uint64_t g_log_bytes;
 
-// stderr's writes (log_sink). g_log_final: rt_log_sync has run, so the process is ending: an exit, a fatal error or a
-// crash report.
+// stderr's writes (log_sink). g_log_final: rt_log_sync has run: an exit, a fatal error, a crash report or a bug
+// capture (bugcap.c).
 static PlatMutex g_err_lock = PLAT_MUTEX_INIT;
 static volatile int32_t g_log_final;
 static volatile int32_t g_log_ending;   // rt_log_ending ran: the process is ending
@@ -106,7 +108,7 @@ static void log_sink(const char *p, size_t n) {
                                           "but for the lines of its end\n";
                 plat_append_write(g_log_file, cut, sizeof cut - 1);
             }
-            if (__atomic_load_n(&g_log_ending, __ATOMIC_ACQUIRE) || __atomic_load_n(&g_log_final, __ATOMIC_ACQUIRE)) {
+            if (__atomic_load_n(&g_log_ending, __ATOMIC_ACQUIRE)) {
                 uint64_t t = __atomic_fetch_add(&g_log_tail, n, __ATOMIC_RELAXED);
                 if (!t) {
                     static const char end[] = "[host] log: the end of the run follows; the lines between the cap and it "
@@ -130,6 +132,12 @@ static void log_sink(const char *p, size_t n) {
 void rt_log_sync(void) {
     __atomic_store_n(&g_log_final, 1, __ATOMIC_RELEASE);
     logq_sync();
+}
+
+// plat_exit's first step in a game run (plat_exit_hook): the process ends here, so its last lines reach the file.
+static void log_sync_ending(void) {
+    rt_log_ending();
+    rt_log_sync();
 }
 
 // The console window was closed, or Ctrl+C or Ctrl+Break pressed in it (platform.h plat_console_setup): the end of a
@@ -227,7 +235,7 @@ static void log_open(int game) {
     // A game run writes its log from the log thread (logq.c), whether the lines go to a log file or to stderr alone.
     const char *e = cfg_get("NX2NAVI_LOG_ASYNC");
     if (!game || (e && !strcmp(e, "0"))) return;
-    plat_exit_hook = rt_log_sync;
+    plat_exit_hook = log_sync_ending;
     if (logq_async()) rt_log("log: lines are written by a thread of their own (NX2NAVI_LOG_ASYNC)");
     else rt_log("log: no log thread; every line is written by the thread that logs it");
 }
@@ -366,6 +374,7 @@ static void crash_handler(const PlatCrash *x) {
     // shared with the fatal error's end (dispatch.c rt_ending_enter): another thread's fault or fatal error waits there
     // while this report is written; a fault inside this thread's own report ends the process at once
     if (!rt_ending_enter()) plat_exit(71);
+    rt_log_ending();   // the report reaches the log file past its cap (log_sink)
     if (__atomic_load_n(&mode_done, __ATOMIC_ACQUIRE) && x->module) {
         rt_log("exit: %s (%#x) in %s while the process was ending, after its work was done and saved%s: the run ends "
                "with its own code %d", x->what, x->code, *x->module ? x->module : "code outside every module",

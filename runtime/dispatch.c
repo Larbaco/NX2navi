@@ -103,6 +103,7 @@ int rt_ending_enter(void) {
 static void fatal_end(int code, const char *fmt, va_list ap) __attribute__((noreturn));
 static void fatal_end(int code, const char *fmt, va_list ap) {
     if (!rt_ending_enter()) plat_terminate(code);   // a fatal error inside this thread's own report: no second one
+    rt_log_ending();   // the report reaches the log file past its cap (main.c log_sink)
     rt_log_sync();   // main.c: the lines queued for the log thread, then these, written here
     rt_log_raw("FATAL: ", 7);
     rt_vlogf(fmt, ap);

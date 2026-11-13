@@ -32,6 +32,7 @@ extern const IMAGE_TLS_DIRECTORY _tls_used;
 const void *volatile keep_tls = &_tls_used;
 
 // ---- the runtime fatal_end reaches
+void rt_log_ending(void) {}
 void rt_log_sync(void) {}
 void rt_log_raw(const char *p, size_t n) {
     DWORD w;

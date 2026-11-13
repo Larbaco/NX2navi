@@ -1,8 +1,9 @@
 """The log file's cap and the end of the run (runtime/main.c log_sink): past the cap ordinary lines are dropped, with
-one line that says so; once the process is ending (rt_log_ending, or rt_log_sync at a fatal error and in the crash
-report) its lines are still written, after one line that says the end follows, up to a reserve of their own, however
-much was dropped before. Builds log_sink with a small cap and reserve against stand-ins for the file and stderr. No
-game files.
+one line that says so; once the process is ending (rt_log_ending, which a fatal error and the crash report call before
+rt_log_sync) its lines are still written, after one line that says the end follows, up to a reserve of their own,
+however much was dropped before. rt_log_sync alone (a bug capture in play, runtime/bugcap.c write_log_tail) does not
+open the reserve. Builds log_sink with a small cap and reserve against stand-ins for the file and stderr, and checks
+statically that every end that syncs the log marks it as ending first. No game files.
 
 Usage: python tests/log_cap_check.py [path to clang]"""
 import os
@@ -79,24 +80,68 @@ static int line(const char *tag, int i) {   // returns the line's length
     return n;
 }
 int main(int argc, char **argv) {
-    int fails = 0, how = argc > 1 && !strcmp(argv[1], "sync");
-    int play_n = 0, end_n = 0;
+    // ending: rt_log_ending (an orderly end); fatal: rt_log_ending, then rt_log_sync (a fatal error, the crash report);
+    // capture: rt_log_sync in play (a bug capture), more play, then rt_log_ending
+    const char *how = argc > 1 ? argv[1] : "ending";
+    int fails = 0, play_n = 0, end_n = 0;
     for (int i = 0; i < 1000; i++) play_n = line("play", i);   // 35,000 bytes, many times the cap
-    size_t before_end = file_n;
     int play = count("play "), cut = count("reached 64 MiB");
-    if (how) rt_log_sync();
-    else rt_log_ending();
+    if (!strcmp(how, "capture")) {
+        rt_log_sync();
+        for (int i = 0; i < 1000; i++) line("more", i);
+        int more = count("more "), early = count("the end of the run follows");
+        printf("capture: after rt_log_sync in play %d of 1000 play lines in the file, the end's line %d time(s)\n", more,
+               early);
+        if (more || early) printf("FAIL: rt_log_sync alone opened the end's reserve\n"), fails++;
+    }
+    size_t before_end = file_n;
+    if (strcmp(how, "fatal")) {
+        rt_log_ending();
+    } else {
+        rt_log_ending();
+        rt_log_sync();
+    }
     for (int i = 0; i < 100; i++) end_n = line("last", i);   // 3,400 bytes, more than the reserve
     int end = count("last "), follows = count("the end of the run follows");
-    printf("%s: %d play lines in the file, the cut line %d time(s); after %s %d end lines, the line before them %d "
-           "time(s); the file %zu bytes (cap %llu, reserve %llu)\n", how ? "rt_log_sync" : "rt_log_ending", play, cut,
-           how ? "rt_log_sync" : "rt_log_ending", end, follows, file_n, LOG_CAP, LOG_END_RESERVE);
+    printf("%s: %d play lines in the file, the cut line %d time(s); %d end lines, the line before them %d time(s); the "
+           "file %zu bytes (cap %llu, reserve %llu)\n", how, play, cut, end, follows, file_n, LOG_CAP, LOG_END_RESERVE);
     if (play != (int)(LOG_CAP / play_n) || cut != 1) printf("FAIL: lines past the cap\n"), fails++;
     if (follows != 1 || end != (int)(LOG_END_RESERVE / end_n)) printf("FAIL: the end's lines\n"), fails++;
     if (file_n - before_end > LOG_END_RESERVE + 200) printf("FAIL: past the reserve\n"), fails++;
     return fails ? 1 : 0;
 }
 '''
+
+
+def static_checks():
+    """Every end that syncs the log marks the process as ending first, so its lines reach the file past the cap."""
+    bad = 0
+    rt = ROOT / 'runtime'
+    ends = [('main.c', 'static void crash_handler(const PlatCrash *x)'),
+            ('main.c', 'static void log_sync_ending(void)'),
+            ('dispatch.c', 'static void fatal_end(int code, const char *fmt, va_list ap) {'),
+            ('vk_device.c', 'static void lost_wait_exit(void *arg)')]
+    for file, sig in ends:
+        text = (rt / file).read_text(encoding='utf-8')
+        if sig not in text:
+            print(f'static: {file}: {sig} is missing: FAIL', flush=True)
+            bad += 1
+            continue
+        start = text.index(sig)
+        brace = text.index('{', start)
+        depth, end = 1, brace + 1
+        while depth:
+            depth += (text[end] == '{') - (text[end] == '}')
+            end += 1
+        body = re.sub(r'//[^\n]*', '', text[start:end])
+        e, s = body.find('rt_log_ending()'), body.find('rt_log_sync()')
+        ok = 0 <= e < s
+        print(f'static: {file} {sig.split("(")[0].split()[-1].lstrip("*")} calls rt_log_ending before rt_log_sync: '
+              f'{"ok" if ok else "FAIL"}', flush=True)
+        bad += not ok
+    ok = 'plat_exit_hook = log_sync_ending;' in source
+    print(f'static: main.c plat_exit_hook is log_sync_ending: {"ok" if ok else "FAIL"}', flush=True)
+    return bad + (not ok)
 
 
 def main():
@@ -116,8 +161,8 @@ def main():
     if os.name == 'nt' and MSYS_BIN.exists():
         env['PATH'] = str(MSYS_BIN) + os.pathsep + env.get('PATH', '')
     subprocess.check_call([compiler(), '-O1', '-g', '-Wall', '-Wno-unused-function', str(src), '-o', str(exe)], env=env)
-    bad = 0
-    for how in ('ending', 'sync'):
+    bad = static_checks()
+    for how in ('ending', 'fatal', 'capture'):
         bad += subprocess.run([str(exe), how], env=env, timeout=60).returncode != 0
     print(f'log_cap_check: {"FAILED" if bad else "ok"}')
     return 1 if bad else 0

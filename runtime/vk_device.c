@@ -880,6 +880,7 @@ static void lost_wait_exit(void *arg) {
     int watchdog = arg != NULL;
     for (int t = 0; t < LOST_EXIT_MS + (watchdog ? 0 : 2000); t += 50) plat_sleep_ms(50);
     if (watchdog) {
+        rt_log_ending();   // its line reaches the log file past its cap (main.c log_sink)
         rt_log_sync();   // the queue's locks only tried (bounded): their holder may be the thread that hangs
         rt_log("vk: the end of the run did not finish in %d s; ending it", LOST_EXIT_MS / 1000);
     }
