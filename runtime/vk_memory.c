@@ -3044,6 +3044,11 @@ static PlatMutex retire_lock = PLAT_MUTEX_INIT;
 static PoolRec **pool_dead;
 static int npool_dead, cpool_dead;
 static uint64_t n_pool_destroyed;   // so far, for the "mem: sizes" line
+// The drains since the last "mem: sizes" line, by caller (PD_BY_*): records destroyed, their time and the longest
+// drain, in ns. The drain runs on whichever collect swaps the list out first, so part of it can fall on the game's
+// thread in pool_fini; the line tells the two apart. vk_mem_sizes takes and clears them.
+enum { PD_BY_COMPLETION, PD_BY_FINI };
+static volatile int64_t pd_n[2], pd_ns[2], pd_max[2];
 
 static void pool_retiring(PoolRec *r) {
     plat_mutex_lock(&retire_lock);
@@ -3062,17 +3067,27 @@ static void pool_retire(void *arg) {
     plat_mutex_unlock(&retire_lock);
 }
 
-// vk_mem_collect only, holding no lock: destroys the records pool_retire put on pool_dead.
-static void pool_dead_drain(VkCtx *c) {
+// vk_mem_collect and vk_mem_collect_try only, holding no lock: destroys the records pool_retire put on pool_dead. by
+// names the caller for the "mem: sizes" line (PD_BY_*).
+static void pool_dead_drain(VkCtx *c, int by) {
     if (!__atomic_load_n(&npool_dead, __ATOMIC_RELAXED)) return;
     plat_mutex_lock(&retire_lock);
     PoolRec **go = pool_dead;
     int n = npool_dead;
     pool_dead = NULL, npool_dead = cpool_dead = 0;
     plat_mutex_unlock(&retire_lock);
+    if (!n) {   // another collect took them first
+        free(go);
+        return;
+    }
+    uint64_t t0 = plat_now_ns();
     for (int i = 0; i < n; i++) destroy_rec(c, go[i]);
     free(go);
+    int64_t ns = (int64_t)(plat_now_ns() - t0);
     __atomic_add_fetch(&n_pool_destroyed, (uint64_t)n, __ATOMIC_RELAXED);
+    plat_add64(&pd_n[by], n), plat_add64(&pd_ns[by], ns);
+    int64_t m = __atomic_load_n(&pd_max[by], __ATOMIC_RELAXED);
+    while (ns > m && !__atomic_compare_exchange_n(&pd_max[by], &m, ns, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
 }
 
 // Replay thread, the first access of this submission: queues the copies of the pages written since the last sync.
@@ -6097,13 +6112,15 @@ static void collect_held(VkCtx *c) {   // cmd_lock held; released here
     free(out);
 }
 
+// pool_fini's collect, on the game's thread (its only caller): the finalized pools it finds go here too, counted apart
+// from the completion thread's on the "mem: sizes" line.
 void vk_mem_collect(void) {
     VkCtx *c = vk_ctx();
     if (!c) return;
     plat_once(&cmd_once, cmd_init, NULL);
     plat_rmutex_lock(&cmd_lock);
     collect_held(c);
-    pool_dead_drain(c);
+    pool_dead_drain(c, PD_BY_FINI);
 }
 
 // The completion thread's collect (vk_sync.c completion_main), after each new done. It only tries cmd_lock: an upload
@@ -6122,14 +6139,14 @@ void vk_mem_collect_try(void) {
     if (!plat_rmutex_trylock(&cmd_lock)) {
         if (++busy <= COLLECT_TRY_MAX) {
             __atomic_add_fetch(&collect_skips, 1, __ATOMIC_RELAXED);
-            pool_dead_drain(c);
+            pool_dead_drain(c, PD_BY_COMPLETION);
             return;
         }
         plat_rmutex_lock(&cmd_lock);
     }
     busy = 0;
     collect_held(c);
-    pool_dead_drain(c);
+    pool_dead_drain(c, PD_BY_COMPLETION);
 }
 
 void vk_mem_stats(VkMemStats *s) {
@@ -6230,6 +6247,17 @@ void vk_mem_sizes(PerfSizes *s) {
     perf_size(s, "deferred destructions", dead_n, 0, PERF_SIZE_NONE);
     perf_size(s, "finalized pools destroyed after the GPU", __atomic_load_n(&n_pool_destroyed, __ATOMIC_RELAXED), 0,
               PERF_SIZE_NONE);
+    // where those destroys ran since the last line, and how long they took (pool_dead_drain)
+    int64_t dn[2], dns[2], dmax[2];
+    for (int i = 0; i < 2; i++)
+        dn[i] = plat_xchg64(&pd_n[i], 0), dns[i] = plat_xchg64(&pd_ns[i], 0), dmax[i] = plat_xchg64(&pd_max[i], 0);
+    char pd[240];
+    snprintf(pd, sizeof pd,
+             "of them since the last line: %lld on the completion thread (%.1f ms, longest drain %.1f ms), %lld by "
+             "pool_fini (%.1f ms, longest drain %.1f ms)",
+             (long long)dn[PD_BY_COMPLETION], dns[PD_BY_COMPLETION] / 1e6, dmax[PD_BY_COMPLETION] / 1e6,
+             (long long)dn[PD_BY_FINI], dns[PD_BY_FINI] / 1e6, dmax[PD_BY_FINI] / 1e6);
+    perf_size(s, pd, PERF_SIZE_NONE, 0, PERF_SIZE_NONE);
     perf_size(s, "completion collects that found the upload lock busy",
               __atomic_load_n(&collect_skips, __ATOMIC_RELAXED), 0, PERF_SIZE_NONE);
     perf_size(s, "upload batches in flight", infl, 0, PERF_SIZE_NONE);
