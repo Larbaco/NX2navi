@@ -172,6 +172,16 @@ def static_checks():
     print(f'gfx_window_win.c: WM_CLOSE and WM_ENDSESSION start the end on its own thread and hide the window: '
           f'{"ok" if ok else "FAIL"}', flush=True)
     bad += not ok
+    # the hide's focus loss is the end's, not a player's: it must not reach perf.c perf_focus_lost, whose session report
+    # would take the exit summary's frames
+    act = proc[proc.index('case WM_ACTIVATEAPP:'):proc.index('case WM_ENDSESSION:')]
+    start = function(win, 'static PlatThread *exit_start(')
+    guard, focus = act.find('g_exit_started'), act.find('gfx_window_focus_changed(')
+    ok = (0 <= guard < focus and 'return 0;' in act[guard:focus] and '!in' in act[:focus]
+          and 0 <= start.find('g_exit_started') < start.find('ShowWindow(h, SW_HIDE)'))
+    print(f'gfx_window_win.c: a focus loss once the end has begun (the hide) does not reach gfx_window_focus_changed: '
+          f'{"ok" if ok else "FAIL"}', flush=True)
+    bad += not ok
     steps = function(gp, 'void rt_exit_steps(unsigned what)')
     pos = calls_in_order(steps, ['rtss_limit_restore', 'vk_pipeline_save_exit'])
     ok = None not in pos and pos[0] < pos[1]

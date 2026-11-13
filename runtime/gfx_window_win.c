@@ -589,6 +589,10 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_ACTIVATEAPP: {
         int in = w != 0;
+        // The end's own hide (exit_start, which sets g_exit_started first on this thread) deactivates the window: no
+        // player's focus loss. Taken as one, the present thread's next present wrote the session's report for the whole
+        // run and started a new period (perf.c perf_focus_lost), so "frametime: exit" covered only the frames since.
+        if (!in && __atomic_load_n(&g_exit_started, __ATOMIC_ACQUIRE)) return 0;
         gfx_window_focus_changed(in);
         if (in && g_fs_pending) {
             g_fs_pending = 0;
