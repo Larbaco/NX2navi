@@ -768,7 +768,7 @@ static void oq_report(VkExec *ex, uint64_t addr) {
 // wait whose signal comes in a later submission does not hold its work back: that work runs before what it waits for.
 // The replay keeps the value each event reaches in replay order (ev_seen, the signals recorded so far, on top of the
 // value in memory) and counts the waits it reaches unmet; NX2NAVI_TRACE=perf logs the count, and the first few are
-// logged as they happen. Replay thread only.
+// logged as they happen. Replay thread only, apart from vk_exec_event_met_now's unlocked read of ev_seen.
 #define EV_SEEN 64
 static struct { volatile uint32_t *val; uint32_t v; } ev_seen[EV_SEEN];
 static int ev_n, ev_next;
@@ -901,6 +901,22 @@ int vk_exec_event_met(const void *payload) {
     const uint32_t *seen;
     int late;
     return ev_met(payload, &mem, &seen, &late);
+}
+
+// The value in memory now, or the signals replayed so far, whatever submission is being recorded: for vk_exec.c
+// vk_exec_held_ready, which asks without the submission lock whether held work can go on in a submission of its own.
+// That submission takes its copies later, so a CPU signal given before now counts for it; testing at the copy point
+// (ev_mem) would take the copy point of the recording another thread may be making. ev_seen belongs to the replay and
+// is read here without its lock, so the answer is a decision only: a wrong "ready" makes an empty submission, which
+// decides again under the lock (vk_exec.c evo_resume).
+int vk_exec_event_met_now(const void *payload) {
+    const p_wait_event *p = payload;
+    if (ev_holds(__atomic_load_n(p->val, __ATOMIC_ACQUIRE), p->mode, p->value)) return 1;
+    int n = __atomic_load_n(&ev_n, __ATOMIC_RELAXED);
+    for (int i = 0; i < n && i < EV_SEEN; i++)
+        if (__atomic_load_n(&ev_seen[i].val, __ATOMIC_RELAXED) == p->val)
+            return ev_holds(__atomic_load_n(&ev_seen[i].v, __ATOMIC_RELAXED), p->mode, p->value);
+    return 0;
 }
 
 int vk_exec_signalled;

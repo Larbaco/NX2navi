@@ -505,7 +505,7 @@ static void ph_flush(uint64_t *why) {
     if (PH.logged < 16)
         PH.logged++, rt_log("vk: the present of frame %llu went out %llu submission(s) after the game's present call, %d "
                             "held submissions left (%s)", (unsigned long long)PH.frame,
-                            (unsigned long long)(vk_exec_submit_seq - PH.since), vk_exec_held(),
+                            (unsigned long long)(vk_exec_submit_seq_now() - PH.since), vk_exec_held(),
                             why == &PH.after ? "the held work was replayed" : why == &PH.capped ? "PH_MAX reached"
                                                                                          : "the next present came");
     present_image(PH.t, PH.has_crop ? PH.crop : NULL, PH.at_ns, PH.queued, PH.frame, 0);
@@ -532,7 +532,7 @@ static uint64_t submit_sync(const uint64_t *handles, int n) {
     if (n && vk_exec_event_at_sync() && vk_exec_held() && vk_exec_held_ready()) f = submit_sync(NULL, 0);
     if (PH.on && n) {
         if (!vk_exec_held()) ph_flush(&PH.after);
-        else if (vk_exec_submit_seq - PH.since >= PH_MAX) ph_flush(&PH.capped);
+        else if (vk_exec_submit_seq_now() - PH.since >= PH_MAX) ph_flush(&PH.capped);
     }
     return f;
 }
@@ -718,7 +718,7 @@ static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
             if (vk_exec_held()) {
                 PH.on = 1, PH.t = t, PH.has_crop = crop != NULL, PH.at_ns = at_ns, PH.queued = queued, PH.frame = frame;
                 if (crop) memcpy(PH.crop, crop, sizeof PH.crop);
-                PH.since = vk_exec_submit_seq, PH.waited++;
+                PH.since = vk_exec_submit_seq_now(), PH.waited++;
                 return;
             }
         }

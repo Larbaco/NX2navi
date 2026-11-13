@@ -1288,9 +1288,10 @@ _Static_assert(sizeof(EvoWait) == sizeof(p_wait_event) && offsetof(EvoWait, val)
                "vk_evo_peek.h EvoWait must have p_wait_event's layout");
 static int evo_on = -1, evo_in;     // knob; inside a continuation
 static uintptr_t evo_queue;         // queue of the stream being walked (0: it cannot stop at a wait)
-static int evo_pending;             // continuations held
+// continuations held: written under the submission lock (cont_push, evo_resume), read by any thread (vk_exec_held)
+static int evo_pending;
 static uint64_t evo_held, evo_resumed, evo_forced, evo_switches;   // since the last perf line
-int vk_exec_held(void) { return evo_pending; }
+int vk_exec_held(void) { return __atomic_load_n(&evo_pending, __ATOMIC_RELAXED); }
 #define ST_LO offsetof(VkExec, rt)
 #define ST_HI offsetof(VkExec, views)
 
@@ -1437,7 +1438,7 @@ static void cont_push(int slot, Cont *c) {
     if (evq[slot].tail) evq[slot].tail->next = c;
     else evq[slot].head = c;
     evq[slot].tail = c;
-    evo_pending++;
+    __atomic_store_n(&evo_pending, evo_pending + 1, __ATOMIC_RELAXED);   // the only writer: under the submission lock
     if (evq[slot].head == c) peek_publish(slot);
 }
 
@@ -1525,10 +1526,14 @@ void vk_exec_gate_wait(const uint64_t *handles, int n) {
 
 // Reads only the published copies (evq_peek): vk_backend.c held_resume and submit_sync call this without the
 // submission lock. A copy that overlapped a publish on every try counts as not ready, as losing that race did before.
+// The wait is tested on the event's value now (vk_exec_event_met_now), not at the copy point of a submission another
+// thread may be recording: the question is whether held work can go on in a submission of its own, which takes its
+// copies later. vk_exec_record, the one caller under the lock, asks right after its own copy point, where the two agree.
 int vk_exec_held_ready(void) {
-    for (int s = 0; evo_pending && s < EVO_QUEUES; s++) {
+    for (int s = 0; __atomic_load_n(&evo_pending, __ATOMIC_RELAXED) && s < EVO_QUEUES; s++) {
         EvoPeekCopy c;
-        if (evo_peek_read(&evq_peek[s], &c) && evo_peek_ready(&c, vk_exec_event_met, vk_exec_submit_seq, CONT_MAX))
+        if (evo_peek_read(&evq_peek[s], &c) &&
+            evo_peek_ready(&c, vk_exec_event_met_now, vk_exec_submit_seq_now(), CONT_MAX))
             return 1;
     }
     return 0;
@@ -1604,7 +1609,7 @@ static void evo_resume(VkExec *ex) {
                 evq[s].head = c->next;   // done: the queue's next submission starts with the state this one left
                 if (!evq[s].head) evq[s].tail = NULL;
                 peek_publish(s);   // the next one, or none; the copy names nothing inside c
-                evo_pending--;
+                __atomic_store_n(&evo_pending, evo_pending - 1, __ATOMIC_RELAXED);
                 vk_exec_evt('d', NULL, 0);
                 cont_free(c);
                 c = evq[s].head;
@@ -2712,7 +2717,7 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     ex->barrier_at = -1;
     ex->nfbl = 0;   // the previous command buffer ended with a full barrier: every image is in GENERAL
     vk_exec_frame.submits++;
-    vk_exec_submit_seq++;
+    __atomic_store_n(&vk_exec_submit_seq, vk_exec_submit_seq + 1, __ATOMIC_RELAXED);   // read without the lock too
     split_draws = part_start = 0;
     split_at = split_n < 0 ? 0 : split_n ? split_n : INT_MAX;   // 0 until maybe_split reads the settings
     part_t0 = kern_now_ns();
