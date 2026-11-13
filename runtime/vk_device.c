@@ -432,6 +432,18 @@ static void fatal_note(void) {
            g_mesh_path);
 }
 
+// NX2NAVI_TRACE=perf: every device memory allocation VMA makes, timed as the "device memory allocations" work mark
+// (perf.c mark_text). An area's first visit made 78 of them, 4.4 GB, in a frame of 421 ms of which about 180 ms
+// showed in no mark; vk_headroom.c measured 8-19 ms per 256 MiB block. VMA takes this one function from the
+// allocator's create info and the others from its static table (vk_vma.cpp VMA_STATIC_VULKAN_FUNCTIONS).
+static VkResult VKAPI_PTR timed_alloc(VkDevice d, const VkMemoryAllocateInfo *ai, const VkAllocationCallbacks *cb,
+                                      VkDeviceMemory *m) {
+    uint64_t t0 = perf_mark_begin();
+    VkResult r = vkAllocateMemory(d, ai, cb, m);
+    perf_mark_end(PERF_M_DEVMEM, t0, r == VK_SUCCESS ? ai->allocationSize : 0);
+    return r;
+}
+
 static int create_device(void) {
     uint32_t ne = 0;
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, NULL);
@@ -721,12 +733,13 @@ static int create_device(void) {
     vk_mem_lazy_decide();   // the driver is known: the lazy write-back's default depends on it
     rt_fatal_note_add(fatal_note);
 
+    static const VmaVulkanFunctions vf = {.vkAllocateMemory = timed_alloc};   // the rest from VMA's static table
     VmaAllocatorCreateInfo ai = {.physicalDevice = g_vk.phys, .device = g_vk.device, .instance = g_vk.instance,
                                  .vulkanApiVersion = VK_API_VERSION_1_3,
                                  .flags = (g_vk.has_buffer_device_address ? VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT : 0) |
                                           (g_vk.has_memory_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0),
                                  .preferredLargeHeapBlockSize = vk_vma_block_size(),
-                                 .pDeviceMemoryCallbacks = vk_headroom_callbacks()};
+                                 .pDeviceMemoryCallbacks = vk_headroom_callbacks(), .pVulkanFunctions = &vf};
     VkDeviceSize heap_limit[VK_MAX_MEMORY_HEAPS];
     if (vram_heap_limits(heap_limit)) ai.pHeapSizeLimit = heap_limit;
     if ((r = vmaCreateAllocator(&ai, &g_vk.vma)) != VK_SUCCESS) { rt_log("vk: vmaCreateAllocator failed (%d)", (int)r); return 0; }

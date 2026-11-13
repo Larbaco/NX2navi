@@ -182,17 +182,13 @@ static void mark_frame(MarkSums *f) {
 }
 
 // "; on any thread: file reads 12.3 ms (40, 5.1 MiB, longest 2.0 ms), ..." for the kinds with work, appended at line + n.
-// Device memory allocations carry no time.
 static int mark_text(const MarkSums *s, char *line, int n, size_t cap) {
     int any = 0;
     for (int k = 0; k < PERF_M_N && n >= 0 && n < (int)cap - 100; k++) {
         if (!s->n[k]) continue;
-        n += snprintf(line + n, cap - (size_t)n, "%s %s", any ? "," : "; on any thread:", mark_name[k]);
-        if (k == PERF_M_DEVMEM)
-            n += snprintf(line + n, cap - (size_t)n, " %llu (%.1f MiB)", (unsigned long long)s->n[k], s->bytes[k] / 1048576.0);
-        else
-            n += snprintf(line + n, cap - (size_t)n, " %.1f ms (%llu, %.1f MiB, longest %.1f ms)", s->ns[k] / 1e6,
-                          (unsigned long long)s->n[k], s->bytes[k] / 1048576.0, s->max[k] / 1e6);
+        n += snprintf(line + n, cap - (size_t)n, "%s %s %.1f ms (%llu, %.1f MiB, longest %.1f ms)",
+                      any ? "," : "; on any thread:", mark_name[k], s->ns[k] / 1e6, (unsigned long long)s->n[k],
+                      s->bytes[k] / 1048576.0, s->max[k] / 1e6);
         any = 1;
     }
     return n;
