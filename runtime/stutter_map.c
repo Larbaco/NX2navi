@@ -427,14 +427,20 @@ typedef struct {
     const Pipe *list[SM_PIPES];
 } MapCopy;
 
-void stutter_report(const char *tag) {
-    if (!stutter_map_on) return;
+// try_only: sm_lock is only tried (a fatal error's summary, perf.c perf_summary_flush_try, on a thread that may
+// hold it); 0 when it was held and nothing was written.
+int stutter_report_as(const char *tag, int try_only) {
+    if (!stutter_map_on) return 1;
     MapCopy *m = malloc(sizeof *m);
     if (!m) {
         rt_log("stutter map (%s): no memory for the report", tag);
-        return;
+        return 1;
     }
-    plat_mutex_lock(&sm_lock);
+    if (!try_only) plat_mutex_lock(&sm_lock);
+    else if (!plat_mutex_trylock(&sm_lock)) {
+        free(m);
+        return 0;
+    }
     int na = n_areas;
     memcpy(m->areas, areas, (size_t)na * sizeof *areas);
     uint32_t np = 0, lost = pipes_lost;
@@ -502,4 +508,7 @@ void stutter_report(const char *tag) {
                p->fresh ? ", a shader translated in play" : "");
     }
     free(m);
+    return 1;
 }
+
+void stutter_report(const char *tag) { stutter_report_as(tag, 0); }

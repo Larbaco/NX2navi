@@ -78,6 +78,13 @@ def static_checks():
     print(f'static: main.c crash_handler starts with the shared guard: {"ok" if ok else "FAIL (" + first + ")"}',
           flush=True)
     bad += not ok
+    # the fatal error's summary leaves out what the failure may have left half made, and only tries the map's lock
+    flush = re.sub(r'//[^\n]*', '', function((RT / 'perf.c').read_text(encoding='utf-8'), 'void perf_summary_flush_try(void)'))
+    ok = ('stutter_report_as(' in flush and 'stutter_report(' not in flush and 'gfx_exit_log' not in flush
+          and 'seg_close' not in flush)
+    print(f'static: perf.c perf_summary_flush_try tries the stutter map\'s lock and leaves the back end out: '
+          f'{"ok" if ok else "FAIL"}', flush=True)
+    bad += not ok
     # both failed ends stop HD rumble through the bounded stop, after RivaTuner's restore
     fatal = re.sub(r'//[^\n]*', '', function((RT / 'dispatch.c').read_text(encoding='utf-8'),
                                               'static void fatal_end(int code, const char *fmt, va_list ap) {'))
@@ -92,7 +99,7 @@ def static_checks():
 
 CASES = [
     # mode, exit code, lines that must be there, lines that must not
-    ('fatal', 70, ['FATAL: the test\'s fatal error 1', 'rumble: stopped'], ['detach:']),
+    ('fatal', 70, ['FATAL: the test\'s fatal error 1', 'frametime: at a fatal error', 'rumble: stopped'], ['detach:']),
     # the rumble stop hangs (SDL's lock held by a thread that crashed): the end goes on after 300 ms
     ('fatal_rumble', 70, ['FATAL: the test\'s fatal error 1'], ['rumble: stopped', 'detach:']),
     # two faults at once: the first report whole, the second thread waits (dispatch.c rt_ending_enter)

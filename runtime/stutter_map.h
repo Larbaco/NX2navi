@@ -28,3 +28,4 @@ void stutter_ready(int mesh, const uint8_t *vi, const uint8_t *fi, double ms, in
 void stutter_frame(uint64_t frame, uint64_t now, uint64_t d, const uint64_t *part, const char *const *names, int n,
                    int cause);
 void stutter_report(const char *tag);   // the map so far; every 5 minutes of play, at a focus loss in play and at exit
+int stutter_report_as(const char *tag, int try_only);   // try_only 1: only when its lock is free (0: it was not, nothing written)

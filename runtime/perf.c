@@ -775,6 +775,19 @@ void perf_summary_flush(void) {   // at exit (prof_write)
     summary_t0 = 0;
 }
 
+// A fatal error's frame-time summary (dispatch.c fatal_end), on the failing thread, which may hold any lock: the
+// running period's "frametime" lines and the stutter map so far, the map only when its lock is free. The back end's
+// exit lines (gfx_exit_log) and the trace's segments (seg_close) are left out: they read state the failure may have
+// left half made. The present thread's numbers may be caught mid-frame if it still runs past ft_stop's wait.
+void perf_summary_flush_try(void) {
+    ft_stop();
+    if (summary_t0) {
+        ft_report(kern_now_ns(), "at a fatal error");
+        if (!stutter_report_as("at a fatal error", 1)) rt_log("stutter map: its lock is held; not written at the fatal error");
+    }
+    summary_t0 = 0;
+}
+
 // Returns the replay time since the previous present. add 0: the exit's summary is written (ft_stop), so the frame
 // is not added to it.
 static uint64_t ft_frame(uint64_t frame, uint64_t now, uint64_t d, int add) {

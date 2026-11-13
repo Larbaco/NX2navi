@@ -59,6 +59,10 @@ void rt_fatal_notes(void) {
 
 __attribute__((weak)) void fs_save_crash_wait(void) {}   // fs_host.c; builds without it (the unit checks) have no saves
 
+// The frame-time summary and the stutter map at a fatal error (perf.c); builds without perf.c (the unit checks) have
+// none.
+__attribute__((weak)) void perf_summary_flush_try(void) {}
+
 // HD rumble's neutral value before a failed run ends (input.c input_rumble_hd_stop); builds without input.c (the unit
 // checks) have no controller.
 __attribute__((weak)) void input_rumble_hd_stop(void) {}
@@ -111,6 +115,7 @@ static void fatal_end(int code, const char *fmt, va_list ap) {
     rt_fatal_notes();
     kern_free_cores_note();
     fs_save_crash_wait();   // a save the game already reported as done finishes first (bounded)
+    perf_summary_flush_try();   // "frametime: at a fatal error" and the stutter map: the session's last period
     prof_sampler_write();   // NX2NAVI_PROFILE: what was sampled until now, else a crash loses the whole profile
     // RivaTuner Statistics Server's profile as it was: left with the game's limit in it, the next run would take that
     // limit for the player's own (rtss_limit.c; it gives up after a second if the failing thread holds its lock)

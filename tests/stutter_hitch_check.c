@@ -11,6 +11,7 @@ int cfg_bool(const char *name) { return !strcmp(name, "NX2NAVI_STUTTER_MAP"); }
 uint64_t kern_now_ns(void) { return clock_ns; }
 void plat_mutex_lock(PlatMutex *m) { (void)m; }
 void plat_mutex_unlock(PlatMutex *m) { (void)m; }
+int plat_mutex_trylock(PlatMutex *m) { (void)m; return 1; }
 static int logged;
 static char head[1400];   // the last report's first line
 void rt_log(const char *fmt, ...) {

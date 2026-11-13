@@ -60,6 +60,9 @@ void prof_sampler_write(void) {}
 void rtss_limit_restore(void) {}
 void kern_checkpoint(void) {}
 
+// perf.c's summary at a fatal error, which dispatch.c calls through a weak symbol
+void perf_summary_flush_try(void) { say("frametime: at a fatal error\n"); }
+
 // input.c's stop, which dispatch.c calls through a weak symbol: says it ran, or hangs as when SDL's lock is held
 static int rumble_hangs;
 void input_rumble_hd_stop(void) {
