@@ -424,6 +424,32 @@ static void active_race(void) {
     CHECK(!hits, "the game's limiter stood aside for a kept-out want %ld times", hits);
 }
 
+// A limit of a fractional monitor (display at 59.94 and 143.856 Hz): an RTSS that knows the denominator holds it as it
+// is, one that does not holds it rounded to whole frames, and the log says what the profile holds, not what was asked.
+static void round_logged(void) {
+    app_set(1, 0xA, 1000, 2000, 60);
+    ask(59940);
+    poll();
+    show("display at 59.94 Hz");
+    CHECK(own.limit == 59940 && own.denom == 1000, "the denominator holds the fraction");
+    CHECK(logged("profile ocarina.exe limits to 59.940 fps\n"), "the exact limit as it is");
+}
+static void round_logged_whole(void) {
+    no_denominator = 1;
+    app_set(1, 0xA, 1000, 2000, 60);
+    ask(59940);
+    poll();
+    show("display at 59.94 Hz, RTSS without a denominator");
+    CHECK(own.limit == 60, "rounded to whole frames");
+    CHECK(logged("profile ocarina.exe limits to 60/1 (60.000 fps; the game asked 59.940)"), "the log names 60/1");
+    ask(143856);
+    poll();
+    CHECK(logged("profile ocarina.exe limits to 144/1 (144.000 fps; the game asked 143.856)"), "the log names 144/1");
+    ask(60000);
+    poll();
+    CHECK(logged("profile ocarina.exe limits to 60.000 fps\n"), "a whole limit as it is");
+}
+
 static const struct { const char *name; void (*run)(void); } scenarios[] = {
     {"restore_race", restore_race},
     {"restore_player", restore_player},
@@ -434,6 +460,8 @@ static const struct { const char *name; void (*run)(void); } scenarios[] = {
     {"kept_lowlat_then_limit", kept_lowlat_then_limit},
     {"kept_framegen", kept_framegen},
     {"active_race", active_race},
+    {"round_logged", round_logged},
+    {"round_logged_whole", round_logged_whole},
 };
 
 int main(int argc, char **argv) {

@@ -208,8 +208,12 @@ static int apply(int64_t mhz) {
     }
     applied = mhz;
     update_profiles();
-    if (mhz) rt_log("frame rate: RivaTuner Statistics Server's profile %s limits to %.3f fps", profile, mhz / 1000.0);
-    else rt_log("frame rate: RivaTuner Statistics Server's profile %s has no limit (unlimited)", profile);
+    if (!mhz) rt_log("frame rate: RivaTuner Statistics Server's profile %s has no limit (unlimited)", profile);
+    else if ((int64_t)limit * 1000 == mhz * denominator)
+        rt_log("frame rate: RivaTuner Statistics Server's profile %s limits to %.3f fps", profile, mhz / 1000.0);
+    else   // rounded to whole frames by an RTSS without FramerateLimitDenominator: the log says what RTSS holds
+        rt_log("frame rate: RivaTuner Statistics Server's profile %s limits to %lu/%lu (%.3f fps; the game asked %.3f)",
+               profile, limit, denominator, (double)limit / denominator, mhz / 1000.0);
     return 1;
 }
 
