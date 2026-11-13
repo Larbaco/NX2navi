@@ -409,8 +409,9 @@ void nvn_pins_stats(uint64_t *live, uint64_t *freed) {
 // adding control memory again releases the copies recorded there without walking every live copy. 4 KiB pages cost
 // about 500 lookups per AddControlMemory under the exclusive lock (1.4.3 field: 53 calls a frame, 2 MiB ranges, 3.7
 // copies per page), and the recording threads waited on it.
-// deferred: 0 unknown, 1 none, 2 some; pins: texture pins its ops name, counted in their refs (pin_refs)
-typedef struct { uint64_t magic, bytes, made_at, used_at, deferred, pins; } copy_prefix;
+// deferred: 0 unknown, 1 none, 2 some; pins: texture pins its ops name, counted in their refs (pin_refs); used_min: the
+// minute of its last use (copy_age)
+typedef struct { uint64_t magic, bytes, made_at, used_at, deferred, pins, used_min; } copy_prefix;
 _Static_assert(sizeof(copy_prefix) % 8 == 0, "records stay 8-byte aligned");
 typedef struct { uintptr_t lo, hi; uint8_t *copy; } cmd_copy;
 typedef struct { cmd_copy *v; uint32_t n, cap; } copy_bucket;
@@ -418,6 +419,28 @@ static PlatMutex copy_lock = PLAT_MUTEX_INIT;    // guards the two maps, the cou
 static nvn_hmap copy_pages = {.klen = 8};   // page -> copy_bucket
 static nvn_hmap copy_live = {.klen = 8};    // handle -> copy_prefix of a live copy
 static uint64_t ncopies, copy_bytes, copies_made;
+
+// The live copies by the minute of their last use (made, called or submitted), so the report can say how many no
+// submission has used for COPY_IDLE_MINS without a walk of the copies under copy_lock, which the recording threads
+// take at every EndRecording. A copy is retired only when the game adds its control memory again
+// (nvnCommandBufferAddControlMemory), and a session of 2026-11-13 grew from 9,138 live copies (0.7 MiB) to 223,753
+// (58.3 MiB) in 7 minutes of play, about 38,000 more at each return to an area: these figures tell copies the game
+// still submits from ones it left behind. Kept for COPY_AGE_MINS minutes of the run, a ring of counters by minute.
+#define COPY_AGE_MINS 1024
+#define COPY_IDLE_MINS 5
+static volatile int64_t age_n[COPY_AGE_MINS], age_b[COPY_AGE_MINS];
+
+static uint64_t copy_minute(void) { return plat_now_ns() / 60000000000ull; }
+
+static void age_add(uint64_t min, const copy_prefix *pf, int64_t sign) {
+    plat_add64(&age_n[min % COPY_AGE_MINS], sign);
+    plat_add64(&age_b[min % COPY_AGE_MINS], sign * (int64_t)pf->bytes);
+}
+
+static void copy_age(copy_prefix *pf, uint64_t min) {   // copy_lock held, shared or exclusive; pf live
+    uint64_t was = __atomic_exchange_n(&pf->used_min, min, __ATOMIC_RELAXED);
+    if (was != min) age_add(was, pf, -1), age_add(min, pf, 1);
+}
 // Asynchronous replay: copies released by the game, and per-submission clones, that a queued submission still reads.
 // Freed once gfx_replayed_submits() reaches their used_at. Empty with synchronous replay.
 static copy_prefix **zombies;
@@ -490,7 +513,7 @@ static uint64_t copy_touch(uint64_t handle, uint64_t now, const char *what) {
     plat_mutex_lock_shared(&copy_lock);
     copy_prefix *pf = copy_find(handle);
     uint64_t bytes = 0;
-    if (pf) __atomic_store_n(&pf->used_at, now, __ATOMIC_RELAXED), bytes = pf->bytes;
+    if (pf) __atomic_store_n(&pf->used_at, now, __ATOMIC_RELAXED), bytes = pf->bytes, copy_age(pf, copy_minute());
     plat_mutex_unlock_shared(&copy_lock);
     if (!pf) rt_fatal("nvn: %s: command handle %#llx is not a live recording (released or never recorded)", what,
                       (unsigned long long)handle);
@@ -546,6 +569,8 @@ static void copy_add(uintptr_t lo, uintptr_t hi, uint8_t *copy) {
     nvn_hm_put(&copy_live, &handle, pf);
     ncopies++;
     copy_bytes += pf->bytes;
+    pf->used_min = copy_minute();
+    age_add(pf->used_min, pf, 1);
     if (++copies_made % 20000 == 0)
         NVN_LOG("recording copies: %llu made, %llu live, %.1f MiB, submit %llu", (unsigned long long)copies_made,
                 (unsigned long long)ncopies, copy_bytes / 1048576.0, (unsigned long long)nsubmits);
@@ -570,6 +595,7 @@ static void release_copies(uintptr_t lo, uintptr_t hi) {
             nvn_hm_del(&copy_live, &handle);
             ncopies--;
             copy_bytes -= pf->bytes;
+            age_add(pf->used_min, pf, -1);
             pf->magic = 0;
             if (pf->used_at > replayed) zombie_add(pf);   // a queued submission still reads it
             else doomed = doom(doomed, pf);
@@ -1295,6 +1321,7 @@ void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
         } else {
             pf->used_at = now;
         }
+        copy_age(pf, copy_minute());
     }
     plat_mutex_unlock(&copy_lock);
     doom_free(doomed);
@@ -1325,7 +1352,23 @@ const char *nvn_op_name(uint32_t op) {
 
 // NX2NAVI_TRACE=perf "mem: sizes" (perf.c): live recording copies and the zombies waiting for their submissions, texture
 // pins with their sweep queue, and the recording-buffer pool.
+void nvn_copies_stats(uint64_t *n, uint64_t *bytes, uint64_t *idle_n, uint64_t *idle_bytes) {
+    uint64_t m = copy_minute();
+    int64_t rn = 0, rb = 0;
+    plat_mutex_lock_shared(&copy_lock);
+    *n = ncopies, *bytes = copy_bytes;
+    for (uint64_t k = 0; k < COPY_IDLE_MINS && k <= m; k++)
+        rn += __atomic_load_n(&age_n[(m - k) % COPY_AGE_MINS], __ATOMIC_RELAXED),
+        rb += __atomic_load_n(&age_b[(m - k) % COPY_AGE_MINS], __ATOMIC_RELAXED);
+    plat_mutex_unlock_shared(&copy_lock);
+    uint64_t un = rn > 0 ? (uint64_t)rn : 0, ub = rb > 0 ? (uint64_t)rb : 0;   // counters read without a lock of theirs
+    *idle_n = un < *n ? *n - un : 0;
+    *idle_bytes = ub < *bytes ? *bytes - ub : 0;
+}
+
 void nvn_cmd_sizes(PerfSizes *s) {
+    uint64_t in, ib, idle_n, idle_b;
+    nvn_copies_stats(&in, &ib, &idle_n, &idle_b);
     plat_mutex_lock_shared(&copy_lock);
     uint64_t nc = ncopies, cb = copy_bytes, nz = nzombies, zb = 0;
     for (uint32_t i = 0; i < nzombies; i++) zb += zombies[i]->bytes;
@@ -1338,6 +1381,7 @@ void nvn_cmd_sizes(PerfSizes *s) {
     for (uint32_t i = 0; i < npool; i++) pb += pool[i].size;
     plat_mutex_unlock(&pool_lock);
     perf_size(s, "recording copies", nc, 0, cb);
+    perf_size(s, "of them unused for 5 minutes", idle_n, 0, idle_b);
     perf_size(s, "recording copy zombies", nz, 0, zb);
     perf_size(s, "texture pins", pins, 0, PERF_SIZE_NONE);
     perf_size(s, "pin sweep queue", pq, 0, PERF_SIZE_NONE);

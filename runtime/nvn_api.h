@@ -121,6 +121,8 @@ uint64_t nvn_submit_count(void);                           // QueueSubmitCommand
 // thread that replays them; now = nvn_submit_count().
 void nvn_pins_sweep(uint64_t now, const tex_t *const *keep, int nkeep);
 void nvn_pins_stats(uint64_t *live, uint64_t *freed);      // pins that exist, pins freed so far
+// the live recording copies and their bytes, and of them those no submission or call used for 5 minutes
+void nvn_copies_stats(uint64_t *n, uint64_t *bytes, uint64_t *idle_n, uint64_t *idle_bytes);
 const char *nvn_op_name(uint32_t op);                      // "DRAW_IDX", ...; "?" past OP_COUNT_
 // MemoryPoolInvalidateMappedRange: the CPU is about to read pool storage the GPU wrote. Weak no-op in nvn_ext.c; a back
 // end that renders into host-side copies defines it and writes them back.
