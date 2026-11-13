@@ -23,6 +23,7 @@
 #include "gfx.h"
 #include "gfx_wsys.h"
 #include "input.h"
+#include "logq.h"
 #include "nvn_api.h"
 #include "ov.h"
 #include "platform/platform.h"
@@ -106,27 +107,55 @@ void gfx_window_focus_changed(int in) {
     if (!in) perf_focus_lost();   // the session's reports, in case the process is ended from outside next (perf.c)
 }
 
+// ---- the orderly end: the window's close (gfx_window_closed), the guest's ExitProcess (svc.c) and the end of a
+// --seconds run (boot.c rt_frame_presented)
+// Once per process, whichever comes first. The window's close and the console's (main.c console_closed) can come
+// together, or the guest's ExitProcess beside either: each ran its own sequence, so two pipeline saves and two
+// frame-time summaries were written while both raced. 1 for the first caller; a caller on another thread waits here
+// for good while the first ends the process; 0 for the first caller's own thread coming back (a message the window
+// thread handles inside the sequence), which goes on with the sequence it is in.
+static volatile uint32_t exit_tid;   // the thread that runs the orderly end, 0 before one started
+
+int rt_exit_begin(void) {
+    uint32_t me = plat_thread_id(), was = 0;
+    if (__atomic_compare_exchange_n(&exit_tid, &was, me, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return 1;
+    if (was == me) return 0;
+    for (;;) plat_sleep_ms(1000);
+}
+
+// What every orderly end saves and puts back, in this order. What a kill of the process must not lose and what is quick
+// comes first: Windows ends a closed console about 5 s after the close, a session's end and an "End task" sooner, and
+// the pipeline save alone can take that long (vk_pipeline_save_exit waits up to 5 s for the builds that run). So a
+// Commit in flight is finished, RivaTuner Statistics Server's profile and the controller's rumble are put back, the
+// settings, the boot prebuild's marker, the frame-time summary and the memory ranking are written, and the log reaches
+// the disk before the pipeline save starts. The final save flush comes last: the game's threads run until plat_exit,
+// and a Commit the game starts during the pipeline save is still taken and waited for. RT_EXIT_SETTINGS: nx2navi.ini
+// gets the menu's changes (not in a scripted --seconds run, whose end is no player's).
+void rt_exit_steps(unsigned what) {
+    fs_save_wait();   // a Commit already under way: finished, nothing refused
+    // the game's frame limit out of the profile; rtss_limit.c keeps it out while frames go on during the pipeline save
+    rtss_limit_restore();
+    input_rumble_hd_stop();   // a controller on HD rumble gets the neutral value: nothing renews or stops it after the exit
+    if (what & RT_EXIT_SETTINGS) cfg_save();   // a menu change saves 400 ms later on the render thread (option_rows.cpp)
+    // The game ended while the boot still built its pipelines: not the driver crash the marker is there to catch. Left
+    // in place, the next start took it for one and every later start skipped the prebuild (vk_pipeline.c pm_skipped).
+    vk_pipeline_prewarm_marker_clear();
+    prof_write();   // "frametime: exit" and the stutter map; plat_exit runs no atexit handlers
+    vk_mem_exit_log();   // the memory report's ranking of the session
+    logq_flush();   // the lines so far on the disk before the slow part; the queue stays on
+    vk_pipeline_save_exit();
+    fs_save_flush();   // last: a Commit started since fs_save_wait finishes, and one after this is refused
+}
+
 // The window was closed: the process ends with it, once a save Commit still running in the background is
 // done. After gfx_window_request_restart the executable then starts again with the same command line and environment
 // (plat_restart), and the new process waits until this one is gone (main.c) before it moves the log and opens the
 // RomFS and the saves.
 void gfx_window_closed(void) {
-    // Once. The console's close (main.c console_closed) can come beside the window's: the later caller waits here
-    // while the first one saves and ends the process.
-    static volatile int32_t closing;
-    if (plat_xchg32(&closing, 1)) for (;;) plat_sleep_ms(1000);
+    if (!rt_exit_begin()) return;
     int restart = plat_cas32(&g_restart, 0, 0) != 0;
     rt_log("gfx: window closed; %s", restart ? "restarting" : "exiting");
-    cfg_save();   // a menu change saves 400 ms later on the render thread (option_rows.cpp); closing sooner kept the old file
-    // The window closed while the boot still built its pipelines: not the driver crash the marker is there to catch.
-    // Left in place, the next start took it for one and every later start skipped the prebuild (vk_pipeline.c pm_skipped).
-    vk_pipeline_prewarm_marker_clear();
-    vk_mem_exit_log();   // the memory report's ranking of the session
-    vk_pipeline_save_exit();
-    prof_write();   // plat_exit runs no atexit handlers
-    rtss_limit_restore();   // RivaTuner Statistics Server's profile as it was
-    input_rumble_hd_stop();   // a controller on HD rumble gets the neutral value: nothing renews or stops it after the exit
-    fs_save_flush();   // last: the game's threads still run until plat_exit, and a Commit after this one is refused
+    rt_exit_steps(RT_EXIT_SETTINGS);
     if (restart) {
         cfg_setenv("NX2NAVI_REEXEC", NULL);   // the new process counts its own address-space retries (memory.c)
         if (!plat_restart()) rt_log("gfx: the restart could not start the game again");

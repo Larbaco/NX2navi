@@ -111,6 +111,12 @@ void perf_summary_flush(void);                  // prints the frame-time summary
 void perf_focus_lost(void);                     // the window lost the focus: the session's reports at the next present, in play
 void gfx_exit_log(void);                        // back end's lines for the exit summary (weak no-op in prof_win.c)
 void gfx_window_closed(void);                   // gfx_present.c (gfx_wsys.h): the end of a closed window; does not return
+// gfx_present.c: the orderly end every exit the game asks for shares (the window's close, svc.c ExitProcess, boot.c
+// --seconds). rt_exit_begin: 1 for the first caller; another thread waits there for good; 0 for that caller's own
+// thread again. rt_exit_steps: the saves and the put-backs, the slow pipeline save late and the final save flush last.
+int rt_exit_begin(void);
+enum { RT_EXIT_SETTINGS = 1 };                  // rt_exit_steps also writes the menu's changes to nx2navi.ini
+void rt_exit_steps(unsigned what);
 void perf_gpu_wait(uint64_t t0);                // a wait for a GPU fence ended (any thread; the render thread's also counts as PERF_FENCE)
 // GPU side of the 60-frame perf line, filled by the graphics back end when it set perf_gpu_stats. gpu_ns: GPU busy time
 // since the previous call (timestamp queries, overlaps counted once), have_gpu 0 when the device has no timestamps.

@@ -152,6 +152,28 @@ int logq_async(void) {
     return 1;
 }
 
+// What is queued, written now on the calling thread, with the queue left on: a point the log is to have reached on the
+// disk before something slow comes (the orderly end before its pipeline save, gfx_present.c rt_exit_steps). Each lock
+// is tried for at most 100 ms: the log thread may be stuck in a write and hold io. Without both locks nothing is
+// written here, since other threads still queue and write, and the log thread writes the lines when it can.
+void logq_flush(void) {
+    if (!__atomic_load_n(&Q.on, __ATOMIC_ACQUIRE)) return;
+    int io = 0, q = 0;
+    for (int i = 0; i < 100 && !(io = plat_mutex_trylock(&Q.io)); i++) plat_sleep_ms(1);
+    if (!io) return;
+    for (int i = 0; i < 100 && !(q = plat_mutex_trylock(&Q.q)); i++) plat_sleep_ms(1);
+    if (!q) {
+        plat_mutex_unlock(&Q.io);
+        return;
+    }
+    char *b = Q.buf;
+    size_t n = Q.n;
+    Q.buf = Q.out, Q.out = b, Q.n = 0;
+    plat_mutex_unlock(&Q.q);
+    if (n) put_out(b, n);
+    plat_mutex_unlock(&Q.io);
+}
+
 void logq_sync(void) {
     if (!plat_xchg32(&Q.on, 0)) return;
     // Each lock is tried for half a second: the thread that holds it may be the one that crashed, or be stuck in the

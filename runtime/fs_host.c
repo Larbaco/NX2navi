@@ -573,6 +573,10 @@ static void save_wait_commit(void) {
     plat_mutex_unlock(&pend_lock);
 }
 
+// The orderly end's first step (gfx_present.c rt_exit_steps): a Commit under way finishes before the quick put-backs and
+// the slow pipeline save, and a later one is still taken; fs_save_flush, the end's last step, refuses those.
+void fs_save_wait(void) { save_wait_commit(); }
+
 // The window closed: a Commit already started finishes first, and none starts afterwards, as the process exit would
 // cut it off halfway (the startup recovery then keeps the previous one; here it is kept outright).
 void fs_save_flush(void) {

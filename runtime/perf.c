@@ -507,6 +507,25 @@ static struct {
 } ft;
 static uint64_t summary_t0;   // start of the current period (0: not started)
 
+// The exit's summary (perf_summary_flush) runs on the exiting thread while the present thread may still add frames to
+// `ft` and write its own reports (ft_frame, session_report), with no lock between them: the exit lines came out torn,
+// or twice. ft_stop marks the end, after which the present thread adds nothing, and waits a little for an update
+// already under way; it is the exiting thread that waits, never the present thread. Both sides are sequentially
+// consistent, so either the present thread sees ft_ending or ft_stop sees it counted in ft_busy.
+static volatile int32_t ft_ending, ft_busy;
+
+static int ft_enter(void) {
+    __atomic_add_fetch(&ft_busy, 1, __ATOMIC_SEQ_CST);
+    return !__atomic_load_n(&ft_ending, __ATOMIC_SEQ_CST);
+}
+
+static void ft_leave(void) { __atomic_sub_fetch(&ft_busy, 1, __ATOMIC_SEQ_CST); }
+
+static void ft_stop(void) {
+    __atomic_store_n(&ft_ending, 1, __ATOMIC_SEQ_CST);
+    for (int i = 0; i < 50 && __atomic_load_n(&ft_busy, __ATOMIC_SEQ_CST); i++) plat_sleep_ms(1);
+}
+
 // NX2NAVI_REPLAY_TIME=1: how the replay splits between the kinds of op it walks, reported with the frame-time summary.
 // The replay is recorded on one thread, so these need no atomics. The kinds are PERF_RP_* in host.h.
 // NX2NAVI_LOCK_TIME=1 (default 0): the replay threads time every lock they have to wait for (platform.h
@@ -745,6 +764,7 @@ static void session_report(uint64_t now) {
 __attribute__((weak)) void vk_texstat_frame(uint64_t frame, uint64_t d) { (void)frame, (void)d; }
 
 void perf_summary_flush(void) {   // at exit (prof_write)
+    ft_stop();
     if (rt_trace & RT_TRACE_PERF) seg_close(__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), kern_now_ns(), 1);
     if (summary_t0) {
         ft_report(kern_now_ns(), "exit");
@@ -754,8 +774,9 @@ void perf_summary_flush(void) {   // at exit (prof_write)
     summary_t0 = 0;
 }
 
-// Returns the replay time since the previous present.
-static uint64_t ft_frame(uint64_t frame, uint64_t now, uint64_t d) {
+// Returns the replay time since the previous present. add 0: the exit's summary is written (ft_stop), so the frame
+// is not added to it.
+static uint64_t ft_frame(uint64_t frame, uint64_t now, uint64_t d, int add) {
     int64_t rep = plat_xchg64(&frame_replay_ns, 0);
     vk_texstat_frame(frame, d);
     uint64_t f_cpu = (uint64_t)plat_xchg64(&frame_replay_cpu_ns, 0);
@@ -764,6 +785,7 @@ static uint64_t ft_frame(uint64_t frame, uint64_t now, uint64_t d) {
     uint64_t f_hold = (uint64_t)plat_xchg64(&fr_hold_ns, 0);
     uint32_t f_op = (uint32_t)fr_max_op;
     for (int c = 0; c < PERF_RP_N; c++) f_ns[c] = (uint64_t)plat_xchg64(&fr_ns[c], 0), f_n[c] = (uint64_t)plat_xchg64(&fr_n[c], 0);
+    if (!add) return (uint64_t)rep;
     if (!summary_t0) {   // the first present starts the period; there is no interval yet
         summary_t0 = now;
         ft.t0 = now;
@@ -1080,8 +1102,10 @@ void perf_present(uint64_t frame) {
         __atomic_fetch_add(&wait_ns[k], (uint64_t)a, __ATOMIC_RELAXED);
         if (k == PERF_PACE) pace_any += (uint64_t)a;
     }
-    uint64_t rep = ft_frame(frame, now, d);   // d is 0 on the first present: it only starts the period
-    if (__atomic_load_n(&session_due, __ATOMIC_RELAXED) && plat_xchg32(&session_due, 0)) session_report(now);
+    int ft_add = ft_enter();   // 0 once the exit's summary is written
+    uint64_t rep = ft_frame(frame, now, d, ft_add);   // d is 0 on the first present: it only starts the period
+    if (ft_add && __atomic_load_n(&session_due, __ATOMIC_RELAXED) && plat_xchg32(&session_due, 0)) session_report(now);
+    ft_leave();
     ab_b += rt_ab();
     cpu_placement();
     reserve_sweep(frame);
