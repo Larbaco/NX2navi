@@ -94,6 +94,12 @@ def static_checks():
         print(f'static: {name} stops HD rumble through rt_rumble_stop_bounded after the RTSS restore: '
               f'{"ok" if ok else "FAIL"}', flush=True)
         bad += not ok
+    # the fatal error's frame-time summary comes after the RTSS restore and the rumble stop, as in the orderly end
+    s, p = fatal.find('rt_rumble_stop_bounded('), fatal.find('perf_summary_flush_try(')
+    ok = 0 <= s < p
+    print(f'static: dispatch.c fatal_end writes the frame-time summary after the RTSS restore and the rumble stop: '
+          f'{"ok" if ok else "FAIL"}', flush=True)
+    bad += not ok
     return bad
 
 
