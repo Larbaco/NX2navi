@@ -63,6 +63,7 @@ void perf_mark_add(int kind, uint64_t ns, uint64_t bytes);   // nothing while th
 // (romfs.c, the area's static placement file) and takes the memory snapshot once no area has loaded for 10 s.
 void perf_segment(const char *name);
 void perf_scene(const char *name);
+uint64_t perf_area_load_ns(void);   // plat_now_ns of the last perf_scene (any trace setting), 0 before the first
 // NX2NAVI_TRACE=perf "mem: sizes" lines (perf.c sizes_log): the entries and bytes of the caches, pools and tables no
 // other line gives, every 600 presents and with each memory snapshot. Each subsystem's *_sizes function (weak no-ops
 // in perf.c) adds its own with perf_size, taking its locks briefly on the present thread. count or bytes UINT64_MAX:

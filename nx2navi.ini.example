@@ -1098,6 +1098,14 @@
 # area's textures are there, instead of showing the ground and the walls black for the first seconds. 0: never.
 # pool_load_backlog = 512
 # pool_load_ms = 50
+# Idle 2 MiB regions of game memory are made read-only so that the per-frame checks for CPU writes skip them. Right
+# after an area load such a freeze can take 4-30 ms instead of microseconds, so after a slow one the freezes wait
+# (250 ms, doubled for each further slow one up to 2 s) and start the doubling over only after freeze_quiet_ms without
+# a slow one (0: after any fast freeze, as in 0.10.1). None is made while an area's textures load nor for
+# freeze_load_hold_ms after that or after an area loads (0: no such hold). The regions wait meanwhile; their checks
+# cost a few microseconds per MiB each submission until they are frozen.
+# freeze_quiet_ms = 5000
+# freeze_load_hold_ms = 3000
 # Written storage-buffer ranges up to this size in MiB (1 to 256) go back to game memory as a merge, in 4 MiB pieces:
 # copied within video memory and only the words that changed written over PCIe. Larger ones are copied back whole at
 # the end of every submission. Raising it from 4 to 16 took a 5.5 MiB range off the plain copies (about 46 MiB a frame

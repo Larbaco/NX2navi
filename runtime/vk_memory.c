@@ -15,6 +15,7 @@
 
 #include "cfg.h"
 #include "flight.h"
+#include "freeze_hold.h"
 #include "gfx.h"
 #include "host.h"
 #include "logq.h"
@@ -1201,6 +1202,9 @@ static int freeze_idle;                       // 0: off
 static uint32_t ww_ep = 1;                    // gen_lock: the submission being recorded (vk_mem_mirror_begin)
 static uint32_t reg_last[RT_ADDRESS_LIMIT >> REG_SHIFT];    // gen_lock: ww_ep of the region's last stamp
 static uint32_t reg_tried[RT_ADDRESS_LIMIT >> REG_SHIFT];   // gen_lock: ww_ep of its last freeze candidacy
+// gen_lock: the region is in fcand. While the passes are held a region still idle came up again every freeze_idle
+// submissions and went in a second time; mem_frozen skipped the copies, but the queue grew with them.
+static uint8_t reg_queued[RT_ADDRESS_LIMIT >> REG_SHIFT];
 static uint32_t *fcand;                       // gen_lock: regions to try at the next freeze pass
 static int nfcand, cfcand;
 static uint64_t n_frz_refused;                // gen_lock: candidates mem_freeze refused
@@ -1306,10 +1310,11 @@ static uint64_t snap_regions(uint64_t r0, uint64_t r1, uint32_t epoch) {
         for (uint64_t j = r; j <= k; j++) {
             snap_at[j] = epoch, snap_untracked[j] = (uint8_t)!tracked;
             if (tracked && freeze_idle && ww_ep - reg_last[j] >= (uint32_t)freeze_idle &&
-                ww_ep - reg_tried[j] >= (uint32_t)freeze_idle) {
+                ww_ep - reg_tried[j] >= (uint32_t)freeze_idle && !reg_queued[j]) {
                 reg_tried[j] = ww_ep;
                 if (nfcand == cfcand) grow((void **)&fcand, &cfcand, sizeof *fcand);
                 fcand[nfcand++] = (uint32_t)j;
+                reg_queued[j] = 1;
             }
         }
         r = k + 1;
@@ -3896,26 +3901,43 @@ void nvn_pool_flushed(const pool_t *p, uint64_t off, uint64_t size) {
 // regions all go idle together, so 32 of them came up in one submission: its mirror begin took 70.5 ms and the frame
 // 78 ms, and one freeze of 9 ms followed in each of the next 20 frames. A freeze only saves later write-watch queries
 // (about a microsecond per MiB per submission), so it can wait: a pass stops once it has spent freeze_budget_ns, and a
-// freeze over FREEZE_SLOW_NS holds the passes for FREEZE_BACKOFF_NS, doubled for each slow one in a row up to 2 s.
-// NX2NAVI_FREEZE_BUDGET_US (default 1000; 0: no budget and no backoff, as before).
-#define FREEZE_SLOW_NS 2000000ull
-#define FREEZE_BACKOFF_NS 250000000ull
-#define FREEZE_BACKOFF_MAX_NS 2000000000ull
+// freeze over FREEZE_SLOW_NS holds the passes for FREEZE_BACKOFF_NS, doubled for each slow one up to 2 s.
+// NX2NAVI_FREEZE_BUDGET_US (default 1000; 0: no budget, no backoff and no hold at loads, as before).
+//
+// The doubling starts over only once NX2NAVI_FREEZE_QUIET_MS (default 5000) have passed without a slow freeze. It
+// started over at the first fast freeze after a hold, and the slow ones are slow for seconds after a load while fast
+// ones come between them: after a load in Kakariko (2026-11-13) a 4-5 ms freeze came every 250 ms, 16 frames apart,
+// five in a row, and 4-10 ms freezes made frames of 25-52 ms cross the stutter line. 0: as before, a fast freeze
+// starts the doubling over.
+// And no pass runs while the texture pool makes an area's textures (vk_exec_pool_loading: the frames are held, and a
+// freeze in the load's frame took 32.4 ms) nor for NX2NAVI_FREEZE_LOAD_HOLD_MS (default 3000; 0: off) after that or
+// after an area's load (perf_area_load_ns), when the loaders write and the driver imports the new memory. The regions
+// that go idle meanwhile stay queued and are frozen after it; until then their write-watch queries go on, a few
+// microseconds per MiB per submission for those seconds. freeze_hold.h has the rules.
 static uint64_t freeze_budget_ns = ~0ull;   // ~0: not read yet
-static uint64_t frz_hold_until, frz_backoff, frz_held_passes, frz_slow;   // gen_lock
+static uint64_t frz_quiet_ns, frz_load_hold_ns;
+static FrzHold frz;                                                // gen_lock
+static uint64_t frz_held_passes, frz_slow, frz_load_held;          // gen_lock
 
 static void freeze_pass(void) {
     if (freeze_budget_ns == ~0ull) {
         long long us = cfg_int("NX2NAVI_FREEZE_BUDGET_US");
         freeze_budget_ns = us > 0 ? (uint64_t)us * 1000 : 0;
+        long long q = cfg_int("NX2NAVI_FREEZE_QUIET_MS"), h = cfg_int("NX2NAVI_FREEZE_LOAD_HOLD_MS");
+        frz_quiet_ns = q > 0 ? (uint64_t)q * 1000000 : 0;
+        frz_load_hold_ns = h > 0 && freeze_budget_ns ? (uint64_t)h * 1000000 : 0;
     }
     uint64_t start = qpc();
-    if (freeze_budget_ns && start < frz_hold_until) {
-        if (nfcand) frz_held_passes++;
+    if (freeze_budget_ns && !frz_may_run(&frz, start, frz_load_hold_ns, vk_exec_pool_loading(), perf_area_load_ns())) {
+        if (nfcand) {
+            frz_held_passes++;
+            if (start >= frz.hold_until) frz_load_held++;
+        }
         return;
     }
     for (int done = 0; nfcand && done < FREEZE_PER_SUB;) {
         uint64_t j = fcand[--nfcand], a = j << REG_SHIFT;
+        reg_queued[j] = 0;
         if (ww_ep - reg_last[j] < (uint32_t)freeze_idle || mem_frozen(a)) continue;
         done++;
         uint64_t t0 = qpc();
@@ -3925,19 +3947,17 @@ static void freeze_pass(void) {
         if (ok) query_stamp(a, a + (1ull << REG_SHIFT), ++gen_now);
         else n_frz_refused++;
         if (!freeze_budget_ns) continue;
-        if (t1 - t0 >= FREEZE_SLOW_NS) {
+        frz_freeze_done(&frz, t1, t1 - t0, frz_quiet_ns);
+        if (t1 - t0 >= FRZ_SLOW_NS) {
             frz_slow++;
-            frz_backoff = frz_backoff ? frz_backoff * 2 : FREEZE_BACKOFF_NS;
-            if (frz_backoff > FREEZE_BACKOFF_MAX_NS) frz_backoff = FREEZE_BACKOFF_MAX_NS;
-            frz_hold_until = t1 + frz_backoff;
             static uint32_t logged;
             if (++logged <= 40)
                 rt_log("mem: freezing an idle region took %.1f ms: no freezes for %.0f ms (%llu slow freezes so far, %llu "
-                       "passes held, %d regions waiting)", (t1 - t0) / 1e6, frz_backoff / 1e6, (unsigned long long)frz_slow,
-                       (unsigned long long)frz_held_passes, nfcand);
+                       "passes held, %llu of them by area loads, %d regions waiting)", (t1 - t0) / 1e6, frz.backoff / 1e6,
+                       (unsigned long long)frz_slow, (unsigned long long)frz_held_passes,
+                       (unsigned long long)frz_load_held, nfcand);
             break;
         }
-        frz_backoff = 0;
         if (qpc() - start >= freeze_budget_ns) break;
     }
 }

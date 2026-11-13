@@ -261,7 +261,12 @@ void perf_segment(const char *name) {
     plat_mutex_unlock(&seg_lock);
 }
 
+static volatile uint64_t area_load_ns;   // plat_now_ns of the last area load (perf_scene), 0 none
+
+uint64_t perf_area_load_ns(void) { return __atomic_load_n(&area_load_ns, __ATOMIC_RELAXED); }
+
 void perf_scene(const char *name) {
+    __atomic_store_n(&area_load_ns, plat_now_ns(), __ATOMIC_RELAXED);
     stutter_area(name);
     if (!(rt_trace & RT_TRACE_PERF)) return;
     char wb[24];
