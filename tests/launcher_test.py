@@ -225,6 +225,21 @@ def fake_repo(folder, damage=None):
     (folder / 'ucrt64.db').write_bytes(tar_bytes(entries))
 
 
+def compiled_sleeper(exe, ms, code):
+    """exe compiled from a C program that sleeps ms milliseconds and exits with code, with the ucrt64 clang or a clang
+    on PATH; False without one. It stands in for the game under a name that no game runner watches."""
+    cc = next((c for c in (r'C:\msys64\ucrt64\bin\clang.exe', shutil.which('clang')) if c and Path(c).is_file()),
+              None)
+    if not cc:
+        return False
+    exe = Path(exe)
+    exe.parent.mkdir(parents=True, exist_ok=True)
+    src = exe.with_suffix('.c')
+    src.write_text(f'#include <windows.h>\nint main(void) {{ Sleep({ms}); return {code}; }}\n', encoding='utf-8')
+    subprocess.run([cc, '-O1', '-o', str(exe), str(src)], check=True, capture_output=True, timeout=300)
+    return True
+
+
 def fake_fast_repo(folder, clang_version='1.0-1'):
     """The CLANG64 packages toolchain.FAST_PACKAGES names, in folder/clang64."""
     folder = folder / 'clang64'
@@ -1079,7 +1094,7 @@ class BackgroundUpdateTest(Tmp):
         self.game = str(self.tmp / 'game')
         self.running = False   # what build.game_running answers: a copy of the game the launcher did not start
         saved = build.game_running
-        build.game_running = lambda game_dir, exe='ocarina.exe': self.running
+        build.game_running = lambda game_dir, exe='ocarina.exe', log=None: self.running
         self.addCleanup(setattr, build, 'game_running', saved)
         self.restarts = []
 
@@ -4329,6 +4344,47 @@ class SavesTest(unittest.TestCase):
         self.assertFalse(saves.game_running(self.game))
         self.assertTrue(os.access(exe, os.W_OK))
 
+    @unittest.skipUnless(os.name == 'nt', 'the running check is Windows only')
+    def test_only_a_sharing_violation_is_a_running_game(self):
+        """A running exe refuses a write open with a sharing violation (32); access denied (5) on an exe that is not
+        read-only (an access list, Controlled Folder Access) is no running game, and is logged when asked."""
+        exe = self.game / 'ocarina.exe'
+        exe.write_bytes(b'MZ')
+        answers = []
+        with mock.patch('launcher.build._write_open_error', side_effect=lambda p: answers.pop(0)) as opened:
+            answers[:] = [32]
+            self.assertTrue(build.game_running(self.game))
+            answers[:] = [0]
+            self.assertFalse(build.game_running(self.game))
+            answers[:] = [5]
+            lines = []
+            self.assertFalse(build.game_running(self.game, log=lines.append))
+            self.assertEqual(len(lines), 1)
+            self.assertIn('cannot be opened for writing (access denied)', lines[0])
+            self.assertEqual(opened.call_count, 3)
+            os.chmod(exe, stat.S_IREAD)                    # read-only: cleared, then the open is tried again
+            answers[:] = [5, 32]
+            self.assertTrue(build.game_running(self.game))
+            self.assertTrue(os.access(exe, os.W_OK))
+            os.chmod(exe, stat.S_IREAD)
+            answers[:] = [5, 5]
+            lines = []
+            self.assertFalse(build.game_running(self.game, log=lines.append))
+            self.assertEqual(len(lines), 1)
+            self.assertEqual(answers, [])
+        self.assertEqual(build._write_open_error(exe), 0)   # the real call on a file nothing holds
+        sleeper = self.game / 'sleeper.exe'                 # and on a running exe
+        if not compiled_sleeper(sleeper, 3000, 0):
+            self.skipTest('needs a C compiler')
+        proc = winsys.start_game(sleeper)
+        try:
+            self.assertEqual(build._write_open_error(sleeper), build.ERROR_SHARING_VIOLATION)
+            self.assertTrue(build.game_running(self.game, exe='sleeper.exe'))
+        finally:
+            proc.kill()
+            proc.wait(10)
+        self.assertFalse(build.game_running(self.game, exe='sleeper.exe'))
+
     def test_read_only_files_import_writable(self):
         acct = saves.account_dir(self.game)
         self.files(acct, {'save.dat': b'old'})
@@ -5210,16 +5266,10 @@ class WhilePlayingTest(Tmp):
         """winsys.game_copy finds a running process by its image file, not by its name, and reads the code it ended
         with after it ended. A sleeper compiled here stands in for the game, under a name that no game runner
         watches."""
-        cc = next((c for c in (r'C:\msys64\ucrt64\bin\clang.exe', shutil.which('clang')) if c and Path(c).is_file()),
-                  None)
-        if not cc:
-            self.skipTest('needs a C compiler')
-        src = self.tmp / 'sleeper.c'
-        src.write_text('#include <windows.h>\nint main(void) { Sleep(4000); return 72; }\n', encoding='utf-8')
         mine, other = self.tmp / 'mine' / 'sleeper.exe', self.tmp / 'other' / 'sleeper.exe'
-        mine.parent.mkdir()
+        if not compiled_sleeper(mine, 4000, 72):
+            self.skipTest('needs a C compiler')
         other.parent.mkdir()
-        subprocess.run([cc, '-O1', '-o', str(mine), str(src)], check=True, capture_output=True, timeout=300)
         shutil.copy(mine, other)
         proc = winsys.start_game(mine)
         try:

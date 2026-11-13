@@ -512,7 +512,7 @@ class RebuildJob(Job):
     def run(self):
         self.ensure_tools('tools_update')
         layout = self.ctx.layout
-        if build.game_running(self.game_dir):
+        if build.game_running(self.game_dir, log=self.ctx.log):
             raise build.BuildError('the game is running: close it and try again')
         if build.can_rebuild(self.game_dir):
             args = build.rebuild_args(layout, self.game_dir, self.retune)
