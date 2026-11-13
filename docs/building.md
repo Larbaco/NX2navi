@@ -703,6 +703,26 @@ A change to which entry of the upscaler stand-in's scratch images serves a new s
 and checks that a match is a hit, a ninth size takes a free entry or the one used longest ago instead of being
 refused, and two images of one frame never evict each other. No GPU, no game files.
 
+A change to the ASTC decoder's scratch trim (`runtime/vk_astc.c` `vk_astc_scratch_trim`, with the upload lock it only
+tries, `runtime/vk_memory.c` `vk_defer_buffer_try`) passes `python tests\astc_trim_check.py`, which builds `vk_astc.c`
+with the platform layer's recursive lock and the rest of the runtime stubbed: the trim gives way while another thread
+holds the upload lock, goes through once it is free, and never deadlocks with an upload that asks for the scratch
+meanwhile. No GPU, no game files.
+
+A change to the copy of each event-ordered queue's first held wait (`runtime/vk_evo_peek.h`, `runtime/vk_exec.c`
+`vk_exec_held_ready`) passes `python tests\evo_peek_check.py`, which builds the header alone: one writer republishes
+while three readers copy, no copy mixes two publishes, and no reader waits for the writer. No GPU, no game files.
+
+A change to how `runtime/memory.c` `mem_copy_readable` reads the lazy heap (`NX2NAVI_HEAP_LAZY=1`) passes
+`python tests\heap_lazy_copy_check.py`, which builds `memory.c` with the Windows platform layer and its fault handler:
+every copy returns, a heap page nothing touched yet reads zero and stays reserved, and pages past the heap's end are
+left out. Windows only, no game files.
+
+A change to the page write generations (`runtime/vk_memory.c`, from its "page write generations" banner to its "dirty
+census" banner: `gen_next`, `gen_mark`) passes `python tests\gen_wrap_check.py`, which builds that part of the file
+alone: the lines logged as the 32-bit generations near their wrap, and the four comparisons known to answer wrong across
+it. No GPU, no game files.
+
 A change to which frames FSR 3.1 frame generation is told are camera cuts (`runtime/vk_fg_reset.h`, `runtime/vk_fg.cpp`
 `generate` and `vk_fg_frame`) passes `python tests\fg_reset_check.py`, which builds the header alone and checks that each
 frame id gets its own frame's cut, that an id never noted or no longer held counts as a cut, and that a slot rewritten
