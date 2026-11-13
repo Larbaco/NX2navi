@@ -2439,6 +2439,21 @@ static void sweep_hard(void) {   // tex_lock held
         }
         int need = nreleased - (RELEASED_HARD - HARD_SLACK);
         int k = trl_hard_pick(cls, n, need < HARD_BATCH ? need : HARD_BATCH, out);
+        // The picks the GPU drew into go back to their storage first, in one upload batch with one wait
+        // (write_back_n), as drop_tex would write each of them back for DROP_HARD with a GPU wait of its own: up to
+        // HARD_BATCH waits on the thread that releases, the replay's overwrite_others included. write_back_n clears
+        // gpu_dirty, so drop_tex then finds nothing to write back; the same entries go, in the same order.
+        static Tex *wbv[HARD_BATCH];
+        int m = 0;
+        wb_cfg_init();
+        for (int i = 0; i < k; i++) {
+            Tex *e = walk[out[i]];
+            uint32_t t;
+            if (!e->gpu_dirty) continue;
+            if (storage_rewritten(e, e->gpu_gen, &t) == 1) e->gpu_dirty = 0;
+            else if (wb_wanted(e)) wbv[m++] = e;
+        }
+        if (m) write_back_n(wbv, m), n_drop_wb += (uint64_t)m;
         for (int i = 0; i < k; i++) n_hard_by[cls[out[i]]]++, drop_tex(walk[out[i]], DROP_HARD);
         if (!k) hard_lru_drop(lru);
     }
