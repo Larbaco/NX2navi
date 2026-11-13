@@ -19,6 +19,7 @@
 #include "prof.h"
 #include "vk.h"
 #include "vk_lowlat.h"
+#include "vk_sync_hw.h"
 #include "platform/platform.h"
 
 #define WEAK __attribute__((weak))
@@ -190,6 +191,14 @@ static int hold_max = -1;
 // NX2NAVI_WB_SPLIT=2 keeps the split with shadow storage too, to measure that fault.
 static VkSemaphore exec_tl;
 static uint64_t exec_sig;             // sub_lock: the newest value a submitted part signals on exec_tl
+
+// ---- a lost device in the timelines' values (vk_sync_hw.h)
+// The newest value any signal of the timeline (tl_hw) and of exec_tl (ex_hw) carries, noted before the signal can
+// happen: by hold_flush_locked before vkQueueSubmit2, by the host's own signals before vkSignalSemaphore. A value read
+// above the note ends the run as a lost device (timeline_beyond). Reaching those values is no proof the device lives:
+// a driver that reports every pending signal as done after a reset reads at or below the note, and the line an
+// occlusion query left unwritten logs (vk_exec_xfer.c oq_cb, vk_sync_state_text) shows which of the two a report had.
+static volatile uint64_t tl_hw, ex_hw;
 static int wb_split = -1;
 static int wb_results;                // the wait on exec_tl also runs the results the game reads (not with 3)
 
@@ -275,6 +284,14 @@ static void hold_flush_locked(VkCtx *c) {
         __atomic_store_n(&held_n, 0, __ATOMIC_RELEASE);
         return;
     }
+    // every value this hand-over signals is noted before the queue can reach it ("a lost device in the timelines'
+    // values")
+    for (int i = 0; i < H.n; i++)
+        for (uint32_t k = 0; k < H.si[i].signalSemaphoreInfoCount; k++) {
+            const VkSemaphoreSubmitInfo *s = &H.si[i].pSignalSemaphoreInfos[k];
+            if (s->semaphore == c->timeline) sync_hw_raise(&tl_hw, s->value);
+            else if (s->semaphore == exec_tl) sync_hw_raise(&ex_hw, s->value);
+        }
     VkResult r = lost_at_due() ? VK_ERROR_DEVICE_LOST : vkQueueSubmit2(c->gfx_queue, (uint32_t)H.n, H.si, VK_NULL_HANDLE);
     if (r != VK_SUCCESS) {
         vk_mem_oom_report("replay submit", r);
@@ -850,6 +867,56 @@ WEAK int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint
     return 0;
 }
 
+// Without vk_exec.c (the probes): no submission is held back for an event.
+WEAK int vk_exec_held(void) { return 0; }
+
+// raw, read from the timeline whose signals hw notes: above every one of them the device is lost, and the run ends
+// here (vk_device_lost_check) after a line with the two values.
+static void timeline_beyond(const char *name, uint64_t raw, volatile uint64_t *hw, const char *where) {
+    uint64_t h = __atomic_load_n(hw, __ATOMIC_ACQUIRE);
+    if (!sync_hw_beyond(raw, h)) return;
+    rt_log("vk: the %s reads %llu, above every value its signals carry (%llu): the device is lost", name,
+           (unsigned long long)raw, (unsigned long long)h);
+    vk_device_lost_check(VK_ERROR_DEVICE_LOST, where);
+}
+
+void vk_sync_signal_note(uint64_t value) { sync_hw_raise(&tl_hw, value); }
+
+void vk_sync_check_timeline(const char *where) {
+    VkCtx *c = vk_ctx();
+    if (!c || !c->timeline || vk_device_is_lost()) return;
+    uint64_t raw = 0;
+    VkResult r = vkGetSemaphoreCounterValue(c->device, c->timeline, &raw);
+    vk_device_lost_check(r, where);
+    if (r == VK_SUCCESS) timeline_beyond("submissions' timeline", raw, &tl_hw, where);
+}
+
+// No lock: the thread that reports a lost device may hold any (vk_device.c device_fault_report).
+void vk_sync_state_text(char *o, size_t n) {
+    VkCtx *c = vk_ctx();
+    uint64_t tl = 0, ex = 0;
+    char a[32] = "nothing (unreadable)", b[32] = "nothing (unreadable)";
+    if (c && c->timeline && vkGetSemaphoreCounterValue(c->device, c->timeline, &tl) == VK_SUCCESS)
+        snprintf(a, sizeof a, "%llu", (unsigned long long)tl);
+    if (c && exec_tl && vkGetSemaphoreCounterValue(c->device, exec_tl, &ex) == VK_SUCCESS)
+        snprintf(b, sizeof b, "%llu", (unsigned long long)ex);
+    snprintf(o, n,
+             "submissions issued up to %llu, their side effects run up to %llu, handed to the queue up to %llu with %d "
+             "held back; the submissions' timeline reads %s of %llu signalled at most, the executed timeline %s of %llu; "
+             "%d submission(s) held for an event",
+             (unsigned long long)__atomic_load_n(&issued, __ATOMIC_ACQUIRE),
+             (unsigned long long)__atomic_load_n(&done, __ATOMIC_ACQUIRE),
+             (unsigned long long)__atomic_load_n(&queued_v, __ATOMIC_ACQUIRE), (int)__atomic_load_n(&held_n, __ATOMIC_ACQUIRE),
+             a, (unsigned long long)__atomic_load_n(&tl_hw, __ATOMIC_ACQUIRE), b,
+             (unsigned long long)__atomic_load_n(&ex_hw, __ATOMIC_ACQUIRE), vk_exec_held());
+}
+
+void vk_sync_lost_report(void) {
+    char t[512];
+    vk_sync_state_text(t, sizeof t);
+    rt_log("vk: when the device was lost: %s", t);
+}
+
 static void completion_main(void *arg) {
     VkCtx *c = arg;
     __atomic_store_n(&cb_tid, plat_thread_id(), __ATOMIC_RELEASE);
@@ -882,9 +949,13 @@ static void completion_main(void *arg) {
                 vk_device_lost_check(r, "the completion thread's read of the submissions' timeline");
                 rt_fatal("vk: the submissions' timeline could not be read (%d; device lost?)", (int)r);
             }
-            // Both calls may succeed on a lost device and give a value its submissions never reached. So before a
-            // new value counts, the device is asked once more with a call of its own (vk_device.c
-            // vk_device_lost_poll, which ends the run when it is lost).
+            // Both calls may succeed on a lost device and give a value its submissions never reached. A value above
+            // every one the timeline's signals carry ends the run ("a lost device in the timelines' values"); then,
+            // before a new value counts, the device is asked once more with a call of its own (vk_device.c
+            // vk_device_lost_poll, which ends the run when it is lost). That poll alone did not see the losses of the
+            // RX 6000 reports of 0.9.1 and 0.9.2: their callbacks ran for work the GPU never finished.
+            timeline_beyond("submissions' timeline", reached, &tl_hw, "the completion thread's read of the submissions' "
+                                                                      "timeline (a value no submission signals)");
             if (reached > __atomic_load_n(&done, __ATOMIC_ACQUIRE)) vk_device_lost_poll();
             plat_mutex_lock(&st_lock);
             if (reached > issued) reached = issued;
@@ -963,6 +1034,8 @@ void vk_sync_start(void) {
         perf_gpu_stats = gpu_stats;
         uint64_t now = 0;
         vkGetSemaphoreCounterValue(c->device, c->timeline, &now);
+        sync_hw_raise(&tl_hw, now > issued ? now : issued);   // before the restart's signal below
+        sync_hw_raise(&ex_hw, now > issued ? now : issued);   // the executed timeline below starts there
         if (issued > now) {   // a new device after vk_shutdown: values keep increasing for the front end
             VkSemaphoreSignalInfo si = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = c->timeline,
                                         .value = issued};
@@ -1623,6 +1696,14 @@ int vk_sync_exec_wait(uint64_t value, uint64_t timeout_ns) {
         vk_device_lost_check(r, "the wait for a submission's commands");
         rt_fatal("vk: the wait for a submission's commands failed (%d; device lost?)", (int)r);
     }
+    if (r == VK_SUCCESS) {   // a lost device may end the wait too: the results below would be read from work never run
+        uint64_t raw = 0;
+        VkResult q = vkGetSemaphoreCounterValue(c->device, exec_tl, &raw);
+        vk_device_lost_check(q, "the read of the executed timeline");
+        if (q == VK_SUCCESS)
+            timeline_beyond("executed timeline", raw, &ex_hw, "the wait for a submission's commands (a value no part "
+                                                              "signals)");
+    }
     // The results the game reads, of this submission and of those before it, which the GPU ran first: here, not when
     // the completion thread gets to them behind the other side effects of the last frame's submissions.
     if (r == VK_SUCCESS && wb_results) results_run(value);
@@ -1734,6 +1815,7 @@ static uint64_t probe_lost_advance(VkCtx *c, volatile int32_t *ran) {
     uint64_t v = issued + 1;
     plat_mutex_unlock(&st_lock);
     vk_completion_add(v, probe_lost_cb, (void *)ran);
+    sync_hw_raise(&tl_hw, v);   // a host signal: noted before it ("a lost device in the timelines' values")
     VkSemaphoreSignalInfo si = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = c->timeline, .value = v};
     if (vkSignalSemaphore(c->device, &si) != VK_SUCCESS) return 0;
     plat_mutex_lock(&st_lock);

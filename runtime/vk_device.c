@@ -797,6 +797,7 @@ static const char *fault_address_type(VkDeviceFaultAddressTypeEXT t) {
 // The report of a lost device: the breadcrumbs, the pass marks, the video memory and the driver's fault information.
 // Once per process, on the thread that saw the loss first (vk_device_lost_check).
 static void device_fault_report(void) {
+    vk_sync_lost_report();
     vk_crumbs_report();
     vk_pass_marks_report();
     vk_mem_lost_report();
@@ -894,6 +895,7 @@ int vk_selftest(void) {
     vmaDestroyBuffer(c->vma, buf, alloc);
 
     VkSemaphoreSignalInfo sig = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = c->timeline, .value = 1};
+    vk_sync_signal_note(1);   // a host signal of the timeline is noted first (vk_sync.c timeline_beyond)
     if ((r = vkSignalSemaphore(c->device, &sig)) != VK_SUCCESS) { rt_log("vk selftest: vkSignalSemaphore failed (%d)", (int)r); return 3; }
     uint64_t value = 1;
     VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &c->timeline,

@@ -129,6 +129,14 @@ static inline int vk_device_is_lost(void) { return __atomic_load_n(&vk_lost, __A
 // signals), and ends the run through vk_device_lost_check when it is. The completion thread calls it before it runs
 // callbacks: a lost device may report the submissions' timeline as reached (vk_sync.c completion_main).
 void vk_device_lost_poll(void);
+// vk_sync.c "a lost device in the timelines' values": a host signal of VkCtx.timeline notes its value first; a read of
+// the timeline above every value its signals carry ends the run as a lost device (vk_sync_check_timeline, any thread,
+// `where` for the fatal line). vk_sync_state_text: the submissions' values and the two timelines' readings, one line
+// without a lock; vk_sync_lost_report logs it (vk_device.c device_fault_report).
+void vk_sync_signal_note(uint64_t value);
+void vk_sync_check_timeline(const char *where);
+void vk_sync_state_text(char *o, size_t n);
+void vk_sync_lost_report(void);
 
 // ---- GPU breadcrumbs (vk_crumbs.c): with VK_AMD_buffer_marker, each crumb has the GPU write its code into host memory
 // twice, when the command processor reaches it and when all work before it has finished. After a lost device the two

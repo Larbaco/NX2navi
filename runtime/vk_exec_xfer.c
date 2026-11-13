@@ -390,7 +390,7 @@ static uint32_t oq_nseg, oq_capseg;
 static int oq_lost;                      // replay: the segment missed a draw (ring full)
 static uint64_t oq_count;                // completion thread: samples since the last reset
 
-typedef struct { uint64_t addr, seq; int reset; volatile int32_t lost; uint32_t n, cap; uint32_t *q; } OqSegment;
+typedef struct { uint64_t addr, seq, fence; int reset; volatile int32_t lost; uint32_t n, cap; uint32_t *q; } OqSegment;
 
 // The replay workers (vk_exec.c "parallel groups") record the draws of one group at once. The front pass replays a
 // group's samples-passed resets and reports in the order of the stream before the workers record (vk_exec_xfer_front):
@@ -682,8 +682,24 @@ static void oq_cb(void *arg) {
         if (avail) sum += v;
         else {
             sum += 1;
-            vk_device_lost_poll();   // a query its submission never wrote: on a lost device the run ends here
-            LOG_ONCE("vk: occlusion query slot %u not available after its fence, counted as visible", s->q[i]);
+            // A query its submission never wrote. Every RX 6000 report of a lost device (0.8.0 to 0.9.2) had this line
+            // first, its callback run for work the GPU had not finished. A timeline read above every value its signals
+            // carry, then the device itself, end the run here when it is lost (vk_sync.c "a lost device in the
+            // timelines' values", vk_device.c vk_device_lost_poll). Otherwise the slot counts as visible and the game
+            // goes on, as a ring that came round too early would leave it. The first such slot is logged with the
+            // submissions' state and the GPU's breadcrumbs: whether the GPU had finished this submission, and whether
+            // the timeline read above what was signalled.
+            vk_sync_check_timeline("an occlusion query its finished submission never wrote (a timeline value no "
+                                   "submission signals)");
+            vk_device_lost_poll();
+            static volatile char logged;
+            if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED)) {
+                char st[512];
+                vk_sync_state_text(st, sizeof st);
+                rt_log("vk: occlusion query slot %u of submission %llu not available after its fence, counted as visible; "
+                       "%s", s->q[i], (unsigned long long)s->fence, st);
+                vk_crumbs_report();
+            }
         }
     }
     if (s->n && ++OQB.segs >= 12000) {
@@ -711,7 +727,7 @@ static void oq_segment(VkExec *ex, uint64_t addr, int reset) {
     OqSegment *s = calloc(1, sizeof *s);
     if (!s || (oq_nseg && !(s->q = malloc(sizeof *s->q * oq_nseg)))) rt_fatal("vk: out of memory");
     s->cap = oq_nseg;
-    s->addr = addr, s->seq = report_seq, s->reset = reset, s->lost = oq_lost, s->n = oq_nseg;
+    s->addr = addr, s->seq = report_seq, s->fence = ex->fence, s->reset = reset, s->lost = oq_lost, s->n = oq_nseg;
     if (addr) vk_exec_note_results(VK_RES_OQ);
     if (oq_nseg) memcpy(s->q, oq_seg, sizeof *s->q * oq_nseg);
     if (gs_on >= 0) {   // the front pass: the workers add the queries of the group's ops before it
