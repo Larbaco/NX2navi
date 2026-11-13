@@ -1,6 +1,8 @@
 """Build and run tests/ipc_session_check.c: runtime/ipc.c with runtime/kernel.c linked, checking that a CloseHandle racing
-a request leaves the session (and its close callback) to the request's end and that a closed transfer memory handle is
-not read; with the platform layer linked and the rest of the runtime stubbed. No game files: the module layout the
+a request leaves the session (and its close callback) to the request's end, that a closed transfer memory handle is not
+read, and that a domain frees closed objects and gives their ids out again, answers a closed id with a bad handle, never
+closes its own id, and is kept while an object with its own handle lives; with the platform layer linked and the rest of
+the runtime stubbed. No game files: the module layout the
 runtime includes is a stand-in written to the test's build folder.
 
 Usage: ipc_session_check.py
