@@ -5035,7 +5035,7 @@ static void fast_retire(Pipe *p) {
 // each one's compiled code in video memory until it is destroyed. In a 4K session with DLSS and frame generation the
 // device-local memory outside the allocator was 4.2 GB with 6,300 graphics pipelines alive, 3,589 of them not drawn
 // once in that run. On a card short of video memory those are the cheapest thing to give back: no draw has recorded
-// them. So while the device-local memory in use is over NX2NAVI_TEX_VRAM_PRESSURE percent of the budget (vk_mem_vram,
+// them. So while the device-local memory in use is over NX2NAVI_TEX_VRAM_PRESSURE percent of the budget (vk_mem_vram_live,
 // which NX2NAVI_VRAM_BUDGET_MB caps for a test), the autosave thread takes up to RELEASE_BATCH graphics pipelines that
 // no draw has looked up in this run out of the table every RELEASE_EVERY_MS, and destroys them with their entries once
 // the GPU is past the submission being recorded and one more (as fast_retire). A draw that needs one later misses it as
@@ -5045,6 +5045,9 @@ static void fast_retire(Pipe *p) {
 // memo (vk_exec_draw.c, the PM context) nor any caller holds their VkPipeInfo. Not taken: mesh pipelines (without
 // stage libraries their build is long), entries building or with a link queued, failed ones, and compute pipelines.
 // The next pass logs the device-local use then and now, so a log says what a batch gave back.
+// The use counts the free space inside the allocator's blocks as free, as the texture evictions do (vk_texture.c
+// sweep_pressure): the driver's figure (vk_mem_vram) counts it as used, so with free blocks it could stay over the line
+// while pipelines went, and every pass would give back another batch until no unused pipeline was left.
 // NX2NAVI_PIPE_RELEASE=0 keeps every pipeline for the run, as before 0.10.0.
 #define RELEASE_EVERY_MS 5000
 #define RELEASE_BATCH 256
@@ -5079,11 +5082,11 @@ static void pressure_release(uint64_t now) {
     if (!on || now - last < RELEASE_EVERY_MS) return;
     last = now;
     uint64_t used = 0, budget = 0;
-    int exact = 0;
-    if (!vk_mem_vram(&used, &budget, &exact) || !budget) return;
+    if (!vk_mem_vram_live(&used, &budget) || !budget) return;
     if (rel_used0) {
-        rt_log("vk_pipeline: device-local memory in use %llu MiB when the last batch of unused pipelines went, %llu MiB "
-               "now", (unsigned long long)rel_used0, (unsigned long long)(used >> 20));
+        rt_log("vk_pipeline: device-local memory in use (free space inside the allocator's blocks not counted) %llu MiB "
+               "when the last batch of unused pipelines went, %llu MiB now", (unsigned long long)rel_used0,
+               (unsigned long long)(used >> 20));
         rel_used0 = 0;
     }
     if (used * 100 < budget * (uint64_t)pct) return;
@@ -5103,9 +5106,10 @@ static void pressure_release(uint64_t now) {
     rel_total += (uint64_t)n, rel_batches++;
     rel_used0 = used >> 20;
     if (rel_batches <= 16 || !(rel_batches & (rel_batches - 1)))
-        rt_log("vk_pipeline: video memory in use %llu of %llu MiB (over %d%%): %d graphics pipelines no draw used in this "
-               "run given back, %llu in %llu batches so far; a draw that needs one builds it again from the pipeline "
-               "cache (NX2NAVI_PIPE_RELEASE)", (unsigned long long)(used >> 20), (unsigned long long)(budget >> 20), pct, n,
+        rt_log("vk_pipeline: video memory in use %llu of %llu MiB (over %d%%, free space inside the allocator's blocks not "
+               "counted): %d graphics pipelines no draw used in this run given back, %llu in %llu batches so far; a draw "
+               "that needs one builds it again from the pipeline cache (NX2NAVI_PIPE_RELEASE)",
+               (unsigned long long)(used >> 20), (unsigned long long)(budget >> 20), pct, n,
                (unsigned long long)rel_total, (unsigned long long)rel_batches);
 }
 
@@ -9250,8 +9254,9 @@ int vk_pipeline_selftest(void) {
     return ok ? 0 : 1;
 }
 
-// NX2NAVI_TRACE=perf "mem: sizes" (perf.c): the pipeline table's entries with their pipelines and fast links (never
-// evicted), layouts, stage libraries, the job queues and the pipeline-keys.bin set. A walk of the hash chains under P.lock
+// NX2NAVI_TRACE=perf "mem: sizes" (perf.c): the pipeline table's entries with their pipelines and fast links (only
+// pressure_release takes entries out, while video memory is short), layouts, stage libraries, the job queues and the
+// pipeline-keys.bin set. A walk of the hash chains under P.lock
 // held shared: the workers' inserts and a draw's memo miss wait for it (well under a millisecond).
 void vk_pipeline_sizes(PerfSizes *s) {
     uint64_t ent = 0, built = 0, fast = 0, libn = 0, libb = 0, lq = 0;
