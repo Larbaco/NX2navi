@@ -67,6 +67,7 @@ static RtssState S = RTSS_STATE_INIT;   // the worker's decisions (rtss_decide.h
 static int has_denominator;   // this RTSS knows FramerateLimitDenominator
 static int had_profile;       // the profile existed before this run changed it
 static DWORD old_limit, old_denominator = 1;
+static int creations, removals;   // the profile's "created" and "removed" lines this run, numbered for the log (under lock)
 
 // RTSS's shared memory as rtss_parse reads it: whether RTSS runs, whether it lists this process, and its frame count.
 static void rtss_map(RtssApp *a) {
@@ -170,8 +171,9 @@ static int apply(void *ctx, int64_t mhz, int first, int clear) {
         return RTSS_WROTE_READONLY;
     }
     if (first) {
-        if (!had_profile)
-            rt_log("frame rate: RivaTuner Statistics Server profile %s created; it goes away when the game closes", profile);
+        if (!had_profile)   // numbered: a want that flips between a limit and kept out creates it again at each flip
+            rt_log("frame rate: RivaTuner Statistics Server profile %s created; it goes away when the game closes "
+                   "(creation %d this run)", profile, ++creations);
         else
             rt_log("frame rate: RivaTuner Statistics Server profile %s held a limit of %lu/%lu; it gets that back when the "
                    "game closes", profile, old_limit, old_denominator);
@@ -198,7 +200,8 @@ static int apply(void *ctx, int64_t mhz, int first, int clear) {
 static void put_back(void) {
     if (!had_profile) {
         delete_profile(profile);
-        rt_log("frame rate: RivaTuner Statistics Server profile %s removed, as before the game started", profile);
+        rt_log("frame rate: RivaTuner Statistics Server profile %s removed, as before the game started (removal %d this "
+               "run)", profile, ++removals);
     } else if (write_limit(old_limit, old_denominator) > 0) {
         rt_log("frame rate: RivaTuner Statistics Server profile %s has its limit of %lu/%lu back", profile, old_limit,
                old_denominator);

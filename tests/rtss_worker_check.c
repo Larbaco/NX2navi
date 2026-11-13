@@ -637,7 +637,7 @@ static void library_run(void) {
 }
 
 // Low latency switching on and off at every poll (the want flips between a limit and kept out): each switch writes or
-// puts back the profile, as it stands.
+// puts back the profile, as it stands, and the log numbers each creation and removal so a play-test can count them.
 static void churn_run(void) {
     app_set(1, 0xA, 1000, 2000, 60);
     ask(60000);
@@ -648,6 +648,12 @@ static void churn_run(void) {
     }
     show("ten polls with the want flipping");
     CHECK(created == 6 && removed == 5, "%ld creations, %ld removals", created, removed);
+    CHECK(logged("created; it goes away when the game closes (creation 1 this run)\n") &&
+              logged("(creation 6 this run)\n") && !logged("(creation 7"),
+          "the created lines are numbered");
+    CHECK(logged("removed, as before the game started (removal 1 this run)\n") && logged("(removal 5 this run)\n") &&
+              !logged("(removal 6"),
+          "the removed lines are numbered");
     CHECK(rtss_limit_active(), "RTSS limits after the last want of a limit");
 }
 
