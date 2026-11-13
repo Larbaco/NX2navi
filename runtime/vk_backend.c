@@ -110,7 +110,8 @@ static void present_main(void *arg) {
         busy = 1;
         plat_cond_broadcast(&pcv);
         plat_mutex_unlock(&pl);
-        int timed = (rt_trace & (RT_TRACE_PRESENT | RT_TRACE_PERF)) != 0;
+        unsigned tr = rt_trace;   // once, as the menu's performance log can switch the trace meanwhile
+        int timed = (tr & (RT_TRACE_PRESENT | RT_TRACE_PERF)) != 0;
         uint64_t b0 = timed ? kern_now_ns() : 0;
         if (flight_on || vk_dump_white) vk_thumbs_frame(j.frame);   // NX2NAVI_DUMP_WHITE reads them too
         vk_dlssg_present_frame(j.frame);
@@ -134,12 +135,12 @@ static void present_main(void *arg) {
         // NX2NAVI_TRACE=present: one line per present: the host present's interval, the interval of the game's present
         // calls (when the host present went out before back-edge pacing), the wait and how far past its target it went;
         // then how long the present call took and how long the presenting thread waited to hand this picture over
-        if (rt_trace & RT_TRACE_PRESENT)
+        if (tr & RT_TRACE_PRESENT)
             rt_log("present: frame %llu interval %.3f ms, game %.3f ms, waited %.3f ms, %.3f ms past target; present call "
                    "%.3f ms, hand-off %.3f ms", (unsigned long long)j.frame, last ? (t1 - last) / 1e6 : 0.0,
                    last_queued ? (j.queued - last_queued) / 1e6 : 0.0, (t1 - t0) / 1e6,
                    j.at && t1 > j.at ? (t1 - j.at) / 1e6 : 0.0, (t2 - t1) / 1e6, j.handoff_ns / 1e6);
-        if (rt_trace & RT_TRACE_PERF)
+        if (tr & RT_TRACE_PERF)
             present_window(&win, j.frame, t0 - b0, t1 - t0, t2 - t1, j.at && t1 > j.at ? t1 - j.at : 0, j.handoff_ns);
         last = t1;
         last_queued = j.queued;
