@@ -713,7 +713,7 @@ __attribute__((weak)) void vk_mem_rank_log(const char *when) { (void)when; }
 // path that skips them, leaves none: a session of 2026-11-13 ended 8 s after its window lost the focus, after 7 minutes
 // of play, with no ranking (one every 10 minutes then) and no map of its last minute. gfx_present.c
 // gfx_window_focus_changed asks for them; the present thread writes them at its next present (perf_present). Formatting
-// only: no device call, no wait.
+// only, after copying the stutter map under its lock (stutter_map.c stutter_report): no device call, no wait.
 #define SESSION_REPORT_GAP_NS 60000000000ull
 static volatile int32_t session_due;
 

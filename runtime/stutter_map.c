@@ -29,7 +29,7 @@
 // Threads: stutter_area runs on the game's loading threads, stutter_miss on the replay thread, stutter_ready on the
 // pipeline workers (under vk_pipeline.c's P.lock; sm_lock is taken inside it and never takes it), stutter_frame and
 // the periodic report on the present thread. The area table's play counts belong to the present thread; the rest is
-// under sm_lock.
+// under sm_lock. A report copies the map under sm_lock and sorts and logs the copy without it.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -370,27 +370,48 @@ static const char *const cause_short[SM_CAUSES] = {"pipeline", "translation", "t
                                                    "replay", "census", "report", "unattributed"};
 
 static int area_cmp(const void *x, const void *y) {
-    const Area *a = &areas[*(const int *)x], *b = &areas[*(const int *)y];
+    const Area *a = *(const Area *const *)x, *b = *(const Area *const *)y;
     uint64_t ka = a->hitch + a->load_hitch, kb = b->hitch + b->load_hitch;
     if (ka != kb) return ka < kb ? 1 : -1;
     return a->ns < b->ns ? 1 : a->ns > b->ns ? -1 : 0;
 }
 
 static int pipe_cmp(const void *x, const void *y) {
-    const Pipe *a = *(Pipe *const *)x, *b = *(Pipe *const *)y;
+    const Pipe *a = *(const Pipe *const *)x, *b = *(const Pipe *const *)y;
     double ka = a->wait_ns / 1e6 + a->ready_max, kb = b->wait_ns / 1e6 + b->ready_max;
     return ka < kb ? 1 : ka > kb ? -1 : 0;
 }
 
+// The map as a report reads it: copied under sm_lock, then sorted and logged without it. The replay thread
+// (stutter_miss) and the pipeline workers (stutter_ready, inside vk_pipeline.c's P.lock, which the draw path takes too)
+// wait for sm_lock, and a report sorts up to SM_PIPES entries and logs about 85 lines.
+typedef struct {
+    Area areas[SM_AREAS];
+    Pipe pipes[SM_PIPES];
+    const Area *order[SM_AREAS];
+    const Pipe *list[SM_PIPES];
+} MapCopy;
+
 void stutter_report(const char *tag) {
     if (!stutter_map_on) return;
+    MapCopy *m = malloc(sizeof *m);
+    if (!m) {
+        rt_log("stutter map (%s): no memory for the report", tag);
+        return;
+    }
     plat_mutex_lock(&sm_lock);
+    int na = n_areas;
+    memcpy(m->areas, areas, (size_t)na * sizeof *areas);
+    uint32_t np = 0, lost = pipes_lost;
+    for (uint32_t i = 0; i < SM_PIPES; i++)
+        if (pipes[i].used) m->pipes[np++] = pipes[i];
+    uint64_t rlost = ring_lost;
+    plat_mutex_unlock(&sm_lock);
     uint64_t hitch = 0, load = 0, ns = 0, cause[SM_CAUSES] = {0};
-    int order[SM_AREAS], na = n_areas;
     for (int i = 0; i < na; i++) {
-        order[i] = i;
-        hitch += areas[i].hitch, load += areas[i].load_hitch, ns += areas[i].ns;
-        for (int c = 0; c < SM_CAUSES; c++) cause[c] += areas[i].by_cause[c];
+        m->order[i] = &m->areas[i];
+        hitch += m->areas[i].hitch, load += m->areas[i].load_hitch, ns += m->areas[i].ns;
+        for (int c = 0; c < SM_CAUSES; c++) cause[c] += m->areas[i].by_cause[c];
     }
     char line[1400];
     int o = snprintf(line, sizeof line, "stutter map (%s): %.1f min of play in %d areas; %llu hitches in play and %llu "
@@ -400,9 +421,9 @@ void stutter_report(const char *tag) {
     for (int c = 0; c < SM_CAUSES; c++)
         if (cause[c]) o += snprintf(line + o, sizeof line - (size_t)o, " %s %llu", cause_short[c], (unsigned long long)cause[c]);
     rt_log("%s", line);
-    qsort(order, (size_t)na, sizeof order[0], area_cmp);
+    qsort(m->order, (size_t)na, sizeof m->order[0], area_cmp);
     for (int k = 0; k < na && k < SM_TOP_AREAS; k++) {
-        const Area *a = &areas[order[k]];
+        const Area *a = m->order[k];
         if (!a->frames) continue;
         o = snprintf(line, sizeof line, "stutter map:   %s: %.1f min at %.0f fps; hitches %llu (%.2f a minute",
                      a->name, a->ns / 6e10, a->ns ? a->frames * 1e9 / a->ns : 0.0, (unsigned long long)a->hitch,
@@ -418,33 +439,31 @@ void stutter_report(const char *tag) {
                       (unsigned long long)a->shader_misses, a->miss_ns / 1e6);
         rt_log("%s", line);
     }
-    static Pipe *list[SM_PIPES];
-    uint32_t np = 0, nrec = 0, nnew = 0, nfresh = 0, nunknown = 0;
-    for (uint32_t i = 0; i < SM_PIPES; i++)
-        if (pipes[i].used) {
-            list[np++] = &pipes[i];
-            if (!pipes[i].key) nunknown++;
-            else if (pipes[i].ready_n) nrec += pipes[i].recorded, nnew += !pipes[i].recorded;
-            nfresh += pipes[i].fresh;
-        }
-    qsort(list, np, sizeof list[0], pipe_cmp);
+    uint32_t nrec = 0, nnew = 0, nfresh = 0, nunknown = 0;
+    for (uint32_t i = 0; i < np; i++) {
+        const Pipe *p = m->list[i] = &m->pipes[i];
+        if (!p->key) nunknown++;
+        else if (p->ready_n) nrec += p->recorded, nnew += !p->recorded;
+        nfresh += p->fresh;
+    }
+    qsort(m->list, np, sizeof m->list[0], pipe_cmp);
     rt_log("stutter map: %u pipelines draws met missing: %u that this install had recorded before (its prebuild had not "
            "come to them), %u new to it, %u with a shader translated in play, %u still translating when met; %u not "
            "kept (table full), %llu draws not seen by a present (ring full); the %d that cost the most:",
-           np, nrec, nnew, nfresh, nunknown, pipes_lost, (unsigned long long)ring_lost, SM_TOP_PIPES);
+           np, nrec, nnew, nfresh, nunknown, lost, (unsigned long long)rlost, SM_TOP_PIPES);
     for (uint32_t k = 0; k < np && k < SM_TOP_PIPES; k++) {
-        const Pipe *p = list[k];
+        const Pipe *p = m->list[k];
         char v[9], f[9];
         hex8(v, (uint32_t)(p->key >> 32), p->key >> 32 != 0);
         hex8(f, (uint32_t)p->key, 1);
         rt_log("stutter map:   %s %s/%s first met in %s: %llu draws met it missing, %llu its shader, %.1f ms on the "
                "replay thread; usable after %.0f ms at most (%llu times); %s%s",
-               p->mesh ? "mesh" : "vertex", v, (uint32_t)p->key ? f : "none", areas[p->area].name,
+               p->mesh ? "mesh" : "vertex", v, (uint32_t)p->key ? f : "none", m->areas[p->area].name,   // copied: area < na
                (unsigned long long)p->misses, (unsigned long long)p->shader_misses, p->wait_ns / 1e6, p->ready_max,
                (unsigned long long)p->ready_n,
                !p->key ? "its shaders still translating" : !p->ready_n ? "not seen ready" : p->recorded ? "recorded before"
                                                                                                         : "new to this install",
                p->fresh ? ", a shader translated in play" : "");
     }
-    plat_mutex_unlock(&sm_lock);
+    free(m);
 }
