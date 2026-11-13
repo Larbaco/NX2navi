@@ -488,11 +488,26 @@ static PlatMutex gtl_lock = PLAT_MUTEX_INIT;
 static const char *const gtl_names[GTL_KINDS] = {"replay parts", "mirror prologues", "pre-pass buffers", "upload batches",
                                                  "presents"};
 
+// The last timed pieces, for the line of a frame whose render thread waited long for the GPU (vk_gpu_parts_log): each
+// piece's hand-over to the queue, GPU start and end (plat_now_ns) and its kind (vk.h GTL_*). Every kind enters, through
+// vk_gtl_note_ns under gtl_lock: the replay's parts as the completion thread reads them, the upload batches when their
+// batch retires (vk_memory.c up_ts_read), the presents when their slot is used again (gfx_present.c pts_read). So the
+// entries are not in GPU order; the reader sorts what it takes. It takes the newest PART_RING / 2 entries, which the
+// writers do not reach before it has read them unless that many pieces end meanwhile (an area load adds hundreds of
+// upload batches).
+#define PART_RING 2048
+static struct { int64_t sub, sn, en; int kind; } part_ring[PART_RING];
+static volatile uint64_t part_n;
+
 static void vk_gtl_note_ns(int kind, int64_t call, int64_t sub, int64_t start, int64_t end) {
     if (!(rt_trace & RT_TRACE_PERF) || kind < 0 || kind >= GTL_KINDS || !sub || end < start) return;
     plat_mutex_lock(&gtl_lock);
     if (gtl_n < GTL_N) gtl[gtl_n++] = (GtlEv){kind, call ? call : sub, sub, start, end};
     else gtl_dropped++;
+    uint64_t pn = part_n;
+    part_ring[pn % PART_RING].sub = sub, part_ring[pn % PART_RING].sn = start;
+    part_ring[pn % PART_RING].en = end, part_ring[pn % PART_RING].kind = kind;
+    __atomic_store_n(&part_n, pn + 1, __ATOMIC_RELEASE);
     plat_mutex_unlock(&gtl_lock);
 }
 
@@ -670,14 +685,6 @@ static void ts_submitted(const VkCommandBufferSubmitInfo *cbi, uint32_t ncb) {
     ts_n_unsent = 0;
 }
 
-// The last timed parts, for the line of a frame whose render thread waited long for the GPU (vk_gpu_parts_log): with
-// calibrated timestamps, each part's submit, GPU start and end (plat_now_ns) and its kind (vk.h GTL_*). Written by the
-// completion thread alone, in submission order; a reader takes the newest PART_RING / 2 entries, which the writer does
-// not reach before it has read them unless the GPU ends that many parts meanwhile.
-#define PART_RING 512
-static struct { int64_t sub, sn, en; int kind; } part_ring[PART_RING];
-static volatile uint64_t part_n;
-
 static void ts_read_cb(void *arg) {   // completion thread, in submission order
     TsRead *t = arg;
     VkCtx *c = vk_ctx();
@@ -698,11 +705,7 @@ static void ts_read_cb(void *arg) {   // completion thread, in submission order
                 gfx_tl_note('G', (uint64_t)sn, (uint64_t)en, (uint64_t)sub);
                 if (en > ts_last_end_ns) ts_last_end_ns = en;
                 int64_t q = (int64_t)ts_queue_ns[t->pair];
-                vk_gtl_note_ns(t->mirror, sub, q ? q : sub, sn, en);
-                uint64_t pn = __atomic_load_n(&part_n, __ATOMIC_RELAXED);
-                part_ring[pn % PART_RING].sub = sub, part_ring[pn % PART_RING].sn = sn;
-                part_ring[pn % PART_RING].en = en, part_ring[pn % PART_RING].kind = t->mirror;
-                __atomic_store_n(&part_n, pn + 1, __ATOMIC_RELEASE);
+                vk_gtl_note_ns(t->mirror, sub, q ? q : sub, sn, en);   // also the parts' ring (vk_gpu_parts_log)
             }
             uint64_t from = s > ts_last_end ? s : ts_last_end;
             if (e > from) {
@@ -724,19 +727,34 @@ static void ts_read_cb(void *arg) {   // completion thread, in submission order
 // present, a line of the timed parts that ended in its interval [t0, t1]: how many, the GPU time they took, the
 // longest ones with their kind and the time they waited in the queue, and the longest gap between two. In a session of
 // 2026-11-13 frames of 60-96 ms followed each area load by 2 to 6 frames, the render thread waiting 59-86 ms for the
-// GPU, and no line said which work the GPU did then. Read from the ring the completion thread fills: nothing here
-// waits for the GPU.
+// GPU, and no line said which work the GPU did then. Read from the ring vk_gtl_note_ns fills, without its lock: nothing
+// here waits for the GPU or for another thread. "In the queue" is the time from a piece's hand-over to the queue to
+// its GPU start (for a replay part held by the submit batching, from the batch's hand-over, not from its submit call).
+typedef struct { int64_t sub, sn, en; int kind; } GpuPart;
+static int part_by_start(const void *a, const void *b) {
+    int64_t x = ((const GpuPart *)a)->sn, y = ((const GpuPart *)b)->sn;
+    return x < y ? -1 : x > y;
+}
+
 void vk_gpu_parts_log(uint64_t frame, uint64_t t0, uint64_t t1, double fence_ms) {
     static uint32_t logged;
     if (logged >= 400) return;
     uint64_t n = __atomic_load_n(&part_n, __ATOMIC_ACQUIRE), from = n > PART_RING / 2 ? n - PART_RING / 2 : 0;
+    GpuPart *sel = malloc(sizeof *sel * (PART_RING / 2));
+    if (!sel) return;
+    int nsel = 0;
+    for (uint64_t i = from; i < n; i++) {   // those that ended in the interval, then in GPU order: the gaps need it
+        const typeof(part_ring[0]) *p = &part_ring[i % PART_RING];
+        if (p->en < (int64_t)t0 || p->en > (int64_t)t1 || p->en < p->sn) continue;
+        sel[nsel++] = (GpuPart){p->sub, p->sn, p->en, p->kind};
+    }
+    qsort(sel, (size_t)nsel, sizeof *sel, part_by_start);
     struct { int64_t ns, q; int kind; } top[6] = {{0}};
     static const char *const kn[GTL_KINDS] = {"part", "mirror copies", "pre-pass", "uploads", "present"};
     uint64_t parts = 0, busy = 0, gap = 0;
     int64_t prev_end = 0;
-    for (uint64_t i = from; i < n; i++) {
-        const typeof(part_ring[0]) *p = &part_ring[i % PART_RING];
-        if (p->en < (int64_t)t0 || p->en > (int64_t)t1 || p->en < p->sn) continue;
+    for (int i = 0; i < nsel; i++) {
+        const GpuPart *p = &sel[i];
         int64_t ns = p->en - p->sn, q = p->sub && p->sn > p->sub ? p->sn - p->sub : 0;
         parts++, busy += (uint64_t)ns;
         if (prev_end && p->sn > prev_end && (uint64_t)(p->sn - prev_end) > gap) gap = (uint64_t)(p->sn - prev_end);
@@ -748,6 +766,7 @@ void vk_gpu_parts_log(uint64_t frame, uint64_t t0, uint64_t t1, double fence_ms)
                 break;
             }
     }
+    free(sel);
     if (!parts) return;
     logged++;
     char line[700];
