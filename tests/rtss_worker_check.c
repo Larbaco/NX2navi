@@ -114,8 +114,19 @@ static void app_set(int listed, DWORD flags, DWORD t0, DWORD t1, DWORD frames) {
     memcpy(e + 4 + MAX_PATH + 4, t, sizeof t);
 }
 
+// The registry and file calls the thread that asks for a limit makes itself: a present must make none.
+static DWORD present_tid;
+static volatile LONG present_calls, reg_calls;
+static int installed = 1;
+static void on_call(void) {
+    if (GetCurrentThreadId() == present_tid) present_calls++;
+}
+
 LSTATUS stub_RegGetValueA(HKEY k, LPCSTR sub, LPCSTR val, DWORD fl, LPDWORD ty, PVOID data, LPDWORD size) {
     (void)k, (void)sub, (void)val, (void)fl, (void)ty;
+    on_call();
+    reg_calls++;
+    if (!installed) return ERROR_FILE_NOT_FOUND;
     snprintf(data, *size, "C:\\FakeRTSS");
     return ERROR_SUCCESS;
 }
@@ -153,11 +164,13 @@ SIZE_T stub_VirtualQuery(LPCVOID p, PMEMORY_BASIC_INFORMATION mi, SIZE_T n) {
 }
 BOOL stub_CloseHandle(HANDLE h) { (void)h; return TRUE; }
 DWORD stub_GetFileAttributesA(LPCSTR p) {
+    on_call();
     if (strstr(p, "RTSSHooks64.dll")) return FILE_ATTRIBUTE_NORMAL;
     return file_of(p) ? FILE_ATTRIBUTE_NORMAL : INVALID_FILE_ATTRIBUTES;
 }
 BOOL stub_GetFileAttributesExA(LPCSTR p, GET_FILEEX_INFO_LEVELS level, LPVOID out) {
     (void)level;
+    on_call();
     const Prof *f = file_of(p);
     if (!f) return FALSE;
     WIN32_FILE_ATTRIBUTE_DATA *a = out;
@@ -166,6 +179,7 @@ BOOL stub_GetFileAttributesExA(LPCSTR p, GET_FILEEX_INFO_LEVELS level, LPVOID ou
     return TRUE;
 }
 DWORD stub_GetPrivateProfileStringA(LPCSTR sec, LPCSTR key, LPCSTR def, LPSTR out, DWORD n, LPCSTR path) {
+    on_call();
     const Prof *f = file_of(path);
     long v = 0;
     int have = f && !strcmp(sec, "Framerate");
@@ -183,6 +197,7 @@ DWORD stub_GetPrivateProfileStringA(LPCSTR sec, LPCSTR key, LPCSTR def, LPSTR ou
 }
 DWORD stub_GetModuleFileNameA(HMODULE m, LPSTR out, DWORD n) {
     (void)m;
+    on_call();
     return (DWORD)snprintf(out, n, "C:\\game\\ocarina.exe");
 }
 DWORD stub_GetCurrentProcessId(void) { return PID; }
@@ -222,6 +237,7 @@ void plat_mutex_unlock(PlatMutex *m) { ReleaseSRWLockExclusive((PSRWLOCK)m); }
 int plat_mutex_trylock(PlatMutex *m) { return TryAcquireSRWLockExclusive((PSRWLOCK)m) != 0; }
 
 static PlatThreadFn worker_fn;
+static HANDLE worker_thread;
 static volatile LONG spawned;
 static volatile LONG free_run;   // the worker polls without waiting
 static volatile LONG64 polls;
@@ -234,7 +250,8 @@ int plat_thread_spawn(PlatThreadFn fn, void *arg, const char *name, size_t stack
     (void)name, (void)stack;
     worker_fn = fn;
     spawned = 1;
-    return CreateThread(NULL, 0, worker_main, arg, 0, NULL) != NULL;
+    worker_thread = CreateThread(NULL, 0, worker_main, arg, 0, NULL);
+    return worker_thread != NULL;
 }
 void plat_sleep_ms(uint32_t ms) {
     if (GetCurrentThreadId() != worker_tid) {
@@ -256,7 +273,10 @@ static void poll(void) {   // one more poll of the worker, waited for
 static void ask(int64_t mhz) {   // a want at a present; the first one that starts the worker waits for its first poll
     int was = spawned;
     rtss_limit_want(mhz);
-    if (spawned && !was) CHECK(wait_done(), "the worker did not finish its first poll");
+    if (spawned && !was) {
+        HANDLE h[2] = {done, worker_thread};   // or for its end, when it finds no RTSS
+        CHECK(WaitForMultipleObjects(2, h, FALSE, 5000) != WAIT_TIMEOUT, "the worker did not finish its first poll");
+    }
 }
 static void show(const char *what) {
     printf("  %s: profile %s %lu/%lu; active %d; state %d; saves %ld deletes %ld updates %ld loads %ld\n", what,
@@ -450,6 +470,30 @@ static void round_logged_whole(void) {
     CHECK(logged("profile ocarina.exe limits to 60.000 fps\n"), "a whole limit as it is");
 }
 
+// The first want comes at a present: the worker, not the present, reads RTSS's registry key and looks for its files.
+static void start_off_present(void) {
+    present_tid = GetCurrentThreadId();
+    app_set(1, 0xA, 1000, 2000, 60);
+    ask(60000);
+    poll();
+    show("playing at 60");
+    CHECK(own.exists && own.limit == 60, "the limit went into the profile");
+    CHECK(reg_calls == 1, "RTSS's folder was looked up once (%ld)", reg_calls);
+    CHECK(!present_calls, "the presenting thread made %ld registry or file calls", present_calls);
+}
+
+// No RTSS: the worker says so and ends, the game's limiter paces, and the exit has nothing to put back.
+static void not_installed(void) {
+    installed = 0;
+    ask(60000);
+    CHECK(spawned && WaitForSingleObject(worker_thread, 5000) == WAIT_OBJECT_0, "the worker ended");
+    CHECK(logged("RivaTuner Statistics Server is not installed; the game's own limiter"), "logged");
+    CHECK(!rtss_limit_active() && !rtss_limit_state(), "the game's limiter paces");
+    ask(144000);
+    rtss_limit_restore();
+    CHECK(!loads && !saves && !own.exists, "nothing loaded or written");
+}
+
 static const struct { const char *name; void (*run)(void); } scenarios[] = {
     {"restore_race", restore_race},
     {"restore_player", restore_player},
@@ -462,6 +506,8 @@ static const struct { const char *name; void (*run)(void); } scenarios[] = {
     {"active_race", active_race},
     {"round_logged", round_logged},
     {"round_logged_whole", round_logged_whole},
+    {"start_off_present", start_off_present},
+    {"not_installed", not_installed},
 };
 
 int main(int argc, char **argv) {

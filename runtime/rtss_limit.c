@@ -56,7 +56,8 @@ static _Atomic int64_t active_for = RTSS_UNSET;   // the want RTSS holds the gam
 static _Atomic int failed;                 // FAIL_*: RTSS is out of it for the rest of the run
 static _Atomic int closed;                 // rtss_limit_restore ran: nothing reaches the profile any more
 static _Atomic int two;                    // kept out, and RTSS limits the game by a setting of its own (watch)
-static int started;
+static _Atomic int started;                // rtss_limit_want spawned the worker
+static _Atomic int ready;                  // the worker found RTSS: dll_path, rtss_dir and profile hold their values
 static char dll_path[MAX_PATH], profile[MAX_PATH], rtss_dir[MAX_PATH];
 static HMODULE dll;
 static EnumProfilesFn enum_profiles;
@@ -315,8 +316,42 @@ static void watch(int64_t w, int listed) {
     atomic_store(&two, on);
 }
 
+// RTSS's folder (InstallDir under its registry key), its hooks library and this executable's profile name, on the
+// worker before its first poll. 0 when RTSS is not installed: the game's own limiter for the run.
+static int find_rtss(void) {
+    char dir[MAX_PATH];
+    DWORD size = sizeof dir;
+    if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\WOW6432Node\\Unwinder\\RTSS", "InstallDir", RRF_RT_REG_SZ, NULL, dir,
+                     &size) != ERROR_SUCCESS) {
+        rt_log("frame rate: RivaTuner Statistics Server is not installed; the game's own limiter");
+        return 0;
+    }
+    snprintf(dll_path, sizeof dll_path, "%s\\RTSSHooks64.dll", dir);
+    snprintf(rtss_dir, sizeof rtss_dir, "%s", dir);
+    if (GetFileAttributesA(dll_path) == INVALID_FILE_ATTRIBUTES) {
+        rt_log("frame rate: RivaTuner Statistics Server's folder %s has no RTSSHooks64.dll; the game's own limiter", dir);
+        return 0;
+    }
+    char exe[MAX_PATH];
+    DWORD n = GetModuleFileNameA(NULL, exe, sizeof exe);
+    if (!n || n >= sizeof exe) return 0;
+    const char *base = exe;
+    for (const char *s = exe; *s; s++)
+        if (*s == '\\' || *s == '/') base = s + 1;
+    snprintf(profile, sizeof profile, "%s", base);   // RTSS names a profile after the executable, as ocarina.exe
+    int64_t first = atomic_load(&want);
+    if (first >= 0)
+        rt_log("frame rate: RivaTuner Statistics Server found in %s; it takes the frame limit while it runs", dir);
+    else
+        rt_log("frame rate: RivaTuner Statistics Server found in %s; kept out (%s), so its thread only reads RTSS's own "
+               "settings for the game, to tell when RTSS limits it a second time", dir, rtss_out_text(first));
+    return 1;
+}
+
 static void worker(void *arg) {
     (void)arg;
+    if (!find_rtss()) return;
+    atomic_store_explicit(&ready, 1, memory_order_release);   // rtss_limit_restore may read the names now
     int was_running = -1, was_hooked = 0, over = 0;
     for (;; plat_sleep_ms(POLL_MS)) {
         int64_t w = atomic_load(&want);
@@ -373,42 +408,16 @@ static void worker(void *arg) {
     }
 }
 
-static void start(int64_t first) {
-    started = 1;
-    char dir[MAX_PATH];
-    DWORD size = sizeof dir;
-    if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\WOW6432Node\\Unwinder\\RTSS", "InstallDir", RRF_RT_REG_SZ, NULL, dir,
-                     &size) != ERROR_SUCCESS) {
-        rt_log("frame rate: RivaTuner Statistics Server is not installed; the game's own limiter");
-        return;
-    }
-    snprintf(dll_path, sizeof dll_path, "%s\\RTSSHooks64.dll", dir);
-    snprintf(rtss_dir, sizeof rtss_dir, "%s", dir);
-    if (GetFileAttributesA(dll_path) == INVALID_FILE_ATTRIBUTES) {
-        rt_log("frame rate: RivaTuner Statistics Server's folder %s has no RTSSHooks64.dll; the game's own limiter", dir);
-        return;
-    }
-    char exe[MAX_PATH];
-    DWORD n = GetModuleFileNameA(NULL, exe, sizeof exe);
-    if (!n || n >= sizeof exe) return;
-    const char *base = exe;
-    for (const char *s = exe; *s; s++)
-        if (*s == '\\' || *s == '/') base = s + 1;
-    snprintf(profile, sizeof profile, "%s", base);   // RTSS names a profile after the executable, as ocarina.exe
-    if (first >= 0)
-        rt_log("frame rate: RivaTuner Statistics Server found in %s; it takes the frame limit while it runs", dir);
-    else
-        rt_log("frame rate: RivaTuner Statistics Server found in %s; kept out (%s), so its thread only reads RTSS's own "
-               "settings for the game, to tell when RTSS limits it a second time", dir, rtss_out_text(first));
-    if (!plat_thread_spawn(worker, NULL, "rtss", 0)) rt_log("frame rate: the RivaTuner Statistics Server thread did not start");
-}
-
 void rtss_limit_want(int64_t mhz) {
     if (atomic_load_explicit(&closed, memory_order_relaxed)) return;   // the exit put the profile back
-    if (!started) start(mhz);   // a first want that keeps RTSS out starts the worker too, which then only reads (watch)
     // a new limit: the game's own limiter holds it until the worker had RTSS apply it, up to POLL_MS later (a movie's
     // cap that waited for that ran the movie's 60 Hz count fast for half a second): active_for no longer matches
     atomic_store(&want, mhz);
+    // The first want starts the worker, a kept-out one too (the worker then only reads, watch). The worker looks for
+    // RTSS itself (find_rtss), so the present that gets here waits on no registry key or file.
+    if (!atomic_load_explicit(&started, memory_order_relaxed) && !atomic_exchange(&started, 1) &&
+        !plat_thread_spawn(worker, NULL, "rtss", 0))
+        rt_log("frame rate: the RivaTuner Statistics Server thread did not start");
 }
 
 int rtss_limit_active(void) {
@@ -432,7 +441,7 @@ void rtss_limit_restore(void) {
     // the profile just put back, and the next run would take it for the player's own. Set before the check below, so
     // that an exit before the first limit, or while RTSS was kept out, also stops a later want from starting the worker.
     atomic_store(&closed, 1);
-    if (!started || !*profile) return;
+    if (!atomic_load_explicit(&ready, memory_order_acquire)) return;
     // the exit may come from a crash on any thread: give up after a second rather than wait on a lock held there
     for (int i = 0; i < 100; i++) {
         if (plat_mutex_trylock(&lock)) {
