@@ -985,9 +985,11 @@ static const char *cfg_memo_get(const char *name, int kind) {
 const char *cfg_get(const char *name) { return cfg_memo_get(name, 0); }
 const char *cfg_value(const char *name) { return cfg_memo_get(name, 1); }
 
-// The row's default as a number, for a set value that does not parse.
+// The row's default as a number, for a set value that does not parse; 0 for a key without a row, whose set value
+// cfg_value hands out without one (tests/cfg_rows_check.py keeps such reads guarded).
 static double default_number(const char *name) {
-    return strtod(cfg_meta(name)->def, NULL);
+    const CfgMeta *m = cfg_meta(name);
+    return m ? strtod(m->def, NULL) : 0;
 }
 
 double cfg_double(const char *name) {

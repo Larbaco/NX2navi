@@ -179,8 +179,10 @@ int gfx_cfg_fullscreen(void) { return cfg_bool("NX2NAVI_FULLSCREEN"); }
 
 void gfx_cfg_window_size(int *w, int *h) {
     int x = 0, y = 0;
-    if (sscanf(cfg_value("NX2NAVI_WINDOW_SIZE"), "%dx%d", &x, &y) != 2 || x < 640 || y < 360 || x > 7680 || y > 4320)
-        sscanf(cfg_meta("WINDOW_SIZE")->def, "%dx%d", &x, &y);   // unparsable or out of range: the default
+    if (sscanf(cfg_value("NX2NAVI_WINDOW_SIZE"), "%dx%d", &x, &y) != 2 || x < 640 || y < 360 || x > 7680 || y > 4320) {
+        const CfgMeta *m = cfg_meta("WINDOW_SIZE");   // unparsable or out of range: the default
+        if (!m || sscanf(m->def, "%dx%d", &x, &y) != 2) x = 1920, y = 1080;
+    }
     *w = x;
     *h = y;
 }

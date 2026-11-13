@@ -3,6 +3,7 @@
 // cfg.c logged ("log: ...") and what the case reads back ("got: ...").
 //   load     cfg_load on the file; then cfg_init's check of the environment (the variables the script set)
 //   full     cfg_load on the file, then two cfg_set of keys the file does not have
+//   norow    cfg_int and cfg_double of a key without a row whose value (the environment's) does not parse
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -78,6 +79,11 @@ int main(int argc, char **argv) {
         cfg_set("NX2NAVI_VK_PRESENT", "fifo");
         cfg_set("NX2NAVI_FULLSCREEN", "1");
         printf("got: vk_present %s\n", cfg_get("NX2NAVI_VK_PRESENT") ? cfg_get("NX2NAVI_VK_PRESENT") : "(unset)");
+        return 0;
+    }
+    if (!strcmp(argv[1], "norow")) {
+        if (!cfg_load(ini)) return printf("cfg_load failed\n"), 2;
+        printf("got: cfg_int %d cfg_double %g\n", cfg_int("NX2NAVI_NO_ROW_CHECK"), cfg_double("NX2NAVI_NO_ROW_CHECK"));
         return 0;
     }
     return 2;

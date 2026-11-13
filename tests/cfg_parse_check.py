@@ -5,7 +5,8 @@ for what it links with. The values stay as written; what is checked is what the 
   word that is none of the menu's choices, and a ';' or '#' comment kept in a value, each named with its line; none
   for a file whose values fit, nor for a list with numbers in it (the menu's presets); at most 16 lines, then a count;
 - a full settings table (cfg.c CFG_MAX_KEYS): one line at load naming the first key not read, one at the first menu
-  change not kept.
+  change not kept;
+- a number read of a key without a row whose set value does not parse gives 0 (cfg.c default_number), not a crash.
 
 No game files.
 
@@ -129,6 +130,8 @@ def main():
           'a file with 601 keys: one line at load from line 513 on', out)
     check(rc == 0 and len(set_lines) == 1 and 'VK_PRESENT is not kept' in set_lines[0],
           'two menu changes past a full table: one line', out)
+    rc, out = run(exe, env, 'norow', CLEAN, work, {'NX2NAVI_NO_ROW_CHECK': 'abc'})
+    check(rc == 0 and 'got: cfg_int 0 cfg_double 0' in out, 'cfg_int of a set, unparsable key without a row: 0', out)
     print(f'cfg_parse_check: {"FAILED" if bad else "ok"}')
     return 1 if bad else 0
 
