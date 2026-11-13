@@ -555,22 +555,36 @@ int mem_lazy_armed(uint64_t a, uint64_t n) {
 // could not be sent). frz_lock is held over all of them, so nothing is armed or probed meanwhile; a range in regions
 // with neither (lzr, prb: both change under that lock, with the pages' protection) is copied without asking the system
 // for its pages' state. Returns how many were copied.
+// With the lazy heap (NX2NAVI_HEAP_LAZY) a heap page nothing touched yet is still reserved, and reading it faults
+// into heap_lazy_fault, which waits for frz_lock: held here, by the same thread, so the copy never returned and every
+// later fault, thaw and freeze waited behind it. So a range that meets the heap is copied run by run as the system
+// reports its pages: the heap's reserved runs read zero, as they would once committed, without committing them.
 int mem_copy_readable(uint8_t *const *dst, const uint64_t (*src)[2], int n, uint8_t *ok) {
     int got = 0;
     plat_mutex_lock(&frz_lock);
+    uint64_t heap = L.heap.base, top = heap + __atomic_load_n(&heap_size, __ATOMIC_ACQUIRE);
     for (int i = 0; i < n; i++) {
         uint64_t a = src[i][0], len = src[i][1];
         ok[i] = 0;
         if (!len || a >= RT_ADDRESS_LIMIT || a + len > RT_ADDRESS_LIMIT) continue;
-        int quick = 1, can = 1;
+        int lazy = heap_lazy && a < top && a + len > heap;   // reserved heap pages may lie in it
+        int quick = !lazy, can = 1;
         for (uint64_t r = a >> FRZ_SHIFT; quick && r <= (a + len - 1) >> FRZ_SHIFT; r++)
             quick = !__atomic_load_n(&lzr[r], __ATOMIC_RELAXED) && !__atomic_load_n(&prb[r], __ATOMIC_RELAXED);
         for (uint64_t x = a, e; !quick && can && x < a + len; x = e) {
             int st = plat_mem_state(x, a + len, &e);
-            can = (st == PLAT_PROT_RW || st == PLAT_PROT_READ) && e > x;
+            int untouched = lazy && st == PLAT_MEM_RESERVED && x >= heap && e <= top;
+            can = (st == PLAT_PROT_RW || st == PLAT_PROT_READ || untouched) && e > x;
         }
         if (!can) continue;
-        memcpy(dst[i], (const void *)(uintptr_t)a, len);
+        if (!lazy) {
+            memcpy(dst[i], (const void *)(uintptr_t)a, len);
+        } else {   // pages are committed and decommitted under frz_lock only: the runs are those checked above
+            for (uint64_t x = a, e; x < a + len; x = e) {
+                if (plat_mem_state(x, a + len, &e) == PLAT_MEM_RESERVED) memset(dst[i] + (x - a), 0, e - x);
+                else memcpy(dst[i] + (x - a), (const void *)(uintptr_t)x, e - x);
+            }
+        }
         ok[i] = 1, got++;
     }
     plat_mutex_unlock(&frz_lock);
