@@ -373,6 +373,7 @@ static void crash_handler(const PlatCrash *x) {
     kern_free_cores_note();
     fs_save_crash_wait();   // a save the game already reported as done finishes first (bounded; fs_host.c)
     rtss_limit_restore();   // after the report: RivaTuner Statistics Server's profile as it was
+    rt_rumble_stop_bounded();   // a controller on HD rumble stops (dispatch.c: 300 ms at most, SDL may be the crash)
     fflush(stderr);
     prof_sampler_write();   // NX2NAVI_PROFILE: what was sampled until the crash (it gives up after 2 s if the sampler hangs)
     plat_exit(71);

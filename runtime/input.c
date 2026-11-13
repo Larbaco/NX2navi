@@ -717,7 +717,12 @@ void input_rumble_hd_stop(void) {
     // The locks are tried for a while and not waited for: a thread of the game may hold one for good by now.
     for (int i = 0; i < 50 && !(got = plat_mutex_trylock(&lock)); i++) plat_wait_ns(1000000);
     if (!got) return;
-    plat_mutex_lock(&hd_lock);
+    got = 0;
+    for (int i = 0; i < 50 && !(got = plat_mutex_trylock(&hd_lock)); i++) plat_wait_ns(1000000);
+    if (!got) {   // a fatal error or a crash on the thread that writes the reports (dispatch.c rt_rumble_stop_bounded)
+        plat_mutex_unlock(&lock);
+        return;
+    }
     hd_ended = 1;
     int buzzing = rumble_hd_buzzing(&hd);
     rumble_hd_forget(&hd);

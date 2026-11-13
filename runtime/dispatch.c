@@ -59,6 +59,25 @@ void rt_fatal_notes(void) {
 
 __attribute__((weak)) void fs_save_crash_wait(void) {}   // fs_host.c; builds without it (the unit checks) have no saves
 
+// HD rumble's neutral value before a failed run ends (input.c input_rumble_hd_stop); builds without input.c (the unit
+// checks) have no controller.
+__attribute__((weak)) void input_rumble_hd_stop(void) {}
+
+// The stop goes through SDL, which takes its own joystick lock: a crash on SDL's thread while it held that lock would
+// hold the ending thread there for good, and the process would never end. So it runs on a thread of its own, and the
+// ending thread waits for it at most 300 ms and never joins it. A controller left buzzing is the lesser harm.
+static volatile int32_t rumble_stopped;
+static void rumble_stop_main(void *arg) {
+    (void)arg;
+    input_rumble_hd_stop();
+    __atomic_store_n(&rumble_stopped, 1, __ATOMIC_RELEASE);
+}
+
+void rt_rumble_stop_bounded(void) {
+    if (!plat_thread_spawn(rumble_stop_main, NULL, "rumble stop", 0)) return;
+    for (int i = 0; i < 30 && !__atomic_load_n(&rumble_stopped, __ATOMIC_ACQUIRE); i++) plat_sleep_ms(10);
+}
+
 // One end for a failed run. The platform layer calls the crash handler on every thread that faults, without
 // waiting for the others (platform/win32.c crash_veh, crash_filter), and a fatal error can come beside a crash from
 // the same bad state (an allocation that failed here, a null pointer read there). The later end cut the first report
@@ -96,6 +115,7 @@ static void fatal_end(int code, const char *fmt, va_list ap) {
     // RivaTuner Statistics Server's profile as it was: left with the game's limit in it, the next run would take that
     // limit for the player's own (rtss_limit.c; it gives up after a second if the failing thread holds its lock)
     rtss_limit_restore();
+    rt_rumble_stop_bounded();   // a controller on HD rumble: nothing renews or stops its vibration after the end
     fflush(stdout);
     fflush(stderr);
     // Not _Exit: in the C runtime it is ExitProcess, which stops the other threads wherever they are and then runs every

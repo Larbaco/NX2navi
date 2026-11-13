@@ -7,13 +7,15 @@
 //   fatal_exit_check crash_crash   two threads fault at once: one whole crash report, exit code 71
 //   fatal_exit_check fatal_crash   a fault on another thread while rt_fatal reports: its FATAL line alone, exit code 70
 //   fatal_exit_check crash_fatal   rt_fatal on another thread while a crash is reported: the whole report, exit code 71
+//   fatal_exit_check fatal_rumble  rt_fatal while the HD rumble stop hangs (SDL's lock held): exit code 70 all the same
 //
 // The crash handler here is a stand-in for main.c crash_handler with its first line (the static check in
 // tests/fatal_exit_check.py holds main.c to it): it writes three report lines 100 ms apart and ends with plat_exit(71).
-#include "dispatch.c"
-
 #include <stdio.h>
 #include <windows.h>
+
+#include "host.h"
+#include "platform/platform.h"
 
 static void say(const char *s) {
     DWORD w;
@@ -58,6 +60,13 @@ void prof_sampler_write(void) {}
 void rtss_limit_restore(void) {}
 void kern_checkpoint(void) {}
 
+// input.c's stop, which dispatch.c calls through a weak symbol: says it ran, or hangs as when SDL's lock is held
+static int rumble_hangs;
+void input_rumble_hd_stop(void) {
+    if (rumble_hangs) Sleep(INFINITE);
+    say("rumble: stopped\n");
+}
+
 // ---- the crash report and the threads that fail beside it
 static void crash(const PlatCrash *x) {
     if (!rt_ending_enter()) plat_exit(71);   // main.c crash_handler's first line
@@ -93,6 +102,10 @@ int main(int argc, char **argv) {
     tls_var = 1;
     plat_crash_hook(crash);
     if (!strcmp(mode, "fatal")) rt_fatal("the test's fatal error %d", 1);
+    if (!strcmp(mode, "fatal_rumble")) {
+        rumble_hangs = 1;
+        rt_fatal("the test's fatal error %d", 1);
+    }
     if (!strcmp(mode, "crash_crash")) {
         CloseHandle(CreateThread(NULL, 0, fault, (void *)0, 0, NULL));
         CloseHandle(CreateThread(NULL, 0, fault, (void *)0, 0, NULL));
@@ -113,6 +126,6 @@ int main(int argc, char **argv) {
         fault(0);
         return 3;
     }
-    printf("usage: fatal_exit_check fatal|crash_crash|fatal_crash|crash_fatal\n");
+    printf("usage: fatal_exit_check fatal|crash_crash|fatal_crash|crash_fatal|fatal_rumble\n");
     return 2;
 }

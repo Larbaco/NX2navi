@@ -66,3 +66,5 @@ void rt_fatal_notes(void);
 // for the first caller, which reports and ends the process; 0 for that thread again (a failure inside its own report),
 // which ends at once with its code; any other thread waits, logging nothing, until the process ends (30 s at most).
 int rt_ending_enter(void);
+// HD rumble stopped before a failed run ends, on a thread of its own that the caller waits for 300 ms at most.
+void rt_rumble_stop_bounded(void);

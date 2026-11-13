@@ -4,6 +4,9 @@ ExitProcess makes (a driver's detach that faulted there turned the end into a cr
 checks statically that no runtime file outside the platform layer ends the process with _Exit, and that the fatal
 error's end and the lost device's (runtime/vk_device.c lost_wait_exit) end with plat_terminate. No game files, no GPU.
 
+A fatal error stops HD rumble on a thread of its own and waits for it 300 ms at most (runtime/dispatch.c
+rt_rumble_stop_bounded), so a stop that hangs on SDL's lock does not hold the end.
+
 Two failures at once end once: two threads that fault, a fault while a fatal error is reported and a fatal error
 while a crash is: the first report is written whole, the process ends with its code, and the second adds no line
 (runtime/dispatch.c rt_ending_enter, which runtime/main.c crash_handler calls first).
@@ -15,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -73,12 +77,24 @@ def static_checks():
     ok = first == 'if (!rt_ending_enter()) plat_exit(71);'
     print(f'static: main.c crash_handler starts with the shared guard: {"ok" if ok else "FAIL (" + first + ")"}',
           flush=True)
-    return bad + (not ok)
+    bad += not ok
+    # both failed ends stop HD rumble through the bounded stop, after RivaTuner's restore
+    fatal = re.sub(r'//[^\n]*', '', function((RT / 'dispatch.c').read_text(encoding='utf-8'),
+                                              'static void fatal_end(int code, const char *fmt, va_list ap) {'))
+    for name, code in (('dispatch.c fatal_end', fatal), ('main.c crash_handler', body)):
+        r, s = code.find('rtss_limit_restore('), code.find('rt_rumble_stop_bounded(')
+        ok = 0 <= r < s and 'input_rumble_hd_stop(' not in code
+        print(f'static: {name} stops HD rumble through rt_rumble_stop_bounded after the RTSS restore: '
+              f'{"ok" if ok else "FAIL"}', flush=True)
+        bad += not ok
+    return bad
 
 
 CASES = [
     # mode, exit code, lines that must be there, lines that must not
-    ('fatal', 70, ['FATAL: the test\'s fatal error 1'], ['detach:']),
+    ('fatal', 70, ['FATAL: the test\'s fatal error 1', 'rumble: stopped'], ['detach:']),
+    # the rumble stop hangs (SDL's lock held by a thread that crashed): the end goes on after 300 ms
+    ('fatal_rumble', 70, ['FATAL: the test\'s fatal error 1'], ['rumble: stopped', 'detach:']),
     # two faults at once: the first report whole, the second thread waits (dispatch.c rt_ending_enter)
     ('crash_crash', 71, ['report line 1', 'report line 2', 'report line 3'], ['detach:', 'FATAL:']),
     # a fault while rt_fatal reports: its FATAL line and notes whole, no crash report, rt_fatal's code
@@ -104,15 +120,17 @@ def main():
     libs = ['-lbcrypt', '-lws2_32', '-lpsapi', '-lwinmm', '-ldbghelp', '-lshell32', '-lole32', '-luser32', '-ladvapi32']
     subprocess.check_call([compiler(), '-O1', '-g', '-Wall', '-Wno-unused-function', '-fno-strict-aliasing',
                            '-march=x86-64-v3', '-I', str(RT), '-I', str(work), str(ROOT / 'tests' / 'fatal_exit_check.c'),
-                           *map(str, plat), '-o', str(exe), '-lm', *libs], env=env)
+                           str(RT / 'dispatch.c'), *map(str, plat), '-o', str(exe), '-lm', *libs], env=env)
     for mode, code, want, unwanted in CASES:
+        t0 = time.monotonic()
         p = subprocess.run([str(exe), mode], env=env, capture_output=True, text=True, errors='replace', timeout=120)
+        took = time.monotonic() - t0
         out = p.stdout + p.stderr
         missing = [w for w in want if w not in out]
         extra = [u for u in unwanted if u in out]
         fatal_lines = out.count('FATAL:')
-        ok = p.returncode == code and not missing and not extra
-        print(f'{mode}: exit code {p.returncode} (want {code}), {fatal_lines} FATAL line(s)'
+        ok = p.returncode == code and not missing and not extra and took < 20
+        print(f'{mode}: exit code {p.returncode} (want {code}) after {took:.1f} s, {fatal_lines} FATAL line(s)'
               + (f', missing {missing}' if missing else '') + (f', unexpected {extra}' if extra else '')
               + ('' if ok else ': FAIL'), flush=True)
         if not ok:
