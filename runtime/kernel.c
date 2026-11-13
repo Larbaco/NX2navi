@@ -2259,6 +2259,10 @@ void kern_clear_system_event(uint64_t ev) {
     if (se_find(ev, NULL) && se_live(ev)) system_event_set(ev, 0);
 }
 
+// A SystemEventType that still holds an event: mapped guest memory with its state byte nonzero. For services that keep
+// their own lists of bound events and reuse the slots of destroyed ones (gfx_present.c gfx_vsync_bind).
+int kern_system_event_live(uint64_t ev) { return mem_readable(ev + SE_STATE, 1) && se_live(ev); }
+
 // ---- fibers
 // The SDK switches fibers by swapping register context, which breaks "RET = C return". Each guest fiber gets a host
 // fiber (own 256 MiB reserved host stack) and its own Cpu, so a suspended fiber's registers and host frames stay

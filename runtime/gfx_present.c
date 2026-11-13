@@ -289,15 +289,29 @@ static void vsync_ensure(void) {
     plat_rmutex_unlock(&g_start_lock);
 }
 
+// Lists a vsync event the vsync thread signals. With the list full, an event the game destroyed since
+// (kern_system_event_live 0: its state byte is 0 or its memory is gone) gives its slot, which also stops the vsync
+// thread signalling it; the list ends the process only when all 16 are live. Each new listing is logged, so a long
+// session's log shows how often the game asks for a vsync event at a new address.
 void gfx_vsync_bind(uint64_t system_event) {
     plat_mutex_lock(&g_vs_lock);
     int have = 0;
     for (int i = 0; i < g_vs_nev; i++) have |= g_vs_ev[i] == system_event;
+    int slot = g_vs_nev;
     if (!have) {
-        if (g_vs_nev == 16) rt_fatal("gfx: more than 16 vsync events");
-        g_vs_ev[g_vs_nev++] = system_event;
+        if (slot == 16) {
+            slot = 0;
+            while (slot < 16 && kern_system_event_live(g_vs_ev[slot])) slot++;
+            if (slot == 16) rt_fatal("gfx: more than 16 live vsync events");
+        } else {
+            g_vs_nev++;
+        }
+        g_vs_ev[slot] = system_event;
     }
+    int listed = g_vs_nev;
     plat_mutex_unlock(&g_vs_lock);
+    if (!have)
+        rt_log("gfx: vsync event %#llx bound in slot %d, %d listed", (unsigned long long)system_event, slot, listed);
     vsync_ensure();
 }
 

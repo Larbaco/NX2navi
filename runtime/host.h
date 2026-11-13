@@ -358,6 +358,7 @@ void kern_event_clear(uint32_t writable);                  // server-side clear 
 void kern_bind_system_event(Cpu *c, uint64_t ev, int autoclear);   // guest thread only
 void kern_signal_system_event(uint64_t ev);                // any thread
 void kern_clear_system_event(uint64_t ev);                 // any thread; a bound, live event only
+int kern_system_event_live(uint64_t ev);                   // in mapped guest memory, its state byte nonzero
 int kern_svc(Cpu *c, uint32_t imm);                        // thread/sync SVCs; 1 if handled
 uint64_t kern_now_ns(void);
 extern uint64_t rt_guest_start_ns;   // kern_now_ns when the guest started (boot.c), 0 before

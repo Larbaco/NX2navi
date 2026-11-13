@@ -5,7 +5,7 @@
 //                  number went to an unrelated event or the state byte reads nonzero again; a host thread signalling
 //                  while a guest thread destroys and binds the event again never ends the process; with the table full,
 //                  a new bind takes a destroyed guest-memory entry and keeps the entries in host memory, which a host
-//                  thread then still signals
+//                  thread then still signals; kern_system_event_live tells live guest events from destroyed ones
 //   full           every entry live: the next bind ends with "table full" (the script checks the exit code and text)
 #include "kernel.c"
 
@@ -111,7 +111,9 @@ static void stale_and_reuse(void) {
     CHECK(signaled(wh) == 1, "a live bound event is signalled");
     kern_clear_system_event(ev_of(ev));
     CHECK(signaled(wh) == 0, "a live bound event is cleared");
+    CHECK(kern_system_event_live(ev_of(ev)), "kern_system_event_live: a bound event in guest memory is live");
     destroy(ev);
+    CHECK(!kern_system_event_live(ev_of(ev)), "kern_system_event_live: a destroyed event is not");
     kern_signal_system_event(ev_of(ev));   // state byte 0: skipped before the kernel lock
     // The byte reads nonzero again with the handles closed (the memory reused, or the SDK made the event again
     // without the binder): the signal must neither end the process nor reach anything.
