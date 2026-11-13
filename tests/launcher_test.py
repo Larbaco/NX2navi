@@ -3116,6 +3116,9 @@ class MakeGameTest(Tmp):
             (out / 'exefs' / name).write_bytes(b'x')
         (lift / 'layout.json').write_text(json.dumps([{'name': 'main'}]))
         text = self.mg.modules_c(lift, out, gen).read_text(encoding='utf-8')
+        import check_content
+        self.assertIn(check_content.GENERATED_MARKER, text.splitlines()[0])
+        self.assertIn('generated from game code', check_content.problems_for(gen / 'modules.c'))   # refused in a commit
         for half in ('\\ud83e', '\\ud842'):   # the first surrogate halves of the two characters
             self.assertNotIn(half, text.lower())
         want = 'const char rt_default_exefs[] = "' + str(out / 'exefs').replace('\\', '\\\\') + '";'

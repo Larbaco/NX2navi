@@ -98,6 +98,7 @@ sys.path.insert(0, str(KIT / 'tools'))
 import nup  # noqa: E402
 import mod_files  # noqa: E402
 import prompt_art  # noqa: E402
+from check_content import GENERATED_MARKER  # noqa: E402
 
 TITLE_ID = 0x0400486024DEC000
 MAIN_BUILD_ID = 'e0f3ccfaf50065ae4ea01eb5aeb13b1a'   # main of game 1.1.1
@@ -642,8 +643,12 @@ def c_string(text):
 
 
 def modules_c(lift, out, gen):
+    """gen/modules.c: the lifted modules' table, the ExeFS's sha256 and this install's folders. It carries
+    GENERATED_MARKER, which tools/check_content.py refuses in a commit: it is derived from the game and names the
+    player's paths."""
     layout = json.loads((lift / 'layout.json').read_text(encoding='utf-8'))
-    L = ['#include "dispatch.h"', '#include "host.h"', '#include "layout.h"', '']
+    L = [f'/* {GENERATED_MARKER}: module table, written by tools/make_game.py modules_c. Do not edit or commit. */',
+         '#include "dispatch.h"', '#include "host.h"', '#include "layout.h"', '']
     for m in layout:
         n = m['name']
         L += [f'extern const uint64_t {n}_fn_addrs[];', f'extern const GuestFn {n}_fn_ptrs[];',
