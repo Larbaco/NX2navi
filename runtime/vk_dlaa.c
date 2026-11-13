@@ -3244,15 +3244,16 @@ static void preset_check(void) {
 // intact (Ultra Performance and DLAA). Measured by capturing every present over six mode changes, 2026-11-10: bad
 // frames 3 and 5 presents after the change, with every other setting the same. evaluate notes a scene of another size;
 // vk_dlaa_frame counts the presents since a setting last changed, so a game that draws two sizes in turn holds nothing.
-static int setting_presents;            // vk_dlaa_frame: presents left in which that counts as a mode change
+// setting_presents: presents left in which that counts as a mode change. vk_dlaa_frame sets and counts it down on the
+// thread that runs the frame's bookkeeping, vk_dlaa_resized_take clears it on the presenting thread: atomics.
+static int setting_presents;
 #define SETTING_PRESENTS 60
 
 // vk_backend.c frame_hold, each present after vk_dlaa_frame: 1 once when the scene took a new size after a setting
 // changed. The previous picture then stays on screen over the frames described above.
 int vk_dlaa_resized_take(void) {
-    if (!__atomic_exchange_n(&size_changed, 0, __ATOMIC_ACQ_REL) || !setting_presents) return 0;
-    setting_presents = 0;
-    return 1;
+    if (!__atomic_exchange_n(&size_changed, 0, __ATOMIC_ACQ_REL)) return 0;
+    return __atomic_exchange_n(&setting_presents, 0, __ATOMIC_ACQ_REL) != 0;
 }
 
 // What DLSS holds while nothing uses it (NX2NAVI_DLSS_IDLE_FREE 1 or 2, the default 1). With the upscaler switched off
@@ -3423,8 +3424,13 @@ void vk_dlaa_frame(void) {
     static int cfg_known;
     unsigned v = cfg_version();
     D.presents++;
-    if (cfg_known && v != cfg_seen) setting_presents = SETTING_PRESENTS;
-    else if (setting_presents) setting_presents--;
+    if (cfg_known && v != cfg_seen) {
+        __atomic_store_n(&setting_presents, SETTING_PRESENTS, __ATOMIC_RELAXED);
+    } else {   // down to 0, not past it: vk_dlaa_resized_take may clear it meanwhile
+        int s = __atomic_load_n(&setting_presents, __ATOMIC_RELAXED);
+        while (s > 0 &&
+               !__atomic_compare_exchange_n(&setting_presents, &s, s - 1, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+    }
     cfg_seen = v, cfg_known = 1;
     vk_dlaa_swap_img = NULL, vk_dlaa_swap_view = VK_NULL_HANDLE;
     D.pre = D.comp = 0, D.comp_game = VK_NULL_HANDLE;   // the frame before was recorded up to its present
