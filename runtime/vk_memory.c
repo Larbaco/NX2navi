@@ -975,6 +975,7 @@ static void owner_log(uint64_t frame);   // the memory report, after the staging
 static void compact_look(void);
 static void outside_watch(uint64_t frame);
 static void up_ts_log(uint64_t frame);
+static void slow_mem_window(uint64_t frame);
 
 static volatile uint64_t mirror_frame;   // the frame vk_mem_census last saw, for mirror_sync's log lines
 
@@ -1004,7 +1005,8 @@ void vk_mem_census(uint64_t frame) {
                qpc_ms(h2 - h1));
     }
     if (vk_texture_compact_due()) compact_look();   // NX2NAVI_TEX_COMPACT: 0 at once with the setting off
-    if ((rt_trace & RT_TRACE_PERF) && frame % 60 == 0) outside_watch(frame), up_ts_log(frame), vk_gtl_log(frame, 60);
+    if ((rt_trace & RT_TRACE_PERF) && frame % 60 == 0)
+        outside_watch(frame), up_ts_log(frame), vk_gtl_log(frame, 60), slow_mem_window(frame);
     if ((rt_trace & RT_TRACE_PERF) && !vk_mirror_on) dirty_frame(frame);
     if ((rt_trace & RT_TRACE_PERF) ? frame % 60 == 0 : frame == 600 || frame == 1800)
         mirror_log(frame), shadow_log(frame), span_log(frame);   // mirror_log also logs the write-watch line
@@ -1184,12 +1186,31 @@ static uint64_t ww_calls, ww_bytes, ww_ticks, ww_dirty_calls, ww_dirty_ticks, ww
 // 200). A frame some ten frames after an area load took 51.6 ms of replay with 1.2 ms of it in the replay's ops; the
 // replaying thread's samples sat in GetWriteWatch under vk_mem_mirror_begin and in the freeze's VirtualProtect, and no
 // thread of the process could be sampled for 28 ms in between.
+// Past the 200 lines the calls are counted, and slow_mem_window gives the count, their time and the longest every 60
+// frames: a session of 2026-11-13 used the 200 lines up by frame 36,387, and its last area load had none.
+static volatile int64_t slow_more_n, slow_more_ns, slow_more_max;
+
 static void slow_mem_call(const char *what, uint64_t addr, uint64_t size, uint64_t pages, uint64_t ns) {
     static uint32_t logged;
-    if (ns < 4000000ull || !(rt_trace & RT_TRACE_PERF) || __atomic_add_fetch(&logged, 1, __ATOMIC_RELAXED) > 200) return;
+    if (ns < 4000000ull || !(rt_trace & RT_TRACE_PERF)) return;
+    if (__atomic_add_fetch(&logged, 1, __ATOMIC_RELAXED) > 200) {
+        plat_add64(&slow_more_n, 1), plat_add64(&slow_more_ns, (int64_t)ns);
+        int64_t m = __atomic_load_n(&slow_more_max, __ATOMIC_RELAXED);
+        while ((int64_t)ns > m && !__atomic_compare_exchange_n(&slow_more_max, &m, (int64_t)ns, 1, __ATOMIC_RELAXED,
+                                                               __ATOMIC_RELAXED)) {}
+        return;
+    }
     rt_log("mem: slow %s: %.1f ms over %#llx + %.1f MiB, %lld pages written (frame %llu)", what, ns / 1e6,
            (unsigned long long)addr, size / 1048576.0, pages == UINT64_MAX ? -1ll : (long long)pages,
            (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED));
+}
+
+static void slow_mem_window(uint64_t frame) {   // NX2NAVI_TRACE=perf, every 60 frames
+    int64_t n = plat_xchg64(&slow_more_n, 0);
+    if (!n) return;
+    int64_t ns = plat_xchg64(&slow_more_ns, 0), max = plat_xchg64(&slow_more_max, 0);
+    rt_log("mem: frame %llu: %lld more slow write-watch queries and freezes (over 4 ms) since the last such line, %.1f ms, "
+           "the longest %.1f ms", (unsigned long long)frame, (long long)n, ns / 1e6, max / 1e6);
 }
 
 static uint64_t ww_query(uint64_t addr, uint64_t size) {

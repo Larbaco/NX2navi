@@ -48,14 +48,33 @@ int main(void) {
     frames(200, 7.0);
     for (int k = 0; k < 5; k++) frames(1, 30.0), frames(60, 7.0);   // five isolated spikes
     expect("five isolated spikes", areas[0].hitch, 5);
-    frames(1, 150.0), frames(1, 150.0), frames(60, 7.0);   // two long frames in a row: the second stands out
-    expect("two frames over the sure line", areas[0].hitch, 7);
-    frames(1, 40.0), frames(1, 40.0), frames(60, 7.0);   // a double spike: the second one counts
-    expect("a double spike", areas[0].hitch, 8);
+    frames(1, 150.0), frames(1, 150.0), frames(60, 7.0);   // two long frames in a row: one episode of 300 ms
+    expect("two frames over the sure line", areas[0].hitch, 6);
+    expect("their episode's time", areas[0].worst_ns, 300000000ull);
+    frames(1, 40.0), frames(1, 40.0), frames(60, 7.0);   // a double spike: one episode
+    expect("a double spike", areas[0].hitch, 7);
+    // three long frames, each followed by one as long, as after an area load in a session of 2026-11-13 (87, 91 and
+    // 96 ms): one episode, not three changes of pace
+    uint64_t paced0 = paced_out, charged0 = areas[0].cause_ns[7];
+    frames(1, 87.0), frames(1, 91.0), frames(1, 96.0), frames(60, 7.0);
+    expect("three slow frames in a row", areas[0].hitch, 8);
+    expect("not a change of pace", paced_out, paced0);
+    expect("the episode's time", areas[0].cause_ns[7] - charged0, 274000000ull);
+    // a change to 30 fps from 140: a run of long frames longer than SM_EPISODE_MAX, a change of pace
+    frames(200, 7.0);
+    frames(300, 33.3);
+    expect("a change to 30 fps", areas[0].hitch, 8);
+    frames(200, 7.0);
     stutter_area("Kakariko");   // a load: what follows within SM_LOAD_NS is the load's
     frames(1, 60.0), frames(30, 7.0);
     expect("a spike right after a load (play)", areas[1].hitch, 0);
     expect("a spike right after a load (load)", areas[1].load_hitch, 1);
+    clock_ns += 10000000000ull;
+    frames(60, 7.0);
+    stutter_load();   // the texture pool's load of an area, without the game's
+    frames(1, 60.0), frames(30, 7.0);
+    expect("a spike right after the pool's load (play)", areas[1].hitch, 0);
+    expect("a spike right after the pool's load (load)", areas[1].load_hitch, 2);
     if (!logged) printf("FAIL nothing was logged\n"), fails++;
     if (fails) return 1;
     printf("stutter_hitch_check: all checks passed\n");

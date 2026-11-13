@@ -2967,8 +2967,10 @@ static void pool_sync_entries(VkExec *ex) {
     if (!pool_loading && backlog > 0 && retry >= backlog) {
         pool_load_made = (uint64_t)retry, pool_load_frame0 = PL.frame;
         __atomic_store_n(&pool_loading, 1, __ATOMIC_RELEASE);
+        stutter_load();   // the stutter map counts the frames around it as an area load's
     } else if (pool_loading && retry < POOL_LOAD_END) {
         __atomic_store_n(&pool_loading, 0, __ATOMIC_RELEASE);
+        stutter_load();
         rt_log("vk: texture pool: an area load of about %llu textures was made in %llu frames (NX2NAVI_POOL_LOAD_BACKLOG)",
                (unsigned long long)pool_load_made, (unsigned long long)(PL.frame - pool_load_frame0 + 1));
     }

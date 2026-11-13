@@ -28,6 +28,7 @@ def main():
                   '"; %s %llu, %.1f ms avg"', '"), worst %.1f ms (frame %llu); over 25 ms %llu; after its "',
                   '"loads %llu; draws that met a pipeline missing %llu, a shader %llu, %.1f ms on the replay thread"',
                   'stutter: frame %llu at %.1f s, %.1f ms (frames about %.1f ms) in %s%s:', '" (charged to %s)"',
+                  '"stutter: frame %llu at %.1f s, %.1f ms (frames about %.1f ms) in %s%s:%s; an episode of %d frames to frame "',
                   'stutter map:   %s %s/%s first met in %s: %llu draws met it missing, %llu its shader, %.1f ms on the ',
                   '"replay thread; usable after %.0f ms at most (%llu times); %s%s"'):
         assert piece in src, f'runtime/stutter_map.c no longer has: {piece}'
@@ -37,6 +38,10 @@ def main():
         'pipeline missing: vertex 1a2b3c4d/5e6f7a8b 23.9 ms (skipped)',
         '[host] ' + c_fmt('stutter: frame %llu at %.1f s, %.1f ms (frames about %.1f ms) in %s%s:', 1300, 80.0, 60.0, 7.0,
                           'Kakariko Village', ', after its load') + ' unattributed 55.0 (charged to unattributed)',
+        # an episode of three frames: its head carries their summed time
+        '[host] ' + c_fmt('stutter: frame %llu at %.1f s, %.1f ms (frames about %.1f ms) in %s%s:%s; an episode of %d '
+                          "frames to frame %llu, %.1f ms the first, the parts above the first frame's", 1400, 90.0, 274.0,
+                          7.0, 'Kakariko Village', '', ' fence 77.1 replay 4.0 (charged to fence)', 3, 1402, 87.0),
         '[host] ' + c_fmt('stutter map (%s): %.1f min of play in %d areas; %llu hitches in play and %llu '
                           'after area loads; %llu long frames were a change of pace (the frames after them as long), not '
                           'hitches; in play by cause:', 'exit', 12.5, 2, 3, 1, 7) + ' pipeline 2 texture 1',
@@ -72,7 +77,8 @@ def main():
         p = block['pipes'][0]
         assert p['v'] == '1a2b3c4d' and p['f'] == '5e6f7a8b' and p['ready'] == 160 and p['misses'] == 3, p
         assert p['state'].startswith('new to this install'), p
-        assert len(hitches) == 2 and hitches[0]['cause'] == 'pipeline' and hitches[1]['load'], hitches
+        assert len(hitches) == 3 and hitches[0]['cause'] == 'pipeline' and hitches[1]['load'], hitches
+        assert hitches[2]['ms'] == 274.0 and hitches[2]['cause'] == 'fence' and not hitches[2]['load'], hitches[2]
         out = Path(d) / 'map.md'
         stutter_map.report([log], out)
         text = out.read_text(encoding='utf-8')

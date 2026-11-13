@@ -10,7 +10,11 @@
 // 60 or 30 fps after 140 is a slower rate, not a run of hitches, and the median takes the new rate within 16 frames.
 // The decision waits two presents; the line and the counts carry what the frame itself waited for. Frames within
 // SM_LOAD_NS of an area's load count apart, as the load's: an area load shows as a few long frames that are not a
-// stutter in play.
+// stutter in play. An area load is the game's (stutter_area) or the texture pool's (stutter_load: the pool makes an
+// area's textures, vk_exec_draw.c pool_loading), which comes without the game's when it streams the next area in.
+// Consecutive long frames are one episode, a hitch counted once with their summed time: a change of pace is a run of
+// more than SM_EPISODE_MAX long frames none of which stands out from the ones after it. Three frames of 87, 91 and
+// 96 ms after an area load (2026-11-13) each counted as a change of pace before, as each was followed by one as long.
 //
 // What a hitch went to comes from the frame-time summary's split (perf.c ft_frame: pipeline, translation, texture,
 // fence, pacing, replay, unattributed), with the draws that met a pipeline or a shader missing between the previous
@@ -46,6 +50,7 @@ int stutter_map_on;
 #define SM_MEDIAN_N 32                     // frames the median is taken over
 #define SM_AFTER 2                         // frames after a candidate that must be shorter...
 #define SM_AFTER_RATIO 1.5                 // ...by this factor
+#define SM_EPISODE_MAX 8                   // a run of long frames up to this long is an episode, longer a new pace
 #define SM_PIPES 4096                      // pipelines kept for the ranking (open addressing)
 #define SM_RING 256                        // draws that met something missing, between two presents
 #define SM_LINES_MAX 4000
@@ -93,11 +98,21 @@ static uint64_t t_first, t_report, line_sec, lines_in_sec, lines, frames_seen, p
 // draws that met something missing then), its area and what it is charged to.
 typedef struct {
     char line[1400];
-    uint64_t frame, d, after_max;
+    uint64_t frame, d, after_max, med;
+    double t_s;            // seconds since the first frame
     int area, load, cause, after;
+    int tail;              // where the line's text after its head ("stutter: frame ... in <area>[, after its load]:") starts
 } Cand;
 static Cand cand[SM_AFTER + 1];
 static int n_cand;
+// The episode being gathered: decided candidates of consecutive frames, the first one's line and area (cand_decide).
+static struct {
+    Cand first;
+    uint64_t last, total;   // the last frame in it; the frames' summed intervals
+    int n, hitch, open;     // frames in it; one of them stood out from the frames after it (or was over the sure line)
+} ep;
+static int pace_run;        // more than SM_EPISODE_MAX long frames, none standing out: a new pace, until it ends
+static uint64_t pace_last;
 
 void stutter_map_init(void) {
     stutter_map_on = cfg_bool("NX2NAVI_STUTTER_MAP");
@@ -115,6 +130,10 @@ static uint32_t id4(const uint8_t *id) {
 }
 
 static uint64_t key_of(const uint8_t *vi, const uint8_t *fi) { return (uint64_t)id4(vi) << 32 | id4(fi); }
+
+void stutter_load(void) {
+    if (stutter_map_on) __atomic_store_n(&load_at, kern_now_ns(), __ATOMIC_RELAXED);
+}
 
 void stutter_area(const char *name) {
     if (!stutter_map_on || !name || !*name) return;
@@ -230,10 +249,12 @@ static uint64_t median_recent(void) {
     return v[n / 2];
 }
 
-// A candidate the SM_AFTER frames after it have been seen for: a hitch, counted and its line logged, or a change of
-// pace (the frames after it as long), left out.
-static void cand_decide(const Cand *c, uint64_t now) {
-    if (c->d <= SM_HITCH_SURE_NS && (double)c->after_max * SM_AFTER_RATIO >= (double)c->d) {
+// The episode ends: a hitch with its frames' summed time, counted in its first frame's area and charged to that frame's
+// cause, and its line logged; a single frame that did not stand out from the ones after it is a change of pace.
+static void episode_close(uint64_t now) {
+    ep.open = 0;
+    const Cand *c = &ep.first;
+    if (!ep.hitch && ep.n < 2) {
         paced_out++;
         return;
     }
@@ -241,15 +262,41 @@ static void cand_decide(const Cand *c, uint64_t now) {
     if (c->load) a->load_hitch++;
     else {
         a->hitch++;
-        if (c->cause >= 0 && c->cause < SM_CAUSES) a->by_cause[c->cause]++, a->cause_ns[c->cause] += c->d;
-        if (c->d > a->worst_ns) a->worst_ns = c->d, a->worst_frame = c->frame;
+        if (c->cause >= 0 && c->cause < SM_CAUSES) a->by_cause[c->cause]++, a->cause_ns[c->cause] += ep.total;
+        if (ep.total > a->worst_ns) a->worst_ns = ep.total, a->worst_frame = c->frame;
     }
     uint64_t sec = (now - t_first) / 1000000000ull;
     if (sec != line_sec) line_sec = sec, lines_in_sec = 0;
     if (lines >= SM_LINES_MAX || lines_in_sec >= SM_LINES_PER_S) return;
-    rt_log("%s", c->line);
+    if (ep.n == 1) rt_log("%s", c->line);
+    else   // the head with the episode's time; the parts and the draws are its first frame's
+        rt_log("stutter: frame %llu at %.1f s, %.1f ms (frames about %.1f ms) in %s%s:%s; an episode of %d frames to frame "
+               "%llu, %.1f ms the first, the parts above the first frame's", (unsigned long long)c->frame, c->t_s,
+               ep.total / 1e6, c->med / 1e6, areas[c->area].name, c->load ? ", after its load" : "", c->line + c->tail,
+               ep.n, (unsigned long long)ep.last, c->d / 1e6);
     lines++, lines_in_sec++;
     if (lines == SM_LINES_MAX) rt_log("stutter: the last such line of this run; the map's counts go on");
+}
+
+// A candidate the SM_AFTER frames after it have been seen for: it stands out (a hitch) or the frames after it are as
+// long (paced). It joins the episode of the frame before it, or starts one. An episode of more than SM_EPISODE_MAX
+// frames none of which stood out is a change of pace: they and the paced frames right after them are left out.
+static void cand_decide(const Cand *c, uint64_t now) {
+    int paced = c->d <= SM_HITCH_SURE_NS && (double)c->after_max * SM_AFTER_RATIO >= (double)c->d;
+    if (pace_run) {
+        if (paced && c->frame == pace_last + 1) {
+            paced_out++, pace_last = c->frame;
+            return;
+        }
+        pace_run = 0;
+    }
+    if (ep.open && c->frame == ep.last + 1) {
+        ep.last = c->frame, ep.total += c->d, ep.n++, ep.hitch |= !paced;
+        if (!ep.hitch && ep.n > SM_EPISODE_MAX) paced_out += (uint64_t)ep.n, ep.open = 0, pace_run = 1, pace_last = c->frame;
+        return;
+    }
+    if (ep.open) episode_close(now);
+    ep.first = *c, ep.last = c->frame, ep.total = c->d, ep.n = 1, ep.hitch = !paced, ep.open = 1;
 }
 
 void stutter_frame(uint64_t frame, uint64_t now, uint64_t d, const uint64_t *part, const char *const *names, int n,
@@ -272,6 +319,7 @@ void stutter_frame(uint64_t frame, uint64_t now, uint64_t d, const uint64_t *par
         memmove(&cand[i], &cand[i + 1], (size_t)(n_cand - i - 1) * sizeof cand[0]);   // at most two others
         n_cand--;
     }
+    if (ep.open && frame > ep.last + SM_AFTER) episode_close(now);   // the frame after its last was no candidate
     uint64_t med = median_recent();
     recent[frames_seen % SM_MEDIAN_N] = d;
     frames_seen++;
@@ -284,9 +332,10 @@ void stutter_frame(uint64_t frame, uint64_t now, uint64_t d, const uint64_t *par
         Cand *c = &cand[n_cand++];
         c->frame = frame, c->d = d, c->after_max = 0, c->after = 0, c->area = ai, c->cause = cause;
         c->load = now - __atomic_load_n(&load_at, __ATOMIC_RELAXED) < SM_LOAD_NS;
+        c->med = med, c->t_s = (now - t_first) / 1e9;
         int o = snprintf(c->line, sizeof c->line, "stutter: frame %llu at %.1f s, %.1f ms (frames about %.1f ms) in %s%s:",
-                         (unsigned long long)frame, (now - t_first) / 1e9, d / 1e6, med / 1e6, a->name,
-                         c->load ? ", after its load" : "");
+                         (unsigned long long)frame, c->t_s, d / 1e6, med / 1e6, a->name, c->load ? ", after its load" : "");
+        c->tail = o < (int)sizeof c->line ? o : (int)sizeof c->line - 1;
         for (int k = 0; k < n && o < (int)sizeof c->line - 40; k++)
             if (part[k] >= 500000) o += snprintf(c->line + o, sizeof c->line - (size_t)o, " %s %.1f", names[k], part[k] / 1e6);
         if (cause >= 0 && cause < n && o < (int)sizeof c->line - 40)

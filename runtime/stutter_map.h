@@ -10,6 +10,9 @@ void stutter_map_init(void);
 // An area's load (perf.c perf_scene, from romfs.c): hitches from here on are counted in that area, and those within
 // SM_LOAD_NS of the load apart from play.
 void stutter_area(const char *name);
+// The texture pool began or ended making an area's textures (vk_exec_draw.c pool_loading): frames within SM_LOAD_NS of
+// it count as an area load's too, in the area of the last stutter_area.
+void stutter_load(void);
 // A draw met its pipeline (shader 0) or one of its shaders (shader 1) missing and the replay thread spent ns on it
 // before it was bound or skipped (vk_exec_draw.c, beside wait_note). vi, fi: the vertex (or mesh) and fragment shaders'
 // input ids, NULL when not known (still translating, or no fragment stage).
