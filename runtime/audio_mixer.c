@@ -1354,13 +1354,14 @@ static const char device_name[] = "AudioTvOutput";
 
 // The events the game took to hear of a change of the output device (IAudioDevice's, its two notifications' and the
 // virtual device manager's). audio_channels_live signals them all: the game then asks for the channel count again, as
-// it does on a console whose output moves from the TV to headphones.
+// it does on a console whose output moves from the TV to headphones. A slot is counted before its handle is stored, so
+// audio_channels_live skips a slot that still reads 0 (kern_event_signal ends the process on a bad handle).
 static uint32_t change_events[16];
 static _Atomic int n_change_events;
 
 static void change_event_list(uint32_t ev) {
     int i = atomic_fetch_add(&n_change_events, 1);
-    if (i < 16) change_events[i] = ev;
+    if (i < 16) __atomic_store_n(&change_events[i], ev, __ATOMIC_RELEASE);
 }
 
 // One event per kind, made at the kind's first request; every request gets its own readable handle to it. Made per
@@ -1396,7 +1397,10 @@ void audio_channels_live(void) {
     if (now == was) return;
     int n = atomic_load(&n_change_events);
     if (n > 16) n = 16;
-    for (int i = 0; i < n; i++) kern_event_signal(change_events[i]);
+    for (int i = 0; i < n; i++) {
+        uint32_t e = __atomic_load_n(&change_events[i], __ATOMIC_ACQUIRE);
+        if (e) kern_event_signal(e);
+    }
     rt_log("audio: NX2NAVI_AUDIO_CHANNELS=%s: the output goes from %s to %s; the game is told the device changed "
            "(%d events)", want, was == 6 ? "5.1" : "stereo", now == 6 ? "5.1" : "stereo", n);
 }

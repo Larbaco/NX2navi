@@ -413,6 +413,14 @@ static void change_events_once(void) {
     for (int i = 0; i < n && i < 16; i++) once += signalled[change_events[i]] == 1;
     CHECK(once == n, "a channel change signals each listed event once (%d of %d)", once, n);
     CHECK(!signal_closed, "no closed event is signalled");
+    /* a slot counted whose handle is not stored yet (a kind's first request on another thread): skipped, never
+       signalled as handle 0, which the kernel answers with a fatal error */
+    atomic_fetch_add(&n_change_events, 1);
+    channels_setting = "stereo";
+    audio_channels_live();
+    CHECK(output_channels() == 2, "back to stereo");
+    CHECK(!signalled[0], "a slot not stored yet is skipped (handle 0 signalled %d times)", signalled[0]);
+    CHECK(signalled[change_events[0]] == 2, "the listed events are signalled again (%d)", signalled[change_events[0]]);
     audio_mode = "none", channels_setting = "stereo";
 }
 
