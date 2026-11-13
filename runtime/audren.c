@@ -717,8 +717,10 @@ void audren_manager_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs
         AudrenParameter p = IPC_ARG(rq, AudrenParameter, 0);
         uint64_t work = IPC_ARG(rq, uint64_t, 0x38);
         need(rq->ncopy >= 1, "OpenAudioRenderer without a transfer memory handle");
-        IpcTransferMemory *tm = kern_handle_get(rq->copy[0], KERN_TMEM);
-        need(tm && tm->size >= work, "OpenAudioRenderer work buffer is not a transfer memory of the stated size");
+        // A copy made under the kernel lock: a CloseHandle of the transfer memory on another thread frees the object.
+        IpcTransferMemory tm;
+        int have_tm = kern_handle_copy(rq->copy[0], KERN_TMEM, &tm, sizeof tm);
+        need(have_tm && tm.size >= work, "OpenAudioRenderer work buffer is not a transfer memory of the stated size");
         AudioRenderer *r = renderer_new(&p);
         if (rt_knob("AUDIO_STATS", "0")) {
             r->stats = calloc(1, sizeof *r->stats);
@@ -743,7 +745,7 @@ void audren_manager_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs
                "splitters %d/%d, REV%d, work buffer %#llx+%#llx",
                p.sample_rate, p.sample_count, p.mix_buffer_count, p.voice_count, p.effect_count, p.submix_count,
                p.sink_count, p.splitter_count, p.splitter_destination_count, revision_number(p.revision),
-               (unsigned long long)tm->addr, (unsigned long long)work);
+               (unsigned long long)tm.addr, (unsigned long long)work);
         rs->move[rs->nmove++] = ipc_session_new("IAudioRenderer", renderer_handler, r, renderer_close);
         return;
     }

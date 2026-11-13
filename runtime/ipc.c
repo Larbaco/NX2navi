@@ -254,6 +254,9 @@ static uint32_t session_clone(IpcSession *s) {
     return kern_handle_new(KERN_SESSION, s);
 }
 
+// kern_handle_hold's callback: a request's reference, dropped through ipc_handle_closed once the request is answered.
+static void session_hold(void *o) { plat_inc32(&((IpcSession *)o)->refs); }
+
 void ipc_handle_closed(int kind, void *obj) {
     if (kind == KERN_TMEM) {
         free(obj);
@@ -529,7 +532,10 @@ int ipc_svc(Cpu *c, uint32_t imm) {
     }
     case 0x21: case 0x22: {   // SendSyncRequest(w0 handle) / WithUserBuffer(x0 buffer, x1 size, w2 handle)
         uint32_t h = (uint32_t)(imm == 0x21 ? x[0] : x[2]);
-        IpcSession *s = kern_handle_get(h, KERN_SESSION);
+        // The request holds a reference on the session until it is answered: a CloseHandle of the session on another
+        // thread meanwhile leaves the object, and its close callback (renderer_close frees the audio renderer the
+        // handler uses), to whichever drops the last reference.
+        IpcSession *s = kern_handle_hold(h, KERN_SESSION, session_hold);
         if (!s) {
             rt_log("ipc: svc %#x on %#x, not a session handle", imm, h);
             x[0] = IPC_R_BAD_HANDLE;
@@ -542,6 +548,7 @@ int ipc_svc(Cpu *c, uint32_t imm) {
         t_req = c;
         dispatch(s, m);
         t_req = outer;
+        ipc_handle_closed(KERN_SESSION, s);   // the request's reference
         x[0] = 0;
         return 1;
     }

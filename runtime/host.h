@@ -344,7 +344,11 @@ void kern_core_diag_frame(uint64_t frame, uint64_t interval_ns);   // perf_prese
 void kern_sched_report(uint64_t frame);                    // NX2NAVI_TRACE=sched: per-thread time split, on present
 uint32_t kern_handle_new(int kind, void *obj);             // kind: KERN_SESSION or KERN_TMEM (ipc.c)
 void *kern_handle_get(uint32_t h, int kind);
-void kern_handle_close(uint32_t h);                        // CloseHandle from the host side, any thread; fatal on a
+void *kern_handle_hold(uint32_t h, int kind, void (*hold)(void *obj));   // kern_handle_get, hold(obj) run under the
+                                                                          // kernel lock (a reference the caller drops)
+int kern_handle_copy(uint32_t h, int kind, void *out, size_t n);         // a copy of the object, made under the
+                                                                          // kernel lock; 0 for a bad handle
+void kern_handle_close(uint32_t h);                       // CloseHandle from the host side, any thread; fatal on a
                                                            // bad handle
 enum { KERN_SESSION = 4, KERN_TMEM = 5 };
 uint32_t kern_event_new(void);                             // writable handle

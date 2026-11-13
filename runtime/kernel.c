@@ -2090,6 +2090,26 @@ void *kern_handle_get(uint32_t h, int kind) {
     return o;
 }
 
+// kern_handle_get that also runs hold(obj) holding G, so the caller can take a reference before a CloseHandle on
+// another thread drops the handle's own: handle_close clears the slot holding G and only then calls ipc_handle_closed.
+void *kern_handle_hold(uint32_t h, int kind, void (*hold)(void *obj)) {
+    lock();
+    void *o = h_peek(h, kind);
+    if (o) hold(o);
+    unlock();
+    return o;
+}
+
+// Copies n bytes of a handle's object holding G, for objects without a reference count (KERN_TMEM, freed by its
+// CloseHandle): 1 when h is a handle of that kind, else 0 and nothing copied.
+int kern_handle_copy(uint32_t h, int kind, void *out, size_t n) {
+    lock();
+    const void *o = h_peek(h, kind);
+    if (o) memcpy(out, o, n);
+    unlock();
+    return o != NULL;
+}
+
 uint32_t kern_event_new(void) {
     Event *e = calloc(1, sizeof *e);
     if (!e) rt_fatal("kernel: event allocation");
