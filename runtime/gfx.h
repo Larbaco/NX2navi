@@ -159,6 +159,8 @@ typedef struct { uint8_t type, comps, packed; } GfxShaderIo;   // GFX_TYPE_*, co
 int gfx_shader_stage(const GfxShader *s);                   // GFX_STAGE_VS, GFX_STAGE_FS or GFX_STAGE_CS
 int gfx_shader_resources(const GfxShader *s, int kind, const GfxShaderRes **res);   // count of GFX_RES_* kind; array in *res
 uint32_t gfx_shader_exact_seen(void);   // shaders loaded so far with a GfxShaderRes.exact texture (the texture census line)
+uint32_t gfx_shader_pool_short_seen(void);   // shaders in memory whose texture pool array has the earlier length, 32768
+                                             // (gfx_shader.c pool_short_note; vk_texture_register's warning)
 uint32_t gfx_shader_slot_mask(const GfxShader *s);                    // texture/image slots whose type its translation read
 uint32_t gfx_shader_inputs(const GfxShader *s, GfxShaderIo io[32]);    // Input Locations (VS attributes, FS varyings) as a mask
 uint32_t gfx_shader_outputs(const GfxShader *s, GfxShaderIo io[32]);

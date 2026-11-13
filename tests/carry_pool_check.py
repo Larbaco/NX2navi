@@ -3,7 +3,8 @@ earlier length (32768, vk.h VK_POOL_TEX_CARRIED) is never served, because its cl
 32768 up with slot 32767. The check cuts pool_short, carry_usable, carry_load, carry_find and carry_find_iid out of
 gfx_shader.c, compiles them against stand-ins for the disk and memory caches, and walks the lookups: a refused entry
 is freed and the lookup goes on to the next previous identity, the owned branch (gfx_shader_load_private) frees it as
-well, and entries with the current length, the sampler pool or no pool are served as before.
+well, and entries with the current length, the sampler pool or no pool are served as before. pool_short_note, which
+counts the shaders of the earlier length that enter the memory cache for vk_texture.c's warning, counts those only.
 
 No GPU, no game files, any Python.
 
@@ -155,8 +156,25 @@ int main(void) {
     disk_len[0] = 32768;
     assert(!carry_find(h, &a, 1, 0) && !carry_find_iid(iid, 0, NULL) && loads == 0);
 
+    /* pool_short_note (what mem_insert calls for every shader entering the memory cache): only shaders with a pool
+       array of the earlier length count, the first is logged, gfx_shader_pool_short_seen gives the count. */
     reset();
-    printf("carry pool check: earlier-length pool translations refused and freed, the lookup goes on, others served\n");
+    uint8_t k[32] = {0};
+    disk_len[0] = 40960, disk_len[1] = 32768, disk_len[2] = -1;
+    GfxShader *cur = disk_load(k, NULL);
+    k[0] = 1;
+    GfxShader *old = disk_load(k, NULL);
+    k[0] = 2;
+    GfxShader *none = disk_load(k, NULL);
+    pool_short_note(cur), pool_short_note(none);
+    assert(gfx_shader_pool_short_seen() == 0 && logs == 0);
+    pool_short_note(old), pool_short_note(old);
+    assert(gfx_shader_pool_short_seen() == 2 && logs == 1 && strstr(last_log, "older than this runtime"));
+    shader_free(cur), shader_free(old), shader_free(none);
+
+    reset();
+    printf("carry pool check: earlier-length pool translations refused and freed, the lookup goes on, others served; "
+           "shaders of the earlier length in use counted\n");
     return 0;
 }
 '''

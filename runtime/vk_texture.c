@@ -4765,6 +4765,14 @@ void vk_texture_register(int id, const tex_t *t, const view_t *v) {
             rt_log("vk: texture slot %d registered, past the %d the shaders index (VK_POOL_TEX): a shader that samples it "
                    "reads slot %d instead (%d for a translation carried over from the translator before)", id,
                    VK_POOL_TEX, VK_POOL_TEX - 1, VK_POOL_TEX_CARRIED - 1);
+    } else if (id >= VK_POOL_TEX_CARRIED) {   // within the pool, past what a shader of the earlier length reaches
+        static int said;
+        uint32_t n;
+        if (!__atomic_load_n(&said, __ATOMIC_RELAXED) && (n = gfx_shader_pool_short_seen()) &&
+            !__atomic_exchange_n(&said, 1, __ATOMIC_RELAXED))
+            rt_log("vk: texture slot %d registered while %u shaders in use index the texture pool with the earlier "
+                   "length (%d, gfx_shader.c pool_short_note): they read slot %d in its place", id, n,
+                   VK_POOL_TEX_CARRIED, VK_POOL_TEX_CARRIED - 1);
     }
     lock();
     if (id >= ntslots) {

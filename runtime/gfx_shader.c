@@ -742,6 +742,7 @@ static void carry_served(const GfxShader *s) {
 }
 
 static void zpass_kick(void);
+static void pool_short_note(const GfxShader *s);
 
 // Inserts s, or frees it and returns the entry another thread inserted first.
 static GfxShader *mem_insert(GfxShader *s) {
@@ -761,7 +762,7 @@ static GfxShader *mem_insert(GfxShader *s) {
     plat_mutex_unlock(&cache_lock);
     if (added && s->carried) carry_served(s);
     else if (added) ids_note();
-    if (added) zpass_kick();
+    if (added) pool_short_note(s), zpass_kick();
     return s;
 }
 
@@ -1991,6 +1992,20 @@ static int pool_short(const GfxShader *s) {
         if (s->res[GFX_RES_TEX][k].pool == 1 && s->res[GFX_RES_TEX][k].count == POOL_TEX_SHORT) return 1;
     return 0;
 }
+
+// Shaders that entered the memory cache with a texture pool array of the earlier length (mem_insert). carry_usable
+// keeps the carried ones out, so these come from a translator in use that is older than the runtime's pool (a dev
+// build pointed at an old one, or an install whose translator was not rebuilt). Counted, the first logged;
+// vk_texture.c vk_texture_register names the count when the game registers a texture they cannot reach.
+static volatile int32_t n_pool_short;
+static void pool_short_note(const GfxShader *s) {
+    if (!pool_short(s) || plat_inc32(&n_pool_short) != 1) return;
+    rt_log("gfx_shader: a shader of the translator in use indexes the texture pool with %d entries: it reads slot %d "
+           "for every texture numbered from %d up; the translator is older than this runtime (tools/build_xlate.py "
+           "builds the current one)", POOL_TEX_SHORT, POOL_TEX_SHORT - 1, POOL_TEX_SHORT);
+}
+
+uint32_t gfx_shader_pool_short_seen(void) { return (uint32_t)__atomic_load_n(&n_pool_short, __ATOMIC_RELAXED); }
 
 // Whether previous identity j's translation s may serve. One that indexes the texture pool with the earlier length is
 // not used: the lookup goes on to the next previous identity and then to a translation under the current one (the boot
