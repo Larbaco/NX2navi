@@ -3,7 +3,9 @@ for what it links with. The values stay as written; what is checked is what the 
 
 - values outside their rows' sets (cfg.c check_value): a 0|1 switch with another value, a number outside its range, a
   word that is none of the menu's choices, and a ';' or '#' comment kept in a value, each named with its line; none
-  for a file whose values fit, nor for a list with numbers in it (the menu's presets); at most 16 lines, then a count.
+  for a file whose values fit, nor for a list with numbers in it (the menu's presets); at most 16 lines, then a count;
+- a full settings table (cfg.c CFG_MAX_KEYS): one line at load naming the first key not read, one at the first menu
+  change not kept.
 
 No game files.
 
@@ -118,6 +120,15 @@ def main():
     listed = sum(1 for l in out.splitlines() if l.startswith('log: cfg: nx2navi.ini line') and "= '7'" in l)
     check(rc == 0 and listed == 16 and 'more values outside their settings' in out,
           f'20 values outside their sets: {listed} lines and a count', out)
+    # more keys than the table holds: one line at load, one for the menu's changes
+    full = ''.join(f'cheat_{0x1000 + i:08x} = 1\n' for i in range(600)) + 'low_latency = 1\n'
+    rc, out = run(exe, env, 'full', full, work)
+    load_lines = [l for l in out.splitlines() if 'has more than 512 keys' in l]
+    set_lines = [l for l in out.splitlines() if 'settings table is full' in l]
+    check(rc == 0 and len(load_lines) == 1 and 'line 513 (CHEAT_' in load_lines[0] and 'got: low_latency (unset)' in out,
+          'a file with 601 keys: one line at load from line 513 on', out)
+    check(rc == 0 and len(set_lines) == 1 and 'VK_PRESENT is not kept' in set_lines[0],
+          'two menu changes past a full table: one line', out)
     print(f'cfg_parse_check: {"FAILED" if bad else "ok"}')
     return 1 if bad else 0
 

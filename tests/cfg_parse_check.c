@@ -2,6 +2,7 @@
 // run by tests/cfg_parse_check.py: `cfg_parse_check <case> <ini>` loads the file the script wrote and prints every line
 // cfg.c logged ("log: ...") and what the case reads back ("got: ...").
 //   load     cfg_load on the file; then cfg_init's check of the environment (the variables the script set)
+//   full     cfg_load on the file, then two cfg_set of keys the file does not have
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -68,6 +69,15 @@ int main(int argc, char **argv) {
         printf("got: pace_smooth '%s'\n", cfg_get("NX2NAVI_PACE_SMOOTH") ? cfg_get("NX2NAVI_PACE_SMOOTH") : "(unset)");
         printf("--- environment\n");
         cfg_init();   // finds no nx2navi.ini next to the stand-in exe; checks the environment's values
+        return 0;
+    }
+    if (!strcmp(argv[1], "full")) {
+        if (!cfg_load(ini)) return printf("cfg_load failed\n"), 2;
+        const char *ll = cfg_get("NX2NAVI_LOW_LATENCY");
+        printf("got: low_latency %s\n", ll ? ll : "(unset)");
+        cfg_set("NX2NAVI_VK_PRESENT", "fifo");
+        cfg_set("NX2NAVI_FULLSCREEN", "1");
+        printf("got: vk_present %s\n", cfg_get("NX2NAVI_VK_PRESENT") ? cfg_get("NX2NAVI_VK_PRESENT") : "(unset)");
         return 0;
     }
     return 2;

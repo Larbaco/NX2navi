@@ -497,10 +497,20 @@ const char *cfg_unknown_keys(int *count) {
     return unknown_keys;
 }
 
+// The table holds CFG_MAX_KEYS keys and keeps none past them: a file's later keys were not read, and a menu change was
+// lost, without a word (every cheat ever switched keeps a line, cheats.c cheats_set). A line says so once per load, and
+// once a run for the changes (cfg_set, cfg_reset, migrate).
+static int full_load_told, full_set_told;
+
+static void full_set(const char *key, const char *what) {
+    if (!full_set_told++) rt_log("cfg: the settings table is full (%d keys): %s %s", CFG_MAX_KEYS, key, what);
+}
+
 static void clear(void) {
     for (int i = 0; i < n_entries; i++) free(entries[i].key), free(entries[i].value);
     n_entries = 0;
     unknown_keys[0] = 0, n_unknown = unknown_cut = 0;
+    full_load_told = 0;
 }
 
 static char *trim(char *s) {
@@ -535,7 +545,12 @@ static void add(char *key, char *value, int line) {
             entry_line[i] = line;
             return;
         }
-    if (n_entries == CFG_MAX_KEYS) return;
+    if (n_entries == CFG_MAX_KEYS) {
+        if (!full_load_told++)
+            rt_log("cfg: nx2navi.ini has more than %d keys: line %d (%s) and the new keys after it are not read",
+                   CFG_MAX_KEYS, line, key);
+        return;
+    }
     entry_line[n_entries] = line;
     entries[n_entries++] = (CfgEntry){strdup(key), strdup(value), 0, 0};
 }
@@ -631,6 +646,8 @@ static void migrate(void) {
     layout->dirty = 1;
     if (!prompts && n_entries < CFG_MAX_KEYS)
         entry_line[n_entries] = 0, entries[n_entries++] = (CfgEntry){strdup("PROMPTS"), strdup("xbox"), 1, 0};
+    else if (!prompts)
+        full_set("PROMPTS", "= xbox is not kept");
     rt_log("cfg: nx2navi.ini pad_layout = xbox_prompts is read as pad_layout = nintendo and prompts = %s",
            prompts ? prompts->value : "xbox");
 }
@@ -848,6 +865,8 @@ void cfg_set(const char *name, const char *value) {
     } else if (n < CFG_MAX_KEYS) {
         entries[n] = (CfgEntry){strdup(key), strdup(value), 1, 0};
         __atomic_store_n(&n_entries, n + 1, __ATOMIC_RELEASE);
+    } else {
+        full_set(key, "is not kept");
     }
     __atomic_add_fetch(&version, 1, __ATOMIC_RELEASE);
     plat_mutex_unlock(&set_lock);
@@ -865,7 +884,10 @@ int cfg_reset(const char *const *keys, int n) {
         int i = 0;
         while (i < n_entries && strcmp(entries[i].key, name)) i++;
         if (i == n_entries) {   // no value in memory ("key =" in the file): the line still has to go
-            if (i == CFG_MAX_KEYS) continue;
+            if (i == CFG_MAX_KEYS) {
+                full_set(name, "keeps its line in the file");
+                continue;
+            }
             entries[i] = (CfgEntry){strdup(name), NULL, 0, 1};
             __atomic_store_n(&n_entries, i + 1, __ATOMIC_RELEASE);
         } else if (entries[i].value) {
