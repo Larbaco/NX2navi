@@ -1441,6 +1441,10 @@ void plat_exit_note_setup(PlatAppend *log, void (*queued)(const char **p, size_t
     en_log = log;
 }
 
+// Each module's size comes from its own image header and its name from GetModuleFileNameA. GetModuleInformation and
+// GetModuleBaseNameA each walk the whole module list through ReadProcessMemory, so a note took about 27 ms with 290
+// modules, on the window thread at every focus loss; this takes about 0.3 ms. The header is read through
+// ReadProcessMemory too, which fails for a module unloaded since EnumProcessModules where a plain read would fault.
 void plat_exit_note_modules(void) {
     HMODULE m[EN_MODS];
     DWORD need = 0;
@@ -1449,11 +1453,25 @@ void plat_exit_note_modules(void) {
     plat_mutex_lock(&en_lock);
     int t = InterlockedCompareExchange(&en_cur, 0, 0) == 0 ? 1 : 0;   // the table the callback does not read
     for (int i = 0; i < n; i++) {
-        MODULEINFO mi;
-        if (!GetModuleInformation(GetCurrentProcess(), m[i], &mi, sizeof mi)) continue;
+        unsigned char hdr[1024];
+        SIZE_T got = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), m[i], hdr, sizeof hdr, &got) || got != sizeof hdr) continue;
+        const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)hdr;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 ||
+            (size_t)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS) > sizeof hdr)
+            continue;
+        const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)(hdr + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) continue;
+        char path[MAX_PATH];
+        DWORD len = GetModuleFileNameA(m[i], path, sizeof path);
+        if (len >= sizeof path) len = sizeof path - 1;
+        path[len] = 0;
+        const char *name = path;
+        for (DWORD j = 0; j < len; j++)
+            if (path[j] == '\\' || path[j] == '/') name = path + j + 1;
         EnMod *e = &en_mods[t][k++];
-        e->base = (uintptr_t)mi.lpBaseOfDll, e->size = mi.SizeOfImage;
-        if (!GetModuleBaseNameA(GetCurrentProcess(), m[i], e->name, sizeof e->name)) e->name[0] = 0;
+        e->base = (uintptr_t)m[i], e->size = nt->OptionalHeader.SizeOfImage;
+        snprintf(e->name, sizeof e->name, "%s", name);
     }
     en_n[t] = k;
     InterlockedExchange(&en_cur, t);
