@@ -1332,13 +1332,22 @@ static DWORD con_mode;
 static void (*con_close)(const char *what);
 static volatile LONG con_closing;
 
+// fs_host.c: a save Commit under way finishes first, 2 s at most and without a lock; builds without it have no saves
+__attribute__((weak)) void fs_save_crash_wait(void) {}
+
 // Runs on a thread the system starts for the event. A close returns only when on_close does, which it must not.
 static BOOL WINAPI con_ctrl(DWORD ev) {
     const char *what = ev == CTRL_CLOSE_EVENT ? "closed" : ev == CTRL_C_EVENT ? "Ctrl+C"
                      : ev == CTRL_BREAK_EVENT ? "Ctrl+Break" : NULL;
-    // log-off and shutdown reach a process with a window as WM_ENDSESSION (gfx_window_win.c), not here; a second event
-    // while on_close runs takes the default path, which ends the process at once
-    if (!what || !con_close || InterlockedExchange(&con_closing, 1)) return FALSE;
+    // log-off and shutdown reach a process with a window as WM_ENDSESSION (gfx_window_win.c), not here
+    if (!what || !con_close) return FALSE;
+    if (InterlockedExchange(&con_closing, 1)) {
+        // A second event while on_close runs: the player wants out now. Left to the default handler, its ExitProcess
+        // cut a save Commit in flight and ran every library's detach; the Commit finishes first, and the process ends
+        // with the code the default handler gives (STATUS_CONTROL_C_EXIT).
+        fs_save_crash_wait();
+        plat_exit((int)0xC000013Au);
+    }
     con_close(what);
     return TRUE;
 }
