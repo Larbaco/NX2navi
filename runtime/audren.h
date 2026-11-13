@@ -185,7 +185,11 @@ typedef struct AudioRenderer {
 void audren_manager_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs);
 long audren_renderers_live(void);      // renderers whose render tick runs
 
-// Mixer interface (audio_mixer.c). Every call but open/close/set_running runs with r->lock held.
+// Mixer interface (audio_mixer.c). Every call runs with r->lock held except open, close and set_running, and the
+// render thread's audio_mixer_pace_ns, audio_mixer_owed and audio_mixer_out_stats (audren.c render_thread and
+// stats_report call them without it). Those three touch only atomics and state that only the render thread changes:
+// device_check and channels_switch, which close and open the output stream, run on that thread too, and
+// audio_mixer_close runs after renderer_close has joined it.
 void audio_mixer_open(AudioRenderer *r);
 void audio_mixer_set_running(AudioRenderer *r, int running);
 void audio_mixer_close(AudioRenderer *r);
