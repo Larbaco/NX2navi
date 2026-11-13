@@ -84,6 +84,7 @@ static const char *const known[] = {
     "TEXUP_LOG_MS", "DYN_RES", "DYN_RES_TARGET", "DYN_RES_STEP", "TEXTURE_DETAIL", "VRAM_USE",   // vram_use: the removed Video memory use row, read by nothing
     "RECORDER_CORE", "RECORDER_PRIO", "REPLAY_TIME", "LOCK_TIME", "POOL_CREATE_BUDGET", "POOL_CREATE_MS", "POOL_FINI_IDLE", "POOL_LOAD_BACKLOG", "POOL_LOAD_MS",
     "VMA_BLOCK_MB", "SYNC_WAKE_ALL", "LOG_ASYNC", "DEVICE_LOST_AT", "STAGING_FAIL_AT", "VRAM_BALLAST_MB",
+    "COPY_RETIRE",
     "MEM_BUDGET_TEST_VRAM_MB", "MEM_BUDGET_TEST_RAM_MB",
     "TEX_COMPACT", "TEX_COMPACT_MIN_MB", "TEX_COMPACT_FRAME_MB",   // texture compaction (vk_texture.c); no menu row
     "STANDIN_FILTER",   // the filter of the scene upscaler's stand-in (vk_tonemap.c); no menu row
@@ -170,6 +171,7 @@ static const struct { const char *key, *section; } sections[] = {
     {"WAIT_WATCH_S", "diagnostics"},
     {"HANDLE_CENSUS", "diagnostics"},
     {"VMA_BLOCK_MB", "diagnostics"}, {"DEVICE_LOST_AT", "diagnostics"}, {"STAGING_FAIL_AT", "diagnostics"}, {"VRAM_BALLAST_MB", "diagnostics"},
+    {"COPY_RETIRE", "diagnostics"},
     {"MEM_BUDGET_TEST_VRAM_MB", "diagnostics"}, {"MEM_BUDGET_TEST_RAM_MB", "diagnostics"},
     {"TEX_COMPACT", "performance"}, {"TEX_COMPACT_MIN_MB", "performance"}, {"TEX_COMPACT_FRAME_MB", "performance"},
 };
@@ -441,6 +443,8 @@ static const CfgMeta metas[] = {
     {"MEM_BUDGET_TEST_VRAM_MB", "0", "0..1048576", RESTART},
     {"MEM_BUDGET_TEST_RAM_MB", "0", "0..1048576", RESTART},
     {"DEVICE_LOST_AT", "0", "0..1000000000", RESTART},   // vk_sync.c lost_at_due: a test of the lost device's end
+    // nvn_api_cmd.c retire_pass: counts the recording copies whose control memory the game reused; frees nothing
+    {"COPY_RETIRE", "0", "0|1", RESTART},
     {"INPUT_RECORD", "", NULL, RESTART},
 };
 

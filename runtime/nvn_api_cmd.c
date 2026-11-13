@@ -425,8 +425,10 @@ static uint64_t ncopies, copy_bytes, copies_made;
 // take at every EndRecording. A copy is retired only when the game adds its control memory again
 // (nvnCommandBufferAddControlMemory), and a session of 2026-11-13 grew from 9,138 live copies (0.7 MiB) to 223,753
 // (58.3 MiB) in 7 minutes of play, about 38,000 more at each return to an area: these figures tell copies the game
-// still submits from ones it left behind. Kept for COPY_AGE_MINS minutes of the run, a ring of counters by minute.
-#define COPY_AGE_MINS 1024
+// still submits from ones it left behind. A ring of counters by minute, COPY_AGE_MINS long (45 days, so it does not
+// wrap within a session: a copy last used that long before would share its slot with the minute now and count as
+// recent); only the minutes that have passed touch its pages.
+#define COPY_AGE_MINS 65536
 #define COPY_IDLE_MINS 5
 static volatile int64_t age_n[COPY_AGE_MINS], age_b[COPY_AGE_MINS];
 
@@ -548,6 +550,142 @@ static uint8_t *flatten_recording(const uint8_t *p, size_t n) {
     return out + sizeof(copy_prefix);
 }
 
+// ---------- recording copies whose control memory the game reused (NX2NAVI_COPY_RETIRE=1: a count, nothing freed)
+// The only event that retires a copy is AddControlMemory over its control memory again (release_copies), so a copy
+// whose control memory the game has since used for other data stays for good; a session of 2026-11-13 held 223,646
+// (56.3 MiB) by frame 39600. This counts those copies before anything retires them. Our driver never writes control
+// memory (cmd_t.ctl is accounting only), so the 16 bytes at a copy's control position are whatever the game left
+// there, and a fingerprint of them that no longer matches says the game wrote there since. A reuse that writes the
+// same bytes (zeros, often) is not seen: the counts are a lower bound.
+// The "nvn copy sweep" thread does every read of guest memory, at its lowest priority: a recording thread taking the
+// fingerprint at EndRecording could fault into the lazy heap (an untouched control block) and wait there. Every
+// RETIRE_PERIOD_MS it fingerprints the copies made since its last pass (a queue copy_add fills, under retire_lock),
+// then visits up to RETIRE_BATCH of the copies it knows, from a cursor, and counts those no submission used for
+// COPY_IDLE_MINS whose bytes changed or whose memory is gone. It takes copy_lock shared only, RETIRE_CHUNK lookups at a
+// time; a copy that is no longer live (retired, or its handle reused: made_at and bytes differ) leaves its records.
+#define RETIRE_PERIOD_MS 5000
+#define RETIRE_BATCH 4096
+#define RETIRE_CHUNK 64
+#define FP_UNKNOWN 0ull   // not read: a lazily armed range, which a read would fetch from the GPU
+#define FP_GONE 2ull      // not mapped; every fingerprint of bytes is odd
+enum { RS_NONE, RS_CHANGED, RS_GONE };   // what a record counts in: nothing, changed, gone
+typedef struct { uint64_t handle, lo, made_at, bytes; } retire_new;
+typedef struct { uint64_t handle, lo, made_at, bytes, fp; int state; } retire_rec;
+static PlatMutex retire_lock = PLAT_MUTEX_INIT;   // the queue; never held with copy_lock
+static retire_new *retire_q;
+static uint32_t retire_qn, retire_qcap;
+static retire_rec *retire_recs;                   // the sweep thread's own
+static uint32_t retire_nrec, retire_cap, retire_cursor;
+static volatile int64_t retire_changed_n, retire_changed_b, retire_gone_n, retire_gone_b;
+
+// 16 bytes of guest memory at lo as a fingerprint: odd, FP_GONE or FP_UNKNOWN. An untouched page of the lazy heap reads
+// as zeros, so it is taken as zeros without the read that would commit it.
+static uint64_t ctl_fingerprint(uint64_t lo) {
+    uint8_t b[16];
+    if (mem_lazy_touches(lo, sizeof b)) return FP_UNKNOWN;
+    if (mem_untouched_run(lo, lo + sizeof b) >= lo + sizeof b) {
+        memset(b, 0, sizeof b);
+    } else {
+        if (!mem_read_hold(lo, sizeof b)) return FP_GONE;
+        memcpy(b, (const void *)(uintptr_t)lo, sizeof b);
+        mem_read_release();
+    }
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (size_t i = 0; i < sizeof b; i++) h = (h ^ b[i]) * 0x100000001b3ull;
+    return h | 1;
+}
+
+static void retire_count(int state, uint64_t bytes, int64_t sign) {
+    if (state == RS_CHANGED) plat_add64(&retire_changed_n, sign), plat_add64(&retire_changed_b, sign * (int64_t)bytes);
+    if (state == RS_GONE) plat_add64(&retire_gone_n, sign), plat_add64(&retire_gone_b, sign * (int64_t)bytes);
+}
+
+// One visit (sweep thread): live, used_min and bytes as copy_lock showed them; min the minute now.
+static void retire_visit(retire_rec *r, int live, uint64_t used_min, uint64_t min) {
+    int state = RS_NONE;
+    if (live && r->fp != FP_UNKNOWN && r->fp != FP_GONE && min >= used_min + COPY_IDLE_MINS) {
+        uint64_t now = ctl_fingerprint(r->lo);
+        state = now == FP_UNKNOWN ? r->state : now == FP_GONE ? RS_GONE : now != r->fp ? RS_CHANGED : RS_NONE;
+    }
+    if (state != r->state) retire_count(r->state, r->bytes, -1), retire_count(state, r->bytes, 1), r->state = state;
+}
+
+// NX2NAVI_COPY_RETIRE, read at the first copy.
+static int retire_on(void) {
+    static volatile int32_t mode = -1;
+    int32_t m = __atomic_load_n(&mode, __ATOMIC_RELAXED);
+    if (m < 0) __atomic_store_n(&mode, m = cfg_int("NX2NAVI_COPY_RETIRE"), __ATOMIC_RELAXED);
+    return m > 0;
+}
+
+// Called by copy_add once the copy is live, copy_lock no longer held. A failed allocation leaves the copy uncounted.
+static void retire_queue(uint64_t handle, uint64_t lo, uint64_t made_at, uint64_t bytes) {
+    plat_mutex_lock(&retire_lock);
+    if (retire_qn == retire_qcap) {
+        uint32_t cap = retire_qcap ? retire_qcap * 2 : 1024;
+        retire_new *q = realloc(retire_q, cap * sizeof *q);
+        if (q) retire_q = q, retire_qcap = cap;
+    }
+    if (retire_qn < retire_qcap) retire_q[retire_qn++] = (retire_new){handle, lo, made_at, bytes};
+    plat_mutex_unlock(&retire_lock);
+}
+
+// One pass of the sweep thread: the new copies' fingerprints, then up to RETIRE_BATCH visits from the cursor.
+static void retire_pass(void) {
+    plat_mutex_lock(&retire_lock);
+    retire_new *q = retire_q;
+    uint32_t qn = retire_qn;
+    retire_q = NULL, retire_qn = retire_qcap = 0;
+    plat_mutex_unlock(&retire_lock);
+    for (uint32_t i = 0; i < qn; i++) {
+        if (retire_nrec == retire_cap) {
+            uint32_t cap = retire_cap ? retire_cap * 2 : 1024;
+            retire_rec *v = realloc(retire_recs, cap * sizeof *v);
+            if (!v) break;   // the rest go uncounted
+            retire_recs = v, retire_cap = cap;
+        }
+        retire_recs[retire_nrec++] =
+            (retire_rec){q[i].handle, q[i].lo, q[i].made_at, q[i].bytes, ctl_fingerprint(q[i].lo), RS_NONE};
+    }
+    free(q);
+    uint64_t min = copy_minute();
+    uint32_t todo = retire_nrec < RETIRE_BATCH ? retire_nrec : RETIRE_BATCH;
+    while (todo && retire_nrec) {
+        if (retire_cursor >= retire_nrec) retire_cursor = 0;
+        uint32_t c = retire_cursor, n = retire_nrec - c;
+        if (n > todo) n = todo;
+        if (n > RETIRE_CHUNK) n = RETIRE_CHUNK;
+        int live[RETIRE_CHUNK];
+        uint64_t used[RETIRE_CHUNK];
+        plat_mutex_lock_shared(&copy_lock);
+        for (uint32_t k = 0; k < n; k++) {
+            const retire_rec *r = &retire_recs[c + k];
+            const copy_prefix *pf = copy_find(r->handle);
+            live[k] = pf && pf->made_at == r->made_at && pf->bytes == r->bytes;
+            used[k] = live[k] ? __atomic_load_n(&pf->used_min, __ATOMIC_RELAXED) : 0;
+        }
+        plat_mutex_unlock_shared(&copy_lock);
+        // From the chunk's last record down: a removal moves the last record into the freed place, which then holds a
+        // record this chunk has visited or one from past it (visited at the next pass).
+        for (uint32_t k = n; k-- > 0;) {
+            retire_rec *r = &retire_recs[c + k];
+            retire_visit(r, live[k], used[k], min);
+            if (!live[k]) *r = retire_recs[--retire_nrec];
+        }
+        retire_cursor = c + n;
+        todo -= n;
+    }
+}
+
+static void retire_main(void *arg) {
+    (void)arg;
+    plat_thread_priority(PLAT_PRIO_LOWEST);
+    for (;;) {
+        plat_sleep_ms(RETIRE_PERIOD_MS);
+        retire_pass();
+    }
+}
+
 static void copy_add(uintptr_t lo, uintptr_t hi, uint8_t *copy) {
     copy_prefix *pf = (copy_prefix *)copy - 1;
     uint64_t handle = (uintptr_t)copy;
@@ -574,7 +712,16 @@ static void copy_add(uintptr_t lo, uintptr_t hi, uint8_t *copy) {
     if (++copies_made % 20000 == 0)
         NVN_LOG("recording copies: %llu made, %llu live, %.1f MiB, submit %llu", (unsigned long long)copies_made,
                 (unsigned long long)ncopies, copy_bytes / 1048576.0, (unsigned long long)nsubmits);
+    uint64_t made_at = pf->made_at, bytes = pf->bytes;
     plat_mutex_unlock(&copy_lock);
+    if (hi && retire_on()) {
+        static volatile int32_t started, failed;
+        if (!plat_xchg32(&started, 1) && !plat_thread_spawn(retire_main, NULL, "nvn copy sweep", 0)) {
+            plat_xchg32(&failed, 1);
+            rt_log("nvn: the copy sweep thread did not start: NX2NAVI_COPY_RETIRE counts nothing");
+        }
+        if (!__atomic_load_n(&failed, __ATOMIC_RELAXED)) retire_queue(handle, lo, made_at, bytes);
+    }
 }
 
 // Adding control memory again retires every recording copy made in it (the driver's handle lived there).
@@ -1383,6 +1530,18 @@ void nvn_cmd_sizes(PerfSizes *s) {
     perf_size(s, "recording copies", nc, 0, cb);
     perf_size(s, "of them unused for 5 minutes", idle_n, 0, idle_b);
     perf_size(s, "recording copy zombies", nz, 0, zb);
+    if (retire_on()) {
+        // NX2NAVI_COPY_RETIRE: of the copies unused for 5 minutes, those whose control memory the game has written
+        // since and those whose control memory is no longer mapped (retire_pass). A lower bound: a rewrite with the
+        // same bytes is not seen.
+        int64_t v[4] = {__atomic_load_n(&retire_changed_n, __ATOMIC_RELAXED),
+                        __atomic_load_n(&retire_changed_b, __ATOMIC_RELAXED),
+                        __atomic_load_n(&retire_gone_n, __ATOMIC_RELAXED),
+                        __atomic_load_n(&retire_gone_b, __ATOMIC_RELAXED)};
+        for (int i = 0; i < 4; i++) v[i] = v[i] > 0 ? v[i] : 0;
+        perf_size(s, "of those idle, control memory changed", (uint64_t)v[0], 0, (uint64_t)v[1]);
+        perf_size(s, "control memory gone", (uint64_t)v[2], 0, (uint64_t)v[3]);
+    }
     perf_size(s, "texture pins", pins, 0, PERF_SIZE_NONE);
     perf_size(s, "pin sweep queue", pq, 0, PERF_SIZE_NONE);
     perf_size(s, "recording-buffer pool", np, POOL_SLOTS, pb);
