@@ -516,6 +516,7 @@ static uint64_t summary_t0;   // start of the current period (0: not started)
 #define LT_N 512
 static struct { void *site; uint64_t ns, n, max, ns0, n0; } lt[LT_N];
 static struct { void *site; uint64_t ns, n, max, ns0, n0; } lh[LT_N];   // texture lock holds over 1 ms (perf_lock_hold)
+static struct { void *site; uint64_t ns, n, max, ns0, n0; } lq[LT_N];   // queue lock holds of 5 ms or more (perf_qlock_hold)
 static uint64_t lt_lost_ns, lt_rec0[2];
 static volatile int64_t fr_hold_ns;   // the texture lock's holds over 1 ms since the last present (ft_frame)
 void (*perf_rec_waits)(uint64_t *full_ns, uint64_t *drain_ns);
@@ -541,6 +542,7 @@ void perf_lock_hold(void *site, uint64_t ns) {
     lt_add((typeof(lt[0]) *)lh, site, ns);
     plat_add64(&fr_hold_ns, (int64_t)ns);
 }
+void perf_qlock_hold(void *site, uint64_t ns) { lt_add((typeof(lt[0]) *)lq, site, ns); }
 
 static int lt_on = -1;
 int perf_lock_holds_on(void) {
@@ -582,7 +584,8 @@ static uint64_t lt_top(typeof(lt[0]) *tab, char *line, int *n, size_t cap, uint6
     return all;
 }
 
-// The lock lines of a summary: the replay threads' waits with the recorder's, then the texture lock's long holds.
+// The lock lines of a summary: the replay threads' waits with the recorder's, then the texture lock's and the queue
+// lock's long holds.
 static void lt_report(void) {
     uint64_t rec[2] = {0, 0}, waits, holds;
     if (perf_rec_waits) perf_rec_waits(&rec[0], &rec[1]);
@@ -596,6 +599,11 @@ static void lt_report(void) {
     n = 0, top[0] = 0;
     all = lt_top((typeof(lt[0]) *)lh, top, &n, sizeof top, &holds);
     snprintf(line, sizeof line, "frametime:   texture lock held over 1 ms: %.0f ms (%llu holds):%s", all / 1e6,
+             (unsigned long long)holds, top);
+    rt_log("%s", line);
+    n = 0, top[0] = 0;
+    all = lt_top((typeof(lt[0]) *)lq, top, &n, sizeof top, &holds);
+    snprintf(line, sizeof line, "frametime:   queue lock held 5 ms or more: %.0f ms (%llu holds):%s", all / 1e6,
              (unsigned long long)holds, top);
     rt_log("%s", line);
     lt_rec0[0] = rec[0], lt_rec0[1] = rec[1], lt_lost_ns = 0;

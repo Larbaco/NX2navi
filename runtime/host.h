@@ -102,6 +102,7 @@ void perf_replay_cpu(uint64_t ns);   // the replaying thread's CPU time over one
 void perf_lock_timing_here(void);
 int perf_lock_holds_on(void);                   // NX2NAVI_LOCK_TIME
 void perf_lock_hold(void *site, uint64_t ns);   // a lock held ns from site (vk_texture.c, holds over 1 ms)   // NX2NAVI_LOCK_TIME: this thread's lock waits go into the frame-time summary
+void perf_qlock_hold(void *site, uint64_t ns);  // the queue lock held ns from site (gfx_present.c, 5 ms or more)
 extern void (*perf_rec_waits)(uint64_t *full_ns, uint64_t *drain_ns);   // set by the back end (vk_rec.c totals)
 void perf_present(uint64_t frame);
 void perf_cpu_start(void);   // the process's logical processors (NX2NAVI_CACHE_DIE, NX2NAVI_ONE_PER_CORE), at start

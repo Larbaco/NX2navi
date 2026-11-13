@@ -42,14 +42,42 @@
 // ---- queue lock
 // Taking it hands the replay's held submissions to the queue first (vk_sync.c, submit batching), so whatever the
 // holder submits or waits for comes after them in queue order.
+// NX2NAVI_LOCK_TIME also names who holds it: a hold of QL_HOLD_NS or more goes into the frame-time summary under the
+// site that took the lock (perf.c perf_qlock_hold), beside the waits for it. A present had waited 48 ms for the lock
+// with no holder named anywhere. The taking functions are not inlined, so that their return address is the caller's
+// site, which is also the site the waits are reported under (plat_rmutex_lock_at). ql_site and ql_t0 are written by
+// the holder only, at the outermost take and release.
+#define QL_HOLD_NS 5000000ull
 static PlatRMutex g_ql;
-void vk_queue_lock(void) {
-    plat_rmutex_lock(&g_ql);
+static void *ql_site;
+static uint64_t ql_t0;
+static void ql_taken(void *site) {
+    if (g_ql.depth == 1 && perf_lock_holds_on()) ql_t0 = plat_now_ns(), ql_site = site;
+}
+__attribute__((noinline)) void vk_queue_lock(void) {
+    void *site = __builtin_return_address(0);
+    plat_rmutex_lock_at(&g_ql, site);
+    ql_taken(site);
     vk_sync_flush_held();
 }
-void vk_queue_lock_raw(void) { plat_rmutex_lock(&g_ql); }
-int vk_queue_trylock_raw(void) { return plat_rmutex_trylock(&g_ql); }
-void vk_queue_unlock(void) { plat_rmutex_unlock(&g_ql); }
+__attribute__((noinline)) void vk_queue_lock_raw(void) {
+    void *site = __builtin_return_address(0);
+    plat_rmutex_lock_at(&g_ql, site);
+    ql_taken(site);
+}
+__attribute__((noinline)) int vk_queue_trylock_raw(void) {
+    if (!plat_rmutex_trylock(&g_ql)) return 0;
+    ql_taken(__builtin_return_address(0));
+    return 1;
+}
+void vk_queue_unlock(void) {
+    if (g_ql.depth == 1 && ql_t0) {
+        uint64_t d = plat_now_ns() - ql_t0;
+        ql_t0 = 0;
+        if (d >= QL_HOLD_NS) perf_qlock_hold(ql_site, d);
+    }
+    plat_rmutex_unlock(&g_ql);
+}
 
 // ---- window state shared with the back end
 static VkSurfaceKHR g_surface;
@@ -448,8 +476,13 @@ static int create_swapchain(void) {
     if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
     if (count > most) count = most;
 
+    // A rebuild holds the queue lock across the device's idle wait and the create, and every submission waits behind
+    // it: the made swapchain's line says how long (the first 16 and each doubling of the count).
+    const uint64_t t_ask = plat_now_ns();
     vk_queue_lock();
+    const uint64_t t_held = plat_now_ns();
     vkDeviceWaitIdle(c->device);
+    const uint64_t t_idle = plat_now_ns();
     vk_lowlat_swapchain(VK_NULL_HANDLE, 0);   // NVIDIA's low-latency calls name the swapchain: none while it is replaced
     VkSwapchainKHR old = g_sc;
     VkSwapchainCreateInfoKHR ci = {
@@ -555,6 +588,15 @@ static int create_swapchain(void) {
         if (vkCreateImageView(c->device, &vi, NULL, &g_sc_view[i]) != VK_SUCCESS) g_sc_view[i] = VK_NULL_HANDLE;
     }
     free_capture();
+    {
+        static uint32_t n_made;
+        const uint64_t t_end = plat_now_ns();
+        if (++n_made <= 16 || !(n_made & (n_made - 1)))
+            rt_log("gfx: swapchain %ux%u made in %.1f ms: %.1f ms waiting for the queue lock, then the lock held "
+                   "%.1f ms (%.1f ms of it waiting for the device to idle); %u made so far", ext.width, ext.height,
+                   (t_end - t_ask) / 1e6, (t_held - t_ask) / 1e6, (t_end - t_held) / 1e6, (t_idle - t_held) / 1e6,
+                   n_made);
+    }
     vk_queue_unlock();
     return 1;
 }
