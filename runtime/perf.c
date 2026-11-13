@@ -100,9 +100,9 @@ void perf_end(int kind, uint64_t t0) {
 }
 
 // The waits of other threads that hold the frame all the same: a game may acquire its window image on a thread other
-// than the one that presents (vk_lowlat.c's comments note it), and perf_end leaves those waits out, so the pacer's
-// wait in the acquire showed nowhere. Added to frame_ns and wait_ns by the present (perf_present) before the frame's
-// parts are read.
+// than the one that presents (vk_lowlat.c vk_lowlat_pace's comment notes it), and perf_end leaves those waits out, so
+// the pacer's wait in the acquire showed nowhere. Added to frame_ns and wait_ns by the present (perf_present) before
+// the frame's parts are read.
 static volatile int64_t any_ns[PERF_N];
 
 void perf_end_any(int kind, uint64_t t0) {
@@ -1057,7 +1057,7 @@ static void reserve_sweep(uint64_t frame) {
 }
 
 void perf_present(uint64_t frame) {
-    static uint64_t last, sum, max, n, win_start, ab_b;
+    static uint64_t last, sum, max, n, win_start, ab_b, pace_any;   // pace_any: other threads' pacing in the window
     crash_filter_guard(frame);
     static int64_t win_prev[PERF_CNT_N];
     prof_render_tid = plat_thread_id();
@@ -1066,7 +1066,10 @@ void perf_present(uint64_t frame) {
     prof_sampler_frame(frame, now, last ? d : 0);
     for (int k = 0; k < PERF_N; k++) {   // other threads' waits for this frame (perf_end_any), before its parts are read
         int64_t a = __atomic_load_n(&any_ns[k], __ATOMIC_RELAXED) ? plat_xchg64(&any_ns[k], 0) : 0;
-        if (a > 0) __atomic_fetch_add(&frame_ns[k], (uint64_t)a, __ATOMIC_RELAXED), __atomic_fetch_add(&wait_ns[k], (uint64_t)a, __ATOMIC_RELAXED);
+        if (a <= 0) continue;
+        __atomic_fetch_add(&frame_ns[k], (uint64_t)a, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&wait_ns[k], (uint64_t)a, __ATOMIC_RELAXED);
+        if (k == PERF_PACE) pace_any += (uint64_t)a;
     }
     uint64_t rep = ft_frame(frame, now, d);   // d is 0 on the first present: it only starts the period
     if (__atomic_load_n(&session_due, __ATOMIC_RELAXED) && plat_xchg32(&session_due, 0)) session_report(now);
@@ -1136,6 +1139,11 @@ void perf_present(uint64_t frame) {
     gfx_shader_disk_counts(&disk[0], &disk[1], &disk[2]);
     uint64_t dwin[3];
     for (int i = 0; i < 3; i++) dwin[i] = disk[i] - disk_prev[i], disk_prev[i] = disk[i];
+    // The pacing share counts other threads' pacing too (perf_end_any: the acquire's wait of a game that acquires its
+    // window images on a thread other than the presenting one, which the one-time "nvn: the game acquires" line of
+    // nvn_api_obj.c nvnWindowAcquireTexture names). That wait can overlap the render thread's own work, so for such a
+    // game the shares can add up to more than 100%. "render busy" takes out only the render thread's own pacing.
+    uint64_t pace_own = wait_ns[PERF_PACE] > pace_any ? wait_ns[PERF_PACE] - pace_any : 0;
     if (n && span)
         rt_log("perf: frame %llu: interval avg %.2f ms max %.2f ms (%.1f fps); render thread blocked: pacing %.0f%% fence %.0f%% drain %.0f%% handoff %.0f%% pipeline build %.0f%% shader xlate %.0f%% texture %.0f%% (astc %.0f%%); pipelines built in background %lld, draws skipped pending %lld, waited %lld, waiting for a shader %lld, one-shot waited %lld; textures uploaded %lld re-uploaded %lld; slowest frame: xlate %.1f ms texture %.1f ms (astc %.1f) pipeline %.1f ms fence %.1f ms; shaders: %llu keys, %llu translated; render busy avg %.2f ms; replay avg %.2f ms; ab %llu/%llu; world %.1f s; shader disk reads: %llu on the render thread (%.1f ms), %llu by the loaders",
                (unsigned long long)frame, sum / 1e6 / n, max / 1e6, n * 1e9 / sum, 100.0 * wait_ns[PERF_PACE] / span,
@@ -1145,14 +1153,14 @@ void perf_present(uint64_t frame) {
                (long long)up, (long long)reup, worst_ns[PERF_XLATE] / 1e6, worst_ns[PERF_TEX] / 1e6,
                worst_ns[PERF_ASTC] / 1e6, worst_ns[PERF_PIPE] / 1e6, worst_ns[PERF_FENCE] / 1e6,
                (unsigned long long)shader_keys, (unsigned long long)shader_xlated,
-               (span > wait_ns[PERF_PACE] ? span - wait_ns[PERF_PACE] : 0) / 1e6 / n,
+               (span > pace_own ? span - pace_own : 0) / 1e6 / n,
                plat_xchg64(&replay_ns, 0) / 1e6 / n, (unsigned long long)ab_b, (unsigned long long)n, frame_step_world_us() / 1e6,
                (unsigned long long)dwin[0], dwin[1] / 1e6, (unsigned long long)dwin[2]);
     if (n && span) perf_gpu_line(frame, sum / 1e6 / n, (double)wait_ns[PERF_PACE] / span, n);
     char marks[700];
     if (mark_text(&mk_win, marks, 0, sizeof marks) > 0) rt_log("perf: frame %llu: work in the window%s", (unsigned long long)frame, marks);
     memset(&mk_win, 0, sizeof mk_win);
-    sum = max = n = ab_b = 0;
+    sum = max = n = ab_b = pace_any = 0;
     memset(wait_ns, 0, sizeof wait_ns);
     win_start = now;
     if (frame % 600 == 0) {   // beside vk_memory.c's 600-frame memory lines, and like them the next frame's "report"
