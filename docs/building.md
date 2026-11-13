@@ -444,6 +444,9 @@ Before a commit:
 - `python tools/check_content.py --staged`: nothing game-derived and no compiled shader is staged. CI runs the same check;
   `git config core.hooksPath .githooks` runs it before each local commit.
 - `build\<ver>\nx2navi.exe --selftest`: layout, dispatch table and host-function registry, without game files.
+- `python tools\check_platform.py` after a runtime change outside `runtime/platform/`: no shared file uses Win32 outside
+  a branch that only a Windows build compiles (`#ifdef _WIN32`, the `#else` of `#ifndef _WIN32`).
+  `python tests\check_platform_test.py` checks the scanner itself on made-up files.
 
 A change to the in-game menu's look (`runtime/ui/menu_skin.cpp`, `option_rows.cpp`, `perf_panel.cpp`) can be looked at
 without game files: `python tools/menu_preview.py` builds the menu's own drawing code with the host's clang++ and
