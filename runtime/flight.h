@@ -1,5 +1,6 @@
 // NX2NAVI_FLIGHT=1 flight recorder (flight.c): the last frames' timing and event counts plus a thumbnail each, written to
-// disk with a bug capture (F8, bugcap.c) or after a slow frame, so a glitch or stutter seen in play can be read after the fact.
+// disk with a bug capture (F8, bugcap.c), after a slow frame or after a one-frame flash, so a glitch or stutter seen
+// in play can be read after the fact.
 #pragma once
 #include <stdint.h>
 
@@ -10,6 +11,9 @@ extern int flight_on;
 extern int vk_dump_white;   // vk_dump.c, NX2NAVI_DUMP_WHITE   // NX2NAVI_FLIGHT=1, set once by flight_init before the first present
 
 void flight_init(void);   // prof_start calls it
+// Its memory in bytes, for the memory report (vk_memory.c system_log): the records and texture events in process memory,
+// and the thumbnail ring in host-visible memory. 0 while it is off.
+void flight_mem(uint64_t *records, uint64_t *thumbs);
 // perf_present, once per present on the render thread: the interval since the previous present, the render thread's
 // blocked time per PERF_* kind in this frame, and the running PERF_CNT_* totals.
 void flight_frame(uint64_t frame, uint64_t now_ns, uint64_t interval_ns, const uint64_t blocked_ns[],
@@ -57,3 +61,9 @@ void vk_thumbs_frame(uint64_t frame);    // the present thread names the frame o
 // Copies frame's thumbnail as RGBA when the ring still holds it complete; 0 when it was never written, is still in
 // flight or was overwritten. Takes the present lock for one slot copy (about 20 us); any thread.
 int vk_thumbs_read(uint64_t frame, uint8_t *rgba);
+
+// The flash trigger (flight_flash.h): while flight_flash_on (set once by flight_init), gfx_present.c hands in the cell
+// means (flash_cells, FLASH_CELLS bytes) of each thumbnail when it completes, on the present thread, in frame order.
+// flight_cells judges the frame before and leaves a flash for flight_frame to dump.
+extern int flight_flash_on;
+void flight_cells(uint64_t frame, const uint8_t *cells);

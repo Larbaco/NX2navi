@@ -534,14 +534,13 @@ static uint64_t shader_hash(const GfxShader *s) {
     if (!s) return 0;
     for (int i = 0; i < n; i++)
         if (tab[i].s == s) return tab[i].h;
-    uint64_t words = 0, h = 0xcbf29ce484222325ull;
-    const uint32_t *w = gfx_shader_spirv(s, &words);
-    const uint8_t *b = (const uint8_t *)w;
-    for (uint64_t i = 0; i < words * 4; i++) h = (h ^ b[i]) * 0x100000001b3ull;
+    uint64_t words = 0, h = gfx_shader_spirv_fnv(s);
+    const uint32_t *w = gfx_shader_spirv_pin(s, &words);
     char path[600];
     snprintf(path, sizeof path, "%s/sh_%016llx.spv", dir, (unsigned long long)h);
     FILE *f = fopen(path, "wb");
     if (f) fwrite(w, 4, (size_t)words, f), fclose(f);
+    gfx_shader_spirv_unpin(s);
     snprintf(path, sizeof path, "%s/sh_%016llx.code", dir, (unsigned long long)h);   // the guest program it came from
     gfx_shader_write_code(s, path);
     if (n < 1024) tab[n].s = s, tab[n].h = h, n++;

@@ -13,6 +13,7 @@
 #include "nvn_api.h"
 #include "perfmon.h"
 #include "prof.h"
+#include "stutter_map.h"
 #include "platform/platform.h"
 
 volatile uint32_t prof_render_tid, prof_main_tid, prof_replay_tid;
@@ -54,6 +55,7 @@ uint64_t perf_gpu_busy_total(void) { return (uint64_t)__atomic_load_n(&gpu_busy_
 
 void prof_start(void) {
     flight_init();
+    stutter_map_init();
     atexit(perf_summary_flush);   // boot.c's _exit path goes through prof_write instead
     perf_base = (rt_trace & RT_TRACE_PERF) || flight_on;
     perf_on = perf_base || overlay == 2;
@@ -260,6 +262,7 @@ void perf_segment(const char *name) {
 }
 
 void perf_scene(const char *name) {
+    stutter_area(name);
     if (!(rt_trace & RT_TRACE_PERF)) return;
     char wb[24];
     rt_log("scene: %s loads (frame %llu, world %s s)", name,
@@ -582,6 +585,7 @@ void perf_summary_flush(void) {   // at exit (prof_write)
     if (rt_trace & RT_TRACE_PERF) seg_close(__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), kern_now_ns(), 1);
     if (summary_t0) {
         ft_report(kern_now_ns(), "exit");
+        stutter_report("exit");
         gfx_exit_log();
     }
     summary_t0 = 0;
@@ -609,8 +613,11 @@ static uint64_t ft_frame(uint64_t frame, uint64_t now, uint64_t d) {
     if (d > 25000000ull) ft.over25++;
     if (d > 50000000ull) ft.over50++;
     if (d > 100000000ull) ft.over100++;
-    if (d > 25000000ull) {   // which part it went to
-        uint64_t part[FT_C_N];
+    // which part it went to: for a frame over 25 ms, and for the stutter map's hitches, which are 12 ms at least
+    // (stutter_map.c)
+    uint64_t part[FT_C_N] = {0};
+    int best = FT_C_OTHER;
+    if (d > 25000000ull || (stutter_map_on && d >= 12000000ull)) {
         part[FT_C_PIPE] = frame_ns[PERF_PIPE];
         part[FT_C_XLATE] = frame_ns[PERF_XLATE];
         part[FT_C_TEX] = frame_ns[PERF_TEX];
@@ -622,10 +629,12 @@ static uint64_t ft_frame(uint64_t frame, uint64_t now, uint64_t d) {
         uint64_t known = 0;
         for (int c = 0; c < FT_C_OTHER; c++) known += part[c];
         part[FT_C_OTHER] = d > known ? d - known : 0;
-        int best = FT_C_OTHER;
         for (int c = 0; c < FT_C_N; c++)
             if (part[c] > part[best]) best = c;
         if (part[best] * 4 < d) best = FT_C_OTHER;   // no recorded part explains a quarter of the frame
+    }
+    stutter_frame(frame, now, d, part, ft_cause_name, FT_C_N, best);
+    if (d > 25000000ull) {
         ft.slow_n[best]++;
         ft.slow_ns[best] += d;
         if (best == FT_C_REPLAY) {

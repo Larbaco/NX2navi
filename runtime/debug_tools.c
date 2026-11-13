@@ -551,9 +551,10 @@ int dbg_texts(void (*cb)(uint32_t hash, const char *text, void *ctx), void *ctx)
 }
 uint32_t dbg_name_hash(const char *name) { return hash_of(name); }
 
-// A text written into the entry's own buffers (game thread). 0: the game has no such text.
+// The area the game is in: its text Sequence_CurrentBanc. 0 while the game has none.
 int dbg_area(char out[64]) { return dbg_supported() && text_get("Sequence_CurrentBanc", out) && out[0]; }
 
+// A text written into the entry's own buffers (game thread). 0: the game has no such text.
 static int text_set(const char *name, const char *value) {
     uint64_t e = gmd_entry(GD_TEXT64, 0x108, hash_of(name)), text = e ? rd_ptr(e + 0x68) : 0, other = e ? rd_ptr(e + 0x18) : 0;
     int32_t room = 0;
