@@ -28,12 +28,17 @@ enum { RT_TRACE_SVC = 1, RT_TRACE_HOSTCALL = 2, RT_TRACE_IPC = 4, RT_TRACE_FS = 
        RT_TRACE_SCHED = 64, RT_TRACE_AUDIO = 128, RT_TRACE_PRESENT = 256 };
 extern unsigned rt_trace;                       // from NX2NAVI_TRACE=svc,host,ipc,fs,gfx,perf,sched,audio,present (or all)
 // prof_win.c: NX2NAVI_PROFILE=<path> sampling profiler; NX2NAVI_TRACE=perf frame timing (waits of the render thread)
-// PERF_TEX: texture uploads on the render thread (deswizzle, decode, staging), PERF_ASTC included
-enum { PERF_PACE, PERF_FENCE, PERF_DRAIN, PERF_PIPE, PERF_XLATE, PERF_TEX, PERF_ASTC, PERF_N };
+// PERF_TEX: texture uploads on the render thread (deswizzle, decode, staging), PERF_ASTC included. PERF_HANDOFF: the
+// presenting thread's wait for the present thread to take the previous picture (vk_backend.c present_image), which is
+// where the present thread's own pacing and a slow present call (an overlay's frame limiter inside it) hold the game.
+enum { PERF_PACE, PERF_FENCE, PERF_DRAIN, PERF_PIPE, PERF_XLATE, PERF_TEX, PERF_ASTC, PERF_HANDOFF, PERF_N };
 void prof_start(void);
 void prof_write(void);                          // idempotent; boot.c calls it before _exit
 uint64_t perf_begin(void);                      // start time of a wait; pair with perf_end
 void perf_end(int kind, uint64_t t0);           // counts render-thread time only
+// The same for a wait that may run on any guest thread (the game's image acquire): the render and replay threads' as
+// perf_end, any other thread's added to the next present's frame (perf_present).
+void perf_end_any(int kind, uint64_t t0);
 void perf_replay(uint64_t t0);                  // replay (NVN -> Vulkan recording) time on any thread, waits inside it included
 void perf_replay_thread(void);                  // the calling thread replays for the render thread: perf_end counts its waits
 void perf_main_thread(void);                    // the calling thread is the guest main thread (NX2NAVI_PROFILE_MAIN)

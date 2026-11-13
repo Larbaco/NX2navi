@@ -17,18 +17,20 @@ void rt_log(const char *fmt, ...) {
     logged++;
 }
 
-// perf.c's causes, in its order (FT_C_*)
-static const char *const names[8] = {"pipeline", "translation", "texture", "fence", "pacing", "replay", "census",
-                                     "unattributed"};
+// perf.c's causes, in its order (FT_C_*); the frames below are charged to the last, unattributed
+static const char *const names[] = {"pipeline", "translation", "texture", "fence", "pacing", "hand-off", "replay",
+                                    "census", "unattributed"};
+#define OTHER (SM_CAUSES - 1)
+_Static_assert(sizeof names / sizeof *names == SM_CAUSES, "names follows perf.c's FT_C_* list");
 static uint64_t frame_no;
 
 static void frames(int n, double ms) {
-    uint64_t part[8] = {0};
+    uint64_t part[SM_CAUSES] = {0};
     for (int i = 0; i < n; i++) {
         uint64_t d = (uint64_t)(ms * 1e6);
         clock_ns += d;
-        part[7] = d;
-        stutter_frame(++frame_no, clock_ns, d, part, names, 8, 7);
+        part[OTHER] = d;
+        stutter_frame(++frame_no, clock_ns, d, part, names, SM_CAUSES, OTHER);
     }
 }
 
@@ -55,11 +57,11 @@ int main(void) {
     expect("a double spike", areas[0].hitch, 7);
     // three long frames, each followed by one as long, as after an area load in a session of 2026-11-13 (87, 91 and
     // 96 ms): one episode, not three changes of pace
-    uint64_t paced0 = paced_out, charged0 = areas[0].cause_ns[7];
+    uint64_t paced0 = paced_out, charged0 = areas[0].cause_ns[OTHER];
     frames(1, 87.0), frames(1, 91.0), frames(1, 96.0), frames(60, 7.0);
     expect("three slow frames in a row", areas[0].hitch, 8);
     expect("not a change of pace", paced_out, paced0);
-    expect("the episode's time", areas[0].cause_ns[7] - charged0, 274000000ull);
+    expect("the episode's time", areas[0].cause_ns[OTHER] - charged0, 274000000ull);
     // a change to 30 fps from 140: a run of long frames longer than SM_EPISODE_MAX, a change of pace
     frames(200, 7.0);
     frames(300, 33.3);
@@ -90,7 +92,7 @@ int main(void) {
     for (int k = 0; k < 5; k++) frames(1, 120.0), frames(59, 33.3);
     expect("five hitches at 30 fps", areas[3].hitch, 5);
     expect("five hitches at 30 fps (worst)", areas[3].worst_ns, 120000000ull);
-    expect("five hitches at 30 fps (their time)", areas[3].cause_ns[7], 600000000ull);
+    expect("five hitches at 30 fps (their time)", areas[3].cause_ns[OTHER], 600000000ull);
     if (!logged) printf("FAIL nothing was logged\n"), fails++;
     if (fails) return 1;
     printf("stutter_hitch_check: all checks passed\n");

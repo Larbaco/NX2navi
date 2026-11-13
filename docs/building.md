@@ -709,6 +709,12 @@ shapes crossing the picture at any speed are none, where each of the test's rule
 without a thumbnail is not judged. With `time` it prints what the cell means of one thumbnail cost. No GPU, no game
 files.
 
+A change to the present side's log lines (`runtime/vk_backend.c` `present_main` and `present_window`, the window line
+of `runtime/perf.c` `perf_present`) or to how `tools/perf_summary.py` reads them passes
+`python tests\perf_summary_check.py`. It checks that the format strings it copies are still the runtime's, makes lines
+with them and checks the present percentiles, the present thread's averages and the hand-off share the tool prints,
+and that the lines of older logs, without those fields, still parse. Any Python, no game files.
+
 The lifter (`recomp/`) and the CPU headers (`runtime/cpu.h`, `runtime/simd.h`) are checked against Unicorn. Every lifter
 change passes these, all run with `.venv`:
 

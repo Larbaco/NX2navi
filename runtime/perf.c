@@ -98,6 +98,22 @@ void perf_end(int kind, uint64_t t0) {
     __atomic_fetch_add(&frame_ns[kind], d, __ATOMIC_RELAXED);
 }
 
+// The waits of other threads that hold the frame all the same: a game may acquire its window image on a thread other
+// than the one that presents (vk_lowlat.c's comments note it), and perf_end leaves those waits out, so the pacer's
+// wait in the acquire showed nowhere. Added to frame_ns and wait_ns by the present (perf_present) before the frame's
+// parts are read.
+static volatile int64_t any_ns[PERF_N];
+
+void perf_end_any(int kind, uint64_t t0) {
+    if (!t0 || (unsigned)kind >= PERF_N) return;
+    uint32_t tid = plat_thread_id();
+    if (tid == prof_render_tid || tid == prof_replay_tid) {
+        perf_end(kind, t0);
+        return;
+    }
+    plat_add64(&any_ns[kind], (int64_t)(kern_now_ns() - t0));
+}
+
 static volatile int64_t other_wait_ns;     // perf_gpu_wait on threads other than the render thread, over the window
 static volatile int64_t render_wait_ns;    // the same on the render thread
 void (*perf_gpu_stats)(PerfGpu *out);
@@ -454,10 +470,12 @@ typedef struct {
 // them in, every frame that waited 900 ms for a pipeline was charged to "replay", the larger number, and a log
 // could not tell a pipeline stall from a slow replay.
 // "census" is the address-space walk of NX2NAVI_MEM_CENSUS (census_check), which runs on the presenting thread after a
-// present: its time is charged to the next frame, which it delays.
-enum { FT_C_PIPE, FT_C_XLATE, FT_C_TEX, FT_C_FENCE, FT_C_PACE, FT_C_REPLAY, FT_C_CENSUS, FT_C_OTHER, FT_C_N };
-static const char *const ft_cause_name[FT_C_N] = { "pipeline", "translation", "texture", "fence", "pacing", "replay",
-                                                   "census", "unattributed" };
+// present: its time is charged to the next frame, which it delays. "hand-off" is the wait for the present thread to
+// take the previous picture (PERF_HANDOFF): its own pacing and its present call, an overlay's frame limiter included.
+// stutter_map.c cause_short and tools/stutter_map.py read these names, in this order.
+enum { FT_C_PIPE, FT_C_XLATE, FT_C_TEX, FT_C_FENCE, FT_C_PACE, FT_C_HANDOFF, FT_C_REPLAY, FT_C_CENSUS, FT_C_OTHER, FT_C_N };
+static const char *const ft_cause_name[FT_C_N] = { "pipeline", "translation", "texture", "fence", "pacing", "hand-off",
+                                                   "replay", "census", "unattributed" };
 static uint64_t census_part_ns;   // present thread: the census walks since the last present (census_check)
 static struct {
     uint64_t t0, frames, sum, over25, over50, over100;
@@ -647,10 +665,11 @@ static void ft_report(uint64_t now, const char *tag) {
                          (unsigned long long)w->op_n[PERF_RP_DRAW], w->op_ns[PERF_RP_BIND] / 1e6,
                          (unsigned long long)w->op_n[PERF_RP_BIND], w->op_ns[PERF_RP_XFER] / 1e6,
                          (unsigned long long)w->op_n[PERF_RP_XFER], nvn_op_name(w->max_op), w->max_ns / 1e6, w->hold_ns / 1e6);
-            rt_log("frametime:   worst frame %llu: %.1f ms; shader translation %.1f, pipeline build %.1f, texture upload %.1f (astc %.1f), replay %.1f (on the CPU %.1f), fence/present wait %.1f, pacing %.1f%s",
+            rt_log("frametime:   worst frame %llu: %.1f ms; shader translation %.1f, pipeline build %.1f, texture upload %.1f (astc %.1f), replay %.1f (on the CPU %.1f), fence/present wait %.1f, pacing %.1f, hand-off %.1f%s",
                    (unsigned long long)w->frame, w->ns / 1e6, w->wait[PERF_XLATE] / 1e6, w->wait[PERF_PIPE] / 1e6,
                    w->wait[PERF_TEX] / 1e6, w->wait[PERF_ASTC] / 1e6, w->replay / 1e6, w->replay_cpu / 1e6,
-                   (w->wait[PERF_FENCE] + w->wait[PERF_DRAIN]) / 1e6, w->wait[PERF_PACE] / 1e6, ops);
+                   (w->wait[PERF_FENCE] + w->wait[PERF_DRAIN]) / 1e6, w->wait[PERF_PACE] / 1e6,
+                   w->wait[PERF_HANDOFF] / 1e6, ops);
         }
     }
     memset(&ft, 0, sizeof ft);
@@ -741,6 +760,7 @@ static uint64_t ft_frame(uint64_t frame, uint64_t now, uint64_t d) {
         part[FT_C_TEX] = frame_ns[PERF_TEX];
         part[FT_C_FENCE] = frame_ns[PERF_FENCE] + frame_ns[PERF_DRAIN];
         part[FT_C_PACE] = frame_ns[PERF_PACE];
+        part[FT_C_HANDOFF] = frame_ns[PERF_HANDOFF];
         part[FT_C_REPLAY] = rep > 0 ? (uint64_t)rep : 0;
         uint64_t inside = part[FT_C_PIPE] + part[FT_C_XLATE] + part[FT_C_TEX];   // waits on the replay thread
         part[FT_C_REPLAY] = part[FT_C_REPLAY] > inside ? part[FT_C_REPLAY] - inside : 0;
@@ -997,6 +1017,10 @@ void perf_present(uint64_t frame) {
     if (rt_trace & RT_TRACE_SCHED) kern_sched_report(frame);
     uint64_t now = kern_now_ns(), d = last ? now - last : 0;
     prof_sampler_frame(frame, now, last ? d : 0);
+    for (int k = 0; k < PERF_N; k++) {   // other threads' waits for this frame (perf_end_any), before its parts are read
+        int64_t a = __atomic_load_n(&any_ns[k], __ATOMIC_RELAXED) ? plat_xchg64(&any_ns[k], 0) : 0;
+        if (a > 0) __atomic_fetch_add(&frame_ns[k], (uint64_t)a, __ATOMIC_RELAXED), __atomic_fetch_add(&wait_ns[k], (uint64_t)a, __ATOMIC_RELAXED);
+    }
     uint64_t rep = ft_frame(frame, now, d);   // d is 0 on the first present: it only starts the period
     if (__atomic_load_n(&session_due, __ATOMIC_RELAXED) && plat_xchg32(&session_due, 0)) session_report(now);
     ab_b += rt_ab();
@@ -1035,13 +1059,14 @@ void perf_present(uint64_t frame) {
             char marks[700];
             marks[0] = 0;
             mark_text(&fm, marks, 0, sizeof marks);
-            // drain: the wait for the present thread's previous job; replay: the replays since the last present, the
-            // pipeline, translation and texture waits above included (the rest of a slow frame is the game's own work)
+            // drain: the wait for the present thread's previous job; handoff: the wait to hand it the next one;
+            // replay: the replays since the last present, the pipeline, translation and texture waits above included
+            // (the rest of a slow frame is the game's own work)
             rt_log("perf: slow frame %llu: %.1f ms; blocked pipeline %.1f xlate %.1f texture %.1f astc %.1f fence %.1f pacing %.1f "
-                   "drain %.1f; replay %.1f%s",
+                   "drain %.1f handoff %.1f; replay %.1f%s",
                    (unsigned long long)frame, d / 1e6, frame_ns[PERF_PIPE] / 1e6, frame_ns[PERF_XLATE] / 1e6,
                    frame_ns[PERF_TEX] / 1e6, frame_ns[PERF_ASTC] / 1e6, frame_ns[PERF_FENCE] / 1e6,
-                   frame_ns[PERF_PACE] / 1e6, frame_ns[PERF_DRAIN] / 1e6, rep / 1e6, marks);
+                   frame_ns[PERF_PACE] / 1e6, frame_ns[PERF_DRAIN] / 1e6, frame_ns[PERF_HANDOFF] / 1e6, rep / 1e6, marks);
         }
     }
     memset(frame_ns, 0, sizeof frame_ns);
@@ -1065,9 +1090,9 @@ void perf_present(uint64_t frame) {
     uint64_t dwin[3];
     for (int i = 0; i < 3; i++) dwin[i] = disk[i] - disk_prev[i], disk_prev[i] = disk[i];
     if (n && span)
-        rt_log("perf: frame %llu: interval avg %.2f ms max %.2f ms (%.1f fps); render thread blocked: pacing %.0f%% fence %.0f%% drain %.0f%% pipeline build %.0f%% shader xlate %.0f%% texture %.0f%% (astc %.0f%%); pipelines built in background %lld, draws skipped pending %lld, waited %lld, waiting for a shader %lld, one-shot waited %lld; textures uploaded %lld re-uploaded %lld; slowest frame: xlate %.1f ms texture %.1f ms (astc %.1f) pipeline %.1f ms fence %.1f ms; shaders: %llu keys, %llu translated; render busy avg %.2f ms; replay avg %.2f ms; ab %llu/%llu; world %.1f s; shader disk reads: %llu on the render thread (%.1f ms), %llu by the loaders",
+        rt_log("perf: frame %llu: interval avg %.2f ms max %.2f ms (%.1f fps); render thread blocked: pacing %.0f%% fence %.0f%% drain %.0f%% handoff %.0f%% pipeline build %.0f%% shader xlate %.0f%% texture %.0f%% (astc %.0f%%); pipelines built in background %lld, draws skipped pending %lld, waited %lld, waiting for a shader %lld, one-shot waited %lld; textures uploaded %lld re-uploaded %lld; slowest frame: xlate %.1f ms texture %.1f ms (astc %.1f) pipeline %.1f ms fence %.1f ms; shaders: %llu keys, %llu translated; render busy avg %.2f ms; replay avg %.2f ms; ab %llu/%llu; world %.1f s; shader disk reads: %llu on the render thread (%.1f ms), %llu by the loaders",
                (unsigned long long)frame, sum / 1e6 / n, max / 1e6, n * 1e9 / sum, 100.0 * wait_ns[PERF_PACE] / span,
-               100.0 * wait_ns[PERF_FENCE] / span, 100.0 * wait_ns[PERF_DRAIN] / span,
+               100.0 * wait_ns[PERF_FENCE] / span, 100.0 * wait_ns[PERF_DRAIN] / span, 100.0 * wait_ns[PERF_HANDOFF] / span,
                100.0 * wait_ns[PERF_PIPE] / span, 100.0 * wait_ns[PERF_XLATE] / span,
                100.0 * wait_ns[PERF_TEX] / span, 100.0 * wait_ns[PERF_ASTC] / span, (long long)async, (long long)skips, (long long)waited, (long long)sskip, (long long)oneshot,
                (long long)up, (long long)reup, worst_ns[PERF_XLATE] / 1e6, worst_ns[PERF_TEX] / 1e6,

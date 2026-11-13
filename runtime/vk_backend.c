@@ -40,7 +40,8 @@
 
 #define WEAK __attribute__((weak))
 
-typedef struct { VkImage image; VkFormat format; int w, h, has_crop, crop[4]; uint64_t frame, at, queued, value; } PresentJob;
+// handoff_ns: how long the presenting thread waited to hand this job over (present_image), for the present lines
+typedef struct { VkImage image; VkFormat format; int w, h, has_crop, crop[4]; uint64_t frame, at, queued, value, handoff_ns; } PresentJob;
 
 static PlatMutex pl = PLAT_MUTEX_INIT;
 static PlatCond pcv = PLAT_COND_INIT;   // job queued, job taken, job submitted
@@ -76,9 +77,31 @@ static void pace_shown(uint64_t interval_ns) {
     pace_avg_ns = pace_avg_ns ? pace_avg_ns + (uint64_t)(((int64_t)interval_ns - (int64_t)pace_avg_ns) / 4) : interval_ns;
 }
 
+// NX2NAVI_TRACE=perf: the present thread's own window of PW_PRESENTS presents. The render thread's perf lines time the
+// game's side and the hand-off; these say where the present thread's time went: the blit and its submission, the
+// wait for the picture's time (pace_smooth), and the present call, which takes the queue lock and in which an overlay
+// with a frame limiter sleeps. With the presenting thread's wait to hand each picture over, which that time causes.
+#define PW_PRESENTS 60
+typedef struct { uint64_t n, blit, wait, call, call_max, past, hand, hand_max; } PresentWin;
+
+static void present_window(PresentWin *w, uint64_t frame, uint64_t blit, uint64_t wait, uint64_t call, uint64_t past,
+                           uint64_t hand) {
+    w->n++, w->blit += blit, w->wait += wait, w->call += call, w->past += past, w->hand += hand;
+    if (call > w->call_max) w->call_max = call;
+    if (hand > w->hand_max) w->hand_max = hand;
+    if (w->n < PW_PRESENTS) return;
+    double n = (double)w->n;
+    rt_log("perf: present thread frame %llu: %llu presents; blit and submit avg %.2f ms, paced wait avg %.2f ms, present "
+           "call avg %.2f ms max %.2f ms, past target avg %.2f ms; the presenting thread waited to hand over avg %.2f ms "
+           "max %.2f ms", (unsigned long long)frame, (unsigned long long)w->n, w->blit / 1e6 / n, w->wait / 1e6 / n,
+           w->call / 1e6 / n, w->call_max / 1e6, w->past / 1e6 / n, w->hand / 1e6 / n, w->hand_max / 1e6);
+    memset(w, 0, sizeof *w);
+}
+
 static void present_main(void *arg) {
     (void)arg;
     uint64_t last = 0, last_queued = 0;
+    PresentWin win = {0};
     plat_mutex_lock(&pl);
     for (;;) {
         while (!pending) plat_cond_wait(&pcv, &pl);
@@ -87,6 +110,8 @@ static void present_main(void *arg) {
         busy = 1;
         plat_cond_broadcast(&pcv);
         plat_mutex_unlock(&pl);
+        int timed = (rt_trace & (RT_TRACE_PRESENT | RT_TRACE_PERF)) != 0;
+        uint64_t b0 = timed ? kern_now_ns() : 0;
         if (flight_on || vk_dump_white) vk_thumbs_frame(j.frame);   // NX2NAVI_DUMP_WHITE reads them too
         vk_dlssg_present_frame(j.frame);
         vk_lowlat_present_frame(j.frame);   // the frame's number for the blit's submit and the present's markers
@@ -104,14 +129,18 @@ static void present_main(void *arg) {
         uint64_t t1 = kern_now_ns();
         if (last) pace_shown(t1 - last);
         vk_present_flip();
+        uint64_t t2 = timed ? kern_now_ns() : 0;
         perfmon_shown(t1);   // the overlay's frame times: the pictures as shown
         // NX2NAVI_TRACE=present: one line per present: the host present's interval, the interval of the game's present
-        // calls (when the host present went out before back-edge pacing), the wait and how far past its target it went
+        // calls (when the host present went out before back-edge pacing), the wait and how far past its target it went;
+        // then how long the present call took and how long the presenting thread waited to hand this picture over
         if (rt_trace & RT_TRACE_PRESENT)
-            rt_log("present: frame %llu interval %.3f ms, game %.3f ms, waited %.3f ms, %.3f ms past target",
-                   (unsigned long long)j.frame, last ? (t1 - last) / 1e6 : 0.0,
+            rt_log("present: frame %llu interval %.3f ms, game %.3f ms, waited %.3f ms, %.3f ms past target; present call "
+                   "%.3f ms, hand-off %.3f ms", (unsigned long long)j.frame, last ? (t1 - last) / 1e6 : 0.0,
                    last_queued ? (j.queued - last_queued) / 1e6 : 0.0, (t1 - t0) / 1e6,
-                   j.at && t1 > j.at ? (t1 - j.at) / 1e6 : 0.0);
+                   j.at && t1 > j.at ? (t1 - j.at) / 1e6 : 0.0, (t2 - t1) / 1e6, j.handoff_ns / 1e6);
+        if (rt_trace & RT_TRACE_PERF)
+            present_window(&win, j.frame, t0 - b0, t1 - t0, t2 - t1, j.at && t1 > j.at ? t1 - j.at : 0, j.handoff_ns);
         last = t1;
         last_queued = j.queued;
         vk_pipeline_autosave();   // starts the autosave thread once
@@ -258,11 +287,16 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
         if (!plat_thread_spawn(present_main, NULL, "vk present", 0)) rt_fatal("vk: cannot start the present thread");
         present_thread = 1;
     }
-    while (pending) plat_cond_wait(&pcv, &pl);   // one present in waiting at most
+    // One present in waiting at most: the wait for the present thread to take the previous one is the hand-off
+    // (PERF_HANDOFF), timed from under pl, where pending is read.
+    uint64_t h0 = pending ? perf_begin() : 0;
+    while (pending) plat_cond_wait(&pcv, &pl);
+    j.handoff_ns = h0 ? kern_now_ns() - h0 : 0;
     job = j;
     pending = 1;
     plat_cond_broadcast(&pcv);
     plat_mutex_unlock(&pl);
+    perf_end(PERF_HANDOFF, h0);
     if (rdoc_active()) { vk_present_drain(); rdoc_after_present(frame); }
 }
 
