@@ -4728,6 +4728,11 @@ static double now_ms(void) { return (double)plat_now_ns() / 1e6; }
 #define READY_SLOW_MS 50.0
 #define READY_LOGS 48
 static void ready_note(Pipe *p, int fast) {
+    // A pipeline goes into pipeline-keys.bin once a draw can use it, so at its fast link too: recorded only when its
+    // optimised build had finished (job_build), the pipelines met in the last seconds of a session were lost. A session
+    // of 2026-11-13 met 46 late pipelines in adult Kokiri Forest and ended about 2 s later; 23 of them never reached the
+    // file, and with it the shared pipeline list (tools/pipeline_list.py merge). keys_note takes each record once.
+    if (fast && p->job && !p->job->prebuild) keys_note(&p->job->s);
     if (!p->t_miss) return;
     double ms = (double)(plat_now_ns() - p->t_miss) / 1e6;
     p->t_miss = 0;
