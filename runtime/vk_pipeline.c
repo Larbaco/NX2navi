@@ -4546,7 +4546,8 @@ static struct {
     uint32_t built, failed, promoted;
     uint32_t gate_ended;               // boot builders the memory gate ended (warm_builder)
     double t0;                         // now_ms() when the prebuild started
-    double until;                      // now_ms() after which the boot builders stop (comment at prewarm_run); 0 none
+    int prep;                          // t0 is the preparation's start (seed_pipelines), not the ready device's
+    double until;                     // now_ms() after which the boot builders stop (comment at prewarm_run); 0 none
 } K = {.io = PLAT_MUTEX_INIT};
 
 static uint64_t rec_hash(const KeyRec *r) {
@@ -4806,8 +4807,8 @@ static void ready_note(Pipe *p, int fast, const VkPipeState *s) {
 }
 
 static void prebuild_report(void) {
-    rt_log("vk_pipeline: prebuild done: %u built, %u failed, %u asked for by a draw first; %.0f ms after the device was "
-           "ready", K.built, K.failed, K.promoted, now_ms() - K.t0);
+    rt_log("vk_pipeline: prebuild done: %u built, %u failed, %u asked for by a draw first; %.0f ms after %s", K.built,
+           K.failed, K.promoted, now_ms() - K.t0, K.prep ? "the preparation started" : "the device was ready");
 }
 
 static void job_lower(Job *j);
@@ -8397,7 +8398,7 @@ static int seed_pipelines(const char *dir) {
     uint32_t queued = 0, dropped = 0, known = 0, other = 0, mesh = 0, no_mesh = 0;
     plat_mutex_lock(&P.lock);
     uint32_t built0 = K.built, failed0 = K.failed;
-    K.t0 = t0;   // prebuild_report's start: this mode never runs prewarm_run, which sets it in play
+    K.t0 = t0, K.prep = 1;   // prebuild_report's start: this mode never runs prewarm_run, which sets it in play
     K.loading = 1;
     for (size_t i = 0; i < n; i++) {
         const uint8_t (*v)[32] = bsearch(r[i].vs, ids, u, 32, id_cmp);
