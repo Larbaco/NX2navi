@@ -190,7 +190,9 @@ DWORD stub_GetCurrentProcessId(void) { return PID; }
 // ---- host.h and platform.h, as far as rtss_limit.c uses them
 static char logged_lines[1 << 16];
 static size_t logged_at;
+static int quiet;   // the stress scenario: no lines kept or printed
 void rt_log(const char *fmt, ...) {
+    if (quiet) return;
     char line[512];
     va_list ap;
     va_start(ap, fmt);
@@ -221,6 +223,8 @@ int plat_mutex_trylock(PlatMutex *m) { return TryAcquireSRWLockExclusive((PSRWLO
 
 static PlatThreadFn worker_fn;
 static volatile LONG spawned;
+static volatile LONG free_run;   // the worker polls without waiting
+static volatile LONG64 polls;
 static DWORD WINAPI worker_main(void *arg) {
     worker_tid = GetCurrentThreadId();
     worker_fn(arg);
@@ -237,6 +241,8 @@ void plat_sleep_ms(uint32_t ms) {
         Sleep(ms);
         return;
     }
+    InterlockedIncrement64(&polls);
+    if (free_run) return;
     SetEvent(done);                      // a poll ended
     WaitForSingleObject(tick, INFINITE);   // the next one starts when the scenario says
 }
@@ -389,6 +395,35 @@ static void kept_framegen(void) {
     CHECK(!loads && !saves, "kept out, the hooks library is never loaded");
 }
 
+// Frame generation switched on while the worker polls without pause: from the switch until the worker sees it, the
+// game's limiter paces, never RTSS's hold of the limit before (the worker's store for a want that changed after it
+// read it must not count for the new one).
+static void active_race(void) {
+    app_set(1, 0xA, 1000, 2000, 60);
+    ask(60000);
+    poll();
+    CHECK(rtss_limit_active(), "RTSS limits at 60");
+    quiet = 1, free_run = 1;
+    SetEvent(tick);
+    long hits = 0, n = 400000, stuck = 0;
+    srand(7);
+    for (long i = 0; i < n && !stuck; i++) {
+        for (volatile int k = rand() % 200; k > 0; k--) {}
+        rtss_limit_want(RTSS_OUT_FRAMEGEN);
+        LONG64 p0 = polls;
+        int seen = 0;
+        while (polls < p0 + 2) seen |= rtss_limit_active();
+        hits += seen;
+        rtss_limit_want(60000);
+        ULONGLONG t0 = GetTickCount64();
+        while (!rtss_limit_active() && !stuck) stuck = GetTickCount64() - t0 > 5000;
+    }
+    quiet = 0;
+    printf("  %ld of %ld switches read RTSS's hold afterwards (worker polls %lld)\n", hits, n, (long long)polls);
+    CHECK(!stuck, "RTSS did not take the limit back");
+    CHECK(!hits, "the game's limiter stood aside for a kept-out want %ld times", hits);
+}
+
 static const struct { const char *name; void (*run)(void); } scenarios[] = {
     {"restore_race", restore_race},
     {"restore_player", restore_player},
@@ -398,6 +433,7 @@ static const struct { const char *name; void (*run)(void); } scenarios[] = {
     {"kept_two", kept_two},
     {"kept_lowlat_then_limit", kept_lowlat_then_limit},
     {"kept_framegen", kept_framegen},
+    {"active_race", active_race},
 };
 
 int main(int argc, char **argv) {

@@ -52,7 +52,7 @@ enum { FAIL_NONE, FAIL_LIBRARY, FAIL_READONLY, FAIL_NOT_LIMITING };
 
 static PlatMutex lock = PLAT_MUTEX_INIT;   // the hooks calls and the state below
 static _Atomic int64_t want = RTSS_UNSET;  // millihertz from the pacer: >0 a limit, 0 none; RTSS_OUT_* kept out
-static _Atomic int active;                 // RTSS limits this process now
+static _Atomic int64_t active_for = RTSS_UNSET;   // the want RTSS holds the game to now; RTSS_UNSET none
 static _Atomic int failed;                 // FAIL_*: RTSS is out of it for the rest of the run
 static _Atomic int closed;                 // rtss_limit_restore ran: nothing reaches the profile any more
 static _Atomic int two;                    // kept out, and RTSS limits the game by a setting of its own (watch)
@@ -229,10 +229,12 @@ static void put_back(void) {
     update_profiles();
 }
 
-// Logs which limiter is in use: the first decision, then each change.
-static void set_active(int on, const char *why) {
+// Whether RTSS holds the game to the want w this poll read, and the log of which limiter is in use: the first decision,
+// then each change. The want may have changed since the poll read it: rtss_limit_active compares the two, so a stale
+// store never lets the game's limiter stand aside for a newer want.
+static void set_active(int64_t w, int on, const char *why) {
     static int logged = -1;
-    atomic_store(&active, on);
+    atomic_store(&active_for, on ? w : RTSS_UNSET);
     if (logged == on) return;
     logged = on;
     if (on) rt_log("frame rate: RivaTuner Statistics Server does the limiting; the game's own limiter stands aside");
@@ -333,24 +335,24 @@ static void worker(void *arg) {
             if (dll) put_back();
             char why[96];
             snprintf(why, sizeof why, "RivaTuner Statistics Server kept out: %s", rtss_out_text(w));
-            set_active(0, why);
+            set_active(w, 0, why);
         } else if (f) {
-            set_active(0, fail_reason(f));
+            set_active(w, 0, fail_reason(f));
         } else if (!run) {
-            set_active(0, "RivaTuner Statistics Server is not running");
+            set_active(w, 0, "RivaTuner Statistics Server is not running");
         } else if (!load_hooks()) {
             atomic_store(&failed, FAIL_LIBRARY);
-            set_active(0, fail_reason(FAIL_LIBRARY));
+            set_active(w, 0, fail_reason(FAIL_LIBRARY));
         } else if (w == refused) {
-            set_active(0, "RivaTuner Statistics Server refused this limit");
+            set_active(w, 0, "RivaTuner Statistics Server refused this limit");
         } else if (w != applied) {
             int r = apply(w);
             over = 0;
-            if (r < 0) atomic_store(&failed, FAIL_READONLY), set_active(0, fail_reason(FAIL_READONLY));
-            else if (r == 0) set_active(0, "RivaTuner Statistics Server refused this limit");
-            else if (atomic_load(&want) == w) set_active(hooked, "RivaTuner Statistics Server has not hooked the game yet");
-        } else if (atomic_load(&want) == w) {   // a newer limit waits for the next poll (rtss_limit_want)
-            set_active(hooked, "RivaTuner Statistics Server has not hooked the game yet");
+            if (r < 0) atomic_store(&failed, FAIL_READONLY), set_active(w, 0, fail_reason(FAIL_READONLY));
+            else if (r == 0) set_active(w, 0, "RivaTuner Statistics Server refused this limit");
+            else set_active(w, hooked, "RivaTuner Statistics Server has not hooked the game yet");
+        } else if (atomic_load(&want) == w) {   // a newer want waits for the next poll: these frames are not its
+            set_active(w, hooked, "RivaTuner Statistics Server has not hooked the game yet");
             // RTSS's own count of the game's frames while the game's limiter stands aside: well above the limit for
             // three seconds means RTSS does not hold the game to it, and the game takes the limiting back for the run
             if (!hooked || w == 0 || fps <= w / 1000.0 * CHECK_SLACK) over = 0;
@@ -359,7 +361,7 @@ static void worker(void *arg) {
                        w / 1000.0);
                 atomic_store(&failed, FAIL_NOT_LIMITING);
                 put_back();
-                set_active(0, fail_reason(FAIL_NOT_LIMITING));
+                set_active(w, 0, fail_reason(FAIL_NOT_LIMITING));
             }
         }
         watch(w, run && hooked);
@@ -401,12 +403,14 @@ void rtss_limit_want(int64_t mhz) {
     if (atomic_load_explicit(&closed, memory_order_relaxed)) return;   // the exit put the profile back
     if (!started) start(mhz);   // a first want that keeps RTSS out starts the worker too, which then only reads (watch)
     // a new limit: the game's own limiter holds it until the worker had RTSS apply it, up to POLL_MS later (a movie's
-    // cap that waited for that ran the movie's 60 Hz count fast for half a second)
-    if (atomic_exchange(&want, mhz) != mhz) atomic_store(&active, 0);
+    // cap that waited for that ran the movie's 60 Hz count fast for half a second): active_for no longer matches
+    atomic_store(&want, mhz);
 }
 
 int rtss_limit_active(void) {
-    return !atomic_load_explicit(&closed, memory_order_relaxed) && atomic_load_explicit(&active, memory_order_relaxed);
+    if (atomic_load_explicit(&closed, memory_order_relaxed)) return 0;
+    int64_t a = atomic_load_explicit(&active_for, memory_order_relaxed);
+    return a >= 0 && a == atomic_load_explicit(&want, memory_order_relaxed);
 }
 
 int rtss_limit_state(void) {
