@@ -8,8 +8,9 @@
 // vk_dlaa.c makes for DLSS and FSR 3.1 upscaling, and without an upscaler for frame generation alone (vk_dlaa.c
 // fg_only_frame: the same pass at the scene's size, no jitter). The HUD is kept out through the picture without it
 // (vk_dlaa.c hudless); the menu is not generated, since generation pauses while it is open. The device creates two more
-// queues for it (vk_device.c create_device, vk_fg_queue_count): of the graphics family where it has them, else of
-// another family that can present.
+// queues for it (vk_device.c create_device, vk_fg_queue_count): of the graphics family where it has them; else the
+// present queue comes from another family that can present, and the acquire queue is a second queue of that family or
+// of any other, or the present queue itself when there is none.
 #ifdef _WIN32
 #include <windows.h>
 #endif
