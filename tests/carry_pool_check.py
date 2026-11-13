@@ -7,13 +7,14 @@ the owned branch (gfx_shader_load_private) frees it as well, and entries with th
 pool are served as before. carry_last, which runs once the current translator has failed the shader, serves the refused
 translation after all and puts it in the memory cache, where the memory lookup finds it. pool_short_note, which counts
 the shaders of the earlier length that enter the memory cache for vk_texture.c's warning, counts those only, and logs
-only one that is not carried.
+only one that is not carried. gfx_shader.c's POOL_TEX_SHORT must equal vk.h's VK_POOL_TEX_CARRIED.
 
 No GPU, no game files, any Python.
 
 Usage: carry_pool_check.py
 """
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -217,8 +218,22 @@ def cut(source, start, end):
     return source[i:source.index(end, i)]
 
 
+def define(source, name):
+    """The decimal value of `#define name <n>` in source."""
+    m = re.search(r'^#define ' + name + r' (\d+)\b', source, re.M)
+    if not m:
+        raise SystemExit(f'carry pool check: no #define {name}')
+    return int(m.group(1))
+
+
 def main():
     src = (ROOT / 'runtime' / 'gfx_shader.c').read_text(encoding='utf-8')
+    # gfx_shader.c does not include vk.h, so it states the earlier length itself: the two must stay equal.
+    short = define(src, 'POOL_TEX_SHORT')
+    carried = define((ROOT / 'runtime' / 'vk.h').read_text(encoding='utf-8'), 'VK_POOL_TEX_CARRIED')
+    if short != carried:
+        print(f'carry pool check: gfx_shader.c POOL_TEX_SHORT is {short}, vk.h VK_POOL_TEX_CARRIED is {carried}')
+        return 1
     production = cut(src, '#define POOL_TEX_SHORT', '// Whether the cache holds a previous translator\'s entry of input iid.')
     work = ROOT / 'build' / 'test' / 'carry_pool'
     work.mkdir(parents=True, exist_ok=True)
