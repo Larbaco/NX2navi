@@ -764,6 +764,13 @@ A change to which frames FSR 3.1 frame generation is told are camera cuts (`runt
 frame id gets its own frame's cut, that an id never noted or no longer held counts as a cut, and that a slot rewritten
 on another thread never answers an old id with a newer frame's value. No GPU, no game files.
 
+A change to who holds the frame limit with DLSS Frame Generation (`runtime/dlssg_pace.h`, `runtime/vk_dlssg.c`
+`vk_dlssg_pace`) passes `python tests\dlssg_pace_check.py`, which builds the header alone and checks that Reflex holds
+the limit only once Streamline took exactly that limit, that the game's own pacer keeps it during a movie, before the
+first host present, after 200 ms without one and with the setting off, that frames coming too soon over a window of 60
+give it to the pacer for the rest of the run, and that frames the multiplier periods apart switch Reflex to the frames
+on screen once and to the pacer the second time. No GPU, no game files.
+
 A change to which frames the flight recorder takes for a one-frame flash (`runtime/flight_flash.h`, `runtime/flight.c`
 `flight_cells`) passes `python tests\flight_flash_check.py`, which builds the header alone, draws pictures of the
 thumbnails' size and checks that a patch or a whole frame shown once is a flash, that a camera cut, a fade, a pan and
