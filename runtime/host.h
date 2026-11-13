@@ -348,7 +348,7 @@ void *kern_handle_hold(uint32_t h, int kind, void (*hold)(void *obj));   // kern
                                                                           // kernel lock (a reference the caller drops)
 int kern_handle_copy(uint32_t h, int kind, void *out, size_t n);         // a copy of the object, made under the
                                                                           // kernel lock; 0 for a bad handle
-void kern_handle_close(uint32_t h);                       // CloseHandle from the host side, any thread; fatal on a
+void kern_handle_close(uint32_t h);                        // CloseHandle from the host side, any thread; fatal on a
                                                            // bad handle
 enum { KERN_SESSION = 4, KERN_TMEM = 5 };
 uint32_t kern_event_new(void);                             // writable handle
