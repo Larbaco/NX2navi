@@ -988,6 +988,13 @@ void vk_sync_lost_report(void) {
     rt_log("vk: when the device was lost: %s", t);
 }
 
+// The hang watch's reading (hang_watch.c): the newest value submitted and the newest done, without a lock or a device
+// call.
+void vk_sync_progress(uint64_t *issued_out, uint64_t *done_out) {
+    *issued_out = __atomic_load_n(&issued, __ATOMIC_ACQUIRE);
+    *done_out = __atomic_load_n(&done, __ATOMIC_ACQUIRE);
+}
+
 static void completion_main(void *arg) {
     VkCtx *c = arg;
     __atomic_store_n(&cb_tid, plat_thread_id(), __ATOMIC_RELEASE);

@@ -126,6 +126,8 @@ int rt_exit_begin(void) {
     for (;;) plat_sleep_ms(1000);
 }
 
+int rt_exit_started(void) { return __atomic_load_n(&exit_tid, __ATOMIC_ACQUIRE) != 0; }
+
 // What every orderly end saves and puts back, in this order. What a kill of the process must not lose and what is quick
 // comes first: Windows ends a closed console about 5 s after the close, a session's end and an "End task" sooner, and
 // the pipeline save alone can take that long (vk_pipeline_save_exit waits up to 5 s for the builds that run). So a
@@ -2012,4 +2014,16 @@ void gfx_window_start(void) {
     }
     plat_rmutex_unlock(&g_start_lock);
     vsync_ensure();
+}
+
+int gfx_window_in_front(void) { return gfx_window_focused() && !wsys_minimized(); }
+
+// For the hang watch's report (hang_watch.c): who holds the present, queue and window-start locks now, read without
+// taking them (0: free). The fields may be caught mid-change; the report only names them.
+void gfx_lock_holders(GfxLockHolders *h) {
+    h->present = __atomic_load_n(&g_pl.owner, __ATOMIC_RELAXED);
+    h->present_depth = __atomic_load_n(&g_pl.depth, __ATOMIC_RELAXED);
+    h->queue = __atomic_load_n(&g_ql.owner, __ATOMIC_RELAXED);
+    h->queue_depth = __atomic_load_n(&g_ql.depth, __ATOMIC_RELAXED);
+    h->start = __atomic_load_n(&g_start_lock.owner, __ATOMIC_RELAXED);
 }

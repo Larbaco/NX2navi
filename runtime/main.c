@@ -754,6 +754,7 @@ static int main_run(int argc, char **argv) {
         if (plat_console_setup(console_closed))
             rt_log("console: QuickEdit off; closing the console ends the game as its window does");
         mem_start_note(0);   // memory.c: a warning when the machine has less memory free than the game takes
+        hang_watch_start();   // a report in the log when the frames or the GPU stop (hang_watch.c); never in tool modes
         cfg.boot = cfg.seconds > 0;   // --seconds starts the game like --boot, with its checkpoints
         vk_driver_cache_env();   // before the threads below and rt_boot's, any of which may load the Vulkan driver
         discord_init();   // the Rich Presence thread (discord_rpc.c); it reads nx2navi.ini itself and idles while off

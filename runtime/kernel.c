@@ -968,6 +968,35 @@ static void wait_watch_holder(char *out, size_t cap, const RtThread *h) {
              (kern_now_ns() - h->blk_since) / 1e9, kinds[k], (unsigned long long)h->wobj);
 }
 
+// One walk over the guest threads, G held: each one that has waited `limit` ns or longer for a lock or for another
+// thread's end gets a line, at most max of them. mark: a wait gets its line once (wait_watch); the hang watch's report
+// (kern_wait_report) lists every such wait as it stands. Returns the lines written.
+static int wait_pass(uint64_t limit, int max, int mark) {
+    int lines = 0;
+    uint64_t now = kern_now_ns();
+    for (RtThread *t = g_all; t && lines < max; t = t->all) {
+        if (!t->blk_since || (mark && t->blk_told) || now - t->blk_since < limit) continue;
+        char who[160];
+        if (t->wkind == W_LOCK) {   // the lock word's owner field is the holder's handle
+            wait_watch_holder(who, sizeof who, h_peek((uint32_t)t->wobj, O_THREAD));
+            rt_log("kernel: thread %#x (priority %d) has waited %.0f s for the lock at %#llx held by %s",
+                   t->handle, t->prio, (now - t->blk_since) / 1e9, (unsigned long long)t->waddr, who);
+        } else if (t->wkind == W_SYNC && t->whs) {
+            const RtThread *end = NULL;
+            for (int i = 0; i < t->wn && !end; i++) end = h_peek(t->whs[i], O_THREAD);
+            if (!end) continue;
+            wait_watch_holder(who, sizeof who, end);
+            rt_log("kernel: thread %#x (priority %d) has waited %.0f s for the end of %s", t->handle, t->prio,
+                   (now - t->blk_since) / 1e9, who);
+        } else {
+            continue;
+        }
+        if (mark) t->blk_told = 1;
+        lines++;
+    }
+    return lines;
+}
+
 static void wait_watch(void *arg) {
     (void)arg;
     uint64_t limit = (uint64_t)atoi(cfg_value("NX2NAVI_WAIT_WATCH_S")) * 1000000000ull;
@@ -976,29 +1005,24 @@ static void wait_watch(void *arg) {
     while (lines < WAIT_WATCH_LINES) {
         plat_wait_ns(2000000000ull);
         lock();
-        uint64_t now = kern_now_ns();
-        for (RtThread *t = g_all; t && lines < WAIT_WATCH_LINES; t = t->all) {
-            if (!t->blk_since || t->blk_told || now - t->blk_since < limit) continue;
-            char who[160];
-            if (t->wkind == W_LOCK) {   // the lock word's owner field is the holder's handle
-                wait_watch_holder(who, sizeof who, h_peek((uint32_t)t->wobj, O_THREAD));
-                rt_log("kernel: thread %#x (priority %d) has waited %.0f s for the lock at %#llx held by %s",
-                       t->handle, t->prio, (now - t->blk_since) / 1e9, (unsigned long long)t->waddr, who);
-            } else if (t->wkind == W_SYNC && t->whs) {
-                const RtThread *end = NULL;
-                for (int i = 0; i < t->wn && !end; i++) end = h_peek(t->whs[i], O_THREAD);
-                if (!end) continue;
-                wait_watch_holder(who, sizeof who, end);
-                rt_log("kernel: thread %#x (priority %d) has waited %.0f s for the end of %s", t->handle, t->prio,
-                       (now - t->blk_since) / 1e9, who);
-            } else {
-                continue;
-            }
-            t->blk_told = 1, lines++;
-        }
+        lines += wait_pass(limit, WAIT_WATCH_LINES - lines, 1);
         unlock();
     }
     rt_log("kernel: %d long waits logged: no more", lines);
+}
+
+// The hang watch's report (hang_watch.c): the guest threads' lock and thread-end waits as they stand. G is only tried,
+// ten times 10 ms apart: its holder may be the thread that hangs, and the watch adds no wait of its own.
+void kern_wait_report(void) {
+    int got = 0;
+    for (int i = 0; i < 10 && !(got = plat_mutex_trylock(&G)); i++) plat_sleep_ms(10);
+    if (!got) {
+        rt_log("kernel: the thread lock stayed taken for 100 ms; the guest threads' waits are not listed");
+        return;
+    }
+    int lines = wait_pass(0, 16, 0);
+    unlock();
+    if (!lines) rt_log("kernel: no guest thread waits for a lock or for another thread's end");
 }
 
 int kern_core_away(void) {

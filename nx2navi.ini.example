@@ -994,6 +994,10 @@
 # it waits for and what that one is doing (at most 24 lines a run): a game that stops then leaves the chain in its log.
 # Off by default: its thread takes the game's thread lock every 2 seconds. 10 is a good value for a hang report.
 # wait_watch_s = 0
+# A report in the log when nothing moves for this many seconds: no frame shown while the window is in front, or a GPU
+# submission not finished. It names who holds the present and queue locks and what the game's threads wait for, at
+# most three times a run; the game goes on. 0 turns it off. Read at start.
+# hang_watch_s = 20
 # Diagnosis: one log line per frame while Link stands near a moving floor (the floating platforms): the frame's step,
 # how far he moved and how far the floor moved. 1 writes 4000 lines, a larger number that many; 0 is off.
 # floor_probe = 0

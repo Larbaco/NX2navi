@@ -25,6 +25,9 @@ void rt_log_raw(const char *p, size_t n);
 const char *rt_log_path(void);                  // the log file, NULL when this run writes none
 void rt_log_sync(void);                         // writes the queued log lines now; later lines are written as they are made
 void rt_log_ending(void);                       // the process is ending: its lines reach the log file past its 64 MiB cap
+void hang_watch_start(void);                    // hang_watch.c: NX2NAVI_HANG_WATCH_S's thread, in a game run
+void kern_wait_report(void);                    // kernel.c: the guest threads' lock and thread-end waits, for a hang report
+void vk_sync_progress(uint64_t *issued, uint64_t *done);   // vk_sync.c: submissions issued and done, no lock or device call
 enum { RT_TRACE_SVC = 1, RT_TRACE_HOSTCALL = 2, RT_TRACE_IPC = 4, RT_TRACE_FS = 8, RT_TRACE_GFX = 16, RT_TRACE_PERF = 32,
        RT_TRACE_SCHED = 64, RT_TRACE_AUDIO = 128, RT_TRACE_PRESENT = 256 };
 extern unsigned rt_trace;                       // from NX2NAVI_TRACE=svc,host,ipc,fs,gfx,perf,sched,audio,present (or all)
@@ -116,6 +119,7 @@ void gfx_window_closed(void);                   // gfx_present.c (gfx_wsys.h): t
 // --seconds). rt_exit_begin: 1 for the first caller; another thread waits there for good; 0 for that caller's own
 // thread again. rt_exit_steps: the saves and the put-backs, the slow pipeline save late and the final save flush last.
 int rt_exit_begin(void);
+int rt_exit_started(void);                      // an orderly end has begun (the hang watch stops judging presents)
 enum { RT_EXIT_SETTINGS = 1 };                  // rt_exit_steps also writes the menu's changes to nx2navi.ini
 void rt_exit_steps(unsigned what);
 void perf_gpu_wait(uint64_t t0);                // a wait for a GPU fence ended (any thread; the render thread's also counts as PERF_FENCE)

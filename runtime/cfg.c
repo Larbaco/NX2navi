@@ -91,6 +91,8 @@ static const char *const known[] = {
     // developer switches read with cfg_get, rt_knob or vk_caps.c env_u32, without a menu row (tests/cfg_rows_check.py)
     "AUDIO_DUMP", "DEFER_STAMP", "DEPTH_TWIN", "DLAA_ZFIT", "DUMP_SKIP_RUNS", "DUMP_TEX", "DUMP_UBO", "EVENT_ORDER",
     "GATHER_BIAS", "PIN_SWEEP", "REC_CHECK", "REC_DELAY_US", "REG_ORDER", "SHADOW", "ZERO_LOCALS",
+    // hang_watch.c: the hang watch's seconds
+    "HANG_WATCH_S",
     // retired: the settings of the co-op of versions up to 0.9.2; read by nothing, listed so that a file which still
     // sets them logs no unknown key
     "COOP", "COOP_BETA", "COOP_NAME", "COOP_SERVER", "COOP_PORT", "COOP_ROOM", "COOP_AUTO", "COOP_DROP",
@@ -173,6 +175,7 @@ static const struct { const char *key, *section; } sections[] = {
     {"WB_MERGE_MAX", "diagnostics"}, {"MV_SURVEY", "diagnostics"}, {"TEXUP_LOG_MS", "diagnostics"},
     {"WAIT_WATCH_S", "diagnostics"},
     {"HANDLE_CENSUS", "diagnostics"},
+    {"HANG_WATCH_S", "diagnostics"},
     {"VMA_BLOCK_MB", "diagnostics"}, {"DEVICE_LOST_AT", "diagnostics"}, {"STAGING_FAIL_AT", "diagnostics"}, {"VRAM_BALLAST_MB", "diagnostics"},
     {"COPY_RETIRE", "diagnostics"},
     {"MEM_BUDGET_TEST_VRAM_MB", "diagnostics"}, {"MEM_BUDGET_TEST_RAM_MB", "diagnostics"},
@@ -431,6 +434,8 @@ static const CfgMeta metas[] = {
     {"WAIT_WATCH_S", "0", "0..3600", RESTART},   // kernel.c wait_watch: a lock or thread-end wait this long is logged; 0 off
     // perf.c hc_main: with NX2NAVI_TRACE=perf, the process's handles by kind when their count grew
     {"HANDLE_CENSUS", "0", "0|1", RESTART},
+    // hang_watch.c: a report when no frame is shown with the window in front, or the GPU does not finish, this long; 0 off
+    {"HANG_WATCH_S", "20", "0..600", RESTART},
     {"VMA_BLOCK_MB", "64", "16..256", RESTART},   // vk_headroom.c vk_vma_block_size
     // vk_texture.c compact_on: idle textures move out of sparsely used blocks of video memory; the free space inside
     // the blocks from which a pass starts, and the bytes moved per frame (also the largest texture that moves)
