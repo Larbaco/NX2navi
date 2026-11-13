@@ -2944,6 +2944,11 @@ static void mirror_create(PoolRec *r) {
         snprintf(why, sizeof why, "device-local allocation of %.1f MiB failed (%d)", n / 1048576.0, (int)res);
         return refuse(r, MR_ALLOC, why);
     }
+    // The device address table names the mirror: the GPU's writes go there, and the sync copies the CPU's. With a
+    // twin they also go to the imported buffer; without one (twin_wanted) the record names the mirror twice. The
+    // table takes the mirror up in queue order, after its first copy (gpa_late, above). Both are decided before
+    // pool_lock is taken: each may read its setting and log once.
+    int twin = twin_wanted(r), late = r->gpa_rec && gpa_late();
     plat_mutex_lock(&pool_lock);
     // The pool may have been finalized on another thread since the check above, without a mirror to forget (its state
     // said refused meanwhile): on the list, the mirror would outlive its record and be freed twice, or never. Its
@@ -2962,27 +2967,24 @@ static void mirror_create(PoolRec *r) {
     memmove(mlist + at + 1, mlist + at, (size_t)(nm - at) * sizeof *mlist);
     mlist[at] = r;
     nm++;
-    plat_mutex_unlock(&pool_lock);
+    // The mirror's state is complete before pool_lock drops. pool_fini takes the pool off the list (mirror_forget) only
+    // when it finds MS_ON there, and destroy_rec frees the record without looking at the list: a finalize between the
+    // insertion and a later MS_ON left a freed record on mlist, and with NX2NAVI_GPA_LATE=0 a table record that named
+    // the destroyed buffer. acc_sub before mstate: vk_mem_use's unlocked fast path reads mstate, then acc_sub.
     r->acc_sub = msub;
     r->mstate = MS_ON;
     r->asked_room = 0;
-    // The device address table names the mirror: the GPU's writes go there, and the sync copies the CPU's. With a
-    // twin they also go to the imported buffer; without one (twin_wanted) the record names the mirror twice. The
-    // table takes the mirror up in queue order, after its first copy (gpa_late, above).
-    r->twin = (uint8_t)twin_wanted(r);
-    if (!r->twin) {
-        plat_inc64(&m_untwinned_n);
-        plat_add64(&m_untwinned_bytes, (int64_t)n);
-    }
-    if (r->gpa_rec && gpa_late()) {
-        plat_mutex_lock(&pool_lock);   // as mirror_forget and gpa_flip_cmds, which count it down
+    r->twin = (uint8_t)twin;
+    if (late) {
         r->gpa_flip = 1, n_gpa_flip++;   // vk_mem_mirror_prologue, with the copy range_add queues below
-        plat_mutex_unlock(&pool_lock);
     } else if (r->gpa_rec) {
-        plat_mutex_lock(&pool_lock);
         r->gpa_rec = r->twin ? vk_gpa_remap(r->import_lo, r->import_hi, r->gpa_rec, r->mbuf, r->import_lo)
                              : vk_gpa_remap_plain(r->import_lo, r->import_hi, r->gpa_rec, r->mbuf, r->import_lo);
-        plat_mutex_unlock(&pool_lock);
+    }
+    plat_mutex_unlock(&pool_lock);
+    if (!twin) {
+        plat_inc64(&m_untwinned_n);
+        plat_add64(&m_untwinned_bytes, (int64_t)n);
     }
     range_add(&pend, &npend, &cpend, r, 0, n);
     mrep.first_n++, mrep.first_bytes += n;
