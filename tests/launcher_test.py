@@ -5343,9 +5343,10 @@ class WhilePlayingTest(Tmp):
         a.ctx.log.assert_called_once_with('the game ended with code 0')
         self.assertNotIn('[launcher]', log.read_text(encoding='utf-8'))
 
-    def play_from_steam(self, code, log_text):
-        """play_only (--play, the Steam shortcut) for a game that ends with code, its log then holding log_text; (the
-        context, the stand-in for tell, the log)."""
+    def play_from_steam(self, code, log_text, lock_held=False):
+        """play_only (--play, the Steam shortcut) for a game that ends with code, its log then holding log_text, with
+        the launcher folder's lock held by another process when lock_held; (the context, the stand-in for tell, the
+        log). self.start_game is the stand-in for winsys.start_game."""
         from launcher.ui import app
         (self.tmp / 'ocarina.exe').write_bytes(b'MZ')
         log = self.tmp / 'logs' / 'nx2navi.log'
@@ -5353,20 +5354,49 @@ class WhilePlayingTest(Tmp):
         log.write_text(log_text, encoding='utf-8')
         ctx = mock.MagicMock()
         ctx.settings = {'game_dir': str(self.tmp)}
+        ctx.layout = self.layout
         proc = mock.MagicMock(returncode=code, pid=5)
         proc.poll.return_value = code
         told = []
 
         def tell(text):   # what the logs hold when the box comes, which waits for OK
             told.append((text, log.read_text(encoding='utf-8'), list(ctx.log.call_args_list)))
-        with mock.patch('launcher.ui.app.winsys.start_game', return_value=proc), \
+        held = mock.patch('launcher.ui.app.locks.FileLock', side_effect=locks.Busy('the launcher window is using x')) \
+            if lock_held else contextlib.nullcontext()
+        with mock.patch('launcher.ui.app.winsys.start_game', return_value=proc) as self.start_game, \
                 mock.patch('launcher.ui.app.saves.game_running', return_value=False), \
                 mock.patch('launcher.ui.app.mods.prepare', return_value=[]), \
                 mock.patch('launcher.ui.app.build.can_rebuild', return_value=False), \
                 mock.patch('launcher.ui.app.time.sleep'), \
-                mock.patch('launcher.ui.app.tell', side_effect=tell):
+                mock.patch('launcher.ui.app.tell', side_effect=tell), held:
             self.assertEqual(app.play_only(ctx), 0)
         return ctx, told, log
+
+    def test_play_from_steam_waits_for_a_job_in_the_game_folder(self):
+        """The Steam shortcut does not start the game while the window or a command runs a job in the game folder
+        (another process holds the launcher folder's lock, and the job's marker is there): the game would be the build
+        the job replaces. A marker that a stopped launcher left, with the lock free, stops nothing, nor does the window
+        open without a job."""
+        try:
+            from launcher.ui import app   # noqa: F401
+        except ImportError as e:
+            self.skipTest(f'no window toolkit: {e}')
+        marker = self.layout.data / jobs.MARKER
+        marker.write_text(json.dumps({'task': 'the rebuild of the game', 'kind': 'rebuild'}), encoding='utf-8')
+        ctx, told, _ = self.play_from_steam(0, '[host] x\n', lock_held=True)
+        self.start_game.assert_not_called()
+        self.assertEqual([t[0] for t in told],
+                         ['NX2navi is busy with the rebuild of the game. Start the game when it is done.'])
+        ctx.log.assert_called_once_with('play from Steam: not started: the launcher is busy with the rebuild of the '
+                                        'game')
+        self.assertTrue(marker.is_file())                              # the job's marker stays
+        ctx, told, _ = self.play_from_steam(0, '[host] gfx: window closed; exiting\n')
+        self.start_game.assert_called_once()                          # the lock is free: the marker is a leftover
+        self.assertEqual(told, [])
+        marker.unlink()
+        ctx, told, _ = self.play_from_steam(0, '[host] gfx: window closed; exiting\n', lock_held=True)
+        self.start_game.assert_called_once()                          # the window is open, with no job
+        self.assertEqual(told, [])
 
     def test_an_end_of_a_game_started_from_steam_is_told(self):
         """The Steam shortcut's game ends as Play's does: launcher.log and the game's log say how, and an end worth it

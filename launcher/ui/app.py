@@ -2867,6 +2867,18 @@ def play_only(ctx):
     exe = Path(gd) / 'ocarina.exe' if gd else None
     if not exe or not exe.is_file():
         return None
+    # The window or a command may run a job in the game folder meanwhile (a rebuild, an update's install, the mods'
+    # build): the game started now would be the build that job is replacing, which then fails to replace it, and
+    # mods.prepare would unpack into the folder the job reads. Such a job holds the launcher folder's lock and leaves
+    # jobs.MARKER. The lock is only tried, and let go at once: held, it would keep the window from opening.
+    try:
+        locks.FileLock(ctx.layout.instance_lock, 'play from Steam', where=ctx.layout.root).release()
+    except locks.Busy:
+        job = jobs.running_job(ctx)
+        if job:
+            ctx.log(f'play from Steam: not started: the launcher is busy with {job["task"]}')
+            tell(f'NX2navi is busy with {job["task"]}. Start the game when it is done.')
+            return 0
     if saves.game_running(gd):
         ctx.log('play from Steam: the game is already running')
         return 0
