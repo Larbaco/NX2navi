@@ -805,6 +805,11 @@ DLL, and passes a DLL with every export `nx2_sl.h` declares; that every function
 `tools/make_launcher.py` and `tools/make_kit.py` make that check of their `--dlssg` DLL before they download anything.
 The DLL itself is checked when `tools/build_dlssg.py` builds it, or with `--check <dll>`. No MSVC, no Streamline SDK,
 no game files.
+A change to the list of what the upscalers let go of while the GPU may still use it (`runtime/vk_up_defer.h`) passes
+`python tests\up_defer_check.py`, which builds the header alone, as C and as C++, and checks that an entry goes only
+once the submission that last named it is done and its present gate is passed, that the ready ones go in the order
+they were put and the rest keep theirs, that a full list refuses without overwriting, and that an entry a release puts
+waits for the next take. No GPU, no game files.
 
 A change to which frames the flight recorder takes for a one-frame flash (`runtime/flight_flash.h`, `runtime/flight.c`
 `flight_cells`) passes `python tests\flight_flash_check.py`, which builds the header alone, draws pictures of the
