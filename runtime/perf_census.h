@@ -1,8 +1,10 @@
 // The part of a frame that an address-space walk of NX2NAVI_MEM_CENSUS overlapped, charged to the census (perf.c
 // ft_frame). vk_memory.c census_main walks on a thread of its own, but the walk holds the process's address-space lock,
-// which the replaying thread's write-watch queries (vk_memory.c vk_mem_mirror_begin) and every page fault wait for: in
+// which the replaying thread's write-watch queries (vk_memory.c vk_mem_mirror_begin) and every page fault take too. In
 // a session of 2026-11-13, 63 of the 66 hitches the stutter map charged to the replay sat beside such a walk, with a
-// 20-34 ms write-watch query in them. So the time the frame overlapped the walk is taken out of the frame's replay part
+// 20-34 ms write-watch query in them; the presenting thread's 600-frame memory report (vk_memory.c vk_mem_census) ran
+// at the same frames, and that log cannot tell which of the two held them up. The charge assumes the walk did, which a
+// play-test with mem_census = 0 checks: the time the frame overlapped the walk is taken out of the frame's replay part
 // first, then out of its unattributed part, never more than the overlap and never so much that the census part grows
 // past the frame. Apart from perf.c so that tests/census_charge_check.py builds it alone.
 #pragma once
