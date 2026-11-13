@@ -161,6 +161,17 @@ def static_checks():
     ok = None not in pos and pos == sorted(pos)
     print(f'cheats.c rebuild_if_needed: {", ".join(want)} in that order: {"ok" if ok else "FAIL " + str(pos)}', flush=True)
     bad += not ok
+    # the window's close runs the end on a thread of its own, and the session's end waits for it
+    win = strip_comments((RT / 'gfx_window_win.c').read_text(encoding='utf-8'))
+    proc = function(win, 'static LRESULT CALLBACK wnd_proc(')
+    close = proc[proc.index('case WM_CLOSE:'):]
+    close = close[:close.index('case WM_ERASEBKGND:')]
+    session = proc[proc.index('case WM_ENDSESSION:'):proc.index('case WM_CLOSE:')]
+    ok = ('exit_start(' in close and 'gfx_window_closed(' not in close and 'exit_start(' in session
+          and 'plat_thread_join(' in session and 'ShowWindow(h, SW_HIDE)' in function(win, 'static PlatThread *exit_start('))
+    print(f'gfx_window_win.c: WM_CLOSE and WM_ENDSESSION start the end on its own thread and hide the window: '
+          f'{"ok" if ok else "FAIL"}', flush=True)
+    bad += not ok
     steps = function(gp, 'void rt_exit_steps(unsigned what)')
     pos = calls_in_order(steps, ['rtss_limit_restore', 'vk_pipeline_save_exit'])
     ok = None not in pos and pos[0] < pos[1]
