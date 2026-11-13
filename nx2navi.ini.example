@@ -430,7 +430,7 @@
 # While the video memory in use is over tex_vram_pressure percent of the budget, the pipelines the game built ahead
 # of play and no draw has used yet are given back, a few hundred every 5 seconds: on a card short of video memory they
 # are what costs least to lose, and a draw that needs one later builds it again from the pipeline cache. 0: every
-# pipeline stays for the run, as before 0.10. Read at start.
+# pipeline stays for the run, as before 0.10; tex_vram_pressure = 0 turns this off too. Read at start.
 # pipe_release = 1
 # Low-end GPU mode (experimental; also in the settings menu's Game tab). For older graphics cards, and ones short of
 # video memory: 1 turns on the settings written for them and measured on a Radeon RX 580, for every key below that

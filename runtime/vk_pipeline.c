@@ -5079,7 +5079,8 @@ static void fast_retire(Pipe *p) {
 // The use counts the free space inside the allocator's blocks as free, as the texture evictions do (vk_texture.c
 // sweep_pressure): the driver's figure (vk_mem_vram) counts it as used, so with free blocks it could stay over the line
 // while pipelines went, and every pass would give back another batch until no unused pipeline was left.
-// NX2NAVI_PIPE_RELEASE=0 keeps every pipeline for the run, as before 0.10.0.
+// NX2NAVI_PIPE_RELEASE=0 keeps every pipeline for the run, as before 0.10.0, and so does NX2NAVI_TEX_VRAM_PRESSURE=0,
+// which keeps the textures from giving way for video memory.
 #define RELEASE_EVERY_MS 5000
 #define RELEASE_BATCH 256
 #define RELEASE_DRAIN 64   // destroyed per autosave tick (500 ms) at most: faster than RELEASE_BATCH per RELEASE_EVERY_MS
@@ -5118,8 +5119,13 @@ static void pressure_release(uint64_t now) {
     if (on < 0) {
         on = cfg_bool("NX2NAVI_PIPE_RELEASE");
         pct = cfg_int("NX2NAVI_TEX_VRAM_PRESSURE");
-        if (pct <= 0 || pct > 100) pct = 80;
+        if (pct < 0 || pct > 100) pct = 80;
         if (!on) rt_log("vk_pipeline: every pipeline stays for the run, also while video memory is short (NX2NAVI_PIPE_RELEASE=0)");
+        else if (!pct) {   // 0 turns the textures' giving way off (vk_texture.c sweep_pressure): the pipelines' too
+            on = 0;
+            rt_log("vk_pipeline: every pipeline stays for the run, also while video memory is short "
+                   "(NX2NAVI_TEX_VRAM_PRESSURE=0)");
+        }
     }
     if (!on || now - last < RELEASE_EVERY_MS) return;
     last = now;
