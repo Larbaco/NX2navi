@@ -226,10 +226,17 @@ typedef struct {
 // RTSS holds the game's frames by a setting of its own.
 static inline int rtss_settings_limit(const RtssSettings *s) { return s->limit || s->time || s->scan0 || s->scan1; }
 
-// Two limiters: RTSS is kept out of the game's limit, and while it lists the game a setting of its own still holds the
-// frames (rtss_settings_limit), beside the game's limiter, the driver's or frame generation's.
-static inline int rtss_two(int64_t want, int listed, int own_limit) {
-    return want < 0 && want != RTSS_UNSET && listed && own_limit;
+// RTSS has no part in the game's limit although it may list the game: the want keeps it out, or it is out for the run
+// because its profile cannot be written or its hooks library did not load. A run whose frame count check gave up on
+// RTSS does not count: RTSS was seen not to hold the game.
+static inline int rtss_out_of_limit(int64_t want, int fail) {
+    return want != RTSS_UNSET && (want < 0 || fail == RTSS_FAIL_READONLY || fail == RTSS_FAIL_LIBRARY);
+}
+
+// Two limiters: RTSS is out of the game's limit (rtss_out_of_limit), and while it lists the game a setting of its own
+// still holds the frames (rtss_settings_limit), beside the game's limiter, the driver's or frame generation's.
+static inline int rtss_two(int64_t want, int fail, int listed, int own_limit) {
+    return rtss_out_of_limit(want, fail) && listed && own_limit;
 }
 
 // "limit L/D, frame time limit T/TD, scanline sync S0/S1", and with modes ", display sync X, Reflex sleep R, passive

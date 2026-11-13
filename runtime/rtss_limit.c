@@ -271,14 +271,19 @@ static void read_settings(void) {
 }
 
 // While RTSS lists the game, the settings it holds for it are logged once per change: what RTSS applies may be more than
-// the FramerateLimit the game writes (a frame time limit, scanline sync, its own Reflex). While RTSS is kept out
-// (w < 0) the game's own limiter, the driver's low latency or frame generation holds the frames, and a limit the player
-// set in RTSS itself for the game (its global profile or the game's own, a frame time limit or scanline sync) still
-// holds them a second time. Logged once per change and shown in the menu (rtss_limit_state 4).
-static void watch(int64_t w, int listed) {
+// the FramerateLimit the game writes (a frame time limit, scanline sync, its own Reflex). While RTSS has no part in the
+// game's limit (rtss_out_of_limit: kept out, w < 0, or out for the run because its profile cannot be written or its
+// hooks library did not load) the game's own limiter, the driver's low latency or frame generation holds the frames,
+// and a limit the player set in RTSS itself for the game (its global profile or the game's own, a frame time limit or
+// scanline sync) still holds them a second time. Logged once per change, and again when the other limiter changes;
+// the menu shows it for a kept-out want (rtss_limit_state 4), while a profile that cannot be written keeps its own note
+// there (state 2).
+static void watch(int64_t w, int fail, int listed) {
     static int said, lines, settings_lines;
+    static const char *said_by;
     static char said_text[128], said_settings[MAX_PATH + 256];
-    int on = 0;
+    int out = rtss_out_of_limit(w, fail), on = 0;
+    const char *by = rtss_out_limiter(w);   // the limiter beside RTSS's own setting
     char text[128] = "";
     if (listed) {
         read_settings();
@@ -289,23 +294,23 @@ static void watch(int64_t w, int listed) {
             rt_log("frame rate: RivaTuner Statistics Server's settings for the game %s", all);
         snprintf(said_settings, sizeof said_settings, "%s", all);
     }
-    if (w < 0 && listed) {
-        on = rtss_two(w, listed, rtss_settings_limit(&settings));
+    if (out && listed) {
+        on = rtss_two(w, fail, listed, rtss_settings_limit(&settings));
         rtss_settings_text(text, sizeof text, &settings, 0);
     }
-    if (w >= 0) said = 0;   // a later kept-out want logs afresh
-    else if (on != said || (on && strcmp(text, said_text))) {
+    if (!out) said = 0;   // RTSS takes the game's limit: a later want out of it logs afresh
+    else if (on != said || (on && (strcmp(text, said_text) || by != said_by))) {
         if (lines++ < 40) {
             if (on)
                 rt_log("frame rate: two limiters: RivaTuner Statistics Server's own setting for the game (%s: %s) limits "
-                       "it beside %s", settings_file, text, rtss_out_limiter(w));
+                       "it beside %s", settings_file, text, by);
             else
-                rt_log("frame rate: RivaTuner Statistics Server no longer limits the game beside %s", rtss_out_limiter(w));
+                rt_log("frame rate: RivaTuner Statistics Server no longer limits the game beside %s", by);
         }
-        said = on;
+        said = on, said_by = by;
         snprintf(said_text, sizeof said_text, "%s", text);
     }
-    atomic_store(&two, on);
+    atomic_store(&two, on && w < 0);   // the menu's note (rtss_limit_state 4) is for a kept-out want
 }
 
 // RTSS's folder (InstallDir under its registry key), its hooks library and this executable's profile name, on the
@@ -372,7 +377,7 @@ static void worker(void *arg) {
             rtss_why_text(why, sizeof why, &o, S.fail);
             set_active(w, o.holds, why);
         }
-        watch(w, in.app.listed);
+        watch(w, S.fail, in.app.listed);
         plat_mutex_unlock(&lock);
     }
 }

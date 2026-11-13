@@ -367,14 +367,21 @@ static void closed_and_library(void) {
     CHECK(!strcmp(t, "RivaTuner Statistics Server is not running"), "%s", t);
 }
 
-// Two limiters: kept out, listed and a limit of RTSS's own; never for a limit the game hands RTSS.
+// Two limiters: RTSS out of the game's limit (kept out, or a profile that cannot be written or a hooks library that did
+// not load), listed and a limit of RTSS's own; never for a limit the game hands RTSS.
 static void two(void) {
-    CHECK(rtss_two(RTSS_OUT_SETTING, 1, 1) && rtss_two(RTSS_OUT_FRAMEGEN, 1, 1) && rtss_two(RTSS_OUT_LOWLAT, 1, 1),
+    CHECK(rtss_two(RTSS_OUT_SETTING, 0, 1, 1) && rtss_two(RTSS_OUT_FRAMEGEN, 0, 1, 1) &&
+              rtss_two(RTSS_OUT_LOWLAT, 0, 1, 1),
           "every reason");
-    CHECK(!rtss_two(RTSS_OUT_SETTING, 0, 1), "not listed: RTSS holds nothing");
-    CHECK(!rtss_two(RTSS_OUT_SETTING, 1, 0), "no limit of its own");
-    CHECK(!rtss_two(60000, 1, 1) && !rtss_two(0, 1, 1), "the game's limit in RTSS: one limiter");
-    CHECK(!rtss_two(RTSS_UNSET, 1, 1), "no want yet");
+    CHECK(!rtss_two(RTSS_OUT_SETTING, 0, 0, 1), "not listed: RTSS holds nothing");
+    CHECK(!rtss_two(RTSS_OUT_SETTING, 0, 1, 0), "no limit of its own");
+    CHECK(!rtss_two(60000, 0, 1, 1) && !rtss_two(0, 0, 1, 1), "the game's limit in RTSS: one limiter");
+    CHECK(!rtss_two(RTSS_UNSET, 0, 1, 1) && !rtss_two(RTSS_UNSET, RTSS_FAIL_READONLY, 1, 1), "no want yet");
+    CHECK(rtss_two(60000, RTSS_FAIL_READONLY, 1, 1) && rtss_two(0, RTSS_FAIL_LIBRARY, 1, 1),
+          "out for the run: the profile cannot be written, or the hooks library did not load");
+    CHECK(!rtss_two(60000, RTSS_FAIL_READONLY, 0, 1) && !rtss_two(60000, RTSS_FAIL_LIBRARY, 1, 0),
+          "out for the run, but not listed or no limit of its own");
+    CHECK(!rtss_two(60000, RTSS_FAIL_NOT_LIMITING, 1, 1), "RTSS seen not to hold the game: not counted");
 }
 
 int main(void) {

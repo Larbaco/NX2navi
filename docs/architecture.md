@@ -258,7 +258,9 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   DLSS Frame Generation's Reflex sleeps where the frame starts while the pacer holds the limit; while RTSS holds it the
   pacer holds nothing at all, through movies and while no picture goes out (a minimised window, `frame_hold`) too; and
   a limit set in RTSS itself still holds the game where the game keeps RTSS out, which the log ("two limiters") and the
-  frame rate row of the menu point out.
+  frame rate row of the menu point out, and the same where RTSS is out of it for the run because its profile cannot be
+  written or its hooks library does not load, which the log points out the same way (the menu shows the administrator
+  note for the first and nothing for the second).
 - RivaTuner Statistics Server (`rtss_limit.c`, `NX2NAVI_RTSS`, restart; its decisions in `rtss_decide.h`): the game's
   first present starts a thread that looks RTSS up (`InstallDir` under `HKLM\SOFTWARE\WOW6432Node\Unwinder\RTSS`,
   `RTSSHooks64.dll`) and reads its shared memory (`RTSSSharedMemoryV2`) every 500 ms. While RTSS runs, the limit goes

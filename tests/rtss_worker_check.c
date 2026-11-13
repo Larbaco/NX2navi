@@ -547,6 +547,45 @@ static void readonly_run(void) {
     CHECK(logged("RivaTuner Statistics Server's profile cannot be changed"), "logged");
 }
 
+// The same with a limit set in RTSS's Global profile: RTSS, out of the game's limit for the run, still holds the game
+// by its own setting, and the log tells of the two limiters; the menu keeps its administrator note.
+static void readonly_two(void) {
+    readonly = 1;
+    global.limit = 50;
+    app_set(1, 0xA, 1000, 2000, 50);
+    ask(60000);
+    poll();
+    show("read-only profiles, Global limit 50");
+    CHECK(rtss_limit_state() == 2 && !rtss_limit_active(), "the menu says RTSS needs administrator rights");
+    CHECK(logged("two limiters: RivaTuner Statistics Server's own setting for the game (Profiles\\Global: limit 50/1, "
+                 "frame time limit 0/0, scanline sync 0/0) limits it beside the game's limiter"),
+          "the two-limiter line names the file and the values");
+    ask(RTSS_OUT_LOWLAT);
+    poll();
+    CHECK(logged("scanline sync 0/0) limits it beside the driver's low latency"), "logged again for the other limiter");
+    CHECK(rtss_limit_state() == 4, "kept out: the menu's two-limiter note");
+    ask(60000);
+    poll();
+    global.limit = 0, touch(&global);
+    poll();
+    CHECK(logged("RivaTuner Statistics Server no longer limits the game beside the game's limiter"), "logged once it ended");
+    CHECK(rtss_limit_state() == 2, "the administrator note again");
+}
+
+// RTSS's hooks library does not load, with a limit set in RTSS's Global profile: the log tells of the two limiters.
+static void library_two(void) {
+    no_library = 1;
+    global.limit = 50;
+    app_set(1, 0xA, 1000, 2000, 50);
+    ask(60000);
+    poll();
+    show("no hooks library, Global limit 50");
+    CHECK(!rtss_limit_active() && !saves, "the game's limiter");
+    CHECK(logged("two limiters: RivaTuner Statistics Server's own setting for the game (Profiles\\Global: limit 50/1, "
+                 "frame time limit 0/0, scanline sync 0/0) limits it beside the game's limiter"),
+          "the two-limiter line");
+}
+
 // RTSS refuses a limit out of its range: the game keeps that one, the earlier limit of this run is cleared to none,
 // and a limit in range goes to RTSS again at once.
 static void refused_run(void) {
@@ -688,6 +727,8 @@ static const struct { const char *name; void (*run)(void); } scenarios[] = {
     {"not_installed", not_installed},
     {"settings_logged", settings_logged},
     {"readonly_run", readonly_run},
+    {"readonly_two", readonly_two},
+    {"library_two", library_two},
     {"refused_run", refused_run},
     {"over_run", over_run},
     {"over_slack_run", over_slack_run},
