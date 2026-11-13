@@ -46,6 +46,16 @@ int main(void) {
     p = charge(1000, 40, 985, 700, 30, 10, 0);
     CHECK(p.moved == 15 * MS && p.replay == 15 * MS, "a running walk with the last one's end: moved %llu",
           (unsigned long long)p.moved);
+    // a torn read (the last walk's start, 10 s back, with the 0 stored before the next start) moves nothing; a walk
+    // running for 1.9 s still counts, one running for just over 2 s (CENSUS_WALK_MAX_NS) does not
+    p = charge(20000, 40, 10000, 0, 30, 10, 0);
+    CHECK(p.moved == 0 && p.replay == 30 * MS && p.other == 10 * MS && p.census == 0, "a torn read: moved %llu",
+          (unsigned long long)p.moved);
+    p = charge(3000, 40, 1100, 0, 30, 10, 0);
+    CHECK(p.moved == 40 * MS && p.replay == 0 && p.other == 0 && p.census == 40 * MS,
+          "a walk running for 1.9 s: moved %llu", (unsigned long long)p.moved);
+    p = charge(3000, 40, 999, 0, 30, 10, 0);
+    CHECK(p.moved == 0 && p.census == 0, "a walk running for 2.001 s: moved %llu", (unsigned long long)p.moved);
     // the overlap caps the charge; the parts cap it too (nothing taken from the other parts of the frame)
     p = charge(1000, 100, 900, 0, 5, 3, 0);
     CHECK(p.moved == 8 * MS && p.replay == 0 && p.other == 0 && p.census == 8 * MS, "parts smaller than the overlap: "
@@ -54,17 +64,21 @@ int main(void) {
     p = charge(1000, 40, 900, 0, 30, 10, 35);
     CHECK(p.moved == 5 * MS && p.census == 40 * MS && p.replay == 25 * MS, "census at the frame's length: moved %llu, "
           "census %llu", (unsigned long long)p.moved, (unsigned long long)p.census);
-    // random frames: the census part never passes the frame, the moved time never passes the overlap, and the sum of
-    // the three parts is kept
+    // random frames: the census part never passes the frame, the moved time is the overlap capped by the frame's room
+    // and its replay and unattributed parts (none for a walk seen running for over 2 s), and the sum of the three parts
+    // is kept
     srand(7);
     for (int i = 0; i < 100000; i++) {
-        uint64_t now = 1000 + (uint64_t)(rand() % 1000), d = 1 + (uint64_t)(rand() % 300);
-        uint64_t w0 = (uint64_t)(rand() % 2000), w1 = rand() % 3 ? w0 + (uint64_t)(rand() % 400) : 0;
+        uint64_t now = 1000 + (uint64_t)(rand() % 4000), d = 1 + (uint64_t)(rand() % 300);
+        uint64_t w0 = (uint64_t)(rand() % 5000), w1 = rand() % 3 ? w0 + (uint64_t)(rand() % 400) : 0;
         uint64_t census = (uint64_t)(rand() % (int)d), replay = (uint64_t)(rand() % 300), other = (uint64_t)(rand() % 300);
         p = charge(now, d, w0, w1, replay, other, census);
         uint64_t lo = now - d > w0 ? now - d : w0, hi = w1 && w1 < now ? w1 : now;
-        uint64_t ov = w0 && hi > lo ? (hi - lo) * MS : 0;
-        int ok = p.census <= d * MS && p.moved <= ov && p.replay + p.other + p.census == (replay + other + census) * MS &&
+        int torn = !w1 && (w0 > now || now - w0 > 2000);
+        uint64_t ov = w0 && !torn && hi > lo ? (hi - lo) * MS : 0, want = ov;
+        if (want > (d - census) * MS) want = (d - census) * MS;
+        if (want > (replay + other) * MS) want = (replay + other) * MS;
+        int ok = p.census <= d * MS && p.moved == want && p.replay + p.other + p.census == (replay + other + census) * MS &&
                  p.census == census * MS + p.moved && (p.other == other * MS || p.replay == 0);
         CHECK(ok, "case %d: now %llu d %llu walk %llu-%llu: moved %llu of overlap %llu, census %llu", i,
               (unsigned long long)now, (unsigned long long)d, (unsigned long long)w0, (unsigned long long)w1,

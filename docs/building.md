@@ -723,9 +723,9 @@ and that the lines of older logs, without those fields, still parse. Any Python,
 
 A change to what the frame-time summary charges to an address-space walk of `NX2NAVI_MEM_CENSUS`
 (`runtime/perf_census.h` `census_charge`, `runtime/perf.c` `ft_frame`) passes `python tests\census_charge_check.py`,
-which builds the header alone: a walk before, after or around a frame, one still running, the charge taken from the
-replay part first, capped by the overlap and the parts, and 100,000 random frames in which the census part never passes
-the frame and the parts keep their sum. No GPU, no game files.
+which builds the header alone: a walk before, after or around a frame, one still running, a torn read of the last walk's
+start (taken as no walk), the charge taken from the replay part first, capped by the overlap and the parts, and 100,000
+random frames in which the census part never passes the frame and the parts keep their sum. No GPU, no game files.
 
 A change to how the on/off switches read their value (`runtime/perf.c` `rt_knob`) passes `python tests\rt_knob_check.py`,
 which cuts the function out of the file with its warning table and builds it with stand-ins for the settings and the
