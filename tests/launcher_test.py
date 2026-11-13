@@ -5059,20 +5059,100 @@ class SteamTest(Tmp):
 class WhilePlayingTest(Tmp):
     def test_the_games_restart_does_not_bring_the_launcher_back(self):
         try:
-            from launcher.ui.app import App
+            from launcher.ui import app
         except ImportError as e:
             self.skipTest(f'no window toolkit: {e}')
+        App, GameRun = app.App, app.GameRun
         a = mock.MagicMock()
         a.settings = {'game_dir': str(self.tmp)}
-        a.game_proc = mock.MagicMock(returncode=0)
-        a.game_proc.poll.return_value = 0                              # the process started here has ended
-        with mock.patch('launcher.ui.app.saves.game_running', return_value=True):
+        a.game_run = GameRun(mock.MagicMock(returncode=0, pid=11), str(self.tmp), time.time())
+        a.game_run.proc.poll.return_value = 0                         # the process started here has ended
+        with mock.patch('launcher.ui.app.saves.game_running', return_value=True), \
+                mock.patch('launcher.ui.app.winsys.game_copy', return_value=None) as copy:
             App.watch_game(a)                                          # but the restarted game runs from the same exe
+        copy.assert_called_once_with(self.tmp / 'ocarina.exe', skip=11)
         a.root.deiconify.assert_not_called()
         a.root.after.assert_called_once()
         with mock.patch('launcher.ui.app.saves.game_running', return_value=False):
             App.watch_game(a)
         a.root.deiconify.assert_called_once()
+
+    def test_the_restarted_copy_is_followed_for_its_exit_code(self):
+        """The game's Restart ends the process the launcher started with code 0 and starts the exe again: the launcher
+        follows that copy (winsys.game_copy) and reports the code it ends with, and its FATAL line."""
+        try:
+            from launcher.ui import app
+        except ImportError as e:
+            self.skipTest(f'no window toolkit: {e}')
+        App, GameRun = app.App, app.GameRun
+        log = self.tmp / 'logs' / 'nx2navi.log'
+        log.parent.mkdir()
+        log.write_text('[host] gfx: window closed; restarting\n', encoding='utf-8')
+        a = mock.MagicMock()
+        a.message = ''
+        a.settings = {'game_dir': str(self.tmp)}
+        a.install_staged.return_value = False
+        a.game_run = GameRun(mock.MagicMock(returncode=0, pid=11), str(self.tmp), time.time() - 60)
+        a.game_run.proc.poll.return_value = 0
+        copy = mock.MagicMock(returncode=None, pid=12, ended=False)
+        copy.poll.return_value = None
+        with mock.patch('launcher.ui.app.saves.game_running', return_value=True), \
+                mock.patch('launcher.ui.app.winsys.game_copy', return_value=copy):
+            App.watch_game(a)                                          # the copy is found and followed
+            App.watch_game(a)                                          # it runs: no further look for one
+        self.assertIs(a.game_run.proc, copy)
+        a.root.deiconify.assert_not_called()
+        log.write_text('[host] boot\nFATAL: vk: the GPU device was lost (seen at: q). The run ends here\n',
+                       encoding='utf-8')                               # the copy's own log (main.c log_open)
+        copy.returncode = 72
+        copy.poll.return_value = 72
+        with mock.patch('launcher.ui.app.saves.game_running', return_value=False):
+            App.watch_game(a)
+        a.ctx.log.assert_called_once_with('the game ended with code 72 after restarting itself; its log says: FATAL: '
+                                          'vk: the GPU device was lost (seen at: q). The run ends here')
+        self.assertIn('(code 72): vk: the GPU device was lost', a.message)
+        self.assertIn('[launcher] the game ended with code 72 (the graphics device was lost',
+                      log.read_text(encoding='utf-8'))
+        self.assertIsNone(a.game_run)
+
+    def test_a_restarted_copy_that_could_not_be_followed_ends_with_its_code_unknown(self):
+        """A copy the launcher could not find (it ended before the next look): its code is not known, so neither
+        launcher.log nor the game's log says code 0, and its FATAL line is still shown."""
+        try:
+            from launcher.ui import app
+        except ImportError as e:
+            self.skipTest(f'no window toolkit: {e}')
+        App, GameRun = app.App, app.GameRun
+        log = self.tmp / 'logs' / 'nx2navi.log'
+        log.parent.mkdir()
+
+        def run(text):
+            log.write_text(text, encoding='utf-8')
+            a = mock.MagicMock()
+            a.message = ''
+            a.settings = {'game_dir': str(self.tmp)}
+            a.install_staged.return_value = False
+            a.game_run = GameRun(mock.MagicMock(returncode=0, pid=11), str(self.tmp), time.time() - 60)
+            a.game_run.proc.poll.return_value = 0
+            with mock.patch('launcher.ui.app.saves.game_running', return_value=True), \
+                    mock.patch('launcher.ui.app.winsys.game_copy', return_value=None):
+                App.watch_game(a)
+            with mock.patch('launcher.ui.app.saves.game_running', return_value=False):
+                App.watch_game(a)
+            return a
+
+        a = run('[host] log: x\n[host] perf: the last line of play\n')
+        a.ctx.log.assert_called_once_with('the game ended after restarting itself; the exit code of its last run is '
+                                          'not known')
+        self.assertEqual(a.message, '')
+        text = log.read_text(encoding='utf-8')
+        self.assertIn('[launcher] the game ended with code unknown (the game had restarted itself;', text)
+        self.assertNotIn('code 0', text)
+        a = run('[host] log: x\nFATAL: fs: another copy of the game is running\n')
+        a.ctx.log.assert_called_once_with('the game ended after restarting itself; its log says: FATAL: fs: another '
+                                          'copy of the game is running')
+        self.assertIn("A copy started by the game's Restart ended with a fatal error: fs: another copy", a.message)
+        self.assertNotIn('[launcher]', log.read_text(encoding='utf-8'))   # the FATAL line says it already
 
     def test_the_games_settings_file_is_left_alone_while_it_runs(self):
         """The game writes nx2navi.ini when a menu setting changes, so the launcher's Discord Status switch (the one
@@ -5105,22 +5185,113 @@ class WhilePlayingTest(Tmp):
         self.assertEqual(gameini.get(game, 'MODS_DISABLED'), '')
         self.assertIn('Quit the game first', a.mods_message)
 
-    def ended(self, code, log_text):
-        """watch_game after the game ended with code, its log holding log_text; (the stand-in window, the log)."""
-        from launcher.ui.app import App
+    def ended(self, code, log_text, started=None):
+        """watch_game after the game ended with code, its log holding log_text; started is the time Play started it,
+        a minute ago unless given; (the stand-in window, the log)."""
+        from launcher.ui.app import App, GameRun
         log = self.tmp / 'logs' / 'nx2navi.log'
         log.parent.mkdir(exist_ok=True)
         if log_text is not None:
             log.write_text(log_text, encoding='utf-8')
         a = mock.MagicMock()
+        a.message = ''
         a.settings = {'game_dir': str(self.tmp)}
         a.game_dir.return_value = str(self.tmp)
-        a.game_proc = mock.MagicMock(returncode=code)
-        a.game_proc.poll.return_value = code
+        proc = mock.MagicMock(returncode=code)
+        proc.poll.return_value = code
+        a.game_run = GameRun(proc, str(self.tmp), time.time() - 60 if started is None else started)
         a.install_staged.return_value = False
         with mock.patch('launcher.ui.app.saves.game_running', return_value=False):
             App.watch_game(a)
         return a, log
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows processes')
+    def test_a_game_copy_is_found_by_its_exe_file(self):
+        """winsys.game_copy finds a running process by its image file, not by its name, and reads the code it ended
+        with after it ended. A sleeper compiled here stands in for the game, under a name that no game runner
+        watches."""
+        cc = next((c for c in (r'C:\msys64\ucrt64\bin\clang.exe', shutil.which('clang')) if c and Path(c).is_file()),
+                  None)
+        if not cc:
+            self.skipTest('needs a C compiler')
+        src = self.tmp / 'sleeper.c'
+        src.write_text('#include <windows.h>\nint main(void) { Sleep(4000); return 72; }\n', encoding='utf-8')
+        mine, other = self.tmp / 'mine' / 'sleeper.exe', self.tmp / 'other' / 'sleeper.exe'
+        mine.parent.mkdir()
+        other.parent.mkdir()
+        subprocess.run([cc, '-O1', '-o', str(mine), str(src)], check=True, capture_output=True, timeout=300)
+        shutil.copy(mine, other)
+        proc = winsys.start_game(mine)
+        try:
+            copy = winsys.game_copy(mine)
+            self.assertIsNotNone(copy)
+            self.assertEqual(copy.pid, proc.pid)
+            self.assertIsNone(copy.poll())
+            self.assertIsNone(winsys.game_copy(mine, skip=proc.pid))
+            self.assertIsNone(winsys.game_copy(other))          # the same name in another folder: another install
+            upper = winsys.game_copy(Path(str(mine).upper()))   # Windows paths ignore case
+            self.assertEqual(upper.pid, proc.pid)
+            proc.wait(30)
+            self.assertEqual(upper.poll(), 72)
+            self.assertEqual(copy.poll(), 72)
+            self.assertTrue(copy.ended)
+            self.assertIsNone(copy.handle)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(10)
+
+    def test_a_lost_device_shows_the_games_fatal_line(self):
+        """Exit code 72 (runtime/vk_device.c vk_device_lost_check) follows a FATAL line as 70 and 71 do; when its
+        watchdog ended the run before that line, the code's own text says what happened."""
+        try:
+            from launcher.ui import app
+        except ImportError as e:
+            self.skipTest(f'no window toolkit: {e}')
+        fatal = 'vk: the GPU device was lost (seen at: q). The run ends here'
+        a, log = self.ended(72, f'[host] x\nFATAL: {fatal}\n[host] fatal: memory commit: this process 9000 MB\n')
+        self.assertEqual(a.message, f'The game ended with a fatal error (code 72): {fatal}. Its log is '
+                                    'logs\\nx2navi.log in the game folder.')
+        a.ctx.log.assert_called_once_with(f'the game ended with code 72; its log says: FATAL: {fatal}')
+        self.assertIn('[launcher] the game ended with code 72 (the graphics device was lost',
+                      log.read_text(encoding='utf-8'))
+        self.assertTrue(app.exit_code_text(72).startswith('72 (the graphics device was lost'))
+        a, _ = self.ended(72, '[host] vk: device fault: none\n')
+        self.assertIn('The game ended with code 72 (the graphics device was lost', a.message)
+
+    def test_a_fatal_line_after_code_0_is_the_restarted_copys(self):
+        """No process of the game writes a FATAL line and exits with 0: after code 0 such a line is a copy's that the
+        game's Restart started and that ended before the launcher saw it, and the player is told. A log older than
+        the start is an earlier run's and tells nothing."""
+        try:
+            from launcher.ui import app   # noqa: F401
+        except ImportError as e:
+            self.skipTest(f'no window toolkit: {e}')
+        a, log = self.ended(0, '[host] x\nFATAL: vk: the GPU device was lost (seen at: x)\n')
+        self.assertEqual(a.message, "A copy started by the game's Restart ended with a fatal error: vk: the GPU device "
+                                    'was lost (seen at: x). Its log is logs\\nx2navi.log in the game folder.')
+        a.ctx.log.assert_called_once_with('the game ended after restarting itself; its log says: FATAL: vk: the GPU '
+                                          'device was lost (seen at: x)')
+        self.assertNotIn('[launcher]', log.read_text(encoding='utf-8'))
+        old = time.time() - 3600
+        log.write_text('FATAL: an earlier run started without the launcher\n', encoding='utf-8')
+        os.utime(log, (old, old))
+        a, _ = self.ended(0, None, started=time.time())
+        self.assertEqual(a.message, '')
+        a.ctx.log.assert_called_once_with('the game ended with code 0')
+
+    def test_a_log_cut_at_its_cap_says_nothing_of_its_end(self):
+        """A log that reached its 64 MiB cap (runtime/main.c log_sink) wrote its end lines to stderr only: it is
+        not taken for a run without its own end."""
+        try:
+            from launcher.ui import app
+        except ImportError as e:
+            self.skipTest(f'no window toolkit: {e}')
+        a, log = self.ended(0, '[host] perf: x\n[host] log: the file reached 64 MiB, the rest of this run goes to '
+                               'stderr only\n')
+        self.assertIsNone(app.log_has_own_exit(self.tmp))
+        a.ctx.log.assert_called_once_with('the game ended with code 0')
+        self.assertNotIn('[launcher]', log.read_text(encoding='utf-8'))
 
     def test_a_fatal_exit_shows_the_games_fatal_line(self):
         """Exit codes 70 and 71 follow a FATAL line in the game's log: the home screen and launcher.log name it."""
