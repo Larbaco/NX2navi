@@ -12,9 +12,15 @@ uint64_t kern_now_ns(void) { return clock_ns; }
 void plat_mutex_lock(PlatMutex *m) { (void)m; }
 void plat_mutex_unlock(PlatMutex *m) { (void)m; }
 static int logged;
+static char head[1400];   // the last report's first line
 void rt_log(const char *fmt, ...) {
-    (void)fmt;
     logged++;
+    char line[1400];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    if (!strncmp(line, "stutter map (", 13)) memcpy(head, line, sizeof head);
 }
 
 // perf.c's causes, in its order (FT_C_*); the frames below are charged to the last, unattributed
@@ -37,6 +43,19 @@ static void frames(int n, double ms) {
 static int fails;
 static void expect(const char *what, uint64_t got, uint64_t want) {
     if (got != want) printf("FAIL %s: %llu, expected %llu\n", what, (unsigned long long)got, (unsigned long long)want), fails++;
+}
+
+// The hitches in play the exit's report prints, and the ones the areas hold (what a report counts so far).
+static uint64_t exit_hitches(void) {
+    head[0] = 0;
+    stutter_report("exit");
+    const char *p = strstr(head, " areas; ");
+    return p ? strtoull(p + 8, NULL, 10) : UINT64_MAX;
+}
+static uint64_t counted(void) {
+    uint64_t n = 0;
+    for (int i = 0; i < n_areas; i++) n += areas[i].hitch;
+    return n;
 }
 
 int main(void) {
@@ -93,6 +112,26 @@ int main(void) {
     expect("five hitches at 30 fps", areas[3].hitch, 5);
     expect("five hitches at 30 fps (worst)", areas[3].worst_ns, 120000000ull);
     expect("five hitches at 30 fps (their time)", areas[3].cause_ns[OTHER], 600000000ull);
+    // The exit's report counts a hitch in the last frames, which only the next frames would have decided: a frame over
+    // the sure line followed by 0, 1 or 2 frames (a waiting candidate, then an open episode), two such frames in a row
+    // (one episode) and three long frames ending the run (one episode); each time what the run counts once it goes on
+    stutter_area("Death Mountain");
+    clock_ns += 10000000000ull;
+    static const double tail[][3] = {{150.0, 0, 0}, {150.0, 7.0, 0}, {150.0, 7.0, 7.0}, {150.0, 150.0, 0},
+                                     {150.0, 150.0, 7.0}, {87.0, 91.0, 96.0}};
+    for (size_t t = 0; t < sizeof tail / sizeof *tail; t++) {
+        frames(100, 7.0);
+        uint64_t before = counted();
+        for (int k = 0; k < 3 && tail[t][k] > 0; k++) frames(1, tail[t][k]);
+        char what[64];
+        snprintf(what, sizeof what, "the exit right after case %zu", t);
+        expect(what, exit_hitches(), before + 1);
+        frames(60, 7.0);
+        snprintf(what, sizeof what, "case %zu once the run went on", t);
+        expect(what, counted(), before + 1);
+    }
+    frames(100, 7.0);
+    expect("the exit with nothing waiting", exit_hitches(), counted());
     if (!logged) printf("FAIL nothing was logged\n"), fails++;
     if (fails) return 1;
     printf("stutter_hitch_check: all checks passed\n");

@@ -382,6 +382,41 @@ static int pipe_cmp(const void *x, const void *y) {
     return ka < kb ? 1 : ka > kb ? -1 : 0;
 }
 
+// At the exit: the hitches in the run's last frames, which cand_decide and episode_close would have counted had the
+// run gone on: the open episode, and the candidates still waiting for their next frames (the last two frames, three
+// in a run of long ones). A waiting candidate counts as one that did not stand out unless it is over SM_HITCH_SURE_NS
+// (a hitch whatever follows), and joins the episode of the frame before it as cand_decide joins it. Added to the
+// exit's printed totals only, and only read: the exit's report runs on another thread (perf.c perf_summary_flush, from
+// the window's close or the game's exit) while the presenting thread, which owns this state, may still be in
+// stutter_frame; a race there miscounts these last frames at worst. Other reports leave them to the next one.
+static void exit_tail(uint64_t *hitch, uint64_t *load, uint64_t *cause) {
+    int n = ep.open ? ep.n : 0, hit = ep.hitch, paced = pace_run, at_load = ep.first.load, why = ep.first.cause;
+    int nc = n_cand < SM_AFTER + 1 ? n_cand : SM_AFTER + 1;
+    uint64_t last = ep.open ? ep.last : pace_last;
+    for (int i = 0; i <= nc; i++) {
+        const Cand *c = i < nc ? &cand[i] : NULL;
+        int sure = c && c->d > SM_HITCH_SURE_NS;
+        if (c && c->frame == last + 1) {
+            last = c->frame;
+            if (n) {   // it joins the episode
+                n++, hit |= sure;
+                if (!hit && n > SM_EPISODE_MAX) n = 0, paced = 1;   // a change of pace
+                continue;
+            }
+            if (paced && !sure) continue;   // the change of pace goes on
+        }
+        if (n && (hit || n >= 2)) {
+            if (at_load) ++*load;
+            else {
+                ++*hitch;
+                if (why >= 0 && why < SM_CAUSES) cause[why]++;
+            }
+        }
+        n = 0, paced = 0;
+        if (c) n = 1, hit = sure, at_load = c->load, why = c->cause, last = c->frame;
+    }
+}
+
 // The map as a report reads it: copied under sm_lock, then sorted and logged without it. The replay thread
 // (stutter_miss) and the pipeline workers (stutter_ready, inside vk_pipeline.c's P.lock, which the draw path takes too)
 // wait for sm_lock, and a report sorts up to SM_PIPES entries and logs about 85 lines.
@@ -413,6 +448,7 @@ void stutter_report(const char *tag) {
         hitch += m->areas[i].hitch, load += m->areas[i].load_hitch, ns += m->areas[i].ns;
         for (int c = 0; c < SM_CAUSES; c++) cause[c] += m->areas[i].by_cause[c];
     }
+    if (!strcmp(tag, "exit")) exit_tail(&hitch, &load, cause);
     char line[1400];
     int o = snprintf(line, sizeof line, "stutter map (%s): %.1f min of play in %d areas; %llu hitches in play and %llu "
                      "after area loads; %llu long frames were a change of pace (the frames after them as long), not "
