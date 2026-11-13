@@ -75,7 +75,7 @@ def static_checks():
     main_c = (RT / 'main.c').read_text(encoding='utf-8')
     body = re.sub(r'//[^\n]*', '', function(main_c, 'static void crash_handler(const PlatCrash *x)'))
     first = body[body.index('{') + 1:].strip().split('\n')[0].strip()
-    ok = first == 'if (!rt_ending_enter()) plat_exit(71);'
+    ok = first == 'if (!rt_ending_enter(71)) plat_exit(71);'
     print(f'static: main.c crash_handler starts with the shared guard: {"ok" if ok else "FAIL (" + first + ")"}',
           flush=True)
     bad += not ok
@@ -95,6 +95,15 @@ def static_checks():
         print(f'static: {name} stops HD rumble through rt_rumble_stop_bounded after the RTSS restore: '
               f'{"ok" if ok else "FAIL"}', flush=True)
         bad += not ok
+    # a first report that hangs: the thread that waits for it ends the process after 30 s with that report's code, and
+    # fatal_end hands its own code to the guard (a hung FATAL must not read as a crash to the launcher)
+    dispatch = re.sub(r'//[^\n]*', '', (RT / 'dispatch.c').read_text(encoding='utf-8'))
+    enter = function(dispatch, 'int rt_ending_enter(int code)')
+    ok = ('__atomic_store_n(&ending_code, code' in enter
+          and 'plat_terminate(__atomic_load_n(&ending_code' in enter and 'rt_ending_enter(code)' in fatal)
+    print(f'static: dispatch.c rt_ending_enter ends a hung first report with that report\'s code: '
+          f'{"ok" if ok else "FAIL"}', flush=True)
+    bad += not ok
     # the fatal error's frame-time summary comes after the RTSS restore and the rumble stop, as in the orderly end
     s, p = fatal.find('rt_rumble_stop_bounded('), fatal.find('perf_summary_flush_try(')
     ok = 0 <= s < p

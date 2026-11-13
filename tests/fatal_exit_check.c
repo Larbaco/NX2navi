@@ -74,7 +74,7 @@ void input_rumble_hd_stop(void) {
 
 // ---- the crash report and the threads that fail beside it
 static void crash(const PlatCrash *x) {
-    if (!rt_ending_enter()) plat_exit(71);   // main.c crash_handler's first line
+    if (!rt_ending_enter(71)) plat_exit(71);   // main.c crash_handler's first line
     char b[160];
     for (int i = 1; i <= 3; i++) {
         snprintf(b, sizeof b, "report line %d: %s on thread %lu\n", i, x->what, (unsigned long)GetCurrentThreadId());

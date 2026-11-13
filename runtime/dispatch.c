@@ -88,21 +88,26 @@ void rt_rumble_stop_bounded(void) {
 // where it was, together with its wait for a save Commit and RivaTuner's restore, and its own FATAL line and exit
 // code replaced the first (the launcher shows the last FATAL). Another thread now waits until the first end is done;
 // it logs nothing, since it may hold the log queue's lock, which the first report only tries. A first report that
-// hangs still ends: after 30 s the waiting thread ends the process with the crash report's code.
+// hangs still ends: after 30 s the waiting thread ends the process with the first report's own code (a fatal error's
+// 70 or 72, the crash report's 71), so the launcher reads the end as the report says it.
 static volatile uint32_t ending_tid;   // the thread that reports, 0 before one does
+static volatile int32_t ending_code = 71;   // the code that report ends with, stored right after it took ending_tid
 
-int rt_ending_enter(void) {
+int rt_ending_enter(int code) {
     uint32_t me = plat_thread_id(), was = 0;
-    if (__atomic_compare_exchange_n(&ending_tid, &was, me, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return 1;
+    if (__atomic_compare_exchange_n(&ending_tid, &was, me, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&ending_code, code, __ATOMIC_RELEASE);
+        return 1;
+    }
     if (was == me) return 0;
     for (int i = 0; i < 3000; i++) plat_sleep_ms(10);
-    plat_terminate(71);
+    plat_terminate(__atomic_load_n(&ending_code, __ATOMIC_ACQUIRE));
 }
 
 // The fatal line, the report's notes and what has to be flushed, then the exit with `code`.
 static void fatal_end(int code, const char *fmt, va_list ap) __attribute__((noreturn));
 static void fatal_end(int code, const char *fmt, va_list ap) {
-    if (!rt_ending_enter()) plat_terminate(code);   // a fatal error inside this thread's own report: no second one
+    if (!rt_ending_enter(code)) plat_terminate(code);   // a fatal error inside this thread's own report: no second one
     rt_log_ending();   // the report reaches the log file past its cap (main.c log_sink)
     rt_log_sync();   // main.c: the lines queued for the log thread, then these, written here
     rt_log_raw("FATAL: ", 7);

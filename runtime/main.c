@@ -373,7 +373,7 @@ static int mode_rc;
 static void crash_handler(const PlatCrash *x) {
     // shared with the fatal error's end (dispatch.c rt_ending_enter): another thread's fault or fatal error waits there
     // while this report is written; a fault inside this thread's own report ends the process at once
-    if (!rt_ending_enter()) plat_exit(71);
+    if (!rt_ending_enter(71)) plat_exit(71);
     rt_log_ending();   // the report reaches the log file past its cap (log_sink)
     if (__atomic_load_n(&mode_done, __ATOMIC_ACQUIRE) && x->module) {
         rt_log("exit: %s (%#x) in %s while the process was ending, after its work was done and saved%s: the run ends "
