@@ -11,8 +11,9 @@
 // Multi frame generation: NX2NAVI_FRAMEGEN_MULTIPLIER (2, 3 or 4, live) is how many frames the display gets per
 // rendered frame, so one, two or three generated ones. Streamline says how many this GPU and driver can generate
 // (numFramesToGenerateMax: one where only 2x runs, three on an RTX 50); a higher setting is clamped to it with a log
-// line. frame_rate.c divides the frame limit by the multiplier in effect (vk_dlssg_multiplier), so the display gets the
-// limit and the game renders a half, a third or a quarter of it.
+// line. The frame limit counts the frames the game draws and the generated ones come on top (frame_rate.c
+// limit_game_hz): 60 at 4x is 60 drawn and 240 shown. Only a limit of display is divided by the multiplier in effect
+// (vk_dlssg_multiplier), since a frame past the monitor's refresh is never seen.
 //
 // DLSS-G needs Reflex, whose low-latency mode paces the game (NX2NAVI_REFLEX, default 1; 0 off, 2 on with boost): the
 // game's frame sleeps in Reflex where it starts (its acquire of a window image), and each frame carries the latency

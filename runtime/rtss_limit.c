@@ -19,13 +19,17 @@
 // rate RTSS itself measures for the game is checked against the limit: well above it for three seconds, and the game
 // takes the limiting back for the rest of the run.
 //
-// The calls run on a thread of their own, every half second, so a present never waits on profile files. On exit
-// (rtss_limit_restore, from every path that ends the process) the profile gets back what it held before the game
-// changed it: the old limit, or no profile of its own when there was none. A crash before that leaves the game's
-// limit in the profile until the next run changes it.
+// The calls run on a thread of their own, every half second, which also looks RTSS up (find_rtss), so a present never
+// waits on the registry or profile files. On every orderly exit (rtss_limit_restore) the profile gets back what it held
+// before the game changed it: the old limit, or no profile of its own when there was none; from then on no want reaches
+// it and the game's own limiter paces the frames left. An exit that skips it (a kill, the device-lost watchdog, a crash
+// inside the crash handler) leaves the game's limit in the profile, and the next run takes that limit for the player's
+// own.
 //
-// NX2NAVI_RTSS=0 keeps RTSS out of it. Frame generation keeps it out too: RTSS counts every presented frame, the
-// generated ones included, and would halve the limit.
+// NX2NAVI_RTSS=0 keeps RTSS out of it. Frame generation keeps it out too (RTSS counts every presented frame, the
+// generated ones included), and so does a driver's low latency (vk_lowlat.c), which holds the frames where they start.
+// Kept out, the thread never loads the hooks library: it only reads RTSS's own settings for the game, to tell when they
+// limit it a second time (watch).
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
