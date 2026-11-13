@@ -315,6 +315,27 @@ static void pb_rewrite(const PbHeader *hd) {   // an empty file with this driver
     PB.file_size = f ? sizeof *hd : 0;
 }
 
+// Indexes the records of f (len bytes) after its header: per record its type, key and offset. Returns the offset
+// after the last whole record, which is len unless the file ends inside a record (an append the process did not
+// finish) or holds a malformed one.
+static uint64_t pb_index(FILE *f, uint64_t len) {
+    uint64_t good = sizeof(PbHeader);
+    for (;;) {
+        uint32_t head[3];
+        uint8_t key[PB_KEY];
+        if (pb_seek(f, (int64_t)good, SEEK_SET) || fread(head, sizeof head, 1, f) != 1 || head[2] > PB_KEY ||
+            head[0] < PB_HEAD || (head[1] != PB_BLOB && head[1] != PB_PIPE) || fread(key, PB_KEY, 1, f) != 1 ||
+            good + 4 + head[0] > len)
+            break;
+        if (pb_insert(pb_hash(head[1], key, head[2]), good, head[0])) {
+            if (head[1] == PB_PIPE) PB.pipes++;
+            else PB.blobs++;
+        }
+        good += 4 + (uint64_t)head[0];
+    }
+    return good;
+}
+
 // Opens pipeline-binaries.bin and indexes its records (cache_load, before P.cache).
 static void pb_init(VkCtx *c) {
     if (!c->has_pipeline_binary || !P.cache_path[0]) return;
@@ -348,24 +369,20 @@ static void pb_init(VkCtx *c) {
         pb_seek(f, 0, SEEK_SET);
         if (fread(&hd, sizeof hd, 1, f) != 1 || memcmp(&hd, &want, sizeof hd)) why = "written by another driver, GPU or version";
         else if (cap && len > cap) why = "over NX2NAVI_PIPE_BINARIES_MAX_MB";
-        else {
-            good = sizeof hd;
-            for (;;) {   // index: per record its type, key and offset
-                uint32_t head[3];
-                uint8_t key[PB_KEY];
-                if (fread(head, sizeof head, 1, f) != 1 || head[2] > PB_KEY || head[0] < PB_HEAD ||
-                    (head[1] != PB_BLOB && head[1] != PB_PIPE) || fread(key, PB_KEY, 1, f) != 1 || good + 4 + head[0] > len)
-                    break;
-                if (pb_insert(pb_hash(head[1], key, head[2]), good, head[0])) {
-                    if (head[1] == PB_PIPE) PB.pipes++;
-                    else PB.blobs++;
-                }
-                good += 4 + (uint64_t)head[0];
-                if (pb_seek(f, (int64_t)good, SEEK_SET)) break;
-            }
-            if (good != len) why = "cut short (a record half written)";
-        }
+        else good = pb_index(f, len);
         fclose(f);
+    }
+    // A file that ends inside a record (the process ended during an append, or a disk filled): the whole records
+    // before it stay, and the file is cut back to them so that appends go on from there. Only when it cannot be cut
+    // does it start empty.
+    if (f && !why && good != len) {
+        if (plat_file_truncate(PB.path, good)) {
+            rt_log("vk_pipeline: pipeline binaries: %s was cut short (a record half written); %llu bytes after the last "
+                   "whole record dropped", PB.path, (unsigned long long)(len - good));
+            len = good;
+        } else {
+            why = "cut short (a record half written), and it cannot be cut back to its whole records";
+        }
     }
     if (why || !f) {   // start empty: the index is dropped and the file rewritten
         if (f) rt_log("vk_pipeline: pipeline binaries: %s %s (%.0f MB); starting empty", PB.path, why, len / 1048576.0);
@@ -393,8 +410,8 @@ static uint8_t *pb_read(uint32_t type, const uint8_t *key, uint32_t ks, uint32_t
         size_t at = (size_t)(s->off - PB.file_size) + 4;
         ok = at + s->size <= PB.pend_n;
         if (ok) memcpy(head, PB.pend + at, s->size);
-    } else {
-        ok = !pb_seek(PB.rf, (int64_t)(s->off + 4), SEEK_SET) && fread(head, s->size, 1, PB.rf) == 1;
+    } else {   // rf is NULL only after pb_flush could not open the file again
+        ok = PB.rf && !pb_seek(PB.rf, (int64_t)(s->off + 4), SEEK_SET) && fread(head, s->size, 1, PB.rf) == 1;
     }
     uint32_t t, k;
     if (ok) memcpy(&t, head, 4), memcpy(&k, head + 4, 4);
@@ -527,8 +544,17 @@ static void pb_flush(void) {
         int ok = f && fwrite(PB.pend, PB.pend_n, 1, f) == 1;
         if (f) ok = !fclose(f) && ok;
         if (ok) PB.file_size += PB.pend_n;
-        else rt_log("vk_pipeline: pipeline binaries: cannot append to %s; this run's binaries stay in memory", PB.path);
         if (ok) PB.pend_n = 0;
+        if (!ok) {
+            // Part of the append may be in the file (a full disk): the file is cut back to file_size, where the index
+            // places the pending records, or the next append would land after those bytes. The read handle is closed
+            // meanwhile, since plat_file_truncate opens the file alone.
+            if (PB.rf) fclose(PB.rf);
+            int cut = plat_file_truncate(PB.path, PB.file_size);
+            PB.rf = fopen(PB.path, "rb");
+            rt_log("vk_pipeline: pipeline binaries: cannot append to %s; this run's binaries stay in memory%s", PB.path,
+                   cut ? "" : " (and the file cannot be cut back to its whole records)");
+        }
     }
     plat_mutex_unlock(&PB.lock);
 }
