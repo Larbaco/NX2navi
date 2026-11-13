@@ -26,6 +26,7 @@
 #include "tex.h"
 #include "vk.h"
 #include "vk_exec.h"
+#include "vk_evo_peek.h"
 #include "vk_target_frames.h"
 #include "vk_dlaa.h"
 
@@ -1277,6 +1278,14 @@ typedef struct Cont {
     uint8_t *st;
 } Cont;
 static struct { uintptr_t q; Cont *head, *tail; } evq[EVO_QUEUES];
+// What vk_exec_held_ready needs of each queue's first continuation, as a copy (vk_evo_peek.h): it runs without the
+// submission lock (vk_sync.c sub_lock) while another thread may free that continuation (evo_resume). Published under
+// that lock by peek_publish wherever evq[s].head, or the head's at or since, changes.
+static EvoPeek evq_peek[EVO_QUEUES];
+_Static_assert(sizeof(EvoWait) == sizeof(p_wait_event) && offsetof(EvoWait, val) == offsetof(p_wait_event, val) &&
+                   offsetof(EvoWait, mode) == offsetof(p_wait_event, mode) &&
+                   offsetof(EvoWait, value) == offsetof(p_wait_event, value),
+               "vk_evo_peek.h EvoWait must have p_wait_event's layout");
 static int evo_on = -1, evo_in;     // knob; inside a continuation
 static uintptr_t evo_queue;         // queue of the stream being walked (0: it cannot stop at a wait)
 static int evo_pending;             // continuations held
@@ -1412,11 +1421,24 @@ static void cont_free(Cont *c) {
     free(c->h), free(c->st), free(c);
 }
 
+// Publishes queue s's first continuation for vk_exec_held_ready (evq_peek): whether one is held, the wait it stopped
+// at, copied out of its private recording, and when it stopped.
+static void peek_publish(int s) {
+    const Cont *c = evq[s].head;
+    EvoPeekCopy v = {0};
+    if (c) {
+        v.has = 1, v.since = c->since;
+        if (c->at) v.has_at = 1, v.w = *(const EvoWait *)nvn_op_payload(c->at);
+    }
+    evo_peek_publish(&evq_peek[s], &v);
+}
+
 static void cont_push(int slot, Cont *c) {
     if (evq[slot].tail) evq[slot].tail->next = c;
     else evq[slot].head = c;
     evq[slot].tail = c;
     evo_pending++;
+    if (evq[slot].head == c) peek_publish(slot);
 }
 
 // Swaps the queue state in ex with buf (ST_HI - ST_LO bytes); what the swapped-in state names is bound again.
@@ -1501,9 +1523,14 @@ void vk_exec_gate_wait(const uint64_t *handles, int n) {
     }
 }
 
+// Reads only the published copies (evq_peek): vk_backend.c held_resume and submit_sync call this without the
+// submission lock. A copy that overlapped a publish on every try counts as not ready, as losing that race did before.
 int vk_exec_held_ready(void) {
-    for (int s = 0; evo_pending && s < EVO_QUEUES; s++)
-        if (evq[s].head && cont_ready(evq[s].head)) return 1;
+    for (int s = 0; evo_pending && s < EVO_QUEUES; s++) {
+        EvoPeekCopy c;
+        if (evo_peek_read(&evq_peek[s], &c) && evo_peek_ready(&c, vk_exec_event_met, vk_exec_submit_seq, CONT_MAX))
+            return 1;
+    }
     return 0;
 }
 
@@ -1566,6 +1593,7 @@ static void evo_resume(VkExec *ex) {
                 evo_resumed++;
                 vk_exec_evt('r', (const void *)evq[s].q, 0);
                 if (cont_walk(ex, c)) {   // waits again: the queue's state stays with it
+                    peek_publish(s);
                     vk_exec_evt('w', NULL, 0);
                     vk_exec_pass_end(ex);
                     if (!c->st && !(c->st = malloc(ST_HI - ST_LO))) rt_fatal("vk: out of memory (queue state)");
@@ -1575,6 +1603,7 @@ static void evo_resume(VkExec *ex) {
                 }
                 evq[s].head = c->next;   // done: the queue's next submission starts with the state this one left
                 if (!evq[s].head) evq[s].tail = NULL;
+                peek_publish(s);   // the next one, or none; the copy names nothing inside c
                 evo_pending--;
                 vk_exec_evt('d', NULL, 0);
                 cont_free(c);
