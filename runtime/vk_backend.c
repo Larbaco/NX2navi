@@ -949,20 +949,20 @@ static void vk_be_guest_read(uint64_t addr, uint64_t size) {
 // The count of such waits that came back while event-ordered work was still held (vk_exec.c): a submission stopped at an
 // event wait returns its value with its remainder held for a later replay, so the game may take a wait for that value
 // as the whole submission done and reuse what the held part still reads. How often that happens decides whether the
-// value should be signalled only after the remainder (audit finding F-2-05). The count is unlocked: a diagnostic.
+// value should be signalled only after the remainder (audit finding F-2-05). The counts are atomic adds without a lock:
+// the game's threads wait at the same time, and each line is logged by the thread whose add reached it.
 // A wait for value 0 is left out: the window acquire's sync stands for no submission (nvn_api_obj.c
 // nvnWindowAcquireTexture gives it fence 0), and such waits were half of the lines in two sessions of 2026-11-13.
 static uint64_t synced_n, synced_held;
 static void synced_held_count(uint64_t fence) {
     if (!fence) return;
-    synced_n++;
+    uint64_t n = __atomic_add_fetch(&synced_n, 1, __ATOMIC_RELAXED);
     int held = vk_exec_held();
     if (!held) return;
-    synced_held++;
-    if (synced_held <= 10 || synced_held % 600 == 0)
+    uint64_t k = __atomic_add_fetch(&synced_held, 1, __ATOMIC_RELAXED);
+    if (k <= 10 || k % 600 == 0)
         rt_log("vk: a game's wait for %llu returned with %d event-ordered submission(s) still held (%llu of %llu such "
-               "waits so far)", (unsigned long long)fence, held, (unsigned long long)synced_held,
-               (unsigned long long)synced_n);
+               "waits so far)", (unsigned long long)fence, held, (unsigned long long)k, (unsigned long long)n);
 }
 
 static void vk_be_cpu_synced(uint64_t fence) {

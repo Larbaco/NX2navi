@@ -1473,7 +1473,9 @@ static int cont_ready(const Cont *c) {
 // taken after the game has finished writing, and the frame is replayed in the call the game's fence stands for.
 // Only state may precede the wait in the command buffer, and the event must be one the CPU has signalled before;
 // the wait ends after NX2NAVI_GATE_WAIT_MS at the latest, and the submission is then held as before.
-static struct { uint64_t n, ns, late; } GW;   // since the last perf line: waits, their time, waits that ran out
+// Since the last perf line: waits, their time, waits that ran out. vk_exec_gate_wait runs on the submitting thread
+// before the submission lock, so several threads add at once: atomics, and the thread whose add ends the window logs it.
+static struct { uint64_t n, ns, late; } GW;
 
 static const void *gate_first_wait(const op_hdr *h) {
     for (int k = 0; k < 256; k++) {
@@ -1508,19 +1510,21 @@ void vk_exec_gate_wait(const uint64_t *handles, int n) {
     uint64_t t0 = kern_now_ns(), now = t0;
     for (unsigned i = 0; !vk_exec_event_holds_now(w); i++) {
         if ((i & 15) == 15 && (now = kern_now_ns()) - t0 >= (uint64_t)cap_ns) {
-            GW.late++;
+            __atomic_add_fetch(&GW.late, 1, __ATOMIC_RELAXED);
             break;
         }
         if (i < 20000) plat_pause();
         else plat_yield();
     }
-    GW.n++, GW.ns += kern_now_ns() - t0;
-    if (GW.n >= 600) {
+    __atomic_add_fetch(&GW.ns, kern_now_ns() - t0, __ATOMIC_RELAXED);
+    if (__atomic_add_fetch(&GW.n, 1, __ATOMIC_RELAXED) == 600) {   // one thread takes the window; adds after it count in
+        uint64_t wn = __atomic_exchange_n(&GW.n, 0, __ATOMIC_RELAXED);
+        uint64_t wns = __atomic_exchange_n(&GW.ns, 0, __ATOMIC_RELAXED);
+        uint64_t late = __atomic_exchange_n(&GW.late, 0, __ATOMIC_RELAXED);
         if (rt_trace & RT_TRACE_PERF)
             rt_log("perf: gate: %llu submissions waited for the CPU's signal before their copies, %.2f ms on average; "
-                   "%llu waited %lld ms without it and were held", (unsigned long long)GW.n, (double)GW.ns / (double)GW.n / 1e6,
-                   (unsigned long long)GW.late, (long long)(cap_ns / 1000000));
-        GW.n = GW.ns = GW.late = 0;
+                   "%llu waited %lld ms without it and were held", (unsigned long long)wn, (double)wns / (double)wn / 1e6,
+                   (unsigned long long)late, (long long)(cap_ns / 1000000));
     }
 }
 

@@ -747,7 +747,7 @@ NVN_API(nvnQueueSubmitCommands) {
     NVN_BLOCKING();
     nvn_call_note(0, (uintptr_t)q, 1);
     uint64_t no = __atomic_add_fetch(&lod_entered, 1, __ATOMIC_SEQ_CST);
-    q->submits++;
+    __atomic_add_fetch(&q->submits, 1, __ATOMIC_RELAXED);   // two of the game's threads may submit on one queue at once
     uint64_t f;
     if (gfx_replay_async()) {
         // Prepare and queue under one lock: submit numbers follow queue order (gfx_replayed_submits).
