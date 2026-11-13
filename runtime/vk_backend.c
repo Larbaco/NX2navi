@@ -177,37 +177,57 @@ void vk_present_drain(void) {
 // to LOAD_HOLD_NS, also beside the allowance.
 #define RESIZE_HOLD 6
 #define LOAD_HOLD_NS 2000000000ull
+// frame_hold, at the present, is the only writer of FH. The replay asks what is left of the allowance as it records
+// (vk_frame_hold_left, vk_exec_draw.c), on whatever thread holds the submission lock, which need not be the one that
+// presents: so that reader works out the allowance from limit_ns, left_ns, last_ns and holding (atomics) and writes
+// nothing. When it refilled FH itself, a refill on the replaying thread beside one at the present on another thread
+// counted the same interval twice or not at all.
 static struct {
     int64_t limit_ns, left_ns;
     uint64_t last_ns, held, runs, shown, load_t0, load_held;
     int holding, resize_left;
 } FH = {.limit_ns = -1};
 
-static void frame_hold_refill(uint64_t now) {
-    if (FH.limit_ns < 0) {
-        long long ms = cfg_int("NX2NAVI_FRAME_HOLD_MS");
-        FH.limit_ns = (int64_t)(ms < 0 ? 0 : ms > 500 ? 500 : ms) * 1000000;
-        FH.left_ns = FH.limit_ns, FH.last_ns = now;
-        if (FH.limit_ns)
-            rt_log("vk: a frame with draws skipped for a pipeline is not shown, the previous picture stays up to %lld ms "
-                   "(NX2NAVI_FRAME_HOLD_MS)", (long long)(FH.limit_ns / 1000000));
-    }
-    if (!FH.holding) FH.left_ns += (int64_t)(now - FH.last_ns) / 8;
-    else FH.left_ns -= (int64_t)(now - FH.last_ns);
-    if (FH.left_ns > FH.limit_ns) FH.left_ns = FH.limit_ns;
-    FH.last_ns = now;
+// NX2NAVI_FRAME_HOLD_MS, read once by whichever thread asks first; that one logs it.
+static int64_t fh_limit(void) {
+    int64_t lim = __atomic_load_n(&FH.limit_ns, __ATOMIC_ACQUIRE);
+    if (lim >= 0) return lim;
+    long long ms = cfg_int("NX2NAVI_FRAME_HOLD_MS");
+    int64_t want = (int64_t)(ms < 0 ? 0 : ms > 500 ? 500 : ms) * 1000000, was = -1;
+    if (__atomic_compare_exchange_n(&FH.limit_ns, &was, want, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) && want)
+        rt_log("vk: a frame with draws skipped for a pipeline is not shown, the previous picture stays up to %lld ms "
+               "(NX2NAVI_FRAME_HOLD_MS)", (long long)(want / 1000000));
+    return want;
 }
 
-// Whether a frame that skipped draws now would be held (vk_exec_draw.c: a full-screen draw is skipped only then).
+// The allowance at now from the last refill (left at last): the time since used up while frames were held, filled
+// again at an eighth of the clock's rate while they were not, never above the limit. Full before the first refill.
+static int64_t fh_left_at(int64_t lim, int64_t left, uint64_t last, int holding, uint64_t now) {
+    if (!last) return lim;
+    left = holding ? left - (int64_t)(now - last) : left + (int64_t)(now - last) / 8;
+    return left > lim ? lim : left;
+}
+
+static int64_t frame_hold_refill(uint64_t now) {   // frame_hold only; returns the limit
+    int64_t lim = fh_limit();
+    __atomic_store_n(&FH.left_ns, fh_left_at(lim, FH.left_ns, FH.last_ns, FH.holding, now), __ATOMIC_RELAXED);
+    __atomic_store_n(&FH.last_ns, now, __ATOMIC_RELAXED);
+    return lim;
+}
+
+// Whether a frame that skipped draws now would be held (vk_exec_draw.c: a full-screen draw is skipped only then). Any
+// thread; reads FH only. The fields are loaded before the clock, so now is not before last.
 int vk_frame_hold_left(void) {
-    frame_hold_refill(kern_now_ns());
-    return FH.left_ns > 0 && !vk_dlssg_active();
+    int64_t lim = fh_limit(), left = __atomic_load_n(&FH.left_ns, __ATOMIC_RELAXED);
+    uint64_t last = __atomic_load_n(&FH.last_ns, __ATOMIC_RELAXED);
+    int holding = __atomic_load_n(&FH.holding, __ATOMIC_RELAXED);
+    return fh_left_at(lim, left, last, holding, kern_now_ns()) > 0 && !vk_dlssg_active();
 }
 
 // 1: this frame is not shown. skipped: the draws it lacks; resized: its scene is the first of a new size.
 static int frame_hold(uint32_t skipped, int resized, uint64_t frame) {
-    frame_hold_refill(kern_now_ns());
-    if (resized && FH.limit_ns > 0) {
+    int64_t lim = frame_hold_refill(kern_now_ns());
+    if (resized && lim > 0) {
         FH.resize_left = RESIZE_HOLD;
         rt_log("vk: frame %llu: the scene has a new size after a setting changed; the previous picture stays for %d "
                "frames", (unsigned long long)frame, RESIZE_HOLD);
@@ -216,7 +236,7 @@ static int frame_hold(uint32_t skipped, int resized, uint64_t frame) {
         FH.resize_left--;
         return 1;
     }
-    if (FH.limit_ns > 0 && vk_exec_pool_loading()) {
+    if (lim > 0 && vk_exec_pool_loading()) {
         uint64_t now = kern_now_ns();
         if (!FH.load_t0) FH.load_t0 = now, FH.load_held = 0;
         if (now - FH.load_t0 < LOAD_HOLD_NS) {
@@ -231,7 +251,7 @@ static int frame_hold(uint32_t skipped, int resized, uint64_t frame) {
     int hold = skipped && FH.left_ns > 0 && !vk_dlssg_active();
     if (hold && !FH.holding) FH.runs++;
     if (skipped && !hold) FH.shown++;
-    FH.holding = hold;
+    __atomic_store_n(&FH.holding, hold, __ATOMIC_RELAXED);
     if (hold) FH.held++;
     static uint64_t logged_at, logged_held, logged_shown;
     if (!hold && FH.held + FH.shown != logged_held + logged_shown && frame - logged_at >= 600) {
