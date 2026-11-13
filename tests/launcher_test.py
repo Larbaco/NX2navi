@@ -5293,6 +5293,57 @@ class WhilePlayingTest(Tmp):
         a.ctx.log.assert_called_once_with('the game ended with code 0')
         self.assertNotIn('[launcher]', log.read_text(encoding='utf-8'))
 
+    def play_from_steam(self, code, log_text):
+        """play_only (--play, the Steam shortcut) for a game that ends with code, its log then holding log_text; (the
+        context, the stand-in for tell, the log)."""
+        from launcher.ui import app
+        (self.tmp / 'ocarina.exe').write_bytes(b'MZ')
+        log = self.tmp / 'logs' / 'nx2navi.log'
+        log.parent.mkdir(exist_ok=True)
+        log.write_text(log_text, encoding='utf-8')
+        ctx = mock.MagicMock()
+        ctx.settings = {'game_dir': str(self.tmp)}
+        proc = mock.MagicMock(returncode=code, pid=5)
+        proc.poll.return_value = code
+        told = []
+
+        def tell(text):   # what the logs hold when the box comes, which waits for OK
+            told.append((text, log.read_text(encoding='utf-8'), list(ctx.log.call_args_list)))
+        with mock.patch('launcher.ui.app.winsys.start_game', return_value=proc), \
+                mock.patch('launcher.ui.app.saves.game_running', return_value=False), \
+                mock.patch('launcher.ui.app.mods.prepare', return_value=[]), \
+                mock.patch('launcher.ui.app.build.can_rebuild', return_value=False), \
+                mock.patch('launcher.ui.app.time.sleep'), \
+                mock.patch('launcher.ui.app.tell', side_effect=tell):
+            self.assertEqual(app.play_only(ctx), 0)
+        return ctx, told, log
+
+    def test_an_end_of_a_game_started_from_steam_is_told(self):
+        """The Steam shortcut's game ends as Play's does: launcher.log and the game's log say how, and an end worth it
+        (a FATAL line, 70, 71 or 72, a Windows status) gets a message box, as no window shows it."""
+        try:
+            from launcher.ui import app   # noqa: F401
+        except ImportError as e:
+            self.skipTest(f'no window toolkit: {e}')
+        ctx, told, log = self.play_from_steam(70, '[host] x\nFATAL: fs: another copy of the game is running\n')
+        self.assertEqual(len(told), 1)
+        text, game_log, calls = told[0]
+        self.assertEqual(text, 'The game ended with a fatal error (code 70): fs: another copy of the game is running. '
+                               'Its log is logs\\nx2navi.log in the game folder.')
+        self.assertIn('[launcher] the game ended with code 70', game_log)
+        self.assertIn(mock.call('play from Steam: the game ended with code 70; its log says: FATAL: fs: another copy '
+                                'of the game is running'), calls)
+        _, told, _ = self.play_from_steam(0xC0000005, '[host] x\n')
+        self.assertEqual([t[0] for t in told], ['The game ended with code 0xC0000005 (access violation). Its log is '
+                                                'logs\\nx2navi.log in the game folder.'])
+        ctx, told, log = self.play_from_steam(0, '[host] x\n[host] gfx: window closed; exiting\n')
+        self.assertEqual(told, [])
+        ctx.log.assert_called_with('play from Steam: the game ended with code 0')
+        ctx, told, log = self.play_from_steam(1, '[host] perf: the last line\n')   # Task Manager's End task
+        self.assertEqual(told, [])
+        ctx.log.assert_called_with('play from Steam: the game ended with code 1')
+        self.assertIn('[launcher] the game ended with code 1 at', log.read_text(encoding='utf-8'))
+
     def test_a_fatal_exit_shows_the_games_fatal_line(self):
         """Exit codes 70 and 71 follow a FATAL line in the game's log: the home screen and launcher.log name it."""
         try:

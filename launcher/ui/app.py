@@ -241,13 +241,13 @@ def shown_fatal(fatal):
 
 
 def game_end(game_dir, code, started=None, restarted=False):
-    """What the launcher says about an end of the game (App.watch_game): a GameEnd of the line for launcher.log, the
-    sentence for the player ('' for none), the text note_exit_in_log adds to the game's log ('' for none), and alarm:
-    whether the end is worth a message box where no window shows the sentence (a FATAL line, a code of FATAL_CODES or
-    a Windows status; not 0, nor 1, which Task Manager's End task gives). code is the exit code of the run's last
-    process, or None when it is not known, which happens only for a copy the game's own Restart started that could not
-    be followed (GameRun). started is time.time() before the game was started, restarted whether it restarted itself
-    on the way."""
+    """What the launcher says about an end of the game (App.watch_game, play_only): a GameEnd of the line for
+    launcher.log, the sentence for the player ('' for none), the text note_exit_in_log adds to the game's log ('' for
+    none), and alarm: whether the end is worth a message box where no window shows the sentence (a FATAL line, a code
+    of FATAL_CODES or a Windows status; not 0, nor 1, which Task Manager's End task gives). code is the exit code of
+    the run's last process, or None when it is not known, which happens only for a copy the game's own Restart started
+    that could not be followed (GameRun). started is time.time() before the game was started, restarted whether it
+    restarted itself on the way."""
     how = ' after restarting itself' if restarted else ''
     if code not in (0, None):
         code &= 0xFFFFFFFF
@@ -2880,16 +2880,24 @@ def play_only(ctx):
     if waiting:   # the window builds the mods' code in, then starts the game (App.start with --play)
         ctx.log(f'play from Steam: the game is built again first for the code of {", ".join(waiting)}')
         return None
+    started = time.time()
     try:
-        proc = winsys.start_game(exe)
+        run = GameRun(winsys.start_game(exe), gd, started)
     except OSError as e:
         ctx.log(f'play from Steam: {exe}: {e}')
         return None
     ctx.log(f'play from Steam: {exe}')
     time.sleep(2)
-    while proc.poll() is None or saves.game_running(gd):
+    while run.running():
         time.sleep(1)
-    ctx.log(f'play from Steam: the game ended (code {proc.returncode})')
+    # The end is told as Play's is (App.watch_game), with no window: a box for an end worth one. The logs come first,
+    # since the box waits for OK and Steam may end this process meanwhile.
+    end = run.end()
+    ctx.log(f'play from Steam: {end.log}')
+    if end.note:
+        note_exit_in_log(gd, end.note)
+    if end.alarm:
+        tell(end.message)
     return 0
 
 

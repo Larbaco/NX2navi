@@ -75,7 +75,8 @@ Customize Launcher (on the home screen) makes the look the player's own:
   Steam reads that file only when it starts and writes it back when it closes, so a running Steam is asked to close
   first and started again after. The shortcut runs the launcher's `pythonw.exe` on `data/steam_play.pyw`, which
   starts the launcher of `app/current.txt` with `--play`: the game starts as Play starts it, and the process waits
-  for it, so Steam counts the game as running while it is.
+  for it, so Steam counts the game as running while it is. Its end goes into the logs as Play's does, and a fatal
+  error or a crash gets a message box, as no window shows it.
 
 The choices are `theme`, `custom_background`, `custom_panel`, `custom_buttons`, `background`, `background_dim`,
 `animations` and `sounds` in `data/launcher.json`.
