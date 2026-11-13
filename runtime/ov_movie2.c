@@ -782,6 +782,15 @@ static void ov_decode(Cpu *c) {
         if (skip_ns >= 0) rt_log("movie: movies end after %.1f s (NX2NAVI_MOVIE_SKIP)", skip_ns / 1e9);
     }
     plat_mutex_lock(&v->lock);
+    // Finalize on another thread may have closed the decoder since the test above. finalize takes v->lock after it
+    // clears v->dav1d, so read here under v->lock it is either still set (the sample is queued before finalize's
+    // clear_queues, which drops it, and ov_finalize or the destructor then clears live) or already NULL: no sample
+    // makes a finalized decoder live again, which would hold the movie frame rate cap (frame_rate.c movie_cap_hz).
+    if (!v->dav1d) {
+        plat_mutex_unlock(&v->lock);
+        ret_x(c, 0);
+        return;
+    }
     if (skip_ns >= 0 && v->eos_queued) {   // after the early end: what the demuxer still sends is dropped
         plat_mutex_unlock(&v->lock);
         ret_x(c, 0);
