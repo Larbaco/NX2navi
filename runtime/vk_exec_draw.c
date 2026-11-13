@@ -4388,18 +4388,15 @@ static void draw_stats_tick(void) {
 
 // The draws skipped since the last present because their shader or pipeline was still building: the picture of that
 // frame lacks them (a light, a wall, a whole lighting pass). vk_backend.c frame_hold reads it at the present and keeps
-// the previous picture on screen instead. Written and read on the replay thread.
+// the previous picture on screen instead. The replay and its parallel chunks add to it; the present takes it, on the
+// presenting thread, which with the replay on the submitting threads need not be the one replaying: atomics.
 static uint32_t pending_draws;
-uint32_t vk_exec_pending_draws_take(void) {
-    uint32_t n = pending_draws;
-    pending_draws = 0;
-    return n;
-}
+uint32_t vk_exec_pending_draws_take(void) { return __atomic_exchange_n(&pending_draws, 0, __ATOMIC_RELAXED); }
 
 static int draw_skipped(const VkExec *ex, int mesh, int why) {
     DRS.skipped[mesh][why]++;
     if (vk_dump_armed) vk_dump_draw_skipped(ex, mesh, why);
-    if (why == SK_SHADER_PENDING || why == SK_PIPE_PENDING) pending_draws++;
+    if (why == SK_SHADER_PENDING || why == SK_PIPE_PENDING) __atomic_add_fetch(&pending_draws, 1, __ATOMIC_RELAXED);
     if (why == SK_PIPE_PENDING) perf_count(PERF_CNT_PIPE_SKIP);   // skipped draws only: a lookup that then waited is none
     if (!(DRS.first[mesh] >> why & 1)) {
         DRS.first[mesh] |= 1u << why;
@@ -4583,7 +4580,7 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
         budget = link_budget();
         // A frame that has left a draw out already is not shown, or is shown without that draw (pending_draws,
         // vk_backend.c frame_hold): a wait for another pipeline would only make it later.
-        wait_ms = pending_draws ? 0 : (uint32_t)(*budget / 1000000);
+        wait_ms = __atomic_load_n(&pending_draws, __ATOMIC_RELAXED) ? 0 : (uint32_t)(*budget / 1000000);
         if (wait_ms > LINK_DRAW_MS) wait_ms = LINK_DRAW_MS;
         linking = wait_ms != 0;
         if (!wait_ms) budget = NULL;
