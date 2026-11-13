@@ -2158,8 +2158,10 @@ void kern_event_clear(uint32_t hw) {
 // Each entry also keeps the serial number of the Event its handle named at bind time (h_new hands a closed number to
 // the next new object at once, so the number alone does not say it is still that event), and whether the object lies
 // in guest memory: host services keep some in their own allocations (ov_movie2.c Video.in_ev/out_ev, net_offline.c
-// HostTask.event), which mem_readable does not know and the SDK never destroys.
-// Lock order: G before g_se_lock (system_event_set); kern_bind_system_event never holds both.
+// HostTask.event), which mem_readable does not know and the game never destroys. A service that frees such an object
+// gives its entry back first (kern_unbind_system_event, from ov_movie2.c ov_dtor).
+// Lock order: G before g_se_lock (system_event_set); kern_bind_system_event and kern_unbind_system_event never hold
+// both.
 #define SE_STATE 0x28
 static struct { uint64_t ev, serial; uint32_t wh; uint8_t guest; } g_se[512];
 static int g_nse;
@@ -2205,10 +2207,11 @@ void kern_bind_system_event(Cpu *c, uint64_t ev, int autoclear) {
     int i = 0;
     while (i < g_nse && g_se[i].ev != ev) i++;
     if (i == g_nse && g_nse == (int)(sizeof g_se / sizeof *g_se)) {
-        // Full: entries are never removed, and a long session binds events at new addresses (two per reload of a
-        // save). An entry in guest memory whose event the guest destroyed (its state byte is 0, or its memory is gone)
-        // gives its slot. Entries in host memory count as live: their services never destroy them through the SDK, and
-        // taking a live one would make the service's next signal bind again on a host thread, which is fatal.
+        // Full: entries in guest memory are never removed, and a long session binds events at new addresses (two per
+        // reload of a save). An entry in guest memory whose event the guest destroyed (its state byte is 0, or its
+        // memory is gone) gives its slot. Entries in host memory count as live: the game never destroys them, their
+        // services remove them before freeing them (kern_unbind_system_event), and taking a live one would make the
+        // service's next signal bind again on a host thread, which is fatal.
         i = 0;
         while (i < g_nse && (!g_se[i].guest || (mem_readable(g_se[i].ev + SE_STATE, 1) && se_live(g_se[i].ev)))) i++;
         if (i == g_nse) rt_fatal("kern_bind_system_event: table full (%d live system events)", g_nse);
@@ -2257,6 +2260,34 @@ void kern_signal_system_event(uint64_t ev) {
 // Clears a bound event (one never bound or since destroyed is left alone).
 void kern_clear_system_event(uint64_t ev) {
     if (se_find(ev, NULL) && se_live(ev)) system_event_set(ev, 0);
+}
+
+// For a service about to free a SystemEventType it bound in its own memory (ov_movie2.c ov_dtor), with nothing left to
+// signal it: on a guest thread the SDK's DestroySystemEvent zeroes the state byte and closes both kernel handles, which
+// would otherwise stay open for the rest of the run; then the table entry goes, and its slot is free for the next bind.
+// The destroy comes first, so a signal still in flight finds the event destroyed (kern_signal_system_event) or its
+// handle no longer naming it (system_event_set) and skips it, rather than finding no entry and binding again. Off a
+// guest thread, or when the SDK lacks the function, only the entry goes.
+void kern_unbind_system_event(Cpu *c, uint64_t ev) {
+    if (!se_find(ev, NULL)) return;
+    if (c && tcur && se_live(ev)) {
+        static uint64_t destroy;   // 1: looked up and not loaded
+        uint64_t fn = __atomic_load_n(&destroy, __ATOMIC_RELAXED);
+        if (!fn) {
+            fn = ldr_symbol("_ZN2nn2os18DestroySystemEventEPNS0_15SystemEventTypeE");
+            if (!fn)
+                rt_log("kernel: the SDK's DestroySystemEvent is not loaded: unbound system events keep their handles");
+            __atomic_store_n(&destroy, fn = fn ? fn : 1, __ATOMIC_RELAXED);
+        }
+        if (fn > 1) rt_call(c, fn, 1, ev);
+    }
+    plat_mutex_lock(&g_se_lock);
+    for (int i = 0; i < g_nse; i++)
+        if (g_se[i].ev == ev) {
+            g_se[i] = g_se[--g_nse];
+            break;
+        }
+    plat_mutex_unlock(&g_se_lock);
 }
 
 // A SystemEventType that still holds an event: mapped guest memory with its state byte nonzero. For services that keep

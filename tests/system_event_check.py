@@ -1,7 +1,7 @@
 """Build and run tests/system_event_check.c: the system-event table of runtime/kernel.c (kern_bind_system_event,
-kern_signal_system_event, kern_clear_system_event) against destroyed events, reused handle numbers, a host thread racing
-a destroy and bind, and a full table holding events in host memory; with the platform layer linked and the rest of the
-runtime stubbed. No game files: the module layout the runtime includes is a stand-in written to the test's build folder.
+kern_signal_system_event, kern_clear_system_event, kern_unbind_system_event) against destroyed events, reused handle
+numbers, a host thread racing a destroy and bind, a full table holding events in host memory, and host-memory events
+unbound before their memory is freed; with the platform layer linked and the rest of the runtime stubbed. No game files: the module layout the runtime includes is a stand-in written to the test's build folder.
 
 Usage: system_event_check.py
 """

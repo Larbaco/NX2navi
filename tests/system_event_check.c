@@ -5,7 +5,9 @@
 //                  number went to an unrelated event or the state byte reads nonzero again; a host thread signalling
 //                  while a guest thread destroys and binds the event again never ends the process; with the table full,
 //                  a new bind takes a destroyed guest-memory entry and keeps the entries in host memory, which a host
-//                  thread then still signals; kern_system_event_live tells live guest events from destroyed ones
+//                  thread then still signals; kern_system_event_live tells live guest events from destroyed ones;
+//                  kern_unbind_system_event destroys a host-memory event and frees its entry, so a full table takes a
+//                  new guest bind once the host entries are unbound
 //   full           every entry live: the next bind ends with "table full" (the script checks the exit code and text)
 #include "kernel.c"
 
@@ -32,8 +34,11 @@ int rt_knob(const char *name, const char *def) { (void)name; return strcmp(def, 
 int64_t frame_step_world_us(void) { return -1; }
 void ipc_handle_closed(int kind, void *obj) { (void)kind, (void)obj; }
 const char *ldr_describe(uint64_t a, char *buf, int n) { snprintf(buf, (size_t)n, "%#llx", (unsigned long long)a); return buf; }
-// The SDK's two functions kern_bind_system_event calls: 1 CreateSystemEvent, 2 GetWritableHandleOfSystemEvent.
-uint64_t ldr_symbol(const char *name) { return strstr(name, "CreateSystemEvent") ? 1 : 2; }
+// The SDK's functions the table calls: 1 CreateSystemEvent, 2 GetWritableHandleOfSystemEvent (kern_bind_system_event),
+// 3 DestroySystemEvent (kern_unbind_system_event).
+uint64_t ldr_symbol(const char *name) {
+    return strstr(name, "CreateSystemEvent") ? 1 : strstr(name, "DestroySystemEvent") ? 3 : 2;
+}
 void perf_main_thread(void) {}
 void perf_size(PerfSizes *s, const char *name, uint64_t count, uint64_t limit, uint64_t bytes) {
     (void)s, (void)name, (void)count, (void)limit, (void)bytes;   // kern_sizes is not called here
@@ -61,8 +66,10 @@ void rt_fatal(const char *fmt, ...) {
 }
 void rt_dispatch(Cpu *c) { (void)c; rt_fatal("rt_dispatch in the test"); }
 void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) { (void)pc; kern_svc(c, imm); }
+static void destroy(void *p);
 // CreateSystemEvent(ev, mode, ipc) makes a kernel event, keeps its writable handle at +0 of the SystemEventType and its
-// readable one at +4, and sets the state byte; GetWritableHandleOfSystemEvent(ev) reads +0.
+// readable one at +4, and sets the state byte; GetWritableHandleOfSystemEvent(ev) reads +0; DestroySystemEvent(ev) as
+// destroy below.
 uint64_t rt_call(Cpu *c, uint64_t fn, int n, ...) {
     (void)c;
     va_list ap;
@@ -75,6 +82,10 @@ uint64_t rt_call(Cpu *c, uint64_t fn, int n, ...) {
         memcpy(p, &wh, 4);
         memcpy(p + 4, &rh, 4);
         __atomic_store_n(p + SE_STATE, 1, __ATOMIC_RELEASE);
+        return 0;
+    }
+    if (fn == 3) {
+        destroy(p);
         return 0;
     }
     uint32_t wh;
@@ -210,6 +221,37 @@ static void full_table(int all_live) {
           "a host thread signals the movie's events with the table full");
 }
 
+// ov_movie2.c ov_dtor with the table full of live guest events and the movie's two host-memory events: each unbound
+// event is destroyed (its handles closed) and leaves the table, the other keeps its entry, and once the last host
+// entry is gone a new guest bind finds room (the full-table scan keeps host entries, so it would end with "table full").
+static void unbind_host(void) {
+    int n = (int)(sizeof g_se / sizeof *g_se);
+    CHECK(g_nse == n, "the table is full before the unbinds (%d of %d)", g_nse, n);
+    uint32_t in_w = wh_of(movie_in), in_r = rh_of(movie_in);
+    kern_unbind_system_event(&cpu, ev_of(movie_in));
+    CHECK(se_find(ev_of(movie_in), NULL) == 0, "an unbound event leaves the table");
+    CHECK(g_nse == n - 1, "the table has one entry fewer (%d)", g_nse);
+    CHECK(se_find(ev_of(movie_out), NULL) != 0, "the other host-memory event keeps its entry");
+    CHECK(movie_in[SE_STATE] == 0 && signaled(in_w) == -1, "the unbound event is destroyed: state 0, handle %#x closed",
+          in_w);
+    lock();
+    int r_open = h_peek(in_r, O_EVENT_R) != NULL;
+    unlock();
+    CHECK(!r_open, "its readable handle %#x is closed too", in_r);
+    kern_unbind_system_event(&cpu, ev_of(movie_in));   // a second unbind finds nothing and leaves the table alone
+    CHECK(g_nse == n - 1, "a second unbind changes nothing (%d)", g_nse);
+    // Full again with live guest entries and one host entry; the host entry unbound, the next guest bind takes its room.
+    int next = n + 2;
+    bind(guest[next++]);
+    CHECK(g_nse == n, "full again (%d)", g_nse);
+    kern_unbind_system_event(&cpu, ev_of(movie_out));
+    bind(guest[next]);
+    CHECK(se_find(ev_of(guest[next]), NULL) != 0 && g_nse == n,
+          "a guest bind succeeds once the host entry is unbound (%d entries)", g_nse);
+    free(movie_in), free(movie_out);
+    movie_in = movie_out = NULL;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     me.cur = &cpu;
@@ -219,6 +261,7 @@ int main(int argc, char **argv) {
     race();
     full_table(full);
     if (full) return 0;
+    unbind_host();
     printf(fails ? "system_event_check: %d failed\n" : "system_event_check: ok\n", fails);
     return fails ? 1 : 0;
 }

@@ -640,9 +640,15 @@ static void ov_ctor(Cpu *c) { *(Video **)arg_p(c, 0) = NULL; }
 static void ov_dtor(Cpu *c) {
     Video **slot = arg_p(c, 0);
     if (!slot || !*slot) return;
-    finalize(*slot);
-    set_live(*slot, 0);
-    free(*slot);   // the bound events' kernel handles stay, as for any guest event never destroyed
+    Video *v = *slot;
+    finalize(v);
+    set_live(v, 0);
+    // The decoder and convert threads are joined, so nothing signals the events now: they are destroyed and leave the
+    // kernel's table of system events before their memory goes (kernel.c kern_unbind_system_event). Kept, each
+    // decoder left two dead entries and their kernel handles, and a long session filled the table.
+    if (v->in_bound) kern_unbind_system_event(c, (uint64_t)(uintptr_t)v->in_ev);
+    if (v->out_bound) kern_unbind_system_event(c, (uint64_t)(uintptr_t)v->out_ev);
+    free(v);
     *slot = NULL;
     gfx_movie_stop();
 }
