@@ -8354,6 +8354,7 @@ static int seed_pipelines(const char *dir) {
     uint32_t queued = 0, dropped = 0, known = 0, other = 0, mesh = 0, no_mesh = 0;
     plat_mutex_lock(&P.lock);
     uint32_t built0 = K.built, failed0 = K.failed;
+    K.t0 = t0;   // prebuild_report's start: this mode never runs prewarm_run, which sets it in play
     K.loading = 1;
     for (size_t i = 0; i < n; i++) {
         const uint8_t (*v)[32] = bsearch(r[i].vs, ids, u, 32, id_cmp);
