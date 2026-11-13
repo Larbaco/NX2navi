@@ -653,6 +653,12 @@ A change to which translations of a previous translator are served (`runtime/gfx
 `gfx_shader.c` and runs them against stand-in caches: a translation whose texture pool array has the earlier length
 (32768) is freed and the lookup goes on, one with the current length or no pool is served. No game files, no GPU.
 
+A change to how the translator children are read and restarted (`runtime/platform/win32.c` `plat_child_read`,
+`runtime/gfx_shader.c` `child_exchange_raw`, `svc_request`) passes `python tests\child_timeout_check.py`, which builds
+those functions with a 300 ms read timeout and runs `cmd.exe` children through them: one that never answers costs one
+timeout and is not asked again, one that exits is restarted once, one that answers gives its line. Windows only; no
+game files, no GPU.
+
 A change to where the lazy write-back is on by default (`runtime/wb_lazy_choice.h`, `runtime/vk_memory.c`
 `vk_mem_lazy_decide`) passes `python tests\wb_lazy_check.py`, which builds the header alone and checks the choice and
 its reason by platform, by GPU driver and by what the player set. No game files, no GPU.

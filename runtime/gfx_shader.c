@@ -562,7 +562,9 @@ static int child_start(Svc *v) {
     return 1;
 }
 
-// One line out, one line in (no newline in the reply). 0 when the pipe broke.
+// One line out, one line in (no newline in the reply). 1 answered; 0 when the child could not start or the pipe broke;
+// -1 when the child sent nothing for PLAT_CHILD_READ_MS (stuck on this request: the translator is deterministic, so
+// sending it again would wait as long).
 static int child_exchange_raw(Svc *v, const char *line, char *reply, size_t reply_size) {
     if (!v->child && !child_start(v)) return 0;
     plat_inc64(&n_requests);
@@ -582,6 +584,7 @@ static int child_exchange_raw(Svc *v, const char *line, char *reply, size_t repl
         }
         if (v->in_len == sizeof v->inbuf) v->in_len = 0;  // an overlong line: drop it, wait for its end
         long got = plat_child_read(v->child, v->inbuf + v->in_len, sizeof v->inbuf - v->in_len);
+        if (got == -2) return -1;
         if (got <= 0) return 0;
         v->in_len += (size_t)got;
     }
@@ -589,9 +592,9 @@ static int child_exchange_raw(Svc *v, const char *line, char *reply, size_t repl
 
 static int child_exchange(Svc *v, const char *line, char *reply, size_t reply_size) {
     uint64_t p0 = perf_begin();   // NX2NAVI_TRACE=perf: render-thread time spent translating
-    int ok = child_exchange_raw(v, line, reply, reply_size);
+    int r = child_exchange_raw(v, line, reply, reply_size);
     perf_end(PERF_XLATE, p0);
-    return ok;
+    return r;
 }
 
 // Children allowed at run time: NX2NAVI_XLATE_PROCS, default 2.
@@ -664,13 +667,25 @@ static void svc_set_limit(int n) {
     plat_cond_broadcast(&S.freed);
 }
 
-// One request on a child; a dead child is restarted once. 0 when the translator is unavailable. The caller has given
-// up its virtual core (kern_core_away): the wait for a child and the translation are host time.
+// One request on a child; a dead child is restarted once. 1 answered, 0 when the translator is unavailable, -1 when
+// the child gave no answer for PLAT_CHILD_READ_MS: it is stopped and the request is not sent again, which would hold
+// the caller (the replay thread for a compute shader) as long once more. The caller has given up its virtual core
+// (kern_core_away): the wait for a child and the translation are host time.
 static int svc_request(const char *line, char *reply, size_t reply_size) {
     Svc *v = svc_get();
     int ok = 0;
-    for (int attempt = 0; attempt < 2 && !ok; attempt++)
-        if (!(ok = child_exchange(v, line, reply, reply_size))) child_stop(v);
+    for (int attempt = 0; attempt < 2; attempt++) {
+        int r = child_exchange(v, line, reply, reply_size);
+        if (r > 0) {
+            ok = 1;
+            break;
+        }
+        child_stop(v);
+        if (r < 0) {
+            ok = -1;
+            break;
+        }
+    }
     svc_put(v);
     return ok;
 }
@@ -2202,7 +2217,7 @@ static void zpass_kick(void) { plat_once(&Z.once, zpass_start, NULL); }
 int gfx_shader_raw_request(const char *line, char *reply, size_t reply_size) {
     int away = kern_core_away();
     Svc *v = svc_get();
-    int ok = child_exchange(v, line, reply, reply_size);
+    int ok = child_exchange(v, line, reply, reply_size) > 0;
     if (!ok) child_stop(v);
     svc_put(v);
     kern_core_back(&away);
@@ -2562,9 +2577,9 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
     } else {
         if (!write_file(code_path, code + skip, code_len)) return free(req), fail("cannot write the code file", hex);
         int ok = svc_request(req, reply, sizeof reply);
-        // Keep a failed translation's job and code for diagnosis.
-        int failed = ok && strncmp(reply, "ok ", 3);
-        int kept = keep >= 2 || (keep && a && a->mvprev) || failed;
+        // Keep a failed translation's job and code for diagnosis, and those of a request the translator never answered.
+        int failed = ok > 0 && strncmp(reply, "ok ", 3);
+        int kept = keep >= 2 || (keep && a && a->mvprev) || failed || ok < 0;
         if (kept) {
             char job_path[PATH_CAP + 80];
             snprintf(job_path, sizeof job_path, "%s/%s.job", cache_dir, hex);
@@ -2572,6 +2587,13 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
         }
         free(req);
         if (!kept) plat_file_delete(code_path);
+        if (ok < 0) {   // whatever the stopped child wrote is not a translation
+            plat_file_delete(spv_path), plat_file_delete(res_path);
+            char why[96];
+            snprintf(why, sizeof why, "the translator gave no answer in %d s; its child was stopped",
+                     PLAT_CHILD_READ_MS / 1000);
+            return fail(why, hex);
+        }
         if (!ok) return fail("translator unavailable", hex);
         if (failed) {
             plat_file_delete(spv_path), plat_file_delete(res_path);
@@ -3724,14 +3746,18 @@ static void carry_wait(void) {
 }
 
 // One request on the pass's child, started below every normal process when needed; a dead child is restarted once.
+// 1 answered, 0 unavailable, -1 no answer for PLAT_CHILD_READ_MS: the child is stopped and the request not sent again
+// (at idle priority a busy machine can starve the child that long, so the next request gets a new child).
 static int carry_exchange(const char *line, char *reply, size_t n) {
     for (int attempt = 0; attempt < 2; attempt++) {
         if (!carry_svc.child) {
             if (!child_start(&carry_svc)) return 0;
             plat_child_lower(carry_svc.child);
         }
-        if (child_exchange_raw(&carry_svc, line, reply, n)) return 1;
+        int r = child_exchange_raw(&carry_svc, line, reply, n);
+        if (r > 0) return 1;
         child_stop(&carry_svc);
+        if (r < 0) return -1;
     }
     return 0;
 }
@@ -3739,8 +3765,8 @@ static int carry_exchange(const char *line, char *reply, size_t n) {
 // Translates a stored input again under the current identity and stores the files as translate_one does, leaving the
 // memory cache alone. The job's files have names of their own (sha256("TKSC", key)), so an on-demand translation of the
 // same key at the same time never writes the same files; each renames its own onto the key's, with the same content.
-// 1 stored, 0 the translator refused the program or wrote no usable translation (why says which), -1 no translator or
-// a file error.
+// 1 stored, 0 the translator refused the program, gave no answer or wrote no usable translation (why says which), -1 no
+// translator or a file error.
 static int carry_translate(const Req *r, const Inputs *in, char *why, size_t nwhy) {
     uint8_t t[32], tb[36];
     memcpy(tb, "TKSC", 4), memcpy(tb + 4, r->key, 32);
@@ -3757,8 +3783,8 @@ static int carry_translate(const Req *r, const Inputs *in, char *why, size_t nwh
     char *req = malloc(cap), reply[LINE_MAX_LEN];
     if (!req) return plat_file_delete(code_path), snprintf(why, nwhy, "out of memory"), -1;
     build_request(req, hex, r->stage_name, code_path, r->c1, r->c1_len, &in->a, in->control, NULL);
-    int ok = carry_exchange(req, reply, sizeof reply), refused = ok && strncmp(reply, "ok ", 3);
-    if (refused) {   // as translate_one: the job and its code stay, for a translator fix to be tested on
+    int ok = carry_exchange(req, reply, sizeof reply), refused = ok > 0 && strncmp(reply, "ok ", 3);
+    if (refused || ok < 0) {   // as translate_one: the job and its code stay, for a translator fix to be tested on
         char job_path[PATH_CAP + 80];
         snprintf(job_path, sizeof job_path, "%s/%s.job", cache_dir, hex);
         write_file(job_path, req, strlen(req));
@@ -3767,6 +3793,10 @@ static int carry_translate(const Req *r, const Inputs *in, char *why, size_t nwh
     }
     free(req);
     if (!ok) return snprintf(why, nwhy, "translator unavailable"), -1;
+    if (ok < 0) {   // this input fails; the pass goes on with the next on a new child
+        plat_file_delete(spv_path), plat_file_delete(res_path);
+        return snprintf(why, nwhy, "the translator gave no answer in %d s", PLAT_CHILD_READ_MS / 1000), 0;
+    }
     GfxShader *s = refused ? NULL : disk_load_from(t, NULL, 0, 0);
     if (!s || s->stage != in->stage) {
         snprintf(why, nwhy, "%s", refused ? reply : s ? "translated to another stage" : "translator output missing or malformed");

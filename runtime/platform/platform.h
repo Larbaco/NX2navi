@@ -563,8 +563,12 @@ void plat_child_stop(PlatChild *c);                       // kills the child and
 // that must not slow the game down (gfx_shader.c, the carry pass).
 void plat_child_lower(PlatChild *c);
 int plat_child_write(PlatChild *c, const void *data, size_t n);   // 1 when all n bytes were written
+#ifndef PLAT_CHILD_READ_MS                                 // a check may build the child functions with a shorter one
 #define PLAT_CHILD_READ_MS 120000   // plat_child_read gives up on a child that sends nothing for this long
-long plat_child_read(PlatChild *c, void *buf, size_t cap);        // bytes read (at least 1); 0 or negative: pipe broke or timed out
+#endif
+// Bytes read (at least 1); 0 or -1 when the pipe broke (the child is gone); -2 when nothing came for PLAT_CHILD_READ_MS
+// while the child kept its end open (a child stuck on its input: asking it again would wait as long).
+long plat_child_read(PlatChild *c, void *buf, size_t cap);
 
 // ---- local IPC: a stream connection to another program of this machine, one listen location per name (Discord's
 // Rich Presence, discord_rpc.c). On Windows the named pipe \\.\pipe\<name>; on Linux the Unix domain socket

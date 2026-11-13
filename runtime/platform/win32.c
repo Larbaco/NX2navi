@@ -2384,15 +2384,16 @@ int plat_child_write(PlatChild *c, const void *data, size_t n) {
 }
 
 // A child that stays alive but never answers (a translator stuck on one program) used to block the reader for good,
-// and with it the draw or dispatch waiting for that shader: after PLAT_CHILD_READ_MS without a byte the read fails,
-// and the caller stops the child (gfx_shader.c svc_request). The pipe is anonymous, so readiness is polled.
+// and with it the draw or dispatch waiting for that shader: after PLAT_CHILD_READ_MS without a byte the read fails
+// with -2, apart from the -1 of a broken pipe, and the caller stops the child without sending the request again
+// (gfx_shader.c svc_request). The pipe is anonymous, so readiness is polled.
 long plat_child_read(PlatChild *c, void *buf, size_t cap) {
     ULONGLONG t0 = GetTickCount64();
     for (unsigned spins = 0;; spins++) {
         DWORD avail = 0;
         if (!PeekNamedPipe(c->out, NULL, 0, NULL, &avail, NULL)) return -1;   // broken: the child exited
         if (avail) break;
-        if (GetTickCount64() - t0 > PLAT_CHILD_READ_MS) return -1;
+        if (GetTickCount64() - t0 > PLAT_CHILD_READ_MS) return -2;
         Sleep(spins < 50 ? 0 : 1);
     }
     DWORD got = 0;
