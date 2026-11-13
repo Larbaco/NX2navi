@@ -4138,6 +4138,23 @@ class LockTest(Tmp):
         self.assertIn(f'error: the launcher window (process {other.pid}', err.getvalue())
         self.assertIn('try again', err.getvalue())
 
+    def test_the_command_line_update_refuses_while_the_game_runs(self):
+        """`update` rebuilds the game after it switched versions: started while the game runs, it would leave the new
+        version with the old build. It refuses before it downloads anything, as the window's Updates row does."""
+        import argparse
+        from launcher import cli
+        ctx = mock.MagicMock()
+        ctx.settings = {'game_dir': str(self.tmp / 'game')}
+        err = io.StringIO()
+        with mock.patch('launcher.cli.build.game_running', return_value=True) as running, \
+                mock.patch('launcher.cli.jobs.CheckJob') as check, \
+                mock.patch('launcher.cli.jobs.UpdateDownloadJob') as download, contextlib.redirect_stderr(err):
+            self.assertEqual(cli.run(argparse.Namespace(cmd='update'), ctx, mock.MagicMock()), 1)
+        running.assert_called_once_with(str(self.tmp / 'game'))
+        check.assert_not_called()
+        download.assert_not_called()
+        self.assertIn('error: the game is running', err.getvalue())
+
 
 # ---------------------------------------------------------------- the icon
 
