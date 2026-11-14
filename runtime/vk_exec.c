@@ -195,7 +195,9 @@ static void runs_frame(uint64_t frame) {
 uint64_t vk_exec_submit_seq;
 
 void vk_exec_frame_log(const tex_t *p, uint64_t frame) {
-    vk_exec_cond_frame_end(frame);   // a frame boundary in replay order (present_image runs on the replay thread)
+    // a frame boundary in replay order: vk_backend.c present_image runs it under the submission lock, or the next
+    // submission does (vk_frame_owed.h)
+    vk_exec_cond_frame_end(frame);
     runs_frame(frame);
     if (!(rt_trace & RT_TRACE_GFX)) return;
     VkExecFrame *f = &vk_exec_frame;

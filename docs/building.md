@@ -774,6 +774,13 @@ each reason a held present goes out seen; step by step what keeps and what puts 
 held elsewhere a submitting thread gives up at once while the presenting thread waits and counts its wait. No GPU, no
 game files.
 
+A change to where a frame's bookkeeping at its present runs (`runtime/vk_frame_owed.h`, `runtime/vk_backend.c`
+`present_image` and `frame_end`, `runtime/vk_sync.c` `submit` and `vk_sync_try_locked`) passes
+`python tests\frame_owed_check.py`, which builds the header with the platform layer: one presenting and three
+replaying threads, some replays holding the lock 40 ms, over 20,000 frames; every frame's bookkeeping runs once, in
+order, never during a replay and before any replay that took the lock after its present, and no present waits for a
+replay. No GPU, no game files.
+
 A change to how `runtime/memory.c` `mem_copy_readable` reads the lazy heap (`NX2NAVI_HEAP_LAZY=1`) passes
 `python tests\heap_lazy_copy_check.py`, which builds `memory.c` with the Windows platform layer and its fault handler:
 every copy returns, a heap page nothing touched yet reads zero and stays reserved, and pages past the heap's end are

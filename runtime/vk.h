@@ -895,6 +895,12 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n);   // records with vk_ex
 // The probes (--probe-vkmem's table parts, the lost-device probe): one submission whose commands the caller records
 // itself where the replay would, with the submission lock, the memory prologue and the fence of any other.
 uint64_t vk_sync_submit_own(void (*record)(VkCommandBuffer, void *), void *arg);
+// Runs fn() under the submission lock when it is free now and returns 1; returns 0 at once, without running it, when
+// another thread holds the lock (vk_backend.c present_image: a frame's bookkeeping never waits for another replay).
+int vk_sync_try_locked(void (*fn)(void));
+// vk_backend.c (vk_frame_owed.h): the bookkeeping of the frames presented while another thread held the submission
+// lock. vk_sync.c submit calls it right after taking the lock, before its replay; a no-op without the back end.
+void vk_present_frames_owed(void);
 uint64_t vk_sync_reserve(void);            // asynchronous replay: the value the next queued submission signals
 int vk_sync_fence_wait(uint64_t value, uint64_t timeout_ns);   // 1 when done; 0 on timeout or a value never submitted
 // The executed timeline (vk_sync.c): a submission's own commands are through the GPU, its write-backs maybe not yet.

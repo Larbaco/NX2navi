@@ -37,6 +37,7 @@
 #include "vk_dlssg.h"
 #include "vk_fg.h"
 #include "vk_lowlat.h"
+#include "vk_frame_owed.h"
 #include "vk_present_held.h"
 
 #define WEAK __attribute__((weak))
@@ -266,6 +267,61 @@ static int frame_hold(uint32_t skipped, int resized, uint64_t frame) {
     return hold;
 }
 
+// ---- a frame's bookkeeping in replay order (vk_frame_owed.h)
+// A present closes the frame for the replay (frame_end): the trace and conditional-render frame counts
+// (vk_exec_frame_log, whose vk_exec_cond_frame_end moves the frame count the conditional draws go by), dynamic
+// resolution's step, the DLSS state of the frame (vk_dlaa_frame: the mode and its LOD bias, the frame's points and
+// the swap image, the idle releases), the motion tables (vk_mvsurvey_frame, vk_mvprev_frame swaps its two) and the GPU
+// pass timing. The replay reads and writes all of it as it records, under the submission lock. With the replay on the
+// submitting threads the game presents on one thread while another may be replaying, and running it at the present
+// then reset it in the middle of that replay: a DLSS frame reset halfway (a shake, a frame without the upscaler), the
+// motion tables swapped halfway (a ghost; with NX2NAVI_MVPREV_CHECK=1 a write out of bounds), the conditional draws
+// counted against the next frame. So it runs under the submission lock: at the present when the lock is free, else
+// first thing in the next submission, on whichever thread makes it (vk_sync.c submit, vk_present_frames_owed), the
+// present thread's blit submission included. The present never waits for another thread's replay for it. Nothing in
+// frame_end may wait for the present thread, submit or flush with a wait: the hand-off, vk_texture_get with its upload
+// flush and vk_present_drain stay in present_image, outside the lock. NX2NAVI_PRESENT_ORDER=0: at the present, whatever
+// another thread replays, as in 0.10.1.
+static void frame_end(uint64_t frame, const tex_t *t) {   // t: the presented texture, for the trace = gfx line
+    vk_exec_frame_log(t, frame);
+    dynres_frame();   // before vk_dlaa_frame reads the DLSS mode it may override
+    vk_exec_barrier_log(frame);
+    vk_dlaa_frame();
+    vk_mvsurvey_frame();
+    vk_mvprev_frame();
+    vk_gpu_passes_frame(frame);
+}
+
+#define FO_TEX 4
+static FrameOwed FO;
+static const tex_t *fo_tex[FO_TEX];   // the newest frames' presented textures, by frame % FO_TEX (atomics)
+static uint64_t fo_owed_n, fo_late_n;   // presents that left it to a submission; frames a submission caught up (atomics)
+
+static int present_order_on(void) {   // read once; present_image runs one at a time
+    static int on = -1;
+    if (on < 0) {
+        on = cfg_bool("NX2NAVI_PRESENT_ORDER");
+        if (!on) rt_log("vk: NX2NAVI_PRESENT_ORDER=0: a frame's bookkeeping runs at the present, whatever another thread "
+                        "replays");
+    }
+    return on;
+}
+
+static void fo_end(uint64_t frame, void *arg) {
+    (void)arg;
+    frame_end(frame, __atomic_load_n(&fo_tex[frame % FO_TEX], __ATOMIC_RELAXED));
+}
+static void fo_here(void) { fo_run(&FO, fo_end, NULL); }
+static int fo_try(void *arg) {
+    (void)arg;
+    return vk_sync_try_locked(fo_here);
+}
+
+// vk_sync.c submit, sub_lock held, before its replay: the frames presented while another thread held the lock.
+void vk_present_frames_owed(void) {
+    if (fo_waiting(&FO)) __atomic_add_fetch(&fo_late_n, fo_run(&FO, fo_end, NULL), __ATOMIC_RELAXED);
+}
+
 // The present after the frame count: resolves the image and hands the blit to the present thread. queued: when the game
 // presented; value: the timeline value queued for this present (asynchronous replay), 0 for the next one (synchronous).
 static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uint64_t queued, uint64_t frame,
@@ -273,15 +329,14 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
     static volatile int32_t n_skipped;
     static int vram_probe;
     if (!vram_probe) vram_probe = 1, perfmon_set_vram_game(vk_mem_device_used_mb);   // the overlay's "game" beside VRAM
-    vk_exec_frame_log(t, frame);
-    dynres_frame();   // before vk_dlaa_frame reads the DLSS mode it may override
-    vk_exec_barrier_log(frame);
-    vk_dlaa_frame();
+    if (present_order_on()) {
+        __atomic_store_n(&fo_tex[frame % FO_TEX], t, __ATOMIC_RELAXED);
+        if (!fo_present(&FO, frame, fo_try, NULL)) __atomic_add_fetch(&fo_owed_n, 1, __ATOMIC_RELAXED);
+    } else {
+        frame_end(frame, t);
+    }
     vk_sampler_aniso_live();   // NX2NAVI_ANISO changed in the menu: the surface textures' samplers take the new level
-    vk_mvsurvey_frame();
-    vk_mvprev_frame();
     vk_mem_census(frame);
-    vk_gpu_passes_frame(frame);
     if (vk_dump_armed) vk_dump_present(frame);
     __atomic_store_n(&gfx_counters.validation_errors, (uint64_t)vk_validation_errors_total(), __ATOMIC_RELAXED);
     const VkTexImage *img = vk_texture_get(t);

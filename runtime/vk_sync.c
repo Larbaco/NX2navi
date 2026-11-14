@@ -1482,6 +1482,7 @@ static uint64_t submit(const uint64_t *handles, int n, const OwnCommands *own) {
     if (vk_device_is_lost()) return __atomic_load_n(&issued, __ATOMIC_ACQUIRE);
     VkCtx *c = vk_ctx();
     plat_mutex_lock(&sub_lock);
+    vk_present_frames_owed();   // frames presented while another thread replayed close before this replay begins
     vk_mem_dirty_submit();   // NX2NAVI_TRACE=perf: what a mirror would upload before this submit
     uint64_t fence = __atomic_load_n(&issued, __ATOMIC_ACQUIRE) + 1;
     cur_fence = fence;
@@ -1572,6 +1573,16 @@ uint64_t vk_sync_submit_own(void (*record)(VkCommandBuffer, void *), void *arg) 
     OwnCommands own = {record, arg};
     return submit(NULL, 0, &own);
 }
+
+int vk_sync_try_locked(void (*fn)(void)) {
+    if (!plat_mutex_trylock(&sub_lock)) return 0;
+    fn();
+    plat_mutex_unlock(&sub_lock);
+    return 1;
+}
+
+// vk_backend.c's, which runs the frames' bookkeeping (vk_frame_owed.h); builds without the back end have none.
+WEAK void vk_present_frames_owed(void) {}
 
 // st_lock held: p at the end of the queue *q.
 static void pending_push(Pending **q, int *head, int *n, int *cap, Pending p) {
