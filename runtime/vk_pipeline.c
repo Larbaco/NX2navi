@@ -3040,10 +3040,9 @@ static Layout *layout_get(Bindings *B) {
 // mesh stages' bindings are visible to the compute stage (they run as compute pipelines of this layout), the
 // fragment stage's stay; push constants (MESH_EMU_PC_BYTES) for the compute stages and the generated vertex shader;
 // set 0 gets a template per bind point. Caller holds P.lock.
-static int mesh_emu_on(void) {
-    static int on = -1;
-    if (on < 0) on = rt_knob("MESH_EMULATION", "0");
-    return on;
+static int mesh_emu_on(void) {   // decided with the mesh fallback at device creation (vk_mesh_path.h)
+    const VkCtx *c = vk_ctx();
+    return c && c->mesh_emulation;
 }
 
 static Layout *layout_get_emu(Bindings *B) {

@@ -6186,7 +6186,7 @@ static int mesh_emu_draw_prim(VkExec *ex) {
 static int mesh_emu_on(void) {
     static int on = -1;
     if (on < 0) {
-        on = !vk_ctx()->has_mesh_shader && rt_knob("MESH_EMULATION", "0");
+        on = vk_ctx()->mesh_emulation;   // decided with the mesh fallback at device creation (vk_mesh_path.h)
         if (on) rt_log("vk: mesh shaders emulated with compute (NX2NAVI_MESH_EMULATION)");
     }
     return on;
