@@ -26,7 +26,8 @@ The release folder (--out) holds:
                                   bin/dlssg/ with --dlssg (DLSS Frame Generation: nx2navi_dlssg.dll, Streamline's
                                   runtime DLLs and nvngx_dlssg.dll at the version tools/streamline_pin.py pins,
                                   downloaded from NVIDIA's Streamline SDK release and checked, or --streamline; their
-                                  licences and a notice),
+                                  licences and a notice; the release stops first on a DLL that lacks an export
+                                  runtime/dlssg/nx2_sl.h declares, tools/build_dlssg.py check),
                                   lib/libnx2navirt.a (the runtime, prebuilt with the release's compiler),
                                   data/pgo-v111.profdata and .json with --pgo (the execution profile make_game.py
                                   compiles the lifted code and the runtime with, the prebuilt runtime included, and
@@ -207,6 +208,17 @@ def check_xlate(xlate):
             sys.exit(f'{xlate / "nx2navi_xlate.exe"}: {reason}')
     have = (xlate / 'nx2navi_xlate.id').read_text(encoding='ascii').strip()
     print(f'translator identity {have[:16]}: built from this checkout\'s sources')
+
+
+def check_dlssg(dll):
+    """A release carries an nx2navi_dlssg.dll that exports every function runtime/dlssg/nx2_sl.h declares. The runtime
+    takes a missing optional export (nx2sl_reflex2, nx2sl_frames_max) for an older DLL and leaves that feature out
+    with one log line, so a DLL built from older sources would ship without an error: with the DLL of 0.8.0, which
+    lacks nx2sl_reflex2, Reflex would never hold the frame limit. Such a DLL, or a missing one, stops the build
+    (build_dlssg.check); main runs this before anything is resolved, downloaded or deleted."""
+    import build_dlssg
+    build_dlssg.check(dll)
+    print(f'{dll}: exports the {len(build_dlssg.declared_exports())} functions runtime/dlssg/nx2_sl.h declares')
 
 
 def build_app(app, ver, xlate, feed_repo, lock, ffx=None, dlss=None, art=None, dlssg=None, pipelines=None, ffx4=None,
@@ -404,6 +416,8 @@ def main():
     if a.pgo:
         pgo.fitting(a.pgo)   # the profile fits this checkout's recomp/ before anything is downloaded or built
     check_xlate(a.xlate)   # the translator is this checkout's before anything is downloaded, built or deleted
+    if a.dlssg:
+        check_dlssg(a.dlssg)   # and so is nx2navi_dlssg.dll
     out = a.out
     shutil.rmtree(out, ignore_errors=True)
     folder = out / 'NX2navi'

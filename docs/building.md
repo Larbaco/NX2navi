@@ -773,8 +773,11 @@ on screen once and to the pacer the second time. No GPU, no game files.
 
 A change to `runtime/dlssg/nx2_sl.h` or to the export check in `tools/build_dlssg.py` (`declared_exports`,
 `pe_exports`) passes `python tests\dlssg_exports_check.py`, which builds a small DLL with MSYS2's clang and checks that
-the export it lacks is the one named, and that every function `nx2_sl.h` declares is read. The DLL itself is checked
-when `tools/build_dlssg.py` builds it, or with `--check <dll>`. No MSVC, no Streamline SDK, no game files.
+the export it lacks is the one named; that `build_dlssg.check` stops on that DLL, a missing file and a file that is no
+DLL, and passes a DLL with every export `nx2_sl.h` declares; that every function `nx2_sl.h` declares is read; and that
+`tools/make_launcher.py` and `tools/make_kit.py` make that check of their `--dlssg` DLL before they download anything.
+The DLL itself is checked when `tools/build_dlssg.py` builds it, or with `--check <dll>`. No MSVC, no Streamline SDK,
+no game files.
 
 A change to which frames the flight recorder takes for a one-frame flash (`runtime/flight_flash.h`, `runtime/flight.c`
 `flight_cells`) passes `python tests\flight_flash_check.py`, which builds the header alone, draws pictures of the

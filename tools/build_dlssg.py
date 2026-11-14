@@ -12,7 +12,8 @@ tools/make_game.py place_dlssg puts them beside the game.
 The built DLL must export every function runtime/dlssg/nx2_sl.h declares (each PFN_nx2sl_<name> is the export
 nx2sl_<name>), or the build fails naming the ones it lacks: the runtime takes a missing optional export for an older
 DLL and leaves its feature out without an error. --check makes the same check of a DLL built before, such as the one
-a release is about to ship.
+a release is about to ship; tools/make_launcher.py and tools/make_kit.py make it on their --dlssg DLL first and stop
+on one that fails.
 """
 import argparse
 import os
@@ -83,8 +84,14 @@ def missing_exports(dll, header=HEADER):
 
 
 def check(dll):
-    """Exit naming the exports nx2_sl.h declares that dll lacks."""
-    missing = missing_exports(dll)
+    """Exit naming the exports nx2_sl.h declares that dll lacks, or saying that dll is missing or no PE file.
+    tools/make_launcher.py and tools/make_kit.py run it on their --dlssg DLL before anything is downloaded or built."""
+    if not Path(dll).is_file():
+        sys.exit(f'{dll} is missing')
+    try:
+        missing = missing_exports(dll)
+    except (ValueError, TypeError, struct.error) as e:   # pe_exports: no PE signature, or a table outside the file
+        sys.exit(f'{dll} is no DLL that can be read ({e})')
     if missing:
         sys.exit(f'{dll} lacks exports runtime/dlssg/nx2_sl.h declares: {", ".join(missing)} '
                  '(a DLL built from older sources: build it again)')
