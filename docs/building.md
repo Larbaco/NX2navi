@@ -694,8 +694,9 @@ which builds memory.c with the Windows fault handler and a fetch that only waits
 process, so an access violation fails it. A thread that reads a range over and over while it is armed and given back
 again never reaches the crash handler, also when the arm's clean test takes 100 ms, and a read of a range being armed
 does not either when a range in flight in its region ends during that test. A fetch holds up nothing but the
-touches of its range: freezes, thaws, arms, releases and copies of other ranges return at once meanwhile, two ranges
-fetch at once, and more touching threads than the flight table holds all end. The touches of a range in flight wait
+touches of its range: freezes, thaws, arms, releases and copies of other ranges return at once meanwhile, also while
+a thaw fetches the armed ranges of its own regions, two ranges fetch at once, and more touching threads than the
+flight table holds all end. The touches of a range in flight wait
 for it and run again, a write among them without releasing the region's other ranges; thaws, mapping changes,
 releases of its buffer, arms and freezes see it. The same with `wb_lazy_chunk = 1`, and with `wb_lazy_unlocked = 0`
 the fetch holds the freeze lock again. The "mem: lazy write-back" lines give the longest fetch, the longest wait of a

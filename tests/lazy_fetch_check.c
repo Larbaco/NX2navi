@@ -155,6 +155,8 @@ static void releaser(void *arg) {
 // the completion thread's arm (vk_memory.c vk_gpu_written_back) of 64 KiB at arg, written back from buffer 1
 static volatile uint64_t arm_n;
 static void armer(void *arg) { arm_n = arm_buf((uint64_t)(uintptr_t)arg, 0x10000, 1); }
+// a file read's thaw of the page at arg (fs_host.c, romfs.c: before the kernel writes the buffer)
+static void thawer(void *arg) { mem_thaw((uint64_t)(uintptr_t)arg, 0x1000); }
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -292,6 +294,21 @@ int main(int argc, char **argv) {
         CHECK(page_rw(s + 0x1000), "the page is not read-write after the thaw");
         plat_thread_join(ta);
         CHECK(fetch_calls == 1, "%d fetches", fetch_calls);
+    } else if (!strcmp(what, "thaw_unlocked")) {
+        // A thaw (a file read into a buffer) of a range armed with stale bytes fetches them before it takes frz_lock
+        // (memory.c lazy_release_regions): a freeze of another region meanwhile does not wait for the copy. With
+        // NX2NAVI_WB_LAZY_UNLOCKED=0 the thaw fetches under the lock, and the freeze waits.
+        uint64_t s = heap + 124 * M, frz_at = heap + 16 * M;
+        CHECK(arm_buf(s, K64, 1) == K64 && stale(s, K64, 1) == 1, "arm");
+        void *th = plat_thread_new(thawer, (void *)(uintptr_t)(s + 0x1000), "thawer");
+        wait_fetch();
+        uint64_t t0 = plat_now_ns();
+        int f = mem_freeze(frz_at);
+        double d = ms(t0);
+        if (lz_unlocked) CHECK(d < 50 && f == 1, "mem_freeze during the thaw's fetch took %.1f ms", d);
+        else CHECK(d > 200, "mem_freeze took %.1f ms, not the fetch's time", d);
+        plat_thread_join(th);
+        CHECK(fetch_calls == 1 && page_rw(s) && !armed(s, K64), "%d fetches, pages %d", fetch_calls, page_rw(s));
     } else if (!strcmp(what, "mapping")) {
         // a mapping change (a commit, decommit or protect: thaw_range_locked under frz_lock) in a region with a range
         // in flight and another armed: the armed one is fetched under the lock, the flight ends first, both given back

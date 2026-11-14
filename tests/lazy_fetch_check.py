@@ -29,6 +29,8 @@ SCENARIOS = {
     'loser': ('loser', {}),
     'concurrent': ('concurrent', {}),
     'thaw': ('thaw', {}),
+    'thaw_unlocked': ('thaw_unlocked', {}),
+    'locked_thaw': ('thaw_unlocked', LOCKED),
     'mapping': ('mapping', {}),
     'release': ('release', {}),
     'release_join': ('release_join', {}),
