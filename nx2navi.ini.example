@@ -948,9 +948,11 @@
 
 [amiibo]
 # The Amiibo tab of the settings menu (F1) puts an amiibo dump (a 540-byte .bin or .nfc file) on the game's NFC reader
-# (docs/amiibo.md). Folder the tab lists; it is saved when you pick or open another one. A relative folder is under the
-# folder the game starts in, the game's folder when the launcher starts it. Default: amiibo there.
+# (docs/amiibo.md). Folder the tab lists, with its subfolders; it is saved when you pick another one. A relative folder
+# is under the folder the game starts in, the game's folder when the launcher starts it. Default: amiibo there.
 # amiibo_dir =
+# 1: when the game asks for an amiibo, the list of dumps opens over the game; A taps one, B closes it. Default: 1.
+# amiibo_popup = 1
 # Your own amiibo keys file (160 bytes). With it the port reads the data a figure already holds (its nickname and the
 # game data a game saved on it) and can write the game's changes back into the dump. The Amiibo tab's Reload keys
 # reads it again. Default: key_retail.bin in the amiibo folder.

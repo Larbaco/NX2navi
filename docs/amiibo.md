@@ -4,20 +4,31 @@ The port has no NFC reader of its own: it puts an amiibo dump file on an emulate
 amiibo. Every `nn::nfp` call the game makes is answered by the runtime (`runtime/ov_system.c`, `runtime/amiibo.c`).
 You need your own dump of your own figure: a 540-byte NTAG215 image as `.bin` or `.nfc`.
 
+## Picking an amiibo
+
+When the game asks for an amiibo, the list of dumps opens over the game by itself. **A** (or a click) puts the
+highlighted figure on the reader and closes the list; **B** closes it without one. It opens again the next time the
+game asks. Turn it off under **Advanced** in the Amiibo tab (`amiibo_popup = 0`).
+
 ## The Amiibo tab
 
 Open the settings menu (F1) and pick the **Amiibo** tab.
 
-- **Amiibo folder**: the folder the list shows, `amiibo` in the folder the game starts in (the game's folder when the
-  launcher starts it). **Open** picks another one, **Default folder** goes back, **Refresh** reads the folder again.
-  Opening a subfolder in the list also makes it the amiibo folder. The choice is saved as `amiibo_dir`.
-- The list shows subfolders and the 540-byte `.bin` and `.nfc` files; other files stay out of it.
-- **Tap the amiibo** (or a double click on a file) loads the dump and puts it on the reader. **Lift the amiibo** takes
-  it off. With **Lift the amiibo by itself after a tap** on, the figure leaves the reader after the time set under it
-  (1 to 6 seconds), as if you had held it there and taken it away.
-- **Reader** shows what the game does: ready, waiting for an amiibo, amiibo on the reader, or reading it.
-- **Amiibo on the reader** shows the file, the figure's character, series, number and type, its UID and the figure's
-  own data (below).
+- The list on the left shows every 540-byte `.bin` and `.nfc` file in the amiibo folder and its subfolders (three
+  levels down), by name; other files stay out of it. **A** or a click on a figure loads the dump and puts it on the
+  reader. The search field above it narrows the list. The figure last loaded has a dot: cyan while it is on the reader,
+  gold after it left.
+- **Reader** shows what the game does: ready, waiting for an amiibo, amiibo on the reader, or reading it. Under it, the
+  last action, and the figure last loaded: its nickname, whether it holds game data, and **Lift the amiibo**.
+- **Advanced**:
+  - **Amiibo folder**: `amiibo` in the folder the game starts in (the game's folder when the launcher starts it).
+    **Open** picks another one, **Default folder** goes back, **Refresh** reads the folder again (the tab also reads
+    it whenever it opens). The choice is saved as `amiibo_dir`.
+  - **Show the amiibo list when the game asks for an amiibo** (`amiibo_popup`).
+  - With **Lift the amiibo by itself after a tap** on, the figure leaves the reader after the time set under it
+    (1 to 6 seconds), as if you had held it there and taken it away.
+  - The figure's file, character, series, number and type, its UID and its own data (below), with **Erase game data**.
+  - The keys file and write-back (below).
 
 ## What the game reads and writes
 
@@ -65,12 +76,13 @@ write into a dump the port copies it once to `<dump>.bak` (an existing `.bak` is
 ## Settings
 
 In `nx2navi.ini` ([nx2navi.ini.example](../nx2navi.ini.example), `[amiibo]`) or as `NX2NAVI_*` environment variables
-(`NX2NAVI_AMIIBO_DIR`, ...). All three apply while the game runs; a changed keys file is read at **Reload keys**.
+(`NX2NAVI_AMIIBO_DIR`, ...). All four apply while the game runs; a changed keys file is read at **Reload keys**.
 
 | Key | Default | |
 | --- | --- | --- |
 | `amiibo_dir` | `amiibo` | The folder the Amiibo tab lists; the keys file's default place. |
 | `amiibo_keys` | `key_retail.bin` in the amiibo folder | Your keys file. |
+| `amiibo_popup` | `1` | `0`: the list does not open over the game when it asks for an amiibo. |
 | `amiibo_writeback` | `0` | `1`: the game's changes also go into the dump file. |
 
 ## Limits
