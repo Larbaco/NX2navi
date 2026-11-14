@@ -2565,7 +2565,8 @@ Its brief: one debugging, stability and frame-pacing pass over the whole project
   PATH in that run).
 - At `87777fea`: 89 checks (the matrix, 45 new checks and three older ones the matrix lacked), 87 pass; `installer_test`
   and `worktree_test` fail as before, for the environment only. The reviews compiled every runtime file on their
-  branches (`pass_cc_check`); it was not run again at `87777fea`. `tools/check_content.py` passes on every tracked
+  branches (`pass_cc_check`), and a clean dev build at `87777fea` compiled all 169 runtime files and linked the exe.
+  `tools/check_content.py` passes on every tracked
   file. `tests/cfg_rows_check.py` now runs with the content guard.
 - The lifter's differential tests did not apply: `recomp/` changed only in `patches-v111.txt` (the set `orecord`), which
   `ocarina_timing_check` compares against Unicorn.
