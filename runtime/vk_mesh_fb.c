@@ -20,6 +20,7 @@
 #include "vk.h"
 #include "vk_mesh_fb.h"
 #include "meshfb_scan_spv.h"
+#include "meshfb_clamp_spv.h"
 
 enum { MESHFB_RECS = 4096, REC_BYTES = 64 };
 
@@ -36,7 +37,7 @@ static struct {
     PFN_vkCmdPushDescriptorSetKHR push;
     VkDescriptorSetLayout dsl;
     VkPipelineLayout layout;
-    VkPipeline scan;
+    VkPipeline scan, clamp;
 } M;
 
 static int make_buffer(VkCtx *c, VkDeviceSize size, VkBufferUsageFlags usage, int host, VkBuffer *b, VmaAllocation *a, void **map) {
@@ -100,11 +101,18 @@ int vk_meshfb_init(void) {
     VkResult res = vkCreateComputePipelines(c->device, VK_NULL_HANDLE, 1, &ci, NULL, &M.scan);
     vkDestroyShaderModule(c->device, m, NULL);
     if (res != VK_SUCCESS) goto fail;
+    // the clamp of a count the GPU wrote (vk_meshfb_clamp): binding 0 and three push constants of the same layout
+    mi.codeSize = sizeof meshfb_clamp_spv, mi.pCode = meshfb_clamp_spv, m = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(c->device, &mi, NULL, &m) != VK_SUCCESS) goto fail;
+    ci.stage.module = m;
+    res = vkCreateComputePipelines(c->device, VK_NULL_HANDLE, 1, &ci, NULL, &M.clamp);
+    vkDestroyShaderModule(c->device, m, NULL);
+    if (res != VK_SUCCESS) goto fail;
     rt_log("vk: mesh fallback: %llu MiB for task payloads, %llu MiB for mesh output (mesh_fallback_mb = %llu)",
            (unsigned long long)(M.task_bytes >> 20), (unsigned long long)(M.mesh_bytes >> 20), (unsigned long long)mb);
     return M.ok = 1;
 fail:
-    rt_log("vk: mesh fallback: the scan pipeline could not be created: task and mesh draws are skipped");
+    rt_log("vk: mesh fallback: the scan or clamp pipeline could not be created: task and mesh draws are skipped");
     return 0;
 }
 
@@ -183,6 +191,23 @@ void vk_meshfb_scan(VkCommandBuffer cb, VkDeviceSize at, uint32_t task_words, ui
     vkCmdDispatch(cb, 1, 1, 1);
 }
 
+// A count the GPU wrote, copied into record `at` (vk_meshfb_record with a source), cut to what the buffers hold before a
+// dispatch reads it (meshfb_clamp.comp says why). task_words: the task stage's payload words, 0 without a task stage.
+// One single-thread dispatch; the caller orders it after the record's copies and before the first dispatch.
+void vk_meshfb_clamp(VkCommandBuffer cb, VkDeviceSize at, uint32_t task_words) {
+    uint32_t i = (uint32_t)(at / REC_BYTES), most = vk_ctx()->props.limits.maxComputeWorkGroupCount[0];
+    uint32_t room = task_words ? (uint32_t)(M.task_bytes / 4 / task_words) : M.cap_slots[i];
+    if (room > most) room = most;
+    VkDescriptorBufferInfo bi = {M.rec, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet w = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1,
+                              .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi};
+    uint32_t pc[3] = {(uint32_t)(at / 4), task_words != 0, room};
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, M.clamp);
+    rec_push(M.push, cb, VK_PIPELINE_BIND_POINT_COMPUTE, M.layout, 0, 1, &w);
+    vkCmdPushConstants(cb, M.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+    vkCmdDispatch(cb, 1, 1, 1);
+}
+
 void vk_meshfb_note(VkCommandBuffer cb, VkDeviceSize at) {
     uint32_t i = (uint32_t)(at / REC_BYTES);
     VkBufferCopy cp = {at + 48, (VkDeviceSize)i * 8, 8};
@@ -204,6 +229,7 @@ void vk_meshfb_shutdown(void) {
                "hold the largest)", (unsigned long long)M.short_draws, (unsigned long long)M.draws,
                (unsigned long long)((M.worst_bytes * 8 / 7 >> 20) + 1));
     if (M.scan) vkDestroyPipeline(c->device, M.scan, NULL);
+    if (M.clamp) vkDestroyPipeline(c->device, M.clamp, NULL);
     if (M.layout) vkDestroyPipelineLayout(c->device, M.layout, NULL);
     if (M.dsl) vkDestroyDescriptorSetLayout(c->device, M.dsl, NULL);
     if (M.task) vmaDestroyBuffer(c->vma, M.task, M.task_a);

@@ -256,11 +256,46 @@ static void session_checks(void) {
            (unsigned long long)r150.remade, (unsigned long long)r200.remade, TRL_HOLD_S);
 }
 
+// ---- past the hard count (trl_hard_class, trl_hard_pick)
+static void hard_checks(void) {
+    CHECK(trl_hard_class(1, 1, 0, 0) == TRL_HC_OVER, "an overwritten entry goes first, sampled or not");
+    CHECK(trl_hard_class(0, 1, 1, 1) == TRL_HC_LATELY, "a sampled entry is kept");
+    CHECK(trl_hard_class(0, 0, 0, 0) == TRL_HC_GPU, "GPU-made content");
+    CHECK(trl_hard_class(0, 0, 1, 1) == TRL_HC_INTACT_OLD && trl_hard_class(0, 0, 1, 0) == TRL_HC_INTACT, "intact");
+    // the session's end: release order mixes render targets (GPU), intact entries and a few overwritten ones; the
+    // render targets are the oldest. The rule before took them first.
+    enum { N = 64 };
+    uint8_t cls[N];
+    int out[N];
+    for (int i = 0; i < N; i++)
+        cls[i] = i < 16 ? TRL_HC_GPU : i % 9 == 0 ? TRL_HC_OVER : i % 3 == 0 ? TRL_HC_LATELY : i < 40 ? TRL_HC_INTACT_OLD
+               : TRL_HC_INTACT;
+    int k = trl_hard_pick(cls, N, 20, out);
+    CHECK(k == 20, "picked %d of 20", k);
+    int last = -1, gpu = 0, prev_i = -1;
+    for (int j = 0; j < k; j++) {
+        int c = cls[out[j]];
+        CHECK(c != TRL_HC_LATELY, "a lately sampled entry was picked (%d)", out[j]);
+        CHECK(c >= last, "class order: %d after %d", c, last);
+        if (c == last) CHECK(out[j] > prev_i, "release order within a class");
+        gpu += c == TRL_HC_GPU;
+        last = c, prev_i = out[j];
+    }
+    CHECK(gpu == 0, "%d render targets went while intact entries were left", gpu);
+    // only render targets and sampled ones: the render targets go, in release order; none unsampled: nothing
+    for (int i = 0; i < N; i++) cls[i] = i % 2 ? TRL_HC_GPU : TRL_HC_LATELY;
+    k = trl_hard_pick(cls, N, 5, out);
+    CHECK(k == 5 && out[0] == 1 && out[4] == 9, "render targets in release order: %d, %d..%d", k, out[0], out[4]);
+    for (int i = 0; i < N; i++) cls[i] = TRL_HC_LATELY;
+    CHECK(trl_hard_pick(cls, N, 5, out) == 0, "all sampled lately: none picked");
+}
+
 int main(void) {
     clock_checks();
     rule_checks();
     taken_back_checks();
     session_checks();
+    hard_checks();
     if (fails) printf("%d checks failed\n", fails);
     else printf("tex_release_check: all checks passed\n");
     return fails ? 1 : 0;
