@@ -516,7 +516,9 @@ stays playable and Rebuild the Game, or Begin Installation, goes on from the ste
    `tools/streamline_pin.py` pins. The script downloads that release once (cached in `toolchain/launcher-dl/`), checks
    the archive's size and sha256 and each file's sha256, and writes `dlssg-NOTICE.txt` with the two licence texts;
    `make_game.py` copies the whole set beside the game. `--streamline SDK` takes an SDK folder on disk instead (its
-   files must be the pinned ones).
+   files must be the pinned ones). `tools/build_dlssg.py` fails a DLL that lacks an export `runtime/dlssg/nx2_sl.h`
+   declares, and `python tools/build_dlssg.py --check <dll>` makes that check of a DLL built earlier: the runtime
+   takes a missing optional export for an older DLL and leaves that feature out, Reflex's frame limit among them.
 
    `--pgo FILE` puts an execution profile and its record in the release (`app/<version>/data`), and the prebuilt
    runtime is compiled with it; the release stops when the record names another `recomp/` than the checkout's, and

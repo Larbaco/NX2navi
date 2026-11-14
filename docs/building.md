@@ -771,6 +771,11 @@ first host present, after 200 ms without one and with the setting off, that fram
 give it to the pacer for the rest of the run, and that frames the multiplier periods apart switch Reflex to the frames
 on screen once and to the pacer the second time. No GPU, no game files.
 
+A change to `runtime/dlssg/nx2_sl.h` or to the export check in `tools/build_dlssg.py` (`declared_exports`,
+`pe_exports`) passes `python tests\dlssg_exports_check.py`, which builds a small DLL with MSYS2's clang and checks that
+the export it lacks is the one named, and that every function `nx2_sl.h` declares is read. The DLL itself is checked
+when `tools/build_dlssg.py` builds it, or with `--check <dll>`. No MSVC, no Streamline SDK, no game files.
+
 A change to which frames the flight recorder takes for a one-frame flash (`runtime/flight_flash.h`, `runtime/flight.c`
 `flight_cells`) passes `python tests\flight_flash_check.py`, which builds the header alone, draws pictures of the
 thumbnails' size and checks that a patch or a whole frame shown once is a flash, that a camera cut, a fade, a pan and
