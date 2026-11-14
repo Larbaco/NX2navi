@@ -811,6 +811,14 @@ once the submission that last named it is done and its present gate is passed, t
 they were put and the rest keep theirs, that a full list refuses without overwriting, and that an entry a release puts
 waits for the next take. No GPU, no game files.
 
+A change to where the upscalers free what they let go of (`runtime/vk_dlaa.c` "what the upscalers let go of while the
+GPU may still use it", `runtime/vk_ffx.cpp` and `runtime/vk_ffx4.cpp` `context_for`) passes
+`python tests\upscaler_idle_check.py`, which reads the sources: `vkDeviceWaitIdle` only in `vk_upscaler_device_idle`
+and the `--probe-ffx-cache` path, that function only behind the rollback switch, a full list and a refused creation,
+every place that lets something go calling `vk_upscaler_let_go`, `upscaler_idle_wait`'s `sections[]` entry and
+`nx2navi.ini.example` line, a name in `perf.c` for each perf mark kind, and `pb_images` noting the images' last use
+after it makes them. Any Python, no game files.
+
 A change to which frames the flight recorder takes for a one-frame flash (`runtime/flight_flash.h`, `runtime/flight.c`
 `flight_cells`) passes `python tests\flight_flash_check.py`, which builds the header alone, draws pictures of the
 thumbnails' size and checks that a patch or a whole frame shown once is a flash, that a camera cut, a fade, a pan and
