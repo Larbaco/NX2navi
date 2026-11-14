@@ -858,11 +858,17 @@ typedef struct { uint64_t mem, block_size, bytes; uint32_t type; } VkBlockRow;
 // their sizes and the textures and rows in them; the textures that could move to another block or be dropped (marks 0:
 // the texture pool's marks do not tell which textures are sampled, and none counts as movable); the blocks at most half
 // full by what is listed, and those of them that hold nothing but such textures, which are what a compaction could
-// give back to the driver.
+// give back to the driver. kept: the other half-full blocks in which something listed stays, by what stays there
+// (VK_HOLES_KINDS kinds, in order: a VRAM mirror, a texture whose content only the GPU made, a texture sampled lately,
+// a texture that cannot move for another reason): kept_with counts the blocks with that kind in them, kept_only those
+// where nothing else stays.
+#define VK_HOLES_KINDS 4
 typedef struct {
     uint32_t type, marks, blocks, sparse, emptiable;
     uint64_t block_bytes, tex_bytes, other_bytes, move_bytes, drop_bytes;
     uint64_t sparse_bytes, sparse_listed, emptiable_bytes, emptiable_move, emptiable_drop;
+    uint32_t kept, kept_with[VK_HOLES_KINDS], kept_only[VK_HOLES_KINDS];
+    uint64_t kept_bytes, kept_only_bytes[VK_HOLES_KINDS];
 } VkTexHoles;
 void vk_texture_holes(const VkBlockRow *other, int nother, VkTexHoles *h);
 // Texture compaction (NX2NAVI_TEX_COMPACT; vk_texture.c "the pass"): idle textures move out of sparsely used blocks

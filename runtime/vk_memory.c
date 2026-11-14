@@ -4976,6 +4976,15 @@ static void holes_log(uint64_t frame) {
            "as unsampled", h.other_bytes / M, h.block_bytes > listed ? (h.block_bytes - listed) / M : 0.0, h.sparse,
            h.sparse_bytes / M, h.sparse_listed / M, h.emptiable, h.emptiable_bytes / M, h.emptiable_move / M,
            h.emptiable_drop / M);
+    // What keeps the other half-full blocks: a session of 2026-11-14 at 5120x2160 held 3 to 5 GiB free inside 140 to
+    // 180 blocks, 48 to 85 of them at most half full, and the line said only that 1 to 18 of those could be emptied.
+    if (h.kept)
+        rt_log("mem: holes frame %llu: %u more of the half-full blocks, %.0f MiB, keep something that cannot move: a VRAM "
+               "mirror in %u (alone in %u, %.0f MiB), a texture only the GPU made in %u (alone in %u, %.0f MiB), a "
+               "texture sampled lately in %u (alone in %u, %.0f MiB), another texture that cannot move in %u (alone in "
+               "%u, %.0f MiB)", (unsigned long long)frame, h.kept, h.kept_bytes / M, h.kept_with[0], h.kept_only[0],
+               h.kept_only_bytes[0] / M, h.kept_with[1], h.kept_only[1], h.kept_only_bytes[1] / M, h.kept_with[2],
+               h.kept_only[2], h.kept_only_bytes[2] / M, h.kept_with[3], h.kept_only[3], h.kept_only_bytes[3] / M);
 }
 
 // With NX2NAVI_TRACE=perf every 60 frames: a line when the device-local memory VMA did not allocate (vram_use_log's

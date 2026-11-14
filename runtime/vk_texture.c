@@ -6220,6 +6220,21 @@ static int compact_what(const Tex *e, uint64_t now, int marks, uint64_t most) {
     return now - e->samp_frame >= COMPACT_IDLE ? TCP_MOVE : TCP_STAY;
 }
 
+// What keeps an allocation compact_what leaves where it is, for the holes line (vk_texture_holes): a VRAM mirror (a row
+// of the caller's, no entry), a texture whose content only the GPU made, one a shader sampled within COMPACT_IDLE
+// presents, or one that cannot move for another reason (compact_what's list). A sparse block that one kind alone
+// keeps is what a change to that kind's placement or rule would give back.
+enum { KEEP_MIRROR = 1, KEEP_GPU = 2, KEEP_USED = 4, KEEP_OTHER = 8 };
+static int stay_why(const Tex *e, int marks, uint64_t most) {
+    if (!e) return KEEP_MIRROR;
+    if (!e->pub.image || e->pub.gone || e->retiring) return KEEP_OTHER;
+    if (!comes_back_intact(e)) return KEEP_GPU;
+    if (!marks || !e->uploaded || e->up_retry || e->wr_fence || e->clobbered || e->pub.samples > 1 || e->f.depth ||
+        e->f.stencil || e->bytes > most)
+        return KEEP_OTHER;
+    return KEEP_USED;
+}
+
 static void table_add(CompTable *t, uint64_t mem, uint64_t size, uint64_t bytes, int what, Tex *e) {
     void *v = nvn_hm_get(&t->by_mem, &mem);
     uint32_t bi = v ? (uint32_t)((uintptr_t)v - 1) : (uint32_t)t->nb;
@@ -6707,6 +6722,22 @@ void vk_texture_holes(const VkBlockRow *other, int nother, VkTexHoles *h) {
                       .move_bytes = s.move_bytes, .drop_bytes = s.drop_bytes, .sparse_bytes = s.sparse_bytes,
                       .sparse_listed = s.sparse_listed, .emptiable_bytes = s.emptiable_bytes,
                       .emptiable_move = s.emptiable_move, .emptiable_drop = s.emptiable_drop};
+    // the sparse blocks a plan could not choose, by what stays in them
+    uint8_t *why = t.nb ? calloc((size_t)t.nb, 1) : NULL;
+    for (int i = 0; why && i < t.na; i++)
+        if (t.a[i].what == TCP_STAY && t.a[i].block < (uint32_t)t.nb)
+            why[t.a[i].block] |= (uint8_t)stay_why(t.ae[i], t.marks, CP.frame_bytes);
+    for (int i = 0; why && i < t.nb; i++) {
+        const TcpBlock *k = &t.b[i];
+        if (!tcp_sparse(k, COMPACT_SPARSE_PCT) || tcp_emptiable(k, COMPACT_SPARSE_PCT) || !why[i]) continue;
+        h->kept++, h->kept_bytes += k->size;
+        for (int j = 0; j < VK_HOLES_KINDS; j++) {
+            if (!(why[i] >> j & 1)) continue;
+            h->kept_with[j]++;
+            if (why[i] == 1u << j) h->kept_only[j]++, h->kept_only_bytes[j] += k->size;
+        }
+    }
+    free(why);
     table_free(&t);
     unlock();
 }
