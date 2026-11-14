@@ -331,9 +331,14 @@ static int fo_try(void *arg) {
     return vk_sync_try_locked(fo_here);
 }
 
-// vk_sync.c submit, sub_lock held, before its replay: the frames presented while another thread held the lock.
+// vk_sync.c submit, sub_lock held, before its replay: the frames presented while another thread held the lock. Their
+// time counts as this thread's replay time (perf_replay), as submit's own timing starts after this call: a DLSS release
+// in vk_dlaa_frame (tens of milliseconds) then shows as replay in the frame-time and slow-frame lines, not unattributed.
 void vk_present_frames_owed(void) {
-    if (fo_waiting(&FO)) __atomic_add_fetch(&fo_late_n, fo_run(&FO, fo_end, NULL), __ATOMIC_RELAXED);
+    if (!fo_waiting(&FO)) return;
+    uint64_t t0 = perf_begin();
+    __atomic_add_fetch(&fo_late_n, fo_run(&FO, fo_end, NULL), __ATOMIC_RELAXED);
+    perf_replay(t0);
 }
 
 // The present thread, before it uses frame (present_main): frame_end of a frame the presenting thread left owed has run
