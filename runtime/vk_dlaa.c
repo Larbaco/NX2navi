@@ -2423,8 +2423,10 @@ static void evaluate(VkExec *ex, const VkExecTarget *dst) {
         }
         D.pre_at = at;
     }
-    // Read once: vk_dlaa_frame runs on the present's thread and can clear fsr_frame while this replay is between the
-    // checks below, which would send the rest of this function to DLSS's path without NGX after all.
+    // Read once: vk_dlaa_frame runs between replays under the submission lock (vk_backend.c frame_end: at the present,
+    // first thing in the next submission, or on the present thread before the frame's blit), but at the present with
+    // NX2NAVI_PRESENT_ORDER=0, where it can clear fsr_frame while this replay is between the checks below, which would
+    // send the rest of this function to DLSS's path without NGX after all.
     const int fsr = use_fsr();
     // The size whose DLSS feature this frame runs on: its own, or the DLSS mode's while that one takes this render size
     // (range_host). On another size's feature DLSS reads a sub-rectangle of this frame's render size from each input.
@@ -3245,11 +3247,13 @@ static void preset_check(void) {
 // frames 3 and 5 presents after the change, with every other setting the same. evaluate notes a scene of another size;
 // vk_dlaa_frame counts the presents since a setting last changed, so a game that draws two sizes in turn holds nothing.
 // setting_presents: presents left in which that counts as a mode change. vk_dlaa_frame sets and counts it down on the
-// thread that runs the frame's bookkeeping, vk_dlaa_resized_take clears it on the presenting thread: atomics.
+// thread that runs the frame's bookkeeping, vk_dlaa_resized_take clears it at the present (vk_backend.c frame_hold):
+// atomics.
 static int setting_presents;
 #define SETTING_PRESENTS 60
 
-// vk_backend.c frame_hold, each present after vk_dlaa_frame: 1 once when the scene took a new size after a setting
+// vk_backend.c frame_hold, at each present (that frame's vk_dlaa_frame may come one submission later,
+// vk_frame_owed.h): 1 once when the scene took a new size after a setting
 // changed. The previous picture then stays on screen over the frames described above.
 int vk_dlaa_resized_take(void) {
     if (!__atomic_exchange_n(&size_changed, 0, __ATOMIC_ACQ_REL)) return 0;
@@ -3423,7 +3427,7 @@ void vk_dlaa_frame(void) {
     static unsigned cfg_seen;
     static int cfg_known;
     unsigned v = cfg_version();
-    D.presents++;
+    __atomic_store_n(&D.presents, D.presents + 1, __ATOMIC_RELAXED);   // one writer; presents_now reads it unlocked
     if (cfg_known && v != cfg_seen) {
         __atomic_store_n(&setting_presents, SETTING_PRESENTS, __ATOMIC_RELAXED);
     } else {   // down to 0, not past it: vk_dlaa_resized_take may clear it meanwhile
