@@ -262,12 +262,13 @@ int rt_knob(const char *name, const char *def) { (void)name, (void)def; return 0
 // The state file next to the executable: here the scenario's folder.
 static char exe_dir[MAX_PATH];
 static int state_readonly;   // the state file cannot be written
+static int state_unreadable;   // the state file is there but does not read (another program holds it)
 static int no_exe_path;      // the executable's path is unknown: no state file at all
 int plat_exe_path(char *out, size_t cap) {
     int k = snprintf(out, cap, "%s\\ocarina.exe", exe_dir);
     return !no_exe_path && k > 0 && (size_t)k < cap;
 }
-uint8_t *plat_file_read(const char *path, uint64_t *size) {
+static uint8_t *read_all(const char *path, uint64_t *size) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
     fseek(f, 0, SEEK_END);
@@ -278,6 +279,15 @@ uint8_t *plat_file_read(const char *path, uint64_t *size) {
     fclose(f);
     if (b) b[n] = 0, *size = (uint64_t)n;
     return b;
+}
+uint8_t *plat_file_read(const char *path, uint64_t *size) { return state_unreadable ? NULL : read_all(path, size); }
+int64_t plat_file_size(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fclose(f);
+    return n;
 }
 int plat_file_write_atomic(const char *path, const void *data, size_t n) {
     if (state_readonly) return 0;
@@ -298,7 +308,7 @@ static const char *state(void) {   // the state file as it is now; "" when there
     char path[MAX_PATH + 32];
     snprintf(path, sizeof path, "%s\\rtss-profile.txt", exe_dir);
     uint64_t n = 0;
-    uint8_t *b = plat_file_read(path, &n);
+    uint8_t *b = read_all(path, &n);
     snprintf(state_text, sizeof state_text, "%s", b ? (char *)b : "");
     free(b);
     return state_text;
@@ -998,6 +1008,27 @@ static void put_back_undeleted(void) {
     CHECK(!own.exists && removed == 1 && !*state(), "the exit removes it:\n%s", state());
 }
 
+// The state file is there with another executable's line but does not read: it is left as it is, with that line, and
+// the run goes on as with a file that cannot be written.
+static void state_locked(void) {
+    char path[MAX_PATH + 32];
+    snprintf(path, sizeof path, "%s\\rtss-profile.txt", exe_dir);
+    FILE *f = fopen(path, "wb");
+    if (f) fputs("rtss1 0 0 1 60 1 60 1 ocarina_dev.exe\n", f), fclose(f);
+    state_unreadable = 1;
+    app_set(1, 0xA, 1000, 2000, 60);
+    ask(60000);
+    poll();
+    poll();
+    show("a state file that does not read");
+    CHECK(own.exists && own.limit == 60 && rtss_limit_active(), "RTSS limits as before");
+    CHECK(logged("rtss-profile.txt could not be written"), "logged");
+    CHECK(!strcmp(state(), "rtss1 0 0 1 60 1 60 1 ocarina_dev.exe\n"), "the file as it was:\n%s", state());
+    state_unreadable = 0;
+    rtss_limit_restore();
+    CHECK(!own.exists && !strcmp(state(), "rtss1 0 0 1 60 1 60 1 ocarina_dev.exe\n"), "still as it was:\n%s", state());
+}
+
 // A crash with the line in the state file: no call into RTSS's library, the profile and the line stay for the next
 // start, and nothing after it reaches the profile.
 static void crash_recorded(void) {
@@ -1209,6 +1240,7 @@ static const struct { const char *name; void (*run)(void); } scenarios[] = {
     {"state_record", state_record},
     {"state_player", state_player},
     {"state_unwritable", state_unwritable},
+    {"state_locked", state_locked},
     {"crash_recorded", crash_recorded},
     {"kill_restart", kill_restart},
     {"kill_restart_player", kill_restart_player},

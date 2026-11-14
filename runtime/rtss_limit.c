@@ -173,6 +173,9 @@ static int state_put(const RtssSaved *r) {
     if (state_off || !*state_path) return 0;
     uint64_t n = 0;
     char *text = (char *)plat_file_read(state_path, &n);
+    // a file that is there but did not read (another program holds it, a scan) keeps the lines of the other executables
+    // in the folder: rewritten from nothing, they would go
+    if (!text && plat_file_size(state_path) > 0) return 0;
     size_t cap = (size_t)(text ? n : 0) + sizeof RTSS_SAVED_HEADER + 2 * (RTSS_NAME_MAX + 96);
     char *out = malloc(cap);
     int records = 0, ok = 0;
