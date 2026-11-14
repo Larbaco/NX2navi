@@ -717,8 +717,9 @@
 # dlss_idle_free = 1
 # When DLSS or FSR lets go of a network, an FSR context or a picture (a new picture size, the pause screen, a mode
 # change). 0: it is freed once the graphics card has finished the frames that used it, and the game does not wait.
-# 1: the game waits for the graphics card to finish all its work first, as up to 0.10.1: a hitch of a frame or more
-# at each such change. For comparison, or if 0 shows a fault. Read at start.
+# 1: the game waits for the graphics card to finish all its work at each such change, as up to 0.10.1 (what was let
+# go of still goes once the card is past it): a hitch of a frame or more at each change. For comparison, or if 0 shows
+# a fault. Read at start.
 # upscaler_idle_wait = 0
 # One DLSS network for the render sizes of a DLSS mode. 1: the network made for the mode's own render size also takes
 # the smaller render sizes DLSS allows on it (dynamic resolution's steps with dyn_res = 1, a screen that renders

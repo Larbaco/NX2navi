@@ -217,7 +217,8 @@ static const CfgMeta metas[] = {
     {"SCENE_SHARE", "0.75", "0..1", LIVE},
     {"DLAA", "0", "0|1", LIVE}, {"DLSS", "dlaa", "dlaa|quality|balanced|performance|ultra_performance", LIVE},
     {"DLSS_PRESET", "default", "default|k|j", LIVE}, {"DLSS_IDLE_FREE", "1", "0|1|2", RESTART}, {"TAA", "dlss", "dlss|fsr3", LIVE},   // vk_dlaa.c fsr3
-    // vk_dlaa.c vk_upscaler_idle_wait: 1 waits for the device to be idle before an upscaler frees anything, as up to 0.10.1
+    // vk_dlaa.c vk_upscaler_idle_wait: 1 waits for the device to be idle wherever an upscaler lets go of something, as up
+    // to 0.10.1 (what was let go of still goes once the GPU is past it, behind its present gate)
     {"UPSCALER_IDLE_WAIT", "0", "0|1", RESTART},
     {"DLSS_RANGE", "0", "0|1", RESTART},   // vk_dlaa.c range_on: one DLSS feature for the render sizes of a mode
     {"DLSS_PREBLOOM", "0", "0|1", LIVE},   // vk_dlaa.c prebloom_run: DLSS or FSR 3.1 before the bloom, not after the tonemap

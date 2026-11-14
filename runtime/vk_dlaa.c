@@ -764,7 +764,10 @@ static void feat_release(NgxHandle *f) {
 // The lists are taken at every evaluation (evaluate), at every pass while none runs (retire_idle), and where something
 // is let go of (vk_upscaler_let_go). What still waits: a feature or context creation refused while ones let go of are
 // in flight waits for the GPU to pass those (vk_upscaler_gpu_wait), and a full list for the device (vk_upscaler_settle).
-// NX2NAVI_UPSCALER_IDLE_WAIT=1 waits for the device wherever something is let go of, as up to 0.10.1.
+// NX2NAVI_UPSCALER_IDLE_WAIT=1 waits for the device wherever something is let go of, as up to 0.10.1, but does not
+// bring 0.10.1 back exactly: what was let go of still goes through these lists and the deferred destruction, an image a
+// present reads keeps its present gate, what the submission being recorded names stays until it is done, and a refused
+// DLSS creation with features let go of still listed waits and tries again, where 0.10.1 turned DLAA off.
 enum { UPD_FEAT = 1, UPD_IMG, UPD_VIEW };   // dead's kinds: a DLSS feature, an image with its allocation (aux), a view
 static UpdList dead;   // DLAA's hook thread only (vk_dlaa_pass and what it runs), as evaluate's state
 // A vk_dlaa.c image frame generation can read at a present goes this many presents after it was let go of. present_image

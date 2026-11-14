@@ -380,8 +380,8 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   while (`vk_dlaa.c` `idle_release`, `vk_fsr.c` `idle_note`, `vk_aa.c` `work_idle`). What DLSS or FSR lets go of at
   a change of size or mode (a network, an FSR context, a work image) goes once the GPU is past the last submission that
   used it, and an image frame generation reads at a present some presents later, without a wait for the device on the
-  replaying thread (`vk_dlaa.c` "what the upscalers let go of", `vk_up_defer.h`; `upscaler_idle_wait = 1` waits as
-  before).
+  replaying thread (`vk_dlaa.c` "what the upscalers let go of", `vk_up_defer.h`; `upscaler_idle_wait = 1` waits for
+  the device at each such change as before, and the freeing keeps these gates).
 - Translated shaders at rest: the shader memory cache keeps every shader for the whole session, but a shader's SPIR-V
   is read only while modules are made of it. A background thread compresses (zstd, checked by decoding it) the SPIR-V
   of each shader no reader used for `shader_compress_idle_s` seconds (30) and frees the plain copy; a reader pins it
