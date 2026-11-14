@@ -13,6 +13,16 @@ It fails when:
 - one of the places that create a DLSS feature or an FSR context (vk_dlaa.c evaluate, vk_ffx.cpp and vk_ffx4.cpp
   context_for) does not call vk_upscaler_gpu_wait: a creation refused while what was let go of is still in flight
   then fails for want of its video memory, where the wait for the device of 0.10.1 had freed it first;
+- one of the places that let go of what the GPU may still use (those above, the helpers that hand it to the lists,
+  vk_dlaa.c retire_size, retire_feat, retire_snap, retire_hl and retire_pb, vk_ffx.cpp and vk_ffx4.cpp retire_up, and
+  the FSR files' trims and release_idle calls) frees something at once: a destroy that takes an idle device or a
+  half-made object (vk_dlaa.c destroy_size, destroy_snap, hl_destroy, pb_destroy, feat_release, N.release,
+  vkDestroyImageView, vmaDestroyImage; the FSR files' A.destroy), which on a GPU still running a frame is a use after
+  free. vk_dlaa.c hudless_from, pb_images and snap_for may destroy only after their first image2d call, what of the new
+  images was made and never used;
+- a whole list is taken whatever its gates (upd_take_all) outside teardown (vk_dlaa.c vk_dlaa_release, vk_ffx.cpp
+  vk_ffx_release, vk_ffx4.cpp vk_ffx4_release) and a full list's fallback (vk_dlaa.c dead_put, the FSR files'
+  retire_up), or there before vk_upscaler_settle's wait for the device;
 - NX2NAVI_UPSCALER_IDLE_WAIT has no sections[] entry in cfg.c or no line in nx2navi.ini.example (its known[] name and
   its metas[] row, and a // that would hide them, are tests/cfg_rows_check.py's);
 - perf.c's mark_name has another count of names than host.h has PERF_M_* kinds: a kind without a name prints a null
@@ -42,6 +52,29 @@ REFUSED = {   # functions that create a feature or context and must retry a refu
     'vk_dlaa.c': ['evaluate'],
     'vk_ffx.cpp': ['context_for'],
     'vk_ffx4.cpp': ['context_for'],
+}
+# Callees that free at once, without a wait: each is for an idle device (teardown) or for what no submission named yet
+# (a half-made object).
+FREE_NOW = {
+    'vk_dlaa.c': ['destroy_size', 'destroy_snap', 'hl_destroy', 'pb_destroy', 'feat_release', 'N.release',
+                  'vkDestroyImageView', 'vmaDestroyImage'],
+    'vk_ffx.cpp': ['A.destroy'],
+    'vk_ffx4.cpp': ['A.destroy'],
+}
+NO_FREE_NOW = {   # functions that let go of what the GPU may still use: no FREE_NOW callee anywhere in them
+    'vk_dlaa.c': ['free_size', 'free_snap', 'stale_sizes', 'release_kept', 'retire_idle', 'evaluate', 'retire_size',
+                  'retire_feat', 'retire_snap', 'retire_hl', 'retire_pb'],
+    'vk_ffx.cpp': ['context_for', 'trim', 'retire_up', 'vk_ffx_trim_idle', 'vk_ffx_release_idle'],
+    'vk_ffx4.cpp': ['context_for', 'vk_ffx4_trim', 'retire_up', 'vk_ffx4_release_idle'],
+}
+# Functions that let go of the old images and then make new ones: no FREE_NOW callee before their first image2d call;
+# after it, the failure path destroys what of the new images was made, which no submission named.
+NO_FREE_BEFORE_MAKE = {'vk_dlaa.c': ['hudless_from', 'pb_images', 'snap_for']}
+# Where upd_take_all may be called, and whether vk_upscaler_settle's wait for the device must come before it there.
+TAKE_ALL = {
+    'vk_dlaa.c': {'vk_dlaa_release': False, 'dead_put': True},
+    'vk_ffx.cpp': {'vk_ffx_release': False, 'retire_up': True},
+    'vk_ffx4.cpp': {'vk_ffx4_release': False, 'retire_up': True},
 }
 # A function definition: at column 0, a return type, the name, the parameters and the body's brace (the runtime's
 # style); declarations end with ';' before any '{'. Read in code whose string literals are blanked: extern "C" is
@@ -114,6 +147,11 @@ def calls(code, funcs, callee):
     return out
 
 
+def call_offsets(code, callee, a, b):
+    """The offsets of each call of callee between a and b."""
+    return [m.start() for m in re.compile(r'\b%s\s*\(' % re.escape(callee)).finditer(code, a, b)]
+
+
 def body(code, funcs, name):
     for n, a, b in funcs:
         if n == name:
@@ -157,6 +195,38 @@ def main():
                 fails.append(f'{f}: no function {name}')
             elif not re.search(r'\bvk_upscaler_gpu_wait\s*\(', b):
                 fails.append(f'{f} {name}: no retry of a refused creation after vk_upscaler_gpu_wait')
+    for f, names in NO_FREE_NOW.items():
+        code, funcs = sources[f]
+        defined = {n for n, _, _ in funcs}
+        fails += [f'{f}: no function {name}' for name in names if name not in defined]
+        for callee in FREE_NOW[f]:
+            for line, fn in calls(code, funcs, callee):
+                if fn in names:
+                    fails.append(f'{f}:{line}: {fn} calls {callee}, which frees at once what the GPU may still use')
+    for f, names in NO_FREE_BEFORE_MAKE.items():
+        code, funcs = sources[f]
+        for name in names:
+            spans = [(a, b) for n, a, b in funcs if n == name]
+            if not spans:
+                fails.append(f'{f}: no function {name}')
+            for a, b in spans:
+                made = call_offsets(code, 'image2d', a, b)
+                if not made:
+                    fails.append(f'{f} {name}: no image2d call')
+                    continue
+                for callee in FREE_NOW[f]:
+                    for at in call_offsets(code, callee, a, made[0]):
+                        fails.append(f'{f}:{code.count(chr(10), 0, at) + 1}: {name} calls {callee} before it makes '
+                                     f'its images, on what the GPU may still use')
+    for f, allowed in TAKE_ALL.items():
+        code, funcs = sources[f]
+        for name, a, b in funcs:
+            for at in call_offsets(code, 'upd_take_all', a, b):
+                line = code.count('\n', 0, at) + 1
+                if name not in allowed:
+                    fails.append(f'{f}:{line}: upd_take_all in {name}, allowed only in {sorted(allowed)}')
+                elif allowed[name] and not call_offsets(code, 'vk_upscaler_settle', a, at):
+                    fails.append(f'{f}:{line}: upd_take_all in {name} before vk_upscaler_settle')
 
     key = 'UPSCALER_IDLE_WAIT'
     cfg = (rt / 'cfg.c').read_text(encoding='utf-8-sig')

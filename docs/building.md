@@ -817,9 +817,13 @@ GPU may still use it", `runtime/vk_ffx.cpp` and `runtime/vk_ffx4.cpp` `context_f
 and the `--probe-ffx-cache` path, that function only behind the rollback switch, a full list and a refused creation,
 every place that lets something go calling `vk_upscaler_let_go`, every creation of a DLSS feature or an FSR context
 (`vk_dlaa.c` `evaluate`, `vk_ffx.cpp` and `vk_ffx4.cpp` `context_for`) trying a refusal once more after a wait for the
-GPU to pass what was let go of (`vk_upscaler_gpu_wait`), `upscaler_idle_wait`'s `sections[]` entry and
-`nx2navi.ini.example` line, a name in `perf.c` for each perf mark kind, and `pb_images` noting the images' last use
-after it makes them. Any Python, no game files.
+GPU to pass what was let go of (`vk_upscaler_gpu_wait`), no place that lets something go (those, the `retire_*`
+helpers, the FSR trims and `release_idle` calls) calling a destroy that frees at once (`destroy_size`, `destroy_snap`,
+`hl_destroy`, `pb_destroy`, `feat_release`, `N.release`, `vkDestroyImageView`, `vmaDestroyImage`, the FSR files'
+`A.destroy`), except after the first `image2d` of `hudless_from`, `pb_images` and `snap_for` for their half-made
+images, a whole list taken (`upd_take_all`) only at teardown or after `vk_upscaler_settle` for a full list,
+`upscaler_idle_wait`'s `sections[]` entry and `nx2navi.ini.example` line, a name in `perf.c` for each perf mark kind,
+and `pb_images` noting the images' last use after it makes them. Any Python, no game files.
 
 A change to which frames the flight recorder takes for a one-frame flash (`runtime/flight_flash.h`, `runtime/flight.c`
 `flight_cells`) passes `python tests\flight_flash_check.py`, which builds the header alone, draws pictures of the
