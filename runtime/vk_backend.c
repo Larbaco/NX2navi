@@ -192,12 +192,15 @@ void vk_present_drain(void) {
 // (vk_frame_hold_left, vk_exec_draw.c), on whatever thread holds the submission lock, which need not be the one that
 // presents: so that reader works out the allowance from limit_ns, left_ns, last_ns and holding (atomics) and writes
 // nothing. When it refilled FH itself, a refill on the replaying thread beside one at the present on another thread
-// counted the same interval twice or not at all.
+// counted the same interval twice or not at all. A refill writes left_ns and last_ns as a pair under a sequence word
+// (seq, odd while it writes), so the reader does not pair a new left_ns with an old last_ns either.
 static struct {
     int64_t limit_ns, left_ns;
     uint64_t last_ns, held, runs, shown, load_t0, load_held;
     int holding, resize_left;
+    uint32_t seq;
 } FH = {.limit_ns = -1};
+#define FH_READ_TRIES 3
 
 // NX2NAVI_FRAME_HOLD_MS, read once by whichever thread asks first; that one logs it.
 static int64_t fh_limit(void) {
@@ -220,17 +223,32 @@ static int64_t fh_left_at(int64_t lim, int64_t left, uint64_t last, int holding,
 }
 
 static int64_t frame_hold_refill(uint64_t now) {   // frame_hold only; returns the limit
-    int64_t lim = fh_limit();
-    __atomic_store_n(&FH.left_ns, fh_left_at(lim, FH.left_ns, FH.last_ns, FH.holding, now), __ATOMIC_RELAXED);
+    int64_t lim = fh_limit(), left = fh_left_at(lim, FH.left_ns, FH.last_ns, FH.holding, now);
+    uint32_t s = FH.seq;
+    __atomic_store_n(&FH.seq, s + 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);   // a reader that sees either new field also sees the odd sequence
+    __atomic_store_n(&FH.left_ns, left, __ATOMIC_RELAXED);
     __atomic_store_n(&FH.last_ns, now, __ATOMIC_RELAXED);
+    __atomic_store_n(&FH.seq, s + 2, __ATOMIC_RELEASE);
     return lim;
 }
 
 // Whether a frame that skipped draws now would be held (vk_exec_draw.c: a full-screen draw is skipped only then). Any
-// thread; reads FH only. The fields are loaded before the clock, so now is not before last.
+// thread; reads FH only. left_ns and last_ns come from one refill: a read that overlaps a refill is made again, and
+// after FH_READ_TRIES such reads the last one is used (it can count one interval twice or not at all, for this one
+// decision), so the reader never waits for the present. holding is stored at the present just after its refill; a
+// read between the two applies the previous frame's holding to the few microseconds since that refill. The fields are
+// loaded before the clock, so now is not before last.
 int vk_frame_hold_left(void) {
-    int64_t lim = fh_limit(), left = __atomic_load_n(&FH.left_ns, __ATOMIC_RELAXED);
-    uint64_t last = __atomic_load_n(&FH.last_ns, __ATOMIC_RELAXED);
+    int64_t lim = fh_limit(), left = 0;
+    uint64_t last = 0;
+    for (int k = 0; k < FH_READ_TRIES; k++) {
+        uint32_t s0 = __atomic_load_n(&FH.seq, __ATOMIC_ACQUIRE);
+        left = __atomic_load_n(&FH.left_ns, __ATOMIC_RELAXED);
+        last = __atomic_load_n(&FH.last_ns, __ATOMIC_RELAXED);
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);   // the fields are read before the sequence is read again
+        if (!(s0 & 1) && __atomic_load_n(&FH.seq, __ATOMIC_RELAXED) == s0) break;
+    }
     int holding = __atomic_load_n(&FH.holding, __ATOMIC_RELAXED);
     return fh_left_at(lim, left, last, holding, kern_now_ns()) > 0 && !vk_dlssg_active();
 }
