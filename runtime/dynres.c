@@ -40,6 +40,7 @@ static struct {
     double avg_ns;        // moving average of the GPU's busy time per frame
     double target_ms;     // NX2NAVI_DYN_RES_TARGET; under 1: the frame time of the game's rate
     double target_ns;     // the target in use
+    double logged_ns;     // the target the log last named (the start line's, or dynres_frame's last line)
     uint64_t last_busy;   // vk_gpu_busy_all at the previous presented frame
     unsigned cfg_seen;    // cfg_version the settings were read at
     char base_mode[32];
@@ -73,6 +74,7 @@ static void dynres_read(void) {
         D.base = D.level = base;
         D.low = base > 2 ? base : 2;
         D.held_from = plat_now_ns(), D.avg_ns = 0, D.last_busy = vk_gpu_busy_all();
+        D.logged_ns = D.target_ns;
         rt_log("resolution: dynamic resolution on: target %.1f ms (%s), each step held %.2f s, DLSS %s down to %s",
                D.target_ns / 1e6, D.target_ms >= 1 ? "as set" : "the frame limit's", D.hold_ns / 1e9,
                DYN_MODE[D.base], DYN_MODE[D.low]);
@@ -94,15 +96,18 @@ const char *dynres_override(void) { return D.on && D.level != D.base ? DYN_MODE[
 void dynres_frame(void) {
     if (cfg_version() != D.cfg_seen) dynres_read();
     if (!D.on) return;
-    double target = target_now_ns();   // the limit, the monitor's rate and frame generation change without a setting
-    if (target != D.target_ns) {   // logged when it moves by more than 1 %: a measured refresh rate wanders a little
-        static double logged_ns;
+    // The limit, the monitor's rate and frame generation move the target without a dyn_res setting changing, so it is
+    // read every frame. A move of more than 1 % from the target the log last named is logged, whether it came from the
+    // frame, from the menu (dynres_read takes a changed limit or dyn_res_target already) or since the start line: a
+    // measured refresh rate wanders a little. At most 20 lines a run.
+    D.target_ns = target_now_ns();
+    if (fabs(D.target_ns - D.logged_ns) > D.logged_ns * 0.01) {
         static int said;
-        if (fabs(target - logged_ns) > logged_ns * 0.01 && said < 20) {
-            said++, logged_ns = target;
-            rt_log("resolution: dynamic resolution: target %.2f ms (the frame limit's)", target / 1e6);
+        if (said < 20) {
+            said++, D.logged_ns = D.target_ns;
+            rt_log("resolution: dynamic resolution: target %.2f ms (%s)", D.target_ns / 1e6,
+                   D.target_ms >= 1 ? "as set" : "the frame limit's");
         }
-        D.target_ns = target;
     }
     uint64_t now = vk_gpu_busy_all(), d = now - D.last_busy;
     D.last_busy = now;

@@ -644,7 +644,7 @@ static const char *misfit(const char *set, const char *v, char *buf, size_t cap)
         if (*end) return NULL;
         double hi = strtod(dots + 2, &end);
         if (end == dots + 2 || *end) return NULL;
-        // any number: some rows with whole ends take fractions (dyn_res_target 16.7 in 1..100)
+        // any number: some rows with whole ends take fractions (dyn_res_target 16.7 in 0..100)
         double x = strtod(v, &end);
         if (end != v && !*end && x == x && x >= lo && x <= hi) return NULL;
         snprintf(buf, cap, "is not a number in %s", set);

@@ -4,7 +4,9 @@ and checks that
 
   - the default target is the frame time of the game's rate (1000 / the limit: 60, 144 and 240 fps), 16.7 ms while
     that rate is unknown or unlimited, and a target that is set wins at any rate;
-  - a limit changed while it runs moves the target on the next frame, with one log line;
+  - a limit changed while it runs moves the target on the next frame, with one log line, also when the menu changed
+    it (or dyn_res_target) and dynres_read took the new target first; a refresh rate wandering under 1 % after the
+    start line logs nothing, and after dyn_res off and on a move back to the earlier run's last target is logged;
   - each step is held for dyn_res_step 60ths of a second of the clock at 60 and 240 fps (45: 0.75 s; 90: 1.5 s), down
     while the GPU is over the target and back up once it is under three quarters of it.
 
@@ -110,6 +112,36 @@ int main(void) {
     before = logs;
     for (int k = 0; k < 100; k++) frame(144, 1);
     CHECK(logs == before, "a steady limit logged %%d lines", logs - before);
+    // A limit or a target changed in the menu (a new cfg_version, so dynres_read takes the new target first): one line.
+    before = logs;
+    game_hz = 120, ver++;
+    frame(120, 1);
+    CHECK(NEAR(D.target_ns, 1e9 / 120) && logs == before + 1 && strstr(last_log, "8.33 ms (the frame limit's)"),
+          "the menu's limit: %%.3f ms, %%d lines (%%s)", D.target_ns / 1e6, logs - before, last_log);
+    before = logs;
+    set_target_ms = 20, ver++;
+    frame(120, 1);
+    CHECK(NEAR(D.target_ns, 20e6) && logs == before + 1 && strstr(last_log, "20.00 ms (as set)"),
+          "the menu's target: %%.3f ms, %%d lines (%%s)", D.target_ns / 1e6, logs - before, last_log);
+    set_target_ms = 0;
+    // A refresh rate wandering under 1 %% after the start line: no line. Off and on again, then back to the target the
+    // earlier run logged last: one line, measured from the new start line.
+    game_hz = 60;
+    restart();
+    before = logs;
+    game_hz = 59.9;
+    frame(59.9, 1);
+    CHECK(logs == before, "a wander of 0.17 %%%% after the start logged %%d lines (%%s)", logs - before, last_log);
+    game_hz = 144;
+    frame(144, 1);
+    dyn = "0", ver++, frame(144, 1);
+    game_hz = 60;
+    dyn = "1", ver++, frame(60, 1);
+    before = logs;
+    game_hz = 144;
+    frame(144, 1);
+    CHECK(logs == before + 1 && strstr(last_log, "6.94"), "back to the earlier run's last target: %%d lines (%%s)",
+          logs - before, last_log);
     // Each step is held for a time, whatever the frame rate.
     static const struct { double hz; int step; double hold_s; } holds[] = {{60, 45, 0.75}, {240, 45, 0.75},
                                                                            {240, 90, 1.5}, {144, 8, 8 / 60.0}};
