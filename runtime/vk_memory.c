@@ -2809,17 +2809,41 @@ static uint64_t mirror_evict(uint64_t need, uint32_t min_idle, const char *why) 
     uint64_t can = 0;   // what all the candidates would free: short of need, none goes (no mirror lost for nothing)
     for (int i = 0; i < nv; i++) can += v[i]->import_hi - v[i]->import_lo;
     if (can < need) nv = 0;
+    // The victims, as the loop below takes them: their ranges and mirrors. What only a victim's mirror holds (its
+    // armed ranges the replay left there, memory.c "Lazy write-back") comes down before the mirror goes, and before the
+    // device address table names the imported buffer again: a shader still running reads through the table as it
+    // changes, and the fetch waits for all the work handed over. That fetch, one call for all the victims, runs here
+    // without pool_lock, which the completion thread's arms and every pool lookup wait for. The victims are mirrored
+    // still, so an arm can land on them before the lock is taken again: the release under the lock below takes that,
+    // usually nothing. The mirrored list changes meanwhile only by vk_pool_fini, which takes a pool off it under the
+    // lock: mirror_create, hot_check and this run on the replay thread, under use_lock while chunks record.
+    uint64_t rel[MAXV][3], f = 0;
+    int nr = 0;
+    for (; nr < nv && f < need; nr++) {
+        PoolRec *r = v[nr];
+        rel[nr][0] = r->import_lo, rel[nr][1] = r->import_hi, rel[nr][2] = (uint64_t)(uintptr_t)r->mbuf;
+        f += r->import_hi - r->import_lo;
+    }
+    if (nr) {
+        plat_mutex_unlock(&pool_lock);
+        mem_lazy_release((const uint64_t (*)[3])rel, nr);
+        plat_mutex_lock(&pool_lock);
+    }
     uint64_t freed = 0;
     uint32_t idle_for[MAXV];
     VkBuffer dead[MAXV];
     VmaAllocation dead_a[MAXV];
     int n = 0;
-    // All under the exclusive lock: vk_pool_fini, on another thread, takes a pool off the list under it, so a victim is
-    // still a live pool here, and a finalize that follows finds it imported, its table pages on the imported buffer.
-    for (; n < nv && freed < need; n++) {
-        PoolRec *r = v[n];
+    // All under the exclusive lock: vk_pool_fini, on another thread, takes a pool off the list under it, so a victim
+    // still on the list is a live pool here, and a finalize that follows finds it imported, its table pages on the
+    // imported buffer.
+    for (int k = 0; k < nr; k++) {
+        PoolRec *r = v[k];
+        int on = 0;
+        for (int i = 0; i < nm && !on; i++) on = mlist[i] == r;
+        if (!on || r->mbuf != (VkBuffer)(uintptr_t)rel[k][2]) continue;   // finalized meanwhile: its mirror is fini's
         idle_for[n] = msub - r->acc_sub;
-        mem_lazy_release(r->import_lo, r->import_hi - r->import_lo);   // what only the mirror holds comes down first
+        mem_lazy_release((const uint64_t (*)[3])&rel[k], 1);   // what was armed since the release above
         mirror_forget(r);   // off the list, mirror_gen bumped: no buffer use gets the mirror from here on
         r->mstate = MS_NONE, r->acc_sub = 0, r->retry_sub = 0;
         dead[n] = r->mbuf, dead_a[n] = r->malloc_;
@@ -2833,6 +2857,7 @@ static uint64_t mirror_evict(uint64_t need, uint32_t min_idle, const char *why) 
         if (m_evicted_n + n < 8)
             rt_log("mem: mirror of pool %#llx+%#llx (%.1f MiB) evicted, idle for %u submissions: %s", (unsigned long long)r->lo,
                    (unsigned long long)r->size, (r->import_hi - r->import_lo) / 1048576.0, idle_for[n], why);
+        n++;
     }
     plat_mutex_unlock(&pool_lock);
     for (int i = 0; i < n; i++) vk_defer_buffer(dead[i], dead_a[i]);   // after the submission being recorded
@@ -3739,9 +3764,13 @@ static void snap_free(void *arg) {   // completion thread: the submission is don
 // from the prologue of a part split off earlier) it writes back, as ever, what it skipped and finds no longer armed;
 // the snapshot for that merge is taken in the part's own prologue, before its GPU work. From that check to the part's
 // hand-over (vk_mem_lazy_handed) memory.c's window keeps a fault from releasing a range unseen.
-static VkCommandPool lz_pool;
-static VkCommandBuffer lz_cb;
-static VkFence lz_fence;
+// Fetches run on several threads at once (memory.c "Ranges in flight": no memory.c lock is held around one), each in a
+// slot of its own: a command pool (used by one thread at a time), its command buffer and a fence. LZ_SLOTS is more than
+// the threads that touch armed pages together; a fetch that finds every slot busy waits 20 us at a time.
+#define LZ_SLOTS 4
+static struct { VkCommandPool pool; VkCommandBuffer cb; VkFence fence; } lz_slot[LZ_SLOTS];
+static volatile uint32_t lz_slot_free;   // bit i: slot i is free
+static volatile int64_t lz_slot_waits;   // fetches that found every slot busy, so far
 static volatile int32_t lz_state;   // 0 not asked, 1 on, 2 off
 static PlatMutex lz_init_lock = PLAT_MUTEX_INIT;
 typedef struct { VkMemSpan sp; uint64_t size; int shader; } LzSkip;
@@ -3753,34 +3782,57 @@ static uint64_t lz_skipped;         // replay: bytes left in the mirror since th
 static void mbarrier(VkCommandBuffer cb, VkPipelineStageFlags2 ss, VkAccessFlags2 sa, VkPipelineStageFlags2 ds,
                      VkAccessFlags2 da);
 
-// memory.c's fetch (frz_lock held there, so one at a time): [off, off + size) of the mirror h0 into the imported
-// buffer h1, after all the GPU work handed over so far.
-static void lazy_fetch(uint64_t h0, uint64_t h1, uint64_t off, uint64_t size) {
-    if (vk_device_is_lost()) return;   // the run is ending (vk_device.c vk_device_lost_check): the bytes stay as they are
+static int lz_slot_take(void) {
+    for (int waited = 0;;) {
+        uint32_t m = __atomic_load_n(&lz_slot_free, __ATOMIC_ACQUIRE);
+        if (m) {
+            int i = __builtin_ctz(m);
+            if (__atomic_compare_exchange_n(&lz_slot_free, &m, m & ~(1u << i), 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                return i;
+            continue;
+        }
+        if (!waited++) plat_inc64(&lz_slot_waits);
+        plat_wait_ns(20000);
+    }
+}
+
+// memory.c's fetch, with no memory.c lock held (frz_lock in a mapping change's thaw or with
+// NX2NAVI_WB_LAZY_UNLOCKED=0): each copy cp[i], [off, off + size) of the mirror h0 into the imported buffer h1, after
+// all the GPU work handed over so far, in one submission with one wait.
+static void lazy_fetch(const MemLazyCopy *cp, int n) {
+    if (vk_device_is_lost() || n <= 0) return;   // the run is ending (vk_device.c vk_device_lost_check): bytes stay
     VkCtx *c = vk_ctx();
-    VkBufferCopy reg = {off, off, size};
+    int s = lz_slot_take();
+    VkCommandBuffer cb = lz_slot[s].cb;
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-    vkResetCommandPool(c->device, lz_pool, 0);
-    vkBeginCommandBuffer(lz_cb, &bi);
-    mbarrier(lz_cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
+    vkResetCommandPool(c->device, lz_slot[s].pool, 0);
+    vkBeginCommandBuffer(cb, &bi);
+    mbarrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
              VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
-    vkCmdCopyBuffer(lz_cb, (VkBuffer)(uintptr_t)h0, (VkBuffer)(uintptr_t)h1, 1, &reg);
-    mbarrier(lz_cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+    uint64_t bytes = 0;
+    for (int i = 0; i < n; i++) {
+        VkBufferCopy reg = {cp[i].off, cp[i].off, cp[i].size};
+        vkCmdCopyBuffer(cb, (VkBuffer)(uintptr_t)cp[i].h0, (VkBuffer)(uintptr_t)cp[i].h1, 1, &reg);
+        bytes += cp[i].size;
+    }
+    mbarrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
              VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
              VK_ACCESS_2_HOST_READ_BIT | VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
-    vkEndCommandBuffer(lz_cb);
-    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &lz_cb};
+    vkEndCommandBuffer(cb);
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
     vk_queue_lock();
     vk_sync_flush_held();   // the held submissions wrote first
-    VkResult r = vkQueueSubmit(c->gfx_queue, 1, &si, lz_fence);
+    VkResult r = vkQueueSubmit(c->gfx_queue, 1, &si, lz_slot[s].fence);
     vk_queue_unlock();
-    if (r == VK_SUCCESS) r = vkWaitForFences(c->device, 1, &lz_fence, VK_TRUE, 10000000000ull);
+    if (r == VK_SUCCESS) r = vkWaitForFences(c->device, 1, &lz_slot[s].fence, VK_TRUE, 10000000000ull);
     if (r != VK_SUCCESS) {
         vk_device_lost_check(r, "the submit or the wait that brings GPU writes down to guest memory");
-        rt_fatal("vk: bringing %llu bytes the GPU wrote down to guest memory failed (%d)", (unsigned long long)size, (int)r);
+        rt_fatal("vk: bringing %llu bytes the GPU wrote down to guest memory failed (%d)", (unsigned long long)bytes,
+                 (int)r);
     }
-    vkResetFences(c->device, 1, &lz_fence);
+    vkResetFences(c->device, 1, &lz_slot[s].fence);
+    __atomic_fetch_or(&lz_slot_free, 1u << s, __ATOMIC_RELEASE);
 }
 
 // memory.c's test before it arms [lo, hi) of the pool ctx (frz_lock held there, the pages already inaccessible): the
@@ -3831,12 +3883,20 @@ static int wb_lazy(void) {
             VkCommandPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
                                           .queueFamilyIndex = c->gfx_family};
             VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-            on = vkCreateCommandPool(c->device, &pi, NULL, &lz_pool) == VK_SUCCESS;
-            VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = lz_pool,
-                                              .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
-            on = on && vkAllocateCommandBuffers(c->device, &ai, &lz_cb) == VK_SUCCESS &&
-                 vkCreateFence(c->device, &fi, NULL, &lz_fence) == VK_SUCCESS;
-            on = on && mem_lazy_enable(lazy_fetch, lazy_clean);
+            int made = 0;   // the slots that could be made, in order; one is enough
+            for (; made < LZ_SLOTS; made++) {
+                if (vkCreateCommandPool(c->device, &pi, NULL, &lz_slot[made].pool) != VK_SUCCESS) break;
+                VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                                  .commandPool = lz_slot[made].pool,
+                                                  .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+                if (vkAllocateCommandBuffers(c->device, &ai, &lz_slot[made].cb) != VK_SUCCESS ||
+                    vkCreateFence(c->device, &fi, NULL, &lz_slot[made].fence) != VK_SUCCESS) {
+                    vkDestroyCommandPool(c->device, lz_slot[made].pool, NULL);   // frees its command buffer too
+                    break;
+                }
+            }
+            __atomic_store_n(&lz_slot_free, (1u << made) - 1, __ATOMIC_RELEASE);
+            on = made > 0 && mem_lazy_enable(lazy_fetch, lazy_clean);
         }
         rt_log("mem: what shaders write into mirrored pools %s (lazy write-back: %s)",
                on ? "goes back to guest memory once and then only when the CPU touches it"
@@ -4135,25 +4195,48 @@ static void hot_check(void) {
     if (fr - hot_frame0 < HOT_FRAMES || npend || nwbl) return;   // nsnl: the previous submission's, recorded already
     double frames = (double)(fr - hot_frame0);
     hot_frame0 = fr;
-    PoolRec *out[8];
-    VkBuffer dead[8];
-    VmaAllocation dead_a[8];
-    int nout = 0;
+    PoolRec *cand[8];
+    uint64_t rel[8][3];   // each candidate's range and mirror, for mem_lazy_release
+    int nc = 0;
     plat_mutex_lock(&pool_lock);
-    for (int i = 0; i < nm;) {
+    for (int i = 0; i < nm; i++) {
         PoolRec *r = mlist[i];
         uint64_t n = r->import_hi - r->import_lo, per = (uint64_t)(r->hot_bytes / frames), up = (uint64_t)(r->hot_up / frames);
         r->hot_bytes = (uint64_t)per;   // kept for the log line below
         r->hot_up = 0;
-        if (nout == 8 || per < HOT_MIN || per * 100 < n * (uint64_t)mirror_hot || up > HOT_UP_MAX || !r->mbuf ||
+        if (nc == 8 || per < HOT_MIN || per * 100 < n * (uint64_t)mirror_hot || up > HOT_UP_MAX || !r->mbuf ||
             (!r->twin && r->gpa_rec)) {
-            r->hot_bytes = 0, i++;   // !twin with a table record: the table's writes are in the mirror alone (mirror_evict)
+            r->hot_bytes = 0;   // !twin with a table record: the table's writes are in the mirror alone (mirror_evict)
             continue;
         }
-        mem_lazy_release(r->import_lo, r->import_hi - r->import_lo);   // what only the mirror holds comes down first
+        rel[nc][0] = r->import_lo, rel[nc][1] = r->import_hi, rel[nc][2] = (uint64_t)(uintptr_t)r->mbuf;
+        cand[nc++] = r;
+    }
+    if (!nc) {
+        plat_mutex_unlock(&pool_lock);
+        return;
+    }
+    // What only the mirrors hold comes down first, without pool_lock, as in mirror_evict (which says why, and why the
+    // release under the lock below usually finds nothing).
+    plat_mutex_unlock(&pool_lock);
+    mem_lazy_release((const uint64_t (*)[3])rel, nc);
+    struct { uint64_t lo, n, per; uint32_t flags; } note[8];   // for the log line: a record may go once the lock drops
+    VkBuffer dead[8];
+    VmaAllocation dead_a[8];
+    int nout = 0;
+    plat_mutex_lock(&pool_lock);
+    for (int k = 0; k < nc; k++) {
+        PoolRec *r = cand[k];
+        int on = 0;
+        for (int i = 0; i < nm && !on; i++) on = mlist[i] == r;
+        if (!on || r->mbuf != (VkBuffer)(uintptr_t)rel[k][2]) continue;   // finalized meanwhile: its mirror is fini's
+        mem_lazy_release((const uint64_t (*)[3])&rel[k], 1);   // what was armed since the release above
+        note[nout].lo = r->lo, note[nout].n = r->import_hi - r->import_lo, note[nout].per = r->hot_bytes;
+        note[nout].flags = r->flags;
+        r->hot_bytes = 0;
         // as mirror_evict, under the exclusive lock (vk_pool_fini takes pools off the list under it), but for good:
         // MS_REFUSED with no retry (retry_sub 0), so neither vk_mem_use nor the budget retries mirror it again
-        mirror_forget(r);   // takes r off mlist: i now names the next pool
+        mirror_forget(r);
         r->mstate = MS_REFUSED, r->retry_sub = 0;
         plat_mutex_lock(&flush_lock);   // flushes not copied yet: the pool is read in place from now on
         __atomic_store_n(&r->fl_n, 0, __ATOMIC_RELEASE);
@@ -4163,19 +4246,16 @@ static void hot_check(void) {
         if (r->gpa_rec) r->gpa_rec = vk_gpa_remap_plain(r->import_lo, r->import_hi, r->gpa_rec, r->buf, r->import_lo);
         dead[nout] = r->mbuf, dead_a[nout] = r->malloc_;
         r->mbuf = VK_NULL_HANDLE, r->malloc_ = NULL;
-        out[nout++] = r;
+        nout++;
     }
     plat_mutex_unlock(&pool_lock);
     for (int k = 0; k < nout; k++) {
-        PoolRec *r = out[k];
-        uint64_t n = r->import_hi - r->import_lo, per = r->hot_bytes;
-        r->hot_bytes = 0;
         vk_defer_buffer(dead[k], dead_a[k]);   // after the submission being recorded
         char f[160];
-        flag_names(r->flags, f, sizeof f);
+        flag_names(note[k].flags, f, sizeof f);
         if (++n_demoted <= 32)
             rt_log("mem: pool %#llx (%.1f MiB, %s) copied %.1f MiB a frame through its mirror: system memory from now on",
-                   (unsigned long long)r->lo, n / 1048576.0, f, per / 1048576.0);
+                   (unsigned long long)note[k].lo, note[k].n / 1048576.0, f, note[k].per / 1048576.0);
     }
 }
 
@@ -6282,6 +6362,8 @@ void vk_mem_sizes(PerfSizes *s) {
     perf_size(s, "of them physical", phys, 0, PERF_SIZE_NONE);
     perf_size(s, "VRAM mirrors", (uint64_t)__atomic_load_n(&m_live_n, __ATOMIC_RELAXED), 0,
               (uint64_t)__atomic_load_n(&m_live_bytes, __ATOMIC_RELAXED));
+    perf_size(s, "lazy fetches that found every slot busy", (uint64_t)__atomic_load_n(&lz_slot_waits, __ATOMIC_RELAXED),
+              0, PERF_SIZE_NONE);
     perf_size(s, "deferred destructions", dead_n, 0, PERF_SIZE_NONE);
     perf_size(s, "finalized pools destroyed after the GPU", __atomic_load_n(&n_pool_destroyed, __ATOMIC_RELAXED), 0,
               PERF_SIZE_NONE);

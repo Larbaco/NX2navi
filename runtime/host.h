@@ -285,8 +285,9 @@ void mem_freeze_stats(uint64_t *frozen, uint64_t *freezes, uint64_t *fault_thaws
                       uint64_t *hot_holds);   // hot_holds: quick thaws that held their region thawed (memory.c "Hot regions")
 // NX2NAVI_WB_PROBE=1 (memory.c, "Probed regions"): who reads what the GPU wrote back into guest memory.
 // NX2NAVI_WB_LAZY (memory.c, "Lazy write-back"): pages the GPU wrote that come down only when the CPU touches them.
-int mem_lazy_enable(void (*fetch)(uint64_t h0, uint64_t h1, uint64_t off, uint64_t size),
-                    int (*clean)(uint64_t lo, uint64_t hi, void *ctx));
+typedef struct { uint64_t h0, h1, off, size; } MemLazyCopy;   // [off, off + size) of buffer h0 into buffer h1
+// fetch: the n copies after all the GPU work handed over so far, and a wait for them; called on several threads at once
+int mem_lazy_enable(void (*fetch)(const MemLazyCopy *c, int n), int (*clean)(uint64_t lo, uint64_t hi, void *ctx));
 uint64_t mem_lazy_arm(uint64_t a, uint64_t n, uint64_t h0, uint64_t h1, uint64_t off, void *ctx);
 int mem_lazy_skip(uint64_t a, uint64_t n, uint64_t h0, int64_t delta, uint64_t out[][2], int max);
 int mem_lazy_armed(uint64_t a, uint64_t n);
@@ -294,7 +295,7 @@ int mem_lazy_armed(uint64_t a, uint64_t n);
 int mem_copy_readable(uint8_t *const *dst, const uint64_t (*src)[2], int n, uint8_t *ok);
 int mem_lazy_touches(uint64_t a, uint64_t n);   // 0: the CPU can read [a, a + n) without a fault now
 void mem_lazy_window(int open);
-void mem_lazy_release(uint64_t a, uint64_t n);
+void mem_lazy_release(const uint64_t (*rg)[3], int n);   // rg[i] = {lo, hi, buffer or 0 for any}: armed parts come down
 void mem_lazy_report(uint64_t frame, uint64_t skipped);
 void mem_lazy_note(char *out, size_t n);                   // its state as a phrase, without a lock (a fatal error's line)
 int mem_lazy_pick(uint64_t *addr, int max);                // test: addresses of armed pages

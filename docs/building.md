@@ -688,12 +688,18 @@ A change to where the lazy write-back is on by default (`runtime/wb_lazy_choice.
 `vk_mem_lazy_decide`) passes `python tests\wb_lazy_check.py`, which builds the header alone and checks the choice and
 its reason by platform, by GPU driver and by what the player set. No game files, no GPU.
 
-A change to the lazy write-back's arms, faults and releases (`runtime/memory.c` "Lazy write-back") passes
-`python tests\lazy_fetch_check.py`, which builds memory.c with the Windows fault handler and a fetch that only waits,
-and runs each scenario as its own process, so an access violation fails it: a thread that reads a range over and over
-while it is armed and given back again never reaches the crash handler, also when the arm's clean test takes 100 ms;
-and the "mem: lazy write-back" line gives the longest fetch and the longest wait of a fault for the freeze lock since
-the line before. Windows only; no game files, no GPU.
+A change to the lazy write-back's arms, faults, releases or fetches (`runtime/memory.c` "Lazy write-back" and "Ranges
+in flight", `runtime/vk_memory.c` `lazy_fetch`, `mirror_evict`, `hot_check`) passes `python tests\lazy_fetch_check.py`,
+which builds memory.c with the Windows fault handler and a fetch that only waits, and runs each scenario as its own
+process, so an access violation fails it. A thread that reads a range over and over while it is armed and given back
+again never reaches the crash handler, also when the arm's clean test takes 100 ms. A fetch holds up nothing but the
+touches of its range: freezes, thaws, arms, releases and copies of other ranges return at once meanwhile, two ranges
+fetch at once, and more touching threads than the flight table holds all end. The touches of a range in flight wait
+for it and run again, a write among them without releasing the region's other ranges; thaws, mapping changes,
+releases of its buffer, arms and freezes see it. The same with `wb_lazy_chunk = 1`, and with `wb_lazy_unlocked = 0`
+the fetch holds the freeze lock again. The "mem: lazy write-back" lines give the longest fetch, the longest wait of a
+fault for the freeze lock and the touches that waited for a range in flight. `vk_memory.c`'s fetch slots and the
+order of an eviction against a pool's finalize have no check without a device. Windows only; no game files, no GPU.
 
 A change to when the freezing of idle guest regions waits (`runtime/freeze_hold.h`, `runtime/vk_memory.c`
 `freeze_pass`) passes `python tests\freeze_hold_check.py`, which builds the header alone: the backoff after a slow
