@@ -19,6 +19,18 @@ float vk_dlaa_fsr3_boost(uint32_t w, uint32_t ow);
 // vk_dlaa.c: a wait for the device to be idle, the queue lock held, before an upscaler frees what the GPU may still
 // use (NX2NAVI_TRACE=perf: "upscaler device waits")
 void vk_upscaler_device_idle(void);
+// vk_dlaa.c "what the upscalers let go of while the GPU may still use it", on the thread that makes the upscalers'
+// calls (vk_dlaa.c's pass hooks):
+int vk_upscaler_idle_wait(void);   // NX2NAVI_UPSCALER_IDLE_WAIT: 1 waits for the device wherever one lets go of something
+// After something was let go of: what the GPU is past goes (with NX2NAVI_UPSCALER_IDLE_WAIT=1 after a wait for the
+// device, vk_upscaler_settle).
+void vk_upscaler_let_go(void);
+// A wait for the device, then everything let go of that a submission made so far names goes (a present gate stays).
+void vk_upscaler_settle(void);
+// A refused creation: waits, without the device's idle, until the GPU is past timeline value v (no further than the
+// submissions made so far) and returns the value it is past; with NX2NAVI_UPSCALER_IDLE_WAIT=1, or when that wait
+// fails, a wait for the device.
+uint64_t vk_upscaler_gpu_wait(uint64_t v);
 
 int vk_ffx_load(void);   // 1 when the library is there with its entry points (loaded once)
 // Whether FSR 3.1 upscaling can run in this build, for the settings menu: after vk_ffx_load ran, what it found; before,
