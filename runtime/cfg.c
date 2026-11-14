@@ -331,8 +331,9 @@ static const CfgMeta metas[] = {
     {"TAIL_EARLY", "0", "0|1", RESTART},
     {"REPLAY_SMALL", "0", "0..63", RESTART},   // vk_exec.c group_start
     {"FREE_CORES", "0", "0|1", RESTART}, {"TIMER_1MS", "1", "0|1", RESTART},
-    // dynamic resolution (dynres.c): the scene follows the GPU time toward DYN_RES_TARGET milliseconds
-    {"DYN_RES", "0", "0|1", LIVE}, {"DYN_RES_TARGET", "16.7", "1..100", LIVE}, {"DYN_RES_STEP", "45", "8..600", LIVE},
+    // dynamic resolution (dynres.c): the scene follows the GPU time toward DYN_RES_TARGET milliseconds (under 1: the
+    // frame limit's frame time), holding each step DYN_RES_STEP 60 Hz frames of the clock
+    {"DYN_RES", "0", "0|1", LIVE}, {"DYN_RES_TARGET", "0", "0..100", LIVE}, {"DYN_RES_STEP", "45", "8..600", LIVE},
     // the recording thread: a core of its own (auto: with 12 or more logical processors) and the highest priority
     // (vk_exec.c rec_claim)
     {"RECORDER_CORE", "0", "auto|0|1", RESTART}, {"RECORDER_PRIO", "1", "0|1", RESTART}, {"REPLAY_TIME", "0", "0|1", RESTART}, {"LOCK_TIME", "0", "0|1", RESTART}, {"POOL_CREATE_BUDGET", "16", "1..4096", RESTART}, {"POOL_CREATE_MS", "6", "0..100", RESTART}, {"POOL_FINI_IDLE", "0", "0|1", RESTART}, {"FREEZE_BUDGET_US", "1000", "0..100000", RESTART}, {"POOL_LOAD_BACKLOG", "512", "0..65536", RESTART},

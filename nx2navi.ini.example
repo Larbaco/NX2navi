@@ -177,10 +177,11 @@
 # present, as before).
 # gate_wait_ms = 10
 # Dynamic resolution, 0 or 1, applied at once: with a DLSS upscaling mode, the scene resolution follows the GPU time
-# per frame toward dyn_res_target milliseconds (1 to 100), one DLSS step at a time, each held for dyn_res_step frames
-# (8 to 600), from the DLSS mode set down to performance. Default: off.
+# per frame toward dyn_res_target milliseconds (1 to 100; 0 is the time of a frame the game draws under fps_limit,
+# 1000 / the limit, and 16.7 with fps_limit = unlimited), one DLSS step at a time, each held for dyn_res_step 60ths of
+# a second (8 to 600; 45 is 0.75 s at any frame rate), from the DLSS mode set down to performance. Default: off.
 # dyn_res = 0
-# dyn_res_target = 16.7
+# dyn_res_target = 0
 # dyn_res_step = 45
 # Processors. On a processor whose dies have L3 caches of different sizes (AMD's two-die X3D processors, with 3D
 # V-Cache on one die) the game runs on the die with the larger cache when that die has 8 cores or more: 1 = on,
