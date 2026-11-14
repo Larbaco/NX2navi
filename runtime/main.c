@@ -437,7 +437,8 @@ static void crash_handler(const PlatCrash *x) {
     kern_free_cores_note();
     fs_save_crash_wait();   // a save the game already reported as done finishes first (bounded; fs_host.c)
     // after the report: RivaTuner Statistics Server's profile goes back at the next start, from the line the run keeps
-    // for it (rtss_limit.c rtss_limit_crash): no call into RTSS's library from a process that failed
+    // for it in rtss-profile.txt (rtss_limit.c rtss_limit_crash), with no call into RTSS's library from a process that
+    // failed; only where that line could not be written is it put back here, and never from RTSS's own thread
     rtss_limit_crash();
     rt_rumble_stop_bounded();   // a controller on HD rumble stops (dispatch.c: 300 ms at most, SDL may be the crash)
     fflush(stderr);

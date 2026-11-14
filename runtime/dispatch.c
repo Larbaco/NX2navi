@@ -123,8 +123,8 @@ static void fatal_end(int code, const char *fmt, va_list ap) {
     fs_save_crash_wait();   // a save the game already reported as done finishes first (bounded)
     prof_sampler_write();   // NX2NAVI_PROFILE: what was sampled until now, else a crash loses the whole profile
     // RivaTuner Statistics Server's profile goes back at the next start, from the line the run keeps for it in
-    // rtss-profile.txt (rtss_limit.c rtss_limit_crash, as in main.c crash_handler): no call into RTSS's library here,
-    // from any thread
+    // rtss-profile.txt (rtss_limit.c rtss_limit_crash, as in main.c crash_handler), with no call into RTSS's library
+    // here; only where that line could not be written is it put back now, and never from RTSS's own thread
     rtss_limit_crash();
     rt_rumble_stop_bounded();   // a controller on HD rumble: nothing renews or stops its vibration after the end
     // "frametime: at a fatal error" and the stutter map, the session's last period: after what a kill of the process

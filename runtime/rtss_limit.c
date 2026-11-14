@@ -1,6 +1,7 @@
 // RivaTuner Statistics Server as the frame limiter (frame_rate.c frame_step_cap_ns): where RTSS is installed and running,
-// the frame limit goes into RTSS's profile for this executable and the game's own pacer holds no frames, so there is
-// one limiter. Anywhere else, or when any step fails, the game's own limiter works as it always did.
+// the frame limit goes into RTSS's profile for this executable and, while RTSS is seen holding the game to it, the
+// game's own pacer keeps only the 240-frame ceiling (rtss_decide.h rtss_pace_period), so there is one limiter.
+// Anywhere else, or when any step fails, the game's own limiter works as it always did.
 //
 // RTSS's hooks library (RTSSHooks64.dll in the folder its installer records under
 // HKLM\SOFTWARE\WOW6432Node\Unwinder\RTSS, InstallDir) exports the profile calls, loaded here at run time:

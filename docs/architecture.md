@@ -257,11 +257,15 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   3%.
 - One limiter is the goal: the driver's low latency (`vk_lowlat.c`), RivaTuner Statistics Server (`rtss_limit.c`) or
   the game's pacer holds the frame limit, and the log's "frame rate:" and "lowlat:" lines name the one in charge.
-  Frame generation keeps RTSS out (it would count the generated frames), and the game's pacer holds the drawn frames
-  beside it. The exceptions as they stand: `pace_smooth` still waits on the present thread while RTSS holds the limit;
-  DLSS Frame Generation's Reflex sleeps where the frame starts while the pacer holds the limit; while RTSS holds it the
-  pacer holds nothing at all, through movies and while no picture goes out (a minimised window, `frame_hold`) too; and
-  a limit set in RTSS itself still holds the game where the game keeps RTSS out, which the log ("two limiters") and the
+  The pacer is the fallback wherever the other limiter's hold is not proven: before the first host present, while a
+  movie plays (the pacer keeps the movie's slots, which no other limiter knows), once no picture went out for 200 ms (a
+  minimised window, `frame_hold`), for the rest of the run once the frames show the other limiter letting them through
+  faster than the limit, and after any failure. While RTSS holds the limit the pacer keeps only the 240-frame ceiling
+  the game's code needs (`rtss_decide.h` `rtss_pace_period`). Frame generation keeps RTSS out (it would count the
+  generated frames), and the game's pacer holds the drawn frames beside it. The exceptions as they stand: `pace_smooth`
+  still waits on the present thread while RTSS holds the limit; DLSS Frame Generation's Reflex sleeps where the frame
+  starts while the pacer holds the limit; and a limit set in RTSS itself still holds the game where the game keeps RTSS
+  out, which the log ("two limiters") and the
   frame rate row of the menu point out, and the same where RTSS is out of it for the run because its profile cannot be
   written or its hooks library does not load, which the log points out the same way (the menu shows the administrator
   note for the first and nothing for the second).
@@ -269,19 +273,29 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   first present starts a thread that looks RTSS up (`InstallDir` under `HKLM\SOFTWARE\WOW6432Node\Unwinder\RTSS`,
   `RTSSHooks64.dll`) and reads its shared memory (`RTSSSharedMemoryV2`) every 500 ms. While RTSS runs, the limit goes
   into RTSS's profile for the executable (`Profiles\<exe>.cfg`, through the hooks library's profile calls, read back
-  from the saved file; a fractional rate over a denominator where RTSS knows one, else rounded to whole frames), and
-  once RTSS lists the process the pacer stands aside (`rtss_limit_active`). The pacer keeps the limit while RTSS does
-  not run or has not hooked the game, for a limit RTSS refuses, and for the rest of the run when the profile cannot be
-  written (no administrator rights), the hooks library does not load, or RTSS's own frame count of the game stays
-  above 1.2 times the limit for six polls; the menu names the first and the last of these. Frame generation, the
+  from the saved file; a fractional rate over a denominator where RTSS knows one, else rounded down to whole frames)
+  once the first picture went out and the limit stayed the same for two polls, so a want that flips (low latency at a
+  swapchain rebuild) writes nothing. A movie leaves the play limit in the profile; only a play limit below the movie's
+  rate gives the profile no limit for the movie's length, so that RTSS does not space out the frames the pacer sends at
+  once to catch up. The pacer stands aside (`rtss_limit_active`) only once RTSS is seen holding the game: it lists the
+  process with its Vulkan presents, has read the profile (its update flag clear) and measured a period of the game's
+  frames lately, no movie plays and a picture went out within 200 ms. The pacer keeps the limit while RTSS does not run
+  or has not hooked the game, for a limit RTSS refuses, and for the rest of the run when the profile cannot be written
+  (no administrator rights), the hooks library does not load, or RTSS's own frame count of the game is above 1.05
+  times the limit in three new periods in a row (a period RTSS no longer moves counts neither way); the menu names the
+  first and the last of these. Frame generation, the
   driver's low latency and `NX2NAVI_RTSS=0` keep RTSS out (`RTSS_OUT_*`): the profile gets back what it held before
   the run changed it, and while RTSS is kept out its thread does not load the hooks library and only reads RTSS's own
   settings for the game; a later limit (frame generation or low latency switched off) loads it and hands RTSS the limit
   as usual, and `NX2NAVI_RTSS=0` keeps the thread read-only for the run. While RTSS lists the game the log names those
   settings (limit, frame time limit, scanline sync, display sync, Reflex sleep, passive wait) once per change. Every
   orderly exit puts the profile back as it was before the run (`rtss_limit_restore`), and no want reaches it after
-  that; a kill, the device-lost watchdog or a crash inside the crash handler leaves the game's limit in the profile,
-  and the next run takes it for the player's own.
+  that. What the profile held is also kept in `rtss-profile.txt` next to the executable, one line per profile, written
+  before the run's first change of it and removed once it is back: a start that finds a line left by a run that did
+  not close (a kill, a hang, the device-lost watchdog, a crash or a fatal error, whose ends make no call into RTSS's
+  library: `rtss_limit_crash`) puts that profile back first, unless the player changed it since. A file that cannot be
+  written leaves the run as before, with a line in the log; profiles that versions before the file left with the
+  game's limit cannot be told from the player's own.
 - Measuring pacing: `NX2NAVI_TRACE=present` logs a line per picture (the host present's interval, the game's present
   interval, the wait for the slot and how far past it the present went), `NX2NAVI_TRACE=perf` each wait's share of the
   frame ("bound:"), and `tools/perf_summary.py` condenses both. Both measure before the host present, so a wait RTSS

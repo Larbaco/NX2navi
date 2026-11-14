@@ -278,10 +278,10 @@ double frame_step_game_hz(void) {
 // frames only to LIMIT_FREE_MAX_HZ, the ceiling the game's code needs, so the two never stack, and it takes the limit
 // back once no picture went out for 200 ms (rtss_decide.h rtss_pace_period): a minimised window or a frame hold leaves
 // RTSS no present to hold. While a movie plays the pacer holds the movie's rate and keeps its slots whatever RTSS does.
-// NX2NAVI_RTSS=0 and frame generation (RTSS would count the generated frames) keep it
-// out, and so does a driver's low latency while it is in effect (vk_lowlat.c): the driver holds the limit where the
-// frame starts, and RTSS would hold the finished picture, the wait that mode is there to remove. RTSS gets the reason
-// (RTSS_OUT_*), for the log and for its check of a limit set in RTSS itself.
+// NX2NAVI_RTSS=0 and frame generation (RTSS would count the generated frames) keep it out, and so does a driver's low
+// latency while it is in effect (vk_lowlat.c): the driver holds the limit where the frame starts, and RTSS would hold
+// the finished picture, the wait that mode is there to remove. RTSS gets the reason (RTSS_OUT_*), for the log and for
+// its check of a limit set in RTSS itself.
 static double paced_hz;   // the game frames a second the newest frame_step_cap_ns paces at (ocarina_step); 0: none
 static int movie_paced;   // the movie rate the newest frame_step_cap_ns paces at (ocarina_step, frame_step_movie_hz); 0: none
 int frame_step_movie_hz(void) { return movie_paced; }

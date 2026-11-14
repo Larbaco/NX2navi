@@ -469,7 +469,9 @@ A change to the step Ocarina is given each frame (`runtime/frame_rate.c` `ocarin
 game's counters get out of it (`whole_take`, `frame_rate_day_host`, `frame_rate_water_host`, `frame_rate_sim_host`), passes
 `python tests\frame_step_check.py`, which builds `frame_rate.c` with the rest of the runtime stubbed and feeds it
 display times: a held 60 fps limit gives exactly one frame every frame, a 240 fps limit never less than a quarter
-frame, uneven frame times one steady step, and game time follows the clock. It calls the two hooks as their patch
+frame, uneven frame times one steady step, and game time follows the clock. While RivaTuner Statistics Server holds
+the limit the pacer keeps the 240 ceiling, the limit's own period once no host present went out for 200 ms, and a
+movie's rate. It calls the two hooks as their patch
 sites do: at 144 fps each of 64 water objects gets its ripple steps and the day its seconds, at 120, 144 and 240 fps
 the water managers and floors of the set `owater` get 60 fixed steps a second with only s0 changed, and a step of one
 frame gives what the game computes. It also checks that each of those sites in `recomp/patches-v111.txt` ends in one
@@ -483,13 +485,20 @@ velocity at the time scales where the game cuts it at 60 fps and nowhere else. N
 A change to how the frame limit goes to RivaTuner Statistics Server (`runtime/rtss_limit.c`, `runtime/rtss_decide.h`)
 passes `python tests\rtss_limit_check.py`. It builds `rtss_decide.h` alone and checks its reader of RTSS's shared
 memory against a fake `RTSSSharedMemoryV2` (a bad header, short entries, an entry past the memory or past the 4096th
-find nothing) and the worker's decisions poll by poll against a fake profile: RTSS's injection delay, RTSS quitting and
-coming back, a read-only profile, a refused limit, the frame count rule, kept-out wants and their reasons, low latency
-switching at every poll, a movie, a closed run, a hooks library that does not load, and two limiters. On Windows it
-also builds the real `rtss_limit.c` against a fake RTSS (its registry key, hooks library, profile files and shared
-memory) and runs each scenario in a process of its own, among them a want after the exit's restore and one the worker
-read before it, a worker polling without pause while the want switches, and the registry and file calls a present
-must not make. No GPU, no RTSS, no game files.
+find nothing; the flags and the period where RTSS keeps them) and the worker's decisions poll by poll against a fake
+profile and a fake RTSS clock: RTSS's injection delay through listed with no API, the profile not read yet and no
+period measured, RTSS quitting and coming back, a read-only profile, a refused limit, the frame count rule (1.05 times
+the limit over three new periods, a frozen period never counted), no picture going out, kept-out wants and their
+reasons, a want that must stay two polls and low latency switching at every poll, a movie at 144 and at 40, a closed
+run, a hooks library that does not load, and two limiters. It also checks the pacer's period beside RTSS
+(`rtss_pace_period`), the limit's rounding without a denominator, and the state file `rtss-profile.txt`: its lines,
+its rewrite and what a start does with a line a run that did not close left. Statically, a crash and a fatal error
+(`main.c` `crash_handler`, `dispatch.c` `fatal_end`) go through `rtss_limit_crash`. On Windows it also builds the real
+`rtss_limit.c` against a fake RTSS (its registry key, hooks library, profile files and shared memory) and runs each
+scenario in a process of its own, among them a want after the exit's restore and one the worker read before it, a
+worker polling without pause while the want switches, the registry and file calls a present must not make, and a run
+killed while RTSS held its limit followed by the next start, each in a process of its own. No GPU, no RTSS, no game
+files.
 
 A change to how the mixer applies volumes (`runtime/audio_mixer.c` `accumulate_ramp`, the voice and splitter paths
 of `audio_mixer_render`) or to what it owes the device after a stall (`ring_pull`, `audio_mixer_owed`) passes
