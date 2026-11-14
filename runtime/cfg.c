@@ -295,7 +295,8 @@ static const CfgMeta metas[] = {
     {"MICROPHONE", "1", "0|1", RESTART},   // ov_audio_input.c mic_on: 0 refuses the game's input streams
     {"AUDIO_RAMP", "1", "0|1", RESTART},   // audio_mixer.c accumulate_ramp: a changed volume is reached across the frame
     {"AUDIO_CATCHUP", "1", "0|1", RESTART},   // audren.c render_thread: frames owed after a stall are rendered and dropped
-    // audren.c audio_bad: 1 ends the process at the first game audio value out of range, as before 0.10.2
+    // audren.c audio_bad: 1 ends the process at the first game audio value the renderer cannot use, as 0.10.1 did for
+    // most of them (a limiter time that is not a number and a negative mix buffer count end it too)
     {"AUDIO_STRICT", "0", "0|1", RESTART},
     // sprint.c: the sprint button (b the game's B, l3 the left stick's click) and toggle or hold; the Controls tab's
     // Sprint rows (1.1.1)

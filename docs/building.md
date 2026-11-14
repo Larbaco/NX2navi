@@ -524,8 +524,8 @@ A change to what the audio renderer does with values the game sends (`runtime/au
 It builds `audren.c` and `audio_mixer.c` with the rest of the runtime stubbed and the real effect DSPs linked, and
 sends hand-built RequestUpdates through `renderer_handler`. An update whose sections do not match the renderer (sizes,
 magic words, overruns, the output buffer, a mix layout with a negative count or more buffers than the renderer has, a
-splitter id run whose length wraps in 32 bits) answers 0x5299, the one result the SDK hands back to the game instead
-of aborting, and writes no output, changes no renderer state and places no C buffers. A channel, voice or splitter
+splitter id run whose length wraps in 32 bits) answers 0x5299, a result the SDK hands back to the game (it aborts on
+any result but 0x5299, 0x5499 and 0x5699), and writes no output, changes no renderer state and places no C buffers. A channel, voice or splitter
 record with an id the renderer does not have, a wave buffer index of 4, a filter that is not a finite number and a
 changed mix with a foreign id are left out of an update that is otherwise applied; a splitter destination id the
 renderer does not have is never read (a guard entry before the destination table would make it heard). Each effect and

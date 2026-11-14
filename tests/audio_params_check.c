@@ -5,8 +5,8 @@
    device: NX2NAVI_AUDIO=none mixes without one.
 
    Every RequestUpdate goes through renderer_handler with a hand-built input. A refused update must answer 0x5299 (the
-   SDK hands that result to the game, which ignores it; any other result makes the SDK abort), write no output and
-   change no renderer state. A record, effect or sink the renderer cannot use is left out of an update that is
+   SDK hands that result to the game, which ignores it; the SDK aborts on any result but 0x5299, 0x5499 and 0x5699),
+   write no output and change no renderer state. A record, effect or sink the renderer cannot use is left out of an update that is
    otherwise applied, or passed through or skipped in the render pass. Each kind is logged once per renderer. rt_fatal
    prints "FATAL:" and exits with 2, so a value that still ends the process fails the run.
 
@@ -890,8 +890,8 @@ static void in_range_quiet(void) {
     }
 }
 
-/* 6. NX2NAVI_AUDIO_STRICT=1: such a value ends the process, as before 0.10.2 (tests/audio_params_check.py runs these
-   in their own processes and expects exit 2). */
+/* 6. NX2NAVI_AUDIO_STRICT=1: such a value ends the process, as most did before 0.10.2 (tests/audio_params_check.py
+   runs these in their own processes and expects exit 2). */
 static int strict(const char *what) {
     strict_setting = 1;
     AudioRenderer *r = open_renderer();

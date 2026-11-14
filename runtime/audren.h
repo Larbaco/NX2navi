@@ -205,14 +205,15 @@ typedef struct AudioRenderer {
     void *mixer;
     uint8_t strict;                  // NX2NAVI_AUDIO_STRICT (OpenAudioRenderer): audio_bad ends the process
     uint8_t bad_seen[AB_KINDS];      // audio_bad: the kinds logged so far (atomic exchange; any thread)
-    uint64_t bad_count;              // audio_bad: values left out and updates refused (atomic)
+    uint64_t bad_count;              // audio_bad: times a value was left out (per update or per render pass) or an
+                                     // update refused (atomic)
     uint64_t refused, refused_run;   // updates refused, and refused in a row (the thread that sends RequestUpdate)
 } AudioRenderer;
 
 // A value the game sent that this host cannot use: the caller refuses the update or leaves the one record, effect or
 // sink out. Logs the first of each kind per renderer, with the game frame, and counts every one; with
-// NX2NAVI_AUDIO_STRICT=1 it ends the process instead, as these values did before 0.10.2. Any thread; takes no lock but
-// the log's.
+// NX2NAVI_AUDIO_STRICT=1 it ends the process instead, as most of these values did before 0.10.2. Any thread; takes no
+// lock but the log's.
 void audio_bad(AudioRenderer *r, int kind, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
 // audio_bad for a refused RequestUpdate, as an expression that gives AUDREN_R_INVALID_UPDATE.
 #define AUDIO_REFUSE(r, kind, fmt, ...)                                                                                \

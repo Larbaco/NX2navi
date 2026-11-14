@@ -4,9 +4,10 @@
 // service validates every section against the header, keeps server-side voice state, advances it in real time (one
 // frame of sample_count / sample_rate seconds per render tick, signalling the renderer's event) and writes the output
 // status the client expects. The mixer behind it is audio_mixer.c.
-// What the game sends is never a reason to end the process (audio_bad): an update whose sections do not match the
-// renderer is refused whole with AUDREN_R_INVALID_UPDATE, and a record, effect or sink whose values the renderer
-// cannot use is left out of an update that is otherwise applied. NX2NAVI_AUDIO_STRICT=1 ends the process there instead.
+// A value in the game's RequestUpdate is not a reason to end the process (audio_bad): an update whose sections do not
+// match the renderer is refused whole with AUDREN_R_INVALID_UPDATE, and a record, effect or sink whose values the
+// renderer cannot use is left out of an update that is otherwise applied. NX2NAVI_AUDIO_STRICT=1 ends the process there
+// instead. OpenAudioRenderer's parameters (need) and the request's buffer descriptors (ipc.c ipc_guest) still end it.
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -83,9 +84,9 @@ void audio_bad(AudioRenderer *r, int kind, const char *fmt, ...) {
     va_end(ap);
     if (r->strict) {
         ipc_backtrace();   // the game's frame chain when the game's update thread is here; nothing on the render thread
-        rt_fatal("audio: %s (NX2NAVI_AUDIO_STRICT=1)", what);
+        rt_fatal("audio: %s; NX2NAVI_AUDIO_STRICT=1 ends the process here instead", what);
     }
-    rt_log("audio: %s; game frame %llu, %llu such values so far; logged once per kind", what,
+    rt_log("audio: %s; game frame %llu, %llu times so far for all kinds together; logged once per kind", what,
            (unsigned long long)game_frame(), (unsigned long long)n);
 }
 
@@ -846,8 +847,8 @@ static void renderer_close(void *p) {
     kern_handle_close(r->event);
     uint64_t bad = __atomic_load_n(&r->bad_count, __ATOMIC_RELAXED);
     if (bad || r->refused)
-        rt_log("audren: renderer closed after %llu frames, %llu game audio values left out or refused (%llu updates "
-               "refused)", (unsigned long long)r->elapsed_frames, (unsigned long long)bad,
+        rt_log("audren: renderer closed after %llu frames, game audio values left out or refused %llu times (%llu "
+               "updates refused)", (unsigned long long)r->elapsed_frames, (unsigned long long)bad,
                (unsigned long long)r->refused);
     else
         rt_log("audren: renderer closed after %llu frames", (unsigned long long)r->elapsed_frames);
