@@ -759,7 +759,8 @@ census" banner, and the readers of its tables `cpu_wrote_since`, `shadow_pool_cl
 passes `python tests\gen_wrap_check.py`, which builds those parts of the file alone and runs the generations across
 2^32 (where 32-bit generations wrapped), 2^40 and 2^63: texture checks, the snapshot path and the region check, the
 CPU-side tables, and mirror and shadow cleanliness answer as below the boundary, and one line is logged when the count
-reaches 2^32. No GPU, no game files.
+reaches 2^32. It also takes the start from `NX2NAVI_GEN_SEED` (`gen_seed`): read as 64 bits, decimal or `0x`, capped
+at 2^62, a value that is no number ignored, each with its log line. No GPU, no game files.
 
 A change to `runtime/vk_memory.c`, `runtime/vk_texture.c` or `runtime/tex_probe.c` passes
 `python tests\gen_width_check.py`, which compiles the three files with the build's flags and `-Wshorten-64-to-32`,

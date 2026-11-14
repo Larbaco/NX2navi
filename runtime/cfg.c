@@ -84,6 +84,7 @@ static const char *const known[] = {
     "TEXUP_LOG_MS", "DYN_RES", "DYN_RES_TARGET", "DYN_RES_STEP", "TEXTURE_DETAIL", "VRAM_USE",   // vram_use: the removed Video memory use row, read by nothing
     "RECORDER_CORE", "RECORDER_PRIO", "REPLAY_TIME", "LOCK_TIME", "POOL_CREATE_BUDGET", "POOL_CREATE_MS", "POOL_FINI_IDLE", "POOL_LOAD_BACKLOG", "POOL_LOAD_MS",
     "VMA_BLOCK_MB", "SYNC_WAKE_ALL", "LOG_ASYNC", "DEVICE_LOST_AT", "STAGING_FAIL_AT", "VRAM_BALLAST_MB",
+    "GEN_SEED",
     "COPY_RETIRE",
     "MEM_BUDGET_TEST_VRAM_MB", "MEM_BUDGET_TEST_RAM_MB",
     "TEX_COMPACT", "TEX_COMPACT_MIN_MB", "TEX_COMPACT_FRAME_MB",   // texture compaction (vk_texture.c); no menu row
@@ -177,6 +178,7 @@ static const struct { const char *key, *section; } sections[] = {
     {"HANDLE_CENSUS", "diagnostics"},
     {"HANG_WATCH_S", "diagnostics"},
     {"VMA_BLOCK_MB", "diagnostics"}, {"DEVICE_LOST_AT", "diagnostics"}, {"STAGING_FAIL_AT", "diagnostics"}, {"VRAM_BALLAST_MB", "diagnostics"},
+    {"GEN_SEED", "diagnostics"},
     {"COPY_RETIRE", "diagnostics"},
     {"MEM_BUDGET_TEST_VRAM_MB", "diagnostics"}, {"MEM_BUDGET_TEST_RAM_MB", "diagnostics"},
     {"TEX_COMPACT", "performance"}, {"TEX_COMPACT_MIN_MB", "performance"}, {"TEX_COMPACT_FRAME_MB", "performance"},
@@ -449,6 +451,8 @@ static const CfgMeta metas[] = {
     {"DRAW_CRUMBS", "0", "0|1", RESTART},   // vk_crumbs.c draw marks: a mark at each change of shaders inside a pass
     {"STAGING_FAIL_AT", "0", "0..1000000000", RESTART},   // vk_memory.c staging_fail_now: a test of give_back
     {"VRAM_BALLAST_MB", "0", "0..131072", RESTART},   // vk_memory.c vk_mem_ballast: a test of a smaller card
+    // vk_memory.c gen_seed: a test that starts the page write generations at this value (at most 2^62)
+    {"GEN_SEED", "0", "0..4611686018427387904", RESTART},
     // mem_budget.h: a test that pretends the video memory or the system memory is that many MiB, for the levels the
     // owners that give memory back go by; 0 as it is
     {"MEM_BUDGET_TEST_VRAM_MB", "0", "0..1048576", RESTART},

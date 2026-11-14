@@ -5,10 +5,14 @@
 // shadow storage and the verify mode make must answer as it does below the boundary. Seeds: 2^32 - 8 (where 32-bit
 // generations wrapped), 2^40 - 8 (the low 32 bits pass through 0 again, so a truncation to 32 bits anywhere fails
 // there too) and 2^63 - 8. gen_next must log one line when the count reaches 2^32, and no other.
+// With --cfg the counter starts at 0 and the seed comes from NX2NAVI_GEN_SEED (vk_memory.c gen_seed), which the first
+// generation reads: the run must go on from the start expected of that value (parsed as 64 bits, capped at 2^62, a
+// value that is no number ignored), with the seed's log line expected of it ("-": none).
 // Stubs: no-op locks; a write watch that reports the pages a check marks as written by the CPU; nothing frozen; no
 // pools in the index.
-// Usage: gen_wrap_check <seed>. Prints each failed check and "gen_wrap_check: seed ...: N of M checks failed"; exit 1
-// on any.
+// Usage: gen_wrap_check <seed>
+//        gen_wrap_check --cfg <NX2NAVI_GEN_SEED's value, or (unset)> <expected start> <expected seed line part, or ->
+// Prints each failed check and "gen_wrap_check: seed ...: N of M checks failed"; exit 1 on any.
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -67,7 +71,8 @@ uint64_t mem_written_peek(uint64_t addr, uint64_t size, uint64_t *pages, uint64_
 int mem_frozen(uint64_t a) { (void)a; return 0; }
 int mem_watched(uint64_t addr, uint64_t size) { (void)addr, (void)size; return 1; }
 int nvn_gpu_only(uint64_t a) { (void)a; return 0; }
-static const char *cfg_get(const char *k) { (void)k; return NULL; }
+static const char *cfg_seed;   // --cfg: what NX2NAVI_GEN_SEED reads (NULL: unset)
+static const char *cfg_get(const char *k) { return !strcmp(k, "NX2NAVI_GEN_SEED") ? cfg_seed : NULL; }
 typedef struct { uintptr_t lo, hi, base; void *buf; } pidx_ent;   // snap_widen's pool lookup: no pools
 typedef struct { int n; } pidx;
 static pidx pool_index;
@@ -75,7 +80,7 @@ static PlatMutex pool_lock;
 static const pidx_ent *pidx_find(const pidx *x, uintptr_t a, uint64_t l) { (void)x, (void)a, (void)l; return NULL; }
 enum { POOL_IMPORT = 1 };
 
-// The log: the page generation lines are kept, the others dropped.
+// The log: the page generation and NX2NAVI_GEN_SEED lines are kept, the others dropped.
 static char gen_lines[16][512];
 static int n_gen_lines;
 static void rt_log(const char *fmt, ...) {
@@ -84,7 +89,7 @@ static void rt_log(const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(line, sizeof line, fmt, ap);
     va_end(ap);
-    if (strncmp(line, "mem: page generations", 21)) return;
+    if (strncmp(line, "mem: page generations", 21) && strncmp(line, "mem: NX2NAVI_GEN_SEED", 21)) return;
     if (n_gen_lines < 16) memcpy(gen_lines[n_gen_lines], line, sizeof line);
     n_gen_lines++;
 }
@@ -122,23 +127,40 @@ static void seen(gen_t now, const char *what) {
 }
 
 int main(int argc, char **argv) {
-    uint64_t seed = argc > 1 ? strtoull(argv[1], NULL, 0) : (1ull << 32) - 8;
+    int from_cfg = argc > 4 && !strcmp(argv[1], "--cfg");
+    const char *want_line = NULL;   // --cfg: a part of the seed's log line
+    uint64_t seed;                  // the counter before the first generation
+    if (from_cfg) {
+        cfg_seed = strcmp(argv[2], "(unset)") ? argv[2] : NULL;
+        seed = strtoull(argv[3], NULL, 0);
+        want_line = strcmp(argv[4], "-") ? argv[4] : NULL;
+    } else {
+        seed = argc > 1 ? strtoull(argv[1], NULL, 0) : (1ull << 32) - 8;
+    }
     uint64_t edge = seed + 8;   // the boundary under test: 2^32 for the first seed
     gen_t w_tex, w_oth, now, d;
     rt_guest_start_ns = 1000000000ull;
     fake_now = rt_guest_start_ns + 3600ull * 1000000000ull;   // an hour in
     gfx_counters.frames = 216000;                             // at 60 fps
-    gen_now = (gen_t)seed;
-    CHECK((uint64_t)gen_now == seed, "the seed %#llx does not fit the generations (%u bits)", (unsigned long long)seed,
-          (unsigned)(8 * sizeof(gen_t)));
-    if (failed) {   // the generations cannot reach the boundary: nothing below can run
-        printf("gen_wrap_check: seed %#llx: 1 of 1 checks failed\n", (unsigned long long)seed);
-        return 1;
+    if (!from_cfg) {
+        gen_now = (gen_t)seed;
+        CHECK((uint64_t)gen_now == seed, "the seed %#llx does not fit the generations (%u bits)",
+              (unsigned long long)seed, (unsigned)(8 * sizeof(gen_t)));
     }
     last_now = (uint64_t)gen_now;
 
-    // Before the boundary: both textures loaded (written) and checked.
-    vk_guest_written(TEX, 0x4000);
+    // Before the boundary: both textures loaded (written) and checked. The first write takes the first generation,
+    // which goes on from the seed (with --cfg, the seed NX2NAVI_GEN_SEED gives).
+    if (!failed) {
+        vk_guest_written(TEX, 0x4000);
+        CHECK((uint64_t)gen_now == seed + 1, "%s%s: the first generation is %llu, not %llu",
+              from_cfg ? "NX2NAVI_GEN_SEED=" : "seeded directly", from_cfg ? (cfg_seed ? cfg_seed : "(unset)") : "",
+              (unsigned long long)gen_now, (unsigned long long)(seed + 1));
+    }
+    if (failed) {   // the generations cannot reach the boundary: nothing below can run
+        printf("gen_wrap_check: seed %#llx: %d of %d checks failed\n", (unsigned long long)seed, failed, checks);
+        return 1;
+    }
     vk_guest_written(OTHER, 0x4000);
     CHECK(vk_mem_changed(TEX, 0x4000, 0, &w_tex) == 1, "TEX: its load is not seen");
     seen(w_tex, "TEX first check");
@@ -229,18 +251,26 @@ int main(int argc, char **argv) {
     CHECK(!page_dirty(TEX + 0x1000, p.mgen), "page_dirty: nothing written since the sync, yet dirty");
     CHECK(shadow_pool_clean(&p, ep, 1) && shadow_pool_clean(&p, ep, 0), "shadow_pool_clean: synced, yet not clean");
 
-    // The log: one line where the count reached 2^32, none at any other boundary.
-    int reached = seed < (1ull << 32) && (uint64_t)gen_now >= (1ull << 32);
-    CHECK(n_gen_lines == reached, "%d page generation lines, not %d (first: %s)", n_gen_lines, reached,
-          n_gen_lines ? gen_lines[0] : "none");
-    if (reached && n_gen_lines)
-        CHECK(strstr(gen_lines[0], "reached 4294967296 at frame 216000 after 1.0 h of play (19884 a frame)"),
-              "the line at 2^32: %s", gen_lines[0]);
+    // The log: one line where the count reached 2^32, none at any other boundary; with --cfg, the seed's line.
+    int reached = seed < (1ull << 32) && (uint64_t)gen_now >= (1ull << 32), n_reached = 0, n_seed = 0;
     for (int i = 0; i < n_gen_lines && i < 16; i++) {
+        if (strstr(gen_lines[i], "reached 4294967296")) {
+            n_reached++;
+            CHECK(strstr(gen_lines[i], "reached 4294967296 at frame 216000 after 1.0 h of play (19884 a frame)"),
+                  "the line at 2^32: %s", gen_lines[i]);
+        }
+        if (strstr(gen_lines[i], "NX2NAVI_GEN_SEED")) {
+            n_seed++;
+            CHECK(want_line && strstr(gen_lines[i], want_line), "the seed's line is not \"%s\": %s",
+                  want_line ? want_line : "(none)", gen_lines[i]);
+        }
         CHECK(!strstr(gen_lines[i], "run out") && !strstr(gen_lines[i], "ran out at"), "a line of running out: %s",
               gen_lines[i]);
         printf("  %s\n", gen_lines[i]);
     }
+    CHECK(n_reached == reached, "%d lines at 2^32, not %d", n_reached, reached);
+    CHECK(n_seed == (want_line != NULL), "%d lines of the seed, not %d", n_seed, want_line != NULL);
+    CHECK(n_gen_lines == n_reached + n_seed, "%d page generation lines, not %d", n_gen_lines, n_reached + n_seed);
 
     printf("gen_wrap_check: seed %#llx, %u-bit generations, gen_now %#llx: %d of %d checks failed\n",
            (unsigned long long)seed, (unsigned)(8 * sizeof(gen_t)), (unsigned long long)gen_now, failed, checks);

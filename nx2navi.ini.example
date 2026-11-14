@@ -1079,6 +1079,11 @@
 # this number is not made and is taken as one the driver refused with a lost device. The log then holds one report and
 # one FATAL line, and the game ends with exit code 72. 0: never. Default: 0.
 # device_lost_at = 0
+# A test of the page write generations (how the renderer tells which game memory changed since it last looked): they
+# start after this number instead of 0, so a run reaches 4294967296, where the 32-bit generations of versions before
+# 0.10.2 ran out, within its first seconds (4294966000 does that). Decimal, or hexadecimal with 0x; at most
+# 4611686018427387904. The log says where they start. Nothing else changes. Read at start. Default: 0.
+# gen_seed = 0
 # Once a second, puts the crash report's exception filter back if a GPU driver or an overlay loaded after the start set
 # its own in its place, and says so in the log. Without it, a crash in such a DLL can end the game with no FATAL line in
 # the log. 0: off.

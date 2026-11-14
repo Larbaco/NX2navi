@@ -1189,10 +1189,37 @@ static void gen_mark(uint64_t g) {
            (unsigned long long)g, (unsigned long long)frames, secs / 3600, frames ? (double)g / (double)frames : 0.0);
 }
 
+// NX2NAVI_GEN_SEED (a test; default 0): the run's generations start after this value, so a run reaches 2^32, where the
+// 32-bit generations of earlier versions ran out, or the low 32 bits passing through 0 again (2^40 - a few), within
+// seconds. The first gen_next reads it, before anything is stamped, and goes on from it or from gen_now, the larger.
+// Parsed as 64 bits with strtoull (strtoul stops at 2^32 - 1 where unsigned long is 32 bits, as on Windows), decimal
+// or 0x hexadecimal, and capped at GEN_SEED_MAX, far from the 64-bit end. It only ever raises the counter: a lower one
+// would leave stamps newer than it, and they would read as written at every check. gen_lock held exclusively; cfg_get
+// and the log take no lock of this file.
+#define GEN_SEED_MAX (1ull << 62)
+static uint64_t gen_seed(void) {
+    const char *e = cfg_get("NX2NAVI_GEN_SEED");
+    if (!e || !*e) return gen_now;
+    char *end;
+    uint64_t seed = strtoull(e, &end, 0);
+    if (end == e || *end || strchr(e, '-')) {
+        rt_log("mem: NX2NAVI_GEN_SEED=%s is not a number from 0 to %llu: the page generations start at %llu", e,
+               GEN_SEED_MAX, (unsigned long long)gen_now);
+        return gen_now;
+    }
+    int capped = seed > GEN_SEED_MAX;
+    if (capped) seed = GEN_SEED_MAX;
+    if (seed <= gen_now) return gen_now;
+    rt_log("mem: page generations start at %llu (NX2NAVI_GEN_SEED%s, a test switch)", (unsigned long long)seed,
+           capped ? " capped at 2^62" : "");
+    return seed;
+}
+
 // gen_lock held exclusively: the only place a generation is handed out. The store is atomic: vk_mem_sizes and
 // verify_cb read gen_now without gen_lock.
 static inline uint64_t gen_next(void) {
     uint64_t g = gen_now + 1;
+    if (__builtin_expect(g == 1, 0)) g = gen_seed() + 1;   // the run's first generation
     if (__builtin_expect(g == 1ull << 32, 0)) gen_mark(g);
     __atomic_store_n(&gen_now, g, __ATOMIC_RELAXED);
     return g;
