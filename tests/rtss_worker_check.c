@@ -64,16 +64,18 @@ static int readonly;         // SaveProfile does not reach the file (no administ
 static DWORD refuse_over;    // RTSS refuses a limit above this many frames a second (0: none refused)
 static int no_library;       // LoadLibraryA fails
 static volatile LONG saves, deletes, updates, loads, created, removed;
+static volatile LONG calls;   // every call into the fake hooks library
 
 static void touch(Prof *p) { p->stamp++; }
 static void WINAPI f_load(LPCSTR name) {
     (void)name;
+    calls++;
     loaded = own.exists ? own : global;
 }
 static void (*during_save)(void);   // runs inside the next SaveProfile, once
 static void WINAPI f_save(LPCSTR name) {
     (void)name;
-    saves++;
+    calls++, saves++;
     if (during_save) {
         void (*f)(void) = during_save;
         during_save = NULL;
@@ -86,16 +88,18 @@ static void WINAPI f_save(LPCSTR name) {
 }
 static void WINAPI f_delete(LPCSTR name) {
     (void)name;
-    deletes++;
+    calls++, deletes++;
     if (!readonly) own.exists = 0, touch(&own);
 }
 static BOOL WINAPI f_get(LPCSTR prop, LPBYTE data, DWORD size) {
+    calls++;
     if (size != 4) return FALSE;
     if (!strcmp(prop, "FramerateLimit")) return memcpy(data, &loaded.limit, 4), TRUE;
     if (!strcmp(prop, "FramerateLimitDenominator") && !no_denominator) return memcpy(data, &loaded.denom, 4), TRUE;
     return FALSE;
 }
 static BOOL WINAPI f_set(LPCSTR prop, LPBYTE data, DWORD size) {
+    calls++;
     if (size != 4) return FALSE;
     DWORD v;
     memcpy(&v, data, 4);
@@ -104,8 +108,13 @@ static BOOL WINAPI f_set(LPCSTR prop, LPBYTE data, DWORD size) {
     if (!strcmp(prop, "FramerateLimitDenominator") && !no_denominator) return memcpy(&loaded.denom, data, 4), TRUE;
     return FALSE;
 }
-static void WINAPI f_update(void) { updates++; }
-static DWORD WINAPI f_enum(LPSTR list, DWORD size) { (void)size; list[0] = 0; return 1; }
+static void WINAPI f_update(void) { calls++, updates++; }
+static DWORD WINAPI f_enum(LPSTR list, DWORD size) {
+    (void)size;
+    calls++;
+    list[0] = 0;
+    return 1;
+}
 
 static Prof *file_of(const char *path) {
     if (strstr(path, "\\Profiles\\ocarina.exe.cfg")) return own.exists ? &own : NULL;
@@ -1029,6 +1038,35 @@ static void state_locked(void) {
     CHECK(!own.exists && !strcmp(state(), "rtss1 0 0 1 60 1 60 1 ocarina_dev.exe\n"), "still as it was:\n%s", state());
 }
 
+// A crash on RTSS's own thread, inside SaveProfile with the lock held, in a run whose state file could not be written:
+// rtss_limit_crash closes the run and returns at once, with no call into RTSS's library and no wait for the lock that
+// thread holds (rtss_limit_restore would try it for a second); nothing after it reaches the profile.
+static ULONGLONG crash_ms;
+static LONG crash_calls = -1;
+static void crash_on_worker(void) {
+    LONG c0 = calls;
+    ULONGLONG t0 = GetTickCount64();
+    rtss_limit_crash();
+    crash_ms = GetTickCount64() - t0;
+    crash_calls = calls - c0;
+}
+static void crash_worker_thread(void) {
+    state_readonly = 1;
+    app_set(1, 0xA, 1000, 2000, 60);
+    during_save = crash_on_worker;
+    ask(60000);
+    poll();
+    show("a crash on RTSS's thread inside SaveProfile");
+    CHECK(crash_calls == 0, "%ld calls into RTSS's library from the crash", crash_calls);
+    CHECK(crash_ms < 200, "the crash took %llu ms", crash_ms);
+    CHECK(atomic_load(&closed) && !rtss_limit_active() && !rtss_limit_state(), "the run closed");
+    LONG s0 = saves;
+    ask(144000);
+    poll();
+    poll();
+    CHECK(saves == s0, "nothing after the crash reaches the profile");
+}
+
 // A crash with the line in the state file: no call into RTSS's library, the profile and the line stay for the next
 // start, and nothing after it reaches the profile.
 static void crash_recorded(void) {
@@ -1242,6 +1280,7 @@ static const struct { const char *name; void (*run)(void); } scenarios[] = {
     {"state_unwritable", state_unwritable},
     {"state_locked", state_locked},
     {"crash_recorded", crash_recorded},
+    {"crash_worker_thread", crash_worker_thread},
     {"kill_restart", kill_restart},
     {"kill_restart_player", kill_restart_player},
     {"kill_restart_edited", kill_restart_edited},
