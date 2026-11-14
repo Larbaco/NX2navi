@@ -125,7 +125,8 @@ ffxReturnCode_t create_counted(ffxContext *ctx, ffxCreateContextDescHeader *desc
 // a switch keeps at most two of an output size for a few frames, and the game's second scenes, of another output size,
 // keep their own. When all slots are taken, the least recently used one goes for the new size. A context that goes is
 // let go of (retire_up) and destroyed once the GPU is past the submission of its last upscale (g_dead, vk_dlaa.c "what
-// the upscalers let go of"), without a wait for the device.
+// the upscalers let go of"), without a wait for the device; a creation refused while some are still in flight waits
+// for the GPU to pass them, and tries once more once they are destroyed (context_for).
 struct Up {
     ffxContext ctx = nullptr;
     uint32_t mw = 0, mh = 0, ow = 0, oh = 0;   // the render size it was made for (the largest it takes with drs); the output size
@@ -259,6 +260,20 @@ Up *context_for(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
     d.maxUpscaleSize = {ow, oh};
     d.fpMessage = message;
     ffxReturnCode_t r = create_counted(&slot->ctx, &d.header);
+    if (r != FFX_API_RETURN_OK && vk_ffx_dead_fence()) {
+        // Refused while contexts let go of (this file's and FSR 4's) are still in flight: most often their video
+        // memory, which a wait for the device freed before the creation up to 0.10.1. The GPU finishes with them
+        // (vk_upscaler_gpu_wait: those submissions only, not the device), they go, and the creation is tried once
+        // more, as vk_ffx4.cpp context_for and vk_dlaa.c evaluate do, rather than the upscaler failing for the run.
+        const ffxReturnCode_t r0 = r;
+        const uint64_t w0 = plat_now_ns();
+        const int gone2 = vk_ffx_dead_take(vk_upscaler_gpu_wait(vk_ffx_dead_fence()));
+        const double waited = (double)(plat_now_ns() - w0) / 1e6;
+        if (gone2) slot->ctx = nullptr, r = create_counted(&slot->ctx, &d.header);
+        rt_log("ffx: FSR 3.1 context creation refused (%u) with contexts let go of still in flight: waited %.1f ms for "
+               "the GPU, %d destroyed, %s", (unsigned)r0, waited, gone2,
+               !gone2 ? "not tried again" : r == FFX_API_RETURN_OK ? "made at the second try" : "refused again");
+    }
     if (r != FFX_API_RETURN_OK) {
         rt_log("ffx: FSR 3.1 context creation for %ux%u (render sizes up to %ux%u) failed (%u)", ow, oh, mw, mh, (unsigned)r);
         slot->ctx = nullptr;

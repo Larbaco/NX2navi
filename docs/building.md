@@ -815,7 +815,9 @@ A change to where the upscalers free what they let go of (`runtime/vk_dlaa.c` "w
 GPU may still use it", `runtime/vk_ffx.cpp` and `runtime/vk_ffx4.cpp` `context_for`) passes
 `python tests\upscaler_idle_check.py`, which reads the sources: `vkDeviceWaitIdle` only in `vk_upscaler_device_idle`
 and the `--probe-ffx-cache` path, that function only behind the rollback switch, a full list and a refused creation,
-every place that lets something go calling `vk_upscaler_let_go`, `upscaler_idle_wait`'s `sections[]` entry and
+every place that lets something go calling `vk_upscaler_let_go`, every creation of a DLSS feature or an FSR context
+(`vk_dlaa.c` `evaluate`, `vk_ffx.cpp` and `vk_ffx4.cpp` `context_for`) trying a refusal once more after a wait for the
+GPU to pass what was let go of (`vk_upscaler_gpu_wait`), `upscaler_idle_wait`'s `sections[]` entry and
 `nx2navi.ini.example` line, a name in `perf.c` for each perf mark kind, and `pb_images` noting the images' last use
 after it makes them. Any Python, no game files.
 

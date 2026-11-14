@@ -10,6 +10,9 @@ It fails when:
 - one of the places that let something go (vk_dlaa.c free_size, free_snap, stale_sizes, release_kept, hudless_from,
   pb_images, retire_idle and evaluate, vk_ffx.cpp and vk_ffx4.cpp context_for) does not call vk_upscaler_let_go, which
   frees what the GPU is past and which the rollback switch turns into a wait for the device;
+- one of the places that create a DLSS feature or an FSR context (vk_dlaa.c evaluate, vk_ffx.cpp and vk_ffx4.cpp
+  context_for) does not call vk_upscaler_gpu_wait: a creation refused while what was let go of is still in flight
+  then fails for want of its video memory, where the wait for the device of 0.10.1 had freed it first;
 - NX2NAVI_UPSCALER_IDLE_WAIT has no sections[] entry in cfg.c or no line in nx2navi.ini.example (its known[] name and
   its metas[] row, and a // that would hide them, are tests/cfg_rows_check.py's);
 - perf.c's mark_name has another count of names than host.h has PERF_M_* kinds: a kind without a name prints a null
@@ -32,6 +35,11 @@ IDLE_ALLOWED = {'vk_upscaler_settle', 'vk_upscaler_gpu_wait'}   # vk_dlaa.c: who
 LET_GO = {   # functions that let something go and must call vk_upscaler_let_go
     'vk_dlaa.c': ['free_size', 'free_snap', 'stale_sizes', 'release_kept', 'hudless_from', 'pb_images', 'retire_idle',
                   'evaluate'],
+    'vk_ffx.cpp': ['context_for'],
+    'vk_ffx4.cpp': ['context_for'],
+}
+REFUSED = {   # functions that create a feature or context and must retry a refusal after vk_upscaler_gpu_wait
+    'vk_dlaa.c': ['evaluate'],
     'vk_ffx.cpp': ['context_for'],
     'vk_ffx4.cpp': ['context_for'],
 }
@@ -141,6 +149,14 @@ def main():
                 fails.append(f'{f}: no function {name}')
             elif not re.search(r'\bvk_upscaler_let_go\s*\(', b):
                 fails.append(f'{f} {name}: lets something go without vk_upscaler_let_go')
+    for f, names in REFUSED.items():
+        code, funcs = sources[f]
+        for name in names:
+            b = body(code, funcs, name)
+            if b is None:
+                fails.append(f'{f}: no function {name}')
+            elif not re.search(r'\bvk_upscaler_gpu_wait\s*\(', b):
+                fails.append(f'{f} {name}: no retry of a refused creation after vk_upscaler_gpu_wait')
 
     key = 'UPSCALER_IDLE_WAIT'
     cfg = (rt / 'cfg.c').read_text(encoding='utf-8-sig')
