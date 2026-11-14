@@ -428,7 +428,7 @@ static void churn(void) {
 
 // A movie under RTSS: the want stays the play limit and the game's pacer holds the movie. At a limit of 144 the profile
 // keeps 144 through it, with no write; under the movie's rate (40) the profile has no limit for the movie's length, so
-// RTSS cannot space out the frames that catch up after a late one, and gets 40 back at its end.
+// RTSS does not hold the movie below its rate, and gets 40 back at its end; at the movie's own rate (60) it keeps 60.
 static void movie(void) {
     Run r;
     run_init(&r);
@@ -458,6 +458,18 @@ static void movie(void) {
           "40 back at its end");
     o = step(&r, 40000);
     CHECK(o.holds, "held from the next poll");
+    // at the movie's own rate (60, the default limit) the profile keeps 60 through the movie, with no write: RTSS holds
+    // the movie beside the pacer, as rtss_target says
+    run_init(&r);
+    step(&r, 60000);
+    step(&r, 60000);
+    r.movie_mhz = 60000;
+    for (int i = 0; i < 5; i++) o = step(&r, 60000);
+    CHECK(o.act == RTSS_DO_NOTHING && !o.holds && o.why == RTSS_WHY_MOVIE && r.st.applies == 1 && r.st.holds == 60000,
+          "a movie at 60: no write, the profile keeps 60");
+    r.movie_mhz = 0;
+    o = step(&r, 60000);
+    CHECK(o.holds && r.st.applies == 1, "held again after it, no write");
     CHECK(rtss_target(60000, 60000) == 60000 && rtss_target(59940, 60000) == 0 && rtss_target(0, 60000) == 0 &&
               rtss_target(144000, 0) == 144000 && rtss_target(RTSS_OUT_LOWLAT, 60000) == RTSS_OUT_LOWLAT,
           "rtss_target");

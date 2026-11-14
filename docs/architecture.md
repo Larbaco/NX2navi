@@ -264,8 +264,9 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   the game's code needs (`rtss_decide.h` `rtss_pace_period`). Frame generation keeps RTSS out (it would count the
   generated frames), and the game's pacer holds the drawn frames beside it. The exceptions as they stand: `pace_smooth`
   still waits on the present thread while RTSS holds the limit; DLSS Frame Generation's Reflex sleeps where the frame
-  starts while the pacer holds the limit; and a limit set in RTSS itself still holds the game where the game keeps RTSS
-  out, which the log ("two limiters") and the
+  starts while the pacer holds the limit; at a play limit equal to a movie's rate (60, the default, for the game's 60
+  fps movies) RTSS's profile keeps that limit and RTSS holds the movie beside the pacer; and a limit set in RTSS itself
+  still holds the game where the game keeps RTSS out, which the log ("two limiters") and the
   frame rate row of the menu point out, and the same where RTSS is out of it for the run because its profile cannot be
   written or its hooks library does not load, which the log points out the same way (the menu shows the administrator
   note for the first and nothing for the second).
@@ -276,8 +277,10 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   from the saved file; a fractional rate over a denominator where RTSS knows one, else rounded down to whole frames)
   once the first picture went out and the limit stayed the same for two polls, so a want that flips (low latency at a
   swapchain rebuild) writes nothing. A movie leaves the play limit in the profile; only a play limit below the movie's
-  rate gives the profile no limit for the movie's length, so that RTSS does not space out the frames the pacer sends at
-  once to catch up. The pacer stands aside (`rtss_limit_active`) only once RTSS is seen holding the game: it lists the
+  rate gives the profile no limit for the movie's length, so that RTSS does not hold the movie below its rate. Above
+  the movie's rate RTSS lets the frames the pacer sends at once after a late frame through faster than the movie runs;
+  at the movie's own rate (a limit of 60) whether RTSS spaces them out, and the picture falls behind the sound, is not
+  measured. The pacer stands aside (`rtss_limit_active`) only once RTSS is seen holding the game: it lists the
   process with its Vulkan presents, has read the profile (its update flag clear) and measured a period of the game's
   frames lately, no movie plays and a picture went out within 200 ms. The pacer keeps the limit while RTSS does not run
   or has not hooked the game, for a limit RTSS refuses, and for the rest of the run when the profile cannot be written

@@ -138,9 +138,13 @@ typedef struct {
 
 // What the profile gets for a want w >= 0 (the play limit: frame_rate.c frame_step_cap_ns wants it through a movie
 // too) while a movie plays at movie_mhz: w, so that a movie no longer rewrites the profile at its start and end; but no
-// limit (0) while the movie runs faster than w (a limit of 30, 40 or 45). The game's pacer holds every movie at its
-// rate and keeps its slots through a late frame (nvn_api_obj.c pace); RTSS at the movie's rate or below would space out
-// the frames that catch up, and the picture would fall behind the sound at each late frame for good.
+// limit (0) while the movie runs faster than w (a limit of 30, 40 or 45), where RTSS would hold the movie below its
+// rate. The game's pacer holds every movie at its rate and keeps its slots through a late frame (nvn_api_obj.c pace),
+// sending the frames that catch up at once. Above the movie's rate RTSS lets them through faster than the movie runs.
+// At the movie's own rate (a limit of 60 for the game's 60 fps movies, the default) the profile keeps that rate, and
+// RTSS holds the movie beside the pacer for its length: whether RTSS's limiter then spaces out the frames that catch
+// up, so that the picture falls behind the sound at each late frame, is not measured. Giving the profile no limit there
+// too would cost two profile writes per movie at the default limit.
 static inline int64_t rtss_target(int64_t w, int64_t movie_mhz) { return w > 0 && movie_mhz > w ? 0 : w; }
 
 // The profile's FramerateLimit and FramerateLimitDenominator for mhz (>= 0): a whole rate over 1, a fraction over 1000
@@ -298,8 +302,8 @@ static inline void rtss_why_text(char *out, size_t n, const RtssOut *o, int fail
 // ---- the game's pacer beside RTSS (frame_rate.c frame_step_cap_ns)
 // The period the pacer keeps (now_ns and hosted_ns are kern_now_ns times; hosted_ns of the newest host present,
 // gfx_present.c gfx_window_hosted_ns, 0 before the first). The limit's own period while RTSS does not hold the game,
-// while a movie plays (from its first frame: the pacer keeps the movie's slots, which RTSS does not know, and the
-// worker's next poll gives the movie to the pacer for its length, rtss_target), before the first host present, and
+// while a movie plays (from its first frame: the pacer keeps the movie's slots, which RTSS does not know; rtss_target
+// says what RTSS's profile holds meanwhile), before the first host present, and
 // once no host present went out for RTSS_HOLD_IDLE_NS: a minimised window or a frame hold (vk_backend.c frame_hold)
 // gives RTSS nothing to hold, and a pacer that held nothing then let the quick menu run at the 640-700 fps that read
 // address 0 (frame_rate.c LIMIT_FREE_MAX_HZ). While RTSS holds, the ceiling's period and never 0: the frames RTSS lets
