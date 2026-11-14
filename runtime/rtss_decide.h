@@ -143,6 +143,17 @@ typedef struct {
 // the frames that catch up, and the picture would fall behind the sound at each late frame for good.
 static inline int64_t rtss_target(int64_t w, int64_t movie_mhz) { return w > 0 && movie_mhz > w ? 0 : w; }
 
+// The profile's FramerateLimit and FramerateLimitDenominator for mhz (>= 0): a whole rate over 1, a fraction over 1000
+// where RTSS knows the denominator (has_den), else rounded down to whole frames. Only "display" asks a fraction (59.94
+// or 143.856 Hz monitors), and a limit rounded up (60, 144) let the game run above the refresh, so that every 7 to 17
+// seconds a frame came that the monitor had no refresh for.
+static inline void rtss_limit_value(int64_t mhz, int has_den, uint32_t *limit, uint32_t *den) {
+    *den = 1;
+    if (mhz % 1000 == 0) *limit = (uint32_t)(mhz / 1000);
+    else if (has_den) *limit = (uint32_t)mhz, *den = 1000;
+    else *limit = (uint32_t)(mhz / 1000);
+}
+
 // The hooks library is loaded only on a poll that may write the profile: a limit is wanted, RTSS is not out of it for
 // the run, and it runs. A poll of a kept-out want never loads it; a later limit does.
 static inline int rtss_wants_hooks(const RtssState *s, const RtssIn *in) {

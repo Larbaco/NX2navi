@@ -578,7 +578,8 @@ static void active_logged(void) {
 }
 
 // A limit of a fractional monitor (display at 59.94 and 143.856 Hz): an RTSS that knows the denominator holds it as it
-// is, one that does not holds it rounded to whole frames, and the log says what the profile holds, not what was asked.
+// is, one that does not holds it rounded down to whole frames, never above the refresh, and the log says what the
+// profile holds, not what was asked.
 static void round_logged(void) {
     app_set(1, 0xA, 1000, 2000, 60);
     ask(59940);
@@ -593,10 +594,11 @@ static void round_logged_whole(void) {
     ask(59940);
     poll();
     show("display at 59.94 Hz, RTSS without a denominator");
-    CHECK(own.limit == 60, "rounded to whole frames");
-    CHECK(logged("profile ocarina.exe limits to 60/1 (60.000 fps; the game asked 59.940)"), "the log names 60/1");
+    CHECK(own.limit == 59, "rounded down to whole frames");
+    CHECK(logged("profile ocarina.exe limits to 59/1 (59.000 fps; the game asked 59.940)"), "the log names 59/1");
     settle(143856);
-    CHECK(logged("profile ocarina.exe limits to 144/1 (144.000 fps; the game asked 143.856)"), "the log names 144/1");
+    CHECK(own.limit == 143, "143.856 rounded down");
+    CHECK(logged("profile ocarina.exe limits to 143/1 (143.000 fps; the game asked 143.856)"), "the log names 143/1");
     settle(60000);
     CHECK(logged("profile ocarina.exe limits to 60.000 fps\n"), "a whole limit as it is");
 }

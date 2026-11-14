@@ -214,10 +214,9 @@ static int apply(void *ctx, int64_t mhz, int first, int clear) {
         has_denominator = get_property("FramerateLimitDenominator", (LPBYTE)&old_denominator, sizeof old_denominator);
         if (!old_denominator) old_denominator = 1;
     }
-    DWORD limit, denominator = 1;
-    if (mhz % 1000 == 0) limit = (DWORD)(mhz / 1000);
-    else if (has_denominator) limit = (DWORD)mhz, denominator = 1000;
-    else limit = (DWORD)((mhz + 500) / 1000);
+    uint32_t l, d;
+    rtss_limit_value(mhz, has_denominator, &l, &d);
+    DWORD limit = l, denominator = d;
     if (first) {   // the line goes in before the profile changes: a kill between the two finds it as it was
         rec = (RtssSaved){had_profile, old_limit, old_denominator, limit, denominator, ""};
         snprintf(rec.name, sizeof rec.name, "%s", profile);

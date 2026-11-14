@@ -578,6 +578,20 @@ static void saved(void) {
           "the denominator is compared too");
 }
 
+// The profile's values for a limit (T15): whole rates as they are, a fraction over 1000 where RTSS knows the
+// denominator, else rounded down, so "display" at 59.94 Hz never holds the game above the refresh.
+static void limit_value(void) {
+    static const struct { int64_t mhz; int has_den; uint32_t limit, den; } cases[] = {
+        {59940, 0, 59, 1},   {59940, 1, 59940, 1000}, {60000, 0, 60, 1},  {60000, 1, 60, 1},
+        {143856, 0, 143, 1}, {143856, 1, 143856, 1000}, {0, 0, 0, 1},     {240000, 1, 240, 1}};
+    for (unsigned i = 0; i < sizeof cases / sizeof *cases; i++) {
+        uint32_t l = 7, d = 7;
+        rtss_limit_value(cases[i].mhz, cases[i].has_den, &l, &d);
+        CHECK(l == cases[i].limit && d == cases[i].den, "%lld mHz, denominator %d: %u/%u, not %u/%u",
+              (long long)cases[i].mhz, cases[i].has_den, l, d, cases[i].limit, cases[i].den);
+    }
+}
+
 int main(void) {
     settings();
     reasons();
@@ -595,6 +609,7 @@ int main(void) {
     two();
     pace_period();
     saved();
+    limit_value();
     printf("rtss_limit_check: %s\n", fails ? "FAIL" : "ok");
     return fails != 0;
 }
