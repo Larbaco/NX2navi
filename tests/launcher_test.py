@@ -2904,6 +2904,47 @@ class MakeGameTest(Tmp):
         (out / 'nx2navi.ini').write_text('[performance]\nNX2NAVI_SHADER_CARRY = "0"\n')
         self.assertFalse(self.mg.shader_carry(out))
 
+    def test_shader_carry_reads_the_switch_as_the_game(self):
+        """shader_carry reads NX2NAVI_SHADER_CARRY as runtime/cfg.c does: 0, off, false and no in any case are off, a
+        comment after a blank is cut unless the value is in double quotes, the file's last line with a value wins and
+        the environment wins over the file. A line the game reads as off and this as on would skip a preparation the
+        game does not make up for."""
+        out = self.tmp / 'game'
+        (out / 'shader-cache').mkdir(parents=True)
+        (out / 'shader-prepared.bin').write_bytes(b'x')
+        (out / 'shader-cache' / 'identities.txt').write_text('# translators\n' + 'ab' * 32 + '\n')
+        ini = out / 'nx2navi.ini'
+        env = {k: v for k, v in os.environ.items() if k.upper() != 'NX2NAVI_SHADER_CARRY'}
+        with mock.patch.dict(os.environ, env, clear=True):
+            for text, carry in (('shader_carry = off\n', False), ('shader_carry = FALSE\n', False),
+                                ('shader_carry = no\n', False), ('shader_carry = 0 ; note\n', False),
+                                ('shader_carry = 0\t# note\n', False), ('shader_carry = 1 # on\n', True),
+                                ('shader_carry = on\n', True), ('shader_carry = "0 ; quoted"\n', True),
+                                ('shader_carry = 0\nshader_carry = on\n', True),
+                                ('shader_carry = on\nshader_carry = off\n', False),
+                                ('shader_carry = 0\nshader_carry = ; nothing\n', False)):
+                ini.write_text(text)
+                self.assertEqual(self.mg.shader_carry(out), carry, text)
+            ini.write_text('shader_carry = 0\n')
+            with mock.patch.dict(os.environ, {'NX2NAVI_SHADER_CARRY': '1'}):
+                self.assertTrue(self.mg.shader_carry(out))   # the environment wins over the file
+            ini.write_text('shader_carry = 1\n')
+            with mock.patch.dict(os.environ, {'NX2NAVI_SHADER_CARRY': 'Off'}):
+                self.assertFalse(self.mg.shader_carry(out))
+
+    def test_guest_opt_from_the_ini_only_with_the_low_end_mode_on(self):
+        """guest_opt_ini takes guest_opt from nx2navi.ini only while low_end_gpu is on as runtime/cfg.c lowend_of
+        reads it: 0, off, false and no in any case are off."""
+        out = self.tmp / 'game'
+        out.mkdir()
+        env = {k: v for k, v in os.environ.items() if k.upper() != 'NX2NAVI_GUEST_OPT'}
+        for low, taken in (('1', True), ('yes', True), ('On', True), ('0', False), ('off', False), ('FALSE', False),
+                           ('no', False), ('0 ; note', False)):
+            (out / 'nx2navi.ini').write_text(f'guest_opt = 2\nlow_end_gpu = {low}\n')
+            with mock.patch.dict(os.environ, env, clear=True):
+                self.mg.guest_opt_ini(out)
+                self.assertEqual(os.environ.get('NX2NAVI_GUEST_OPT'), '2' if taken else None, low)
+
     def test_cache_from_before_carrying_names_its_translator(self):
         """Before a new translator goes beside the game, a shader cache with no identities.txt gets one naming the
         translator still there, in the form runtime/gfx_shader.c reads (ids_parse): '#' lines, then 64 hex digits."""

@@ -7,6 +7,8 @@ for what it links with. What the readers get and what the log says about the val
   it is part of the value; at most 16 lines, then a count;
 - switches written as words (cfg.c switch_word, cfg_bool): false, off and no in any case read as 0 and true, on and
   yes as 1 through cfg_get, cfg_bool and cfg_int, from the file and from the environment, with no line about them;
+  the low-end mode's switch (cfg.c lowend_of, read apart from cfg_get) takes the same words, so "low_end_gpu = off"
+  leaves the mode and its keys off;
 - values outside their rows' sets (cfg.c check_value): a 0|1 switch with another value, a number outside its range, a
   word that is none of the menu's choices, each named with its line; none for a file whose values fit, nor for a list
   with numbers in it (the menu's presets); at most 16 lines, then a count;
@@ -185,6 +187,17 @@ def main():
           'a file with 601 keys: one line at load from line 513 on', out)
     check(rc == 0 and len(set_lines) == 1 and 'VK_PRESENT is not kept' in set_lines[0],
           'two menu changes past a full table: one line', out)
+    # the low-end mode's switch, read apart from cfg_get (cfg.c lowend_of): the same words as cfg_bool, from the file
+    # and from the environment; the mode is decided once per process, so each value is its own run
+    for text, extra, want in (
+            ('low_end_gpu = Off\n', None, "low_end 0 bool 0 mesh_emulation '(unset)'"),
+            ('low_end_gpu = 0 ; note\n', None, "low_end 0 bool 0 mesh_emulation '(unset)'"),
+            ('low_end_gpu = yes\n', None, "low_end 1 bool 1 mesh_emulation '1'"),
+            ('; nothing\n', {'NX2NAVI_LOW_END_GPU': 'FALSE'}, "low_end 0 bool 0 mesh_emulation '(unset)'"),
+            ('; nothing\n', {'NX2NAVI_LOW_END_GPU': '0 ; x'}, "low_end 1 bool 1 mesh_emulation '1'")):
+        rc, out = run(exe, env, 'lowend', text, work, extra)
+        what = text.strip() if extra is None else f"the environment's {extra['NX2NAVI_LOW_END_GPU']!r}"
+        check(rc == 0 and f'got: {want}' in out, f'low end: {what}: {want}', out)
     rc, out = run(exe, env, 'norow', CLEAN, work, {'NX2NAVI_NO_ROW_CHECK': 'abc'})
     check(rc == 0 and 'got: cfg_int 0 cfg_double 0' in out, 'cfg_int of a set, unparsable key without a row: 0', out)
     print(f'cfg_parse_check: {"FAILED" if bad else "ok"}')

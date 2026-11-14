@@ -852,11 +852,13 @@ static int lowend_only(const char *key) {
     return 0;
 }
 static int lowend = -1;
+// Read through raw_get, which skips switch_word, so the words are taken here as cfg_bool takes them: "low_end_gpu =
+// off" is off for the mode as for the menu and cfg_get, and any value that is not 0 or one of the off words is on.
 static int lowend_of(void) {
     int p = __atomic_load_n(&lowend, __ATOMIC_ACQUIRE);
     if (p >= 0) return p;
     const char *set = raw_get(PREFIX "LOW_END_GPU");
-    p = set && *set && strcmp(set, "0") != 0;
+    p = set && *set && switch_of(set) != 0;
     __atomic_store_n(&lowend, p, __ATOMIC_RELEASE);
     return p;
 }
