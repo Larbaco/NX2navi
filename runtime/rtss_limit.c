@@ -13,11 +13,13 @@
 // then fails silently. So every change is read back
 // from the saved profile, and a limit that did not stick leaves the game's own limiter in charge for the session.
 //
-// RTSS runs when its shared memory "RTSSSharedMemoryV2" carries the signature 'RTSS'; it limits this process once the
-// memory's application list holds this process id (RTSS hooks a process some seconds after it starts, its injection
-// delay). Until then, and again if RTSS quits, the game's own limiter paces the frames. While RTSS limits, the frame
-// rate RTSS itself measures for the game is checked against the limit: well above it for three seconds, and the game
-// takes the limiting back for the rest of the run.
+// RTSS runs when its shared memory "RTSSSharedMemoryV2" carries the signature 'RTSS'. The game's own limiter stands
+// aside only once RTSS is seen to hold the game (rtss_decide.h rtss_decide): the memory's application list holds this
+// process id with its Vulkan presents (RTSS hooks a process some seconds after it starts, its injection delay), RTSS
+// has read the profile the game wrote, it measured a period of the game's frames lately, no movie plays and pictures
+// go out. Until then, and again whenever one of these ends (RTSS quits, the window is minimised), the game's own limiter
+// paces the frames. While RTSS limits, each new period RTSS measures for the game is checked against the limit: above
+// 1.05 times it for three periods in a row, and the game takes the limiting back for the rest of the run.
 //
 // The calls run on a thread of their own, every half second, which also looks RTSS up (find_rtss), so a present never
 // waits on the registry or profile files. On every orderly exit (rtss_limit_restore) the profile gets back what it held
@@ -40,6 +42,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "gfx.h"
 #include "host.h"
 #include "platform/platform.h"
 #include "rtss_decide.h"
@@ -328,17 +331,23 @@ static void put_back_op(void *ctx, const RtssOut *o) {   // rtss_poll's RtssOps.
 }
 
 // Whether RTSS holds the game to the want w this poll read, and the log of which limiter is in use: the first decision,
-// then each change. The want may have changed since the poll read it: rtss_limit_active compares the two, so a stale
-// store never lets the game's limiter stand aside for a newer want. The store is made either way (a want that went
-// w, w2, w again must not find an older hold), but a hold is logged only while its want is still the current one: the
-// game's limiter paces a newer want, and the next poll logs what holds it.
+// then each change of the limiter or of why the game's own one paces (RTSS not hooked yet, not read the profile, a
+// minimised window), up to LIMITER_LINES lines. The want may have changed since the poll read it: rtss_limit_active
+// compares the two, so a stale store never lets the game's limiter stand aside for a newer want. The store is made
+// either way (a want that went w, w2, w again must not find an older hold), but a hold is logged only while its want
+// is still the current one: the game's limiter paces a newer want, and the next poll logs what holds it.
+#define LIMITER_LINES 100
 static void set_active(int64_t w, int on, const char *why) {
-    static int logged = -1;
+    static int logged = -1, lines;
+    static char said[128];
     atomic_store(&active_for, on ? w : RTSS_UNSET);
-    if (logged == on || (on && atomic_load(&want) != w)) return;
+    if ((on && atomic_load(&want) != w) || (logged == on && (on || !strcmp(why, said)))) return;
     logged = on;
+    snprintf(said, sizeof said, "%s", on ? "" : why);
+    if (++lines > LIMITER_LINES) return;
     if (on) rt_log("frame rate: RivaTuner Statistics Server does the limiting; the game's own limiter stands aside");
     else rt_log("frame rate: the game's own limiter (%s)", why);
+    if (lines == LIMITER_LINES) rt_log("frame rate: later changes of the limiter in charge are not logged");
 }
 
 // RTSS's own settings for the game, read from its profile file as RTSS keeps it: Profiles\<exe>.cfg, else
@@ -473,7 +482,8 @@ static void worker(void *arg) {
             plat_mutex_unlock(&lock);
             continue;
         }
-        RtssIn in = {.want = w, .movie_mhz = atomic_load(&movie_mhz)};
+        RtssIn in = {.want = w, .movie_mhz = atomic_load(&movie_mhz), .now_ns = kern_now_ns(),
+                     .hosted_ns = gfx_window_hosted_ns()};
         rtss_map(&in.app);
         if (in.app.running != was_running || in.app.listed != was_listed) {
             if (!in.app.running) rt_log("frame rate: RivaTuner Statistics Server is installed but not running");

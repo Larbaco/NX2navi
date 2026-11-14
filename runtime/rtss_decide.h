@@ -32,13 +32,20 @@ static inline const char *rtss_out_limiter(int64_t want) {
 
 // ---- RTSS's shared memory, "RTSSSharedMemoryV2". The header: signature, version, application entry size, offset of
 // the application array, its length. An entry: the process id, the executable path (260 bytes), flags, then RTSS's
-// last frame rate period for the process: its start and end in ms and the frames in it.
+// last frame rate period for the process: its start and end in ms and the frames in it. The flags' low 16 bits hold
+// the API RTSS saw the process present with, a value rather than bits (Vulkan is 0xA), and RTSS_UPDATE_ASKED stays set
+// from UpdateProfiles until the process has read its profile again.
 #define RTSS_SIGNATURE 0x52545353u   // 'RTSS' as RTSS writes it: the memory holds valid data
-enum { RTSS_PERIOD_AT = 4 + 260 + 4, RTSS_ENTRY_MIN = RTSS_PERIOD_AT + 12, RTSS_APPS_MAX = 4096 };
+#define RTSS_API_MASK 0xFFFFu
+#define RTSS_API_VULKAN 0xAu
+#define RTSS_UPDATE_ASKED 0x10000000u
+enum { RTSS_FLAGS_AT = 4 + 260, RTSS_PERIOD_AT = RTSS_FLAGS_AT + 4, RTSS_ENTRY_MIN = RTSS_PERIOD_AT + 12,
+       RTSS_APPS_MAX = 4096 };
 
 typedef struct {
     int running;                 // the signature and a version of 2.0 or later
     int listed;                  // the application list holds this process: RTSS has hooked it
+    uint32_t flags;              // the entry's flags
     uint32_t t0, t1, frames;     // the period of this process's entry
 } RtssApp;
 
@@ -56,6 +63,7 @@ static inline void rtss_parse(const uint8_t *p, size_t size, uint32_t pid, RtssA
         memcpy(&id, p + at, 4);
         if (id != pid) continue;
         a->listed = 1;
+        memcpy(&a->flags, p + at + RTSS_FLAGS_AT, 4);
         memcpy(t, p + at + RTSS_PERIOD_AT, sizeof t);
         a->t0 = t[0], a->t1 = t[1], a->frames = t[2];
         break;
@@ -68,8 +76,10 @@ static inline double rtss_fps(const RtssApp *a) {
 }
 
 // ---- the worker's decisions
-#define RTSS_CHECK_POLLS 6     // polls in a row RTSS's own frame rate of the game may stay above the limit
-#define RTSS_CHECK_SLACK 1.2   // above limit * this, RTSS is taken not to hold the game to it
+#define RTSS_OVER_PERIODS 3            // fresh periods in a row RTSS's frame rate of the game may stay above the limit
+#define RTSS_OVER_SLACK 1.05           // above limit * this, RTSS is taken not to hold the game to it
+#define RTSS_FRESH_NS 2500000000ull    // a period is stale after this, or 2.5 times its own length if longer
+#define RTSS_HOLD_IDLE_NS 200000000ull   // no host present for this long: RTSS holds nothing (vk_lowlat.c HOLD_IDLE_NS)
 
 enum { RTSS_FAIL_NONE, RTSS_FAIL_LIBRARY, RTSS_FAIL_READONLY, RTSS_FAIL_NOT_LIMITING };   // out of it for the run
 enum { RTSS_DO_NOTHING, RTSS_DO_APPLY, RTSS_DO_PUT_BACK };
@@ -83,17 +93,24 @@ enum {
     RTSS_WHY_NEWER,         // the want changed while the poll ran: nothing decided, the next poll takes the new one
     RTSS_WHY_UNSET,         // no want yet
     RTSS_WHY_MOVIE,         // a movie plays: the game's pacer holds it at its rate and keeps its slots
+    RTSS_WHY_NOT_VULKAN,    // RTSS lists the game but has not seen its Vulkan presents
+    RTSS_WHY_UPDATE,        // RTSS has not read the profile the game wrote yet
+    RTSS_WHY_NOT_COUNTING,  // RTSS has measured no period of the game's frames lately
+    RTSS_WHY_IDLE,          // no picture went out lately (a minimised window, a frame hold): RTSS has none to hold
 };
 
 // What the worker keeps between polls.
 typedef struct {
-    int64_t applied;   // the millihertz the profile holds from this run; -1 untouched
-    int64_t refused;   // a limit RTSS refused (out of its range): the game's own limiter keeps that one
-    int changed;       // the profile holds a value from this run: put the old one back on exit
-    int over;          // polls in a row RTSS's frame rate of the game stayed above the limit
-    int fail;          // RTSS_FAIL_*
+    int64_t applied;     // the millihertz the profile holds from this run; -1 untouched
+    int64_t refused;     // a limit RTSS refused (out of its range): the game's own limiter keeps that one
+    int changed;         // the profile holds a value from this run: put the old one back on exit
+    int over;            // fresh periods in a row RTSS's frame rate of the game stayed above the limit
+    int fail;            // RTSS_FAIL_*
+    int held;            // the poll before stood aside: a fresh period now shows how RTSS holds the game
+    uint32_t t1, span;   // the end and length (ms) of the newest period seen
+    uint64_t fresh_ns;   // when a new period was last seen; 0 never
 } RtssState;
-#define RTSS_STATE_INIT {-1, -1, 0, 0, RTSS_FAIL_NONE}
+#define RTSS_STATE_INIT {-1, -1, 0, 0, RTSS_FAIL_NONE, 0, 0, 0, 0}
 
 // One poll's view.
 typedef struct {
@@ -101,6 +118,8 @@ typedef struct {
     int current;         // the want is still that one when the poll decides
     int hooks;           // RTSS's hooks library: 1 loaded, 0 failed to load, -1 not tried (rtss_wants_hooks)
     int64_t movie_mhz;   // the rate of a movie that plays (rtss_limit_movie), 0 none
+    uint64_t now_ns;     // kern_now_ns at the poll
+    uint64_t hosted_ns;  // kern_now_ns of the newest host present (gfx_present.c gfx_window_hosted_ns), 0 none yet
     RtssApp app;
 } RtssIn;
 
@@ -128,39 +147,58 @@ static inline int rtss_wants_hooks(const RtssState *s, const RtssIn *in) {
 // The decision of one poll, in this order: no want does nothing; a kept-out want puts back what this run wrote (once
 // the hooks are loaded); a failure lasts the run; RTSS not running leaves the profile for its return; a library that
 // did not load fails the run; a refused limit stays with the game; a new limit (rtss_target) goes into the profile at
-// once, and RTSS holds it as soon as it lists the game. On an unchanged limit RTSS's own frame count is checked: more
-// than RTSS_CHECK_SLACK times the limit for RTSS_CHECK_POLLS polls in a row puts the profile back for the run. While a
-// movie plays the game's pacer holds it (rtss_target). After the exit put the profile back (rtss_limit_restore) no poll
-// decides: rtss_limit.c worker skips it under the lock.
+// once. The game's limiter stands aside only once RTSS is seen to hold the game: the profile held the limit at the poll
+// before (RTSS reads it after the write), RTSS lists the game with its Vulkan presents, has read the profile
+// (RTSS_UPDATE_ASKED clear) and measured a period of the game's frames lately (a fresh one, rtss_fresh), no movie plays
+// (rtss_target) and a picture went out within RTSS_HOLD_IDLE_NS. Each fresh period after a poll that stood aside is
+// checked against the limit: more than RTSS_OVER_SLACK times it for RTSS_OVER_PERIODS periods in a row puts the profile
+// back for the run; a stale period counts neither way. After the exit put the profile back (rtss_limit_restore) no
+// poll decides: rtss_limit.c worker skips it under the lock.
 static inline RtssOut rtss_decide(RtssState *s, const RtssIn *in) {
     int64_t w = in->want;
     RtssOut o = {RTSS_DO_NOTHING, w, 0, RTSS_WHY_NOT_LISTED, 0};
     if (w == RTSS_UNSET) return o.why = RTSS_WHY_UNSET, o;
+    const RtssApp *a = &in->app;
+    int fresh = a->listed && a->t1 > a->t0 && a->frames && a->t1 != s->t1;   // a period RTSS measured since
+    if (fresh) s->t1 = a->t1, s->span = a->t1 - a->t0, s->fresh_ns = in->now_ns;
+    int held = s->held;
+    s->held = 0;   // until this poll stands aside again
     if (w < 0) {
         if (in->hooks == 1 && s->changed) o.act = RTSS_DO_PUT_BACK;
+        s->over = 0;
         return o.why = RTSS_WHY_OUT, o;
     }
     if (s->fail) return o.why = RTSS_WHY_FAILED, o;
-    if (!in->app.running) return o.why = RTSS_WHY_NOT_RUNNING, o;
+    if (!a->running) return o.why = RTSS_WHY_NOT_RUNNING, o;
     if (in->hooks == 0) return s->fail = RTSS_FAIL_LIBRARY, o.why = RTSS_WHY_FAILED, o;
     int64_t t = o.mhz = rtss_target(w, in->movie_mhz);
     if (t == s->refused) return o.why = RTSS_WHY_REFUSED, o;
-    o.holds = in->app.listed;
-    o.why = o.holds ? RTSS_WHY_HOLDS : RTSS_WHY_NOT_LISTED;
-    if (in->movie_mhz) o.holds = 0, o.why = RTSS_WHY_MOVIE;
-    if (t != s->applied) {   // the result of the write may still undo the hold (rtss_written)
+    if (t != s->applied) {   // RTSS reads it after the write: a later poll sees whether it holds
         o.act = RTSS_DO_APPLY;
+        o.why = in->movie_mhz ? RTSS_WHY_MOVIE : a->listed ? RTSS_WHY_UPDATE : RTSS_WHY_NOT_LISTED;
         s->over = 0;
         return o;
     }
-    if (!in->current) return o.holds = 0, o.why = RTSS_WHY_NEWER, o;   // these frames are not the new want's
-    double fps = rtss_fps(&in->app);
-    if (!in->app.listed || t == 0 || fps <= t / 1000.0 * RTSS_CHECK_SLACK) s->over = 0;
-    else if (++s->over == RTSS_CHECK_POLLS) {
-        s->fail = RTSS_FAIL_NOT_LIMITING;
-        o.act = RTSS_DO_PUT_BACK, o.holds = 0, o.why = RTSS_WHY_FAILED, o.fps = fps;
+    if (!in->current) return o.why = RTSS_WHY_NEWER, o;   // these frames are not the new want's
+    if (!a->listed) return o.why = RTSS_WHY_NOT_LISTED, o;
+    if ((a->flags & RTSS_API_MASK) != RTSS_API_VULKAN) return o.why = RTSS_WHY_NOT_VULKAN, o;
+    if (a->flags & RTSS_UPDATE_ASKED) return o.why = RTSS_WHY_UPDATE, o;
+    uint64_t stale = (uint64_t)s->span * 2500000ull > RTSS_FRESH_NS ? (uint64_t)s->span * 2500000ull : RTSS_FRESH_NS;
+    if (!s->fresh_ns || in->now_ns - s->fresh_ns > stale) return o.why = RTSS_WHY_NOT_COUNTING, o;
+    if (fresh && held && t > 0) {
+        double fps = rtss_fps(a);
+        s->over = fps > t / 1000.0 * RTSS_OVER_SLACK ? s->over + 1 : 0;
+        if (s->over == RTSS_OVER_PERIODS) {
+            s->fail = RTSS_FAIL_NOT_LIMITING;
+            o.act = RTSS_DO_PUT_BACK, o.why = RTSS_WHY_FAILED, o.fps = fps;
+            return o;
+        }
     }
-    return o;
+    if (in->movie_mhz) return o.why = RTSS_WHY_MOVIE, o;
+    uint64_t idle = in->now_ns > in->hosted_ns ? in->now_ns - in->hosted_ns : 0;
+    if (!in->hosted_ns || idle >= RTSS_HOLD_IDLE_NS) return o.why = RTSS_WHY_IDLE, o;
+    s->held = o.holds = 1;
+    return o.why = RTSS_WHY_HOLDS, o;
 }
 
 // What a write of the limit did (RtssOps.apply).
@@ -221,12 +259,17 @@ static inline void rtss_why_text(char *out, size_t n, const RtssOut *o, int fail
     else if (o->why == RTSS_WHY_NOT_RUNNING) snprintf(out, n, "RivaTuner Statistics Server is not running");
     else if (o->why == RTSS_WHY_REFUSED) snprintf(out, n, "RivaTuner Statistics Server refused this limit");
     else if (o->why == RTSS_WHY_MOVIE) snprintf(out, n, "a movie plays: the game keeps its pictures on time");
+    else if (o->why == RTSS_WHY_NOT_VULKAN)
+        snprintf(out, n, "RivaTuner Statistics Server lists the game but has not seen its Vulkan presents yet");
+    else if (o->why == RTSS_WHY_UPDATE)
+        snprintf(out, n, "RivaTuner Statistics Server has not read the game's limit from its profile yet");
+    else if (o->why == RTSS_WHY_NOT_COUNTING)
+        snprintf(out, n, "RivaTuner Statistics Server has measured no frames of the game lately");
+    else if (o->why == RTSS_WHY_IDLE) snprintf(out, n, "no picture went out lately: RivaTuner has none to hold");
     else snprintf(out, n, "RivaTuner Statistics Server has not hooked the game yet");
 }
 
 // ---- the game's pacer beside RTSS (frame_rate.c frame_step_cap_ns)
-#define RTSS_HOLD_IDLE_NS 200000000ull   // no host present for this long: RTSS holds nothing (vk_lowlat.c HOLD_IDLE_NS)
-
 // The period the pacer keeps (now_ns and hosted_ns are kern_now_ns times; hosted_ns of the newest host present,
 // gfx_present.c gfx_window_hosted_ns, 0 before the first). The limit's own period while RTSS does not hold the game,
 // while a movie plays (from its first frame: the pacer keeps the movie's slots, which RTSS does not know, and the

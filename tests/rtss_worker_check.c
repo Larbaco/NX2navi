@@ -127,6 +127,25 @@ static void app_set(int listed, DWORD flags, DWORD t0, DWORD t1, DWORD frames) {
     memcpy(e + 4 + MAX_PATH, &flags, 4);
     memcpy(e + 4 + MAX_PATH + 4, t, sizeof t);
 }
+static void app_flags(DWORD flags) { memcpy(shm + ENTRY_AT + 4 + MAX_PATH, &flags, 4); }
+static void app_frames(DWORD frames) { memcpy(shm + ENTRY_AT + 4 + MAX_PATH + 4 + 8, &frames, 4); }
+
+// RTSS's clock and the game's presents as rtss_limit.c reads them: each poll() comes 500 ms after the one before, RTSS
+// measures a new period of the game's frames at each (counting), and the game presents a millisecond before it unless
+// a scenario stops that (presenting).
+static uint64_t fake_now = 10000000000ull, hosted_at;
+static int counting = 1, presenting = 1;
+uint64_t kern_now_ns(void) { return fake_now; }
+uint64_t gfx_window_hosted_ns(void) { return presenting ? fake_now - 1000000 : hosted_at; }
+static void time_passes(void) {
+    if (presenting) hosted_at = fake_now - 1000000;
+    fake_now += 500000000ull;
+    if (!counting) return;
+    DWORD t[2];
+    memcpy(t, shm + ENTRY_AT + 4 + MAX_PATH + 4, sizeof t);
+    t[0] += 500, t[1] += 500;
+    memcpy(shm + ENTRY_AT + 4 + MAX_PATH + 4, t, sizeof t);
+}
 
 // The registry and file calls the thread that asks for a limit makes itself: a present must make none.
 static DWORD present_tid;
@@ -348,6 +367,7 @@ static void prof_load(void) {
 // ---- the scenarios' steps
 static int wait_done(void) { return WaitForSingleObject(done, 5000) == WAIT_OBJECT_0; }
 static void poll(void) {   // one more poll of the worker, waited for
+    time_passes();
     SetEvent(tick);
     CHECK(wait_done(), "the worker did not finish a poll");
 }
@@ -482,7 +502,8 @@ static void kept_lowlat_then_limit(void) {
     poll();
     show("low latency off, limit 60");
     CHECK(loads == 1 && own.exists && own.limit == 60, "the limit goes into the profile once RTSS is let in");
-    CHECK(rtss_limit_state() == 1 && rtss_limit_active(), "RTSS limits the game");
+    poll();
+    CHECK(rtss_limit_state() == 1 && rtss_limit_active(), "RTSS limits the game from the next poll");
 }
 
 // Frame generation keeps RTSS out, with no limit of RTSS's own: one limiter, and the line names frame generation.
@@ -544,6 +565,7 @@ static void active_logged(void) {
           "the kept-out line");
     CHECK(!logged("does the limiting"), "still no line says RTSS does the limiting");
     ask(60000);
+    poll();
     poll();
     show("frame generation off");
     CHECK(rtss_limit_active() && logged("does the limiting; the game's own limiter stands aside"), "held and logged");
@@ -703,22 +725,23 @@ static void refused_run(void) {
     ask(144000);
     poll();
     show("144 after the refusal");
-    CHECK(own.limit == 144 && rtss_limit_active(), "144 taken at once");
+    CHECK(own.limit == 144, "144 written at once");
+    poll();
+    CHECK(rtss_limit_active(), "and held from the next poll");
     ask(240000);
     poll();
     CHECK(!rtss_limit_active(), "240 stays with the game");
 }
 
-// RTSS lists the game but lets it run well over the limit: after six polls in a row over 1.2 times the limit the
-// profile is put back and the game limits for the run. 1.15 times the limit is not caught (the rule as it stands),
-// and a period RTSS no longer moves still counts.
+// RTSS lists the game but lets it run well over the limit: three fresh periods in a row over 1.05 times the limit, each
+// after a poll that stood aside, put the profile back and the game limits for the run.
 static void over_run(void) {
     app_set(1, 0xA, 1000, 2000, 144);
     ask(60000);
-    for (int i = 0; i < 5; i++) poll();
-    CHECK(rtss_limit_active() && own.exists, "five polls over: RTSS still limits");
+    for (int i = 0; i < 3; i++) poll();
+    CHECK(rtss_limit_active() && own.exists, "two periods over: RTSS still limits");
     poll();
-    show("six polls at 144 fps with the limit at 60");
+    show("three periods at 144 fps with the limit at 60");
     CHECK(rtss_limit_state() == 3 && !rtss_limit_active(), "the menu says RTSS does not limit the game");
     CHECK(!own.exists, "the profile is put back");
     CHECK(logged("RivaTuner Statistics Server measures 144.0 fps with its limit at 60.000 fps"), "logged");
@@ -726,15 +749,63 @@ static void over_run(void) {
     poll();
     CHECK(saves == 1 && rtss_limit_state() == 3, "out for the run");
 }
+// 1.05 times the limit is not caught; a period RTSS no longer moves (the limit lowered, then the window minimised)
+// counts neither way, and the game's limiter holds meanwhile; 1.15 times the limit is caught.
 static void over_slack_run(void) {
-    app_set(1, 0xA, 1000, 2000, 69);
+    app_set(1, 0xA, 1000, 2000, 63);
     ask(60000);
     for (int i = 0; i < 20; i++) poll();
-    show("20 polls at 69 fps with the limit at 60");
-    CHECK(rtss_limit_active() && rtss_limit_state() == 1, "1.15 times the limit is not caught");
-    app_set(1, 0xA, 1000, 2000, 73);
+    show("20 polls at 63 fps with the limit at 60");
+    CHECK(rtss_limit_active() && rtss_limit_state() == 1, "1.05 times the limit is not caught");
+    counting = 0;
+    app_frames(144);
+    for (int i = 0; i < 20; i++) poll();
+    show("a period frozen at 144 fps for 20 polls");
+    CHECK(!rtss_limit_active() && rtss_limit_state() != 3 && own.exists && own.limit == 60, "never counted");
+    CHECK(logged("the game's own limiter (RivaTuner Statistics Server has measured no frames of the game lately)"),
+          "logged");
+    counting = 1;
+    app_frames(69);
     for (int i = 0; i < 6; i++) poll();
-    CHECK(rtss_limit_state() == 3, "1.22 times the limit is caught after six polls");
+    CHECK(rtss_limit_state() == 3, "1.15 times the limit is caught");
+}
+
+// RTSS lists the game before it has seen a Vulkan present, and asks the game to read its profile again after each
+// write: the game's limiter holds until both are done.
+static void api_run(void) {
+    app_set(1, 0, 1000, 2000, 60);
+    ask(60000);
+    for (int i = 0; i < 3; i++) poll();
+    show("listed, no API yet");
+    CHECK(!rtss_limit_active() && own.limit == 60, "the game's limiter");
+    CHECK(logged("the game's own limiter (RivaTuner Statistics Server lists the game but has not seen its Vulkan "
+                 "presents yet)"),
+          "logged");
+    app_flags(0xA | 0x10000000u);
+    poll();
+    CHECK(!rtss_limit_active() && logged("has not read the game's limit from its profile yet"), "the update asked");
+    app_flags(0xA);
+    poll();
+    show("Vulkan, profile read");
+    CHECK(rtss_limit_active() && saves == 1, "RTSS limits, no second write");
+}
+
+// No picture goes out (a minimised window): RTSS has nothing to hold, and the game's limiter holds until pictures go
+// out again; the profile stays as it is.
+static void idle_run(void) {
+    app_set(1, 0xA, 1000, 2000, 60);
+    ask(60000);
+    poll();
+    CHECK(rtss_limit_active(), "RTSS limits");
+    presenting = 0;
+    poll();
+    show("minimised");
+    CHECK(!rtss_limit_active() && logged("the game's own limiter (no picture went out lately: RivaTuner has none to hold)"),
+          "the game's limiter");
+    presenting = 1;
+    poll();
+    show("back");
+    CHECK(rtss_limit_active() && saves == 1, "RTSS again, no write");
 }
 static void over_unlimited_run(void) {
     app_set(1, 0xA, 1000, 2000, 700);
@@ -783,6 +854,7 @@ static void churn_run(void) {
         poll();
     }
     show("ten polls with the want flipping");
+    poll();
     CHECK(created == 6 && removed == 5, "%ld creations, %ld removals", created, removed);
     CHECK(logged("created; it goes away when the game closes (creation 1 this run)\n") &&
               logged("(creation 6 this run)\n") && !logged("(creation 7"),
@@ -967,7 +1039,9 @@ static void movie_low_run(void) {
     rtss_limit_movie(0);
     poll();
     show("after the movie");
-    CHECK(own.limit == 40 && rtss_limit_active() && saves - s0 == 2, "40 back: two writes for the movie");
+    CHECK(own.limit == 40 && saves - s0 == 2, "40 back: two writes for the movie");
+    poll();
+    CHECK(rtss_limit_active(), "RTSS holds 40 again");
 }
 
 static const struct { const char *name; void (*run)(void); } scenarios[] = {
@@ -993,6 +1067,8 @@ static const struct { const char *name; void (*run)(void); } scenarios[] = {
     {"over_run", over_run},
     {"over_slack_run", over_slack_run},
     {"over_unlimited_run", over_unlimited_run},
+    {"api_run", api_run},
+    {"idle_run", idle_run},
     {"quit_run", quit_run},
     {"library_run", library_run},
     {"churn_run", churn_run},
