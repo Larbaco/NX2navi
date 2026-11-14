@@ -119,14 +119,16 @@
 # Does nothing without one of those upscalers, nor with the lazy write-back (the default on NVIDIA and Intel cards).
 # Also in the menu: Game, Testing, Start next frame early.
 # tail_early = 1
-# EXPERIMENTAL, with replay_workers. replay_pipe = N (0 to 4, default 4): the submitting thread goes on past up to N
-# groups its workers still record. replay_small = N (0 to 63, default 16, needs replay_pipe): a group of N draws or more
+# EXPERIMENTAL, with replay_workers. replay_pipe = N (0 to 4, default 0): the submitting thread goes on past up to N
+# groups its workers still record. replay_small = N (0 to 63, default 0, needs replay_pipe): a group of N draws or more
 # that is too small to share out (fewer than 64 draws) goes whole to one worker; 64 or more reads as 63. Kokiri Forest
 # standing on an RX 7900 XT with FSR 4, tail_early = 1, replay_workers = 5, replay_pipe = 4 and replay_small = 16: 63
-# instead of 45 fps with all of them off. Also in the menu: Game, Testing, Helpers work ahead (replay_pipe) and Helpers
-# take small jobs (replay_small). Neither does anything without replay workers.
-# replay_pipe = 4
-# replay_small = 16
+# instead of 45 fps with all of them off. On an RTX 3090 a tester measured the same three settings against the
+# defaults at eight places: slower at four (50.1 instead of 58.1 fps at one) and level or up to 7 % faster at the
+# other four. So both stay off unless you turn them on. Also in the menu: Game, Testing, Helpers work ahead
+# (replay_pipe) and Helpers take small jobs (replay_small). Neither does anything without replay workers.
+# replay_pipe = 0
+# replay_small = 0
 # EXPERIMENTAL, THE GAME CRASHES WITH 1. 1 lifts the virtual core gate: guest threads run without the console's limit
 # of one thread per core, and the game keeps per-core data without locks. With 1 the game crashes or hangs,
 # usually at start. Keep 0 to play.

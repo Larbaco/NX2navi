@@ -1923,7 +1923,7 @@ static void op_one(VkExec *ex, const op_hdr *h) {
 // replays the op again once in turn, and so do the contact shadows' pass and the HDR pass's source. Per-object motion
 // lists its draws under a lock (vk_exec_draw.c mvobj_draw), and the occlusion queries' slots and segments follow the
 // stream (vk_exec_xfer.c vk_exec_xfer_slots, vk_exec_xfer_group_merge).
-// NX2NAVI_REPLAY_PIPE=N (0-4, default 4): the submitting thread hands the group to the workers, takes chunks of it as
+// NX2NAVI_REPLAY_PIPE=N (1-4, default 0): the submitting thread hands the group to the workers, takes chunks of it as
 // they do until none is left to take, and goes on with the ops after it, in a new command buffer after the chunks'
 // places in the part (vk_sync_append_later), while the last chunks are recorded; also into the front pass of the next
 // group: up to N (at most LIVE_GROUPS) groups are handed out and not in their part yet, their chunks taken from one
@@ -2472,7 +2472,7 @@ static const op_hdr *group_start(VkExec *ex, const op_hdr *h, int depth) {
     int n = (int)(draws / CHUNK_DRAWS);
     if (n > RW.n + 1) n = RW.n + 1;
     if (n > GROUP_CHUNKS) n = GROUP_CHUNKS;
-    // NX2NAVI_REPLAY_SMALL=N (default 16, with NX2NAVI_REPLAY_PIPE): a group of N draws or more that is too small to cut
+    // NX2NAVI_REPLAY_SMALL=N (default 0, with NX2NAVI_REPLAY_PIPE): a group of N draws or more that is too small to cut
     // goes whole to one worker, and the submitting thread goes on with what follows it without taking the chunk
     // itself. Kokiri Forest standing, 5 workers, 4 groups out, the early tail on (2026-11-13): about 700 draws a frame
     // were in such groups, 3.6 ms of the submitting thread; with 16 the replay took 10.2 instead of 11.0 ms a frame
