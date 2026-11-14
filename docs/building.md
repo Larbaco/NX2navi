@@ -493,13 +493,16 @@ hold (given up after 30 s, a minimised window not counted), no picture going out
 reasons, a want that must stay two polls and low latency switching at every poll, a movie at 144, 60 and 40, a closed
 run, a hooks library that does not load, and two limiters. It also checks the pacer's period beside RTSS
 (`rtss_pace_period`), the limit's rounding without a denominator, and the state file `rtss-profile.txt`: its lines,
-its rewrite and what a start does with a line a run that did not close left. Statically, a crash and a fatal error
+its rewrite and what a start does with a line a run that did not close left, the value written before the newest one
+included. Statically, a crash and a fatal error
 (`main.c` `crash_handler`, `dispatch.c` `fatal_end`) go through `rtss_limit_crash`. On Windows it also builds the real
 `rtss_limit.c` against a fake RTSS (its registry key, hooks library, profile files and shared memory) and runs each
 scenario in a process of its own, among them a want after the exit's restore and one the worker read before it, a
 worker polling without pause while the want switches, the registry and file calls a present must not make, and a run
 killed while RTSS held its limit followed by the next start, each in a process of its own (a next start with a limit,
-with frame generation on and with `NX2NAVI_RTSS=0`). No GPU, no RTSS, no game files.
+with frame generation on and with `NX2NAVI_RTSS=0`, and a run killed inside the save of its second limit), put backs
+that do not land, a state file that does not read, and a crash on RTSS's own thread with no line in the file. No GPU,
+no RTSS, no game files.
 
 A change to how the mixer applies volumes (`runtime/audio_mixer.c` `accumulate_ramp`, the voice and splitter paths
 of `audio_mixer_render`) or to what it owes the device after a stall (`ring_pull`, `audio_mixer_owed`) passes
