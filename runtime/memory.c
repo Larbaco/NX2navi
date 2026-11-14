@@ -266,15 +266,17 @@ static volatile uint32_t lz_fetch_ms;      // plat_now_ms() | 1 at the end of th
 //   - an arm leaves its pages alone (mem_lazy_arm), a freeze its region (lzr), and mem_lazy_touches counts it.
 // Every segment that leaves the list with inaccessible pages becomes an entry in the same lz_lock hold, and an entry
 // ends only once its pages are read-write; lists and entries never overlap. So a fault that finds its address in
-// neither, holding frz_lock (no arm runs then), has an address that is not ours or no longer inaccessible. An entry
-// starts under frz_lock and lz_lock and ends under lz_lock alone, so a holder of frz_lock may wait for one: its fetch
-// takes the queue lock, and no holder of the queue lock takes frz_lock. Every store to lzr is made under lz_lock, from
-// the list, the entries and the region an arm is protecting (lz_arm_r). Fetches of different ranges run at once (the
-// back end has a slot for each, vk_memory.c lazy_fetch). NX2NAVI_WB_LAZY_UNLOCKED=0 brings back 0.10.1's locking: frz_lock
-// is kept from the moment a fault or a release takes a range out until its entry ends, a release takes one segment at a
-// time, mem_thaw releases under the lock, and vk_memory.c mirror_evict and hot_check release their victims under
-// pool_lock, so one fetch runs at a time. The entries stay with it: a touch of a range in flight waits for that entry
-// and runs again, the hold is set at the take-out, and mem_lazy_touches counts the range.
+// neither, holding frz_lock (no arm runs then), has an address that is not ours or no longer inaccessible: the page's
+// state, asked under that lock, decides whether the access runs again (lazy_fault), and an arm after it only has the
+// access fault here once more. An entry starts under frz_lock and lz_lock and ends under lz_lock alone, so a holder of
+// frz_lock may wait for one: its fetch takes the queue lock, and no holder of the queue lock takes frz_lock. Every
+// store to lzr is made under lz_lock, from the list, the entries and the region an arm is protecting (lz_arm_r).
+// Fetches of different ranges run at once (the back end has a slot for each, vk_memory.c lazy_fetch).
+// NX2NAVI_WB_LAZY_UNLOCKED=0 brings back 0.10.1's locking: frz_lock is kept from the moment a fault or a release takes
+// a range out until its entry ends, a release takes one segment at a time, mem_thaw releases under the lock, and
+// vk_memory.c mirror_evict and hot_check release their victims under pool_lock, so one fetch runs at a time. The
+// entries stay with it: a touch of a range in flight waits for that entry and runs again, the hold is set at the
+// take-out, and mem_lazy_touches counts the range.
 #define LZ_FLY 64          // more than the threads that touch armed pages at once; when full, a touch waits for room
 #define LZ_BATCH 16        // segments a release takes out together and fetches in one call (1 with the setting at 0)
 typedef struct { uint64_t lo, hi, h0, bytes; uint32_t seq, tid; uint8_t used; } LzFly;   // bytes: to fetch, 0 none
@@ -814,8 +816,9 @@ void mem_lazy_window(int open) {
     plat_mutex_unlock(&lz_lock);
 }
 
-// An access fault at a: 1 when a was armed or in flight and its pages are read-write again (the access runs again), 0
-// when a is none of the lazy write-back's.
+// An access fault at a: 1 when a was armed or in flight and its pages are read-write again, or when its page allows the
+// access by now (another thread gave it back): the access runs again. 0 when a is none of the lazy write-back's and its
+// page does not allow the access (a write to a frozen page goes on to thaw_fault).
 static int lazy_fault(uint64_t a, int write) {
     if (a >= RT_ADDRESS_LIMIT || !__atomic_load_n(&lzr[a >> FRZ_SHIFT], __ATOMIC_ACQUIRE)) return 0;
     uint32_t me = plat_thread_id();
@@ -834,11 +837,23 @@ static int lazy_fault(uint64_t a, int write) {
         plat_mutex_lock(&lz_lock);   // the window's test and the segment's leaving the list in one step
         int i = 0;
         while (i < lz_n && !(a >= lzs[i].lo && a < lzs[i].hi)) i++;
-        if (i == lz_n) {   // in flight since the look above; else not ours, or given back (no arm runs under frz_lock)
-            plat_mutex_unlock(&frz_lock);
-            int joined = lazy_fly_join_locked(a);
+        if (i == lz_n) {
+            if (lazy_fly_find_locked(a, a + 1, 0) >= 0) {   // in flight since the look above: wait for it alone
+                plat_mutex_unlock(&frz_lock);
+                lazy_fly_join_locked(a);
+                plat_mutex_unlock(&lz_lock);
+                return 1;
+            }
+            // Not ours, or given back since the fault: the page's state decides, asked under frz_lock alone (no system
+            // call under lz_lock), so that no arm makes the page inaccessible between the answer and the retry. A write
+            // to a page a flight gave back runs again here instead of going on to thaw_fault, whose thaw would release
+            // every armed range of the region; and a read is not passed to the crash handler because an arm (after a
+            // release that sets no hold, mem_lazy_skip's give-back) made the page inaccessible again once this returned.
             plat_mutex_unlock(&lz_lock);
-            return joined;
+            uint64_t pg = a & ~(PAGE - 1), end;
+            int st = plat_mem_state(pg, pg + PAGE, &end);
+            plat_mutex_unlock(&frz_lock);
+            return write ? st == PLAT_PROT_RW : st >= PLAT_PROT_READ;
         }
         uint32_t w = __atomic_load_n(&lz_win_tid, __ATOMIC_ACQUIRE);
         if (w && w != me && tries < 400) {   // up to 20 ms: after the hand-over the fetch has that part's writes

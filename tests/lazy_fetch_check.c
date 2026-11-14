@@ -268,6 +268,30 @@ int main(int argc, char **argv) {
         CHECK(armed(s2, K64), "the region's other range was released");
         CHECK(lz_other == 0, "%llu other releases", (unsigned long long)lz_other);
         CHECK(b.took < 250 && b.got == 0x77, "the write waited %.1f ms and read back %#x", b.took, b.got);
+    } else if (!strcmp(what, "late_write")) {
+        // B writes a range whose flight starts and ends while B waits for frz_lock in lazy_fault (this thread holds the
+        // lock and runs a release's flight under it, as a thaw does): B finds the page given back and writes again, and
+        // the region's other range stays armed (B went on to thaw_fault before, whose thaw released it)
+        uint64_t R = heap + 128 * M, s1 = R, s2 = R + M;
+        CHECK(arm_buf(s1, K64, 1) == K64 && arm_buf(s2, K64, 1) == K64, "arms");
+        stale(s1, K64, 1), stale(s2, K64, 1);
+        fetch_ns = 20000000ull;
+        plat_mutex_lock(&frz_lock);
+        Touch b;
+        void *tb = touch(&b, s1 + 0x20, 1);
+        plat_wait_ns(50000000);   // B waits for frz_lock in lazy_fault, past its look for a range in flight
+        int k[LZ_BATCH];
+        LzSeg sg[LZ_BATCH];
+        uint64_t rg[1][3] = {{s1, s1 + K64, 0}};
+        plat_mutex_lock(&lz_lock);
+        int nt = lazy_take_batch_locked((const uint64_t (*)[3])rg, 1, k, sg);
+        plat_mutex_unlock(&lz_lock);
+        if (nt > 0) lazy_fly_run(k, sg, nt);
+        plat_mutex_unlock(&frz_lock);
+        plat_thread_join(tb);
+        CHECK(nt == 1 && b.got == 0x77, "%d taken out, the write read back %#x", nt, b.got);
+        CHECK(armed(s2, K64) && lz_other == 0, "the region's other range was released (%llu other releases)",
+              (unsigned long long)lz_other);
     } else if (!strcmp(what, "concurrent")) {
         // two threads touch two ranges at once: their fetches run at the same time
         uint64_t s1 = heap + 40 * M, s2 = heap + 48 * M;

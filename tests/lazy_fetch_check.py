@@ -27,6 +27,7 @@ SCENARIOS = {
     'no_stall': ('no_stall', {}),
     'join': ('join', {}),
     'loser': ('loser', {}),
+    'late_write': ('late_write', {}),
     'concurrent': ('concurrent', {}),
     'thaw': ('thaw', {}),
     'thaw_unlocked': ('thaw_unlocked', {}),
