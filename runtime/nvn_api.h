@@ -60,7 +60,10 @@ void nvn_guest_written(uint64_t addr, uint64_t size);      // the host or the ga
 // NX2NAVI_TRACE=perf: MemoryPoolFlushMappedRange [0] and BufferFlushMappedRange [1] calls [0] and bytes [1] by the pool's
 // CPU class (0 CPU_CACHED, 1 CPU_UNCACHED, 2 other) since the previous call.
 void nvn_flush_stats(uint64_t out[2][3][2]);
-void nvn_submit_prepare(const uint64_t *handles, int n);   // weak no-op; the command-buffer slice reads deferred binds
+// Synchronous replay: the command-buffer slice reads the deferred binds and writes the handles to replay to out (a
+// clone where another thread's submission of the recording is in flight); weak: a copy of handles.
+void nvn_submit_prepare(const uint64_t *handles, uint64_t *out, int n);
+void nvn_submit_done(const uint64_t *handles, const uint64_t *out, int n);   // after the replay of out; weak no-op
 // Asynchronous replay: as nvn_submit_prepare, writing the handles to replay to out (a clone where a still queued
 // submission uses the same recording with other deferred binds)
 void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n);

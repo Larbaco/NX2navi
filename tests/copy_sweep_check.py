@@ -42,7 +42,7 @@ static void plat_mutex_lock_shared(PlatMutex *m) { (void)m; }
 static void plat_mutex_unlock_shared(PlatMutex *m) { (void)m; }
 static int64_t plat_add64(volatile int64_t *p, int64_t v) { return __atomic_add_fetch(p, v, __ATOMIC_SEQ_CST); }
 static int cfg_int(const char *name) { (void)name; return 1; }
-typedef struct { uint64_t magic, bytes, made_at, used_at, deferred, pins, used_min; } copy_prefix;
+typedef struct { uint64_t magic, bytes, made_at, used_at, deferred, used_min; uint32_t pins, busy; } copy_prefix;
 static PlatMutex copy_lock = PLAT_MUTEX_INIT;
 #define COPY_IDLE_MINS 5
 #define NCOPY 6000

@@ -20,6 +20,7 @@
 #include "host.h"
 #include "nvn_api.h"
 #include "nvn_hmap.h"
+#include "nvn_submit_guard.h"
 #include "platform/platform.h"
 
 #define CMD_MAGIC MAGIC('C', 'M', 'D', 'B')
@@ -409,10 +410,13 @@ void nvn_pins_stats(uint64_t *live, uint64_t *freed) {
 // adding control memory again releases the copies recorded there without walking every live copy. 4 KiB pages cost
 // about 500 lookups per AddControlMemory under the exclusive lock (1.4.3 field: 53 calls a frame, 2 MiB ranges, 3.7
 // copies per page), and the recording threads waited on it.
-// deferred: 0 unknown, 1 none, 2 some; pins: texture pins its ops name, counted in their refs (pin_refs); used_min: the
-// minute of its last use (copy_age)
-typedef struct { uint64_t magic, bytes, made_at, used_at, deferred, pins, used_min; } copy_prefix;
+// deferred: 0 unknown, 1 none, 2 some; used_min: the minute of its last use (copy_age); pins: texture pins its ops name,
+// counted in their refs (pin_refs); busy: synchronous submissions of it between their prepare and the end of their
+// replay (nvn_submit_prepare, nvn_submit_done; atomic, see nvn_submit_guard.h).
+typedef struct { uint64_t magic, bytes, made_at, used_at, deferred, used_min; uint32_t pins, busy; } copy_prefix;
 _Static_assert(sizeof(copy_prefix) % 8 == 0, "records stay 8-byte aligned");
+// a session held over 200,000 copies (the note at COPY_AGE_MINS): busy shares the 8 bytes pins had
+_Static_assert(sizeof(copy_prefix) == 56, "copy_prefix keeps its size");
 typedef struct { uintptr_t lo, hi; uint8_t *copy; } cmd_copy;
 typedef struct { cmd_copy *v; uint32_t n, cap; } copy_bucket;
 static PlatMutex copy_lock = PLAT_MUTEX_INIT;    // guards the two maps, the counters and every prefix
@@ -444,7 +448,8 @@ static void copy_age(copy_prefix *pf, uint64_t min) {   // copy_lock held, share
     if (was != min) age_add(was, pf, -1), age_add(min, pf, 1);
 }
 // Asynchronous replay: copies released by the game, and per-submission clones, that a queued submission still reads.
-// Freed once gfx_replayed_submits() reaches their used_at. Empty with synchronous replay.
+// Freed once gfx_replayed_submits() reaches their used_at. Synchronous replay: copies the game released while another
+// of its threads' submission of them was still in flight (busy), freed at the next sweep after it ended.
 static copy_prefix **zombies;
 static uint32_t nzombies, cap_zombies;
 
@@ -481,7 +486,7 @@ static void doom_free(copy_prefix *list) {   // copy_lock not held
 
 static copy_prefix *zombie_sweep(uint64_t replayed, copy_prefix *doomed) {   // copy_lock held; returns the doom chain
     for (uint32_t i = 0; i < nzombies;) {
-        if (zombies[i]->used_at <= replayed) {
+        if (zombies[i]->used_at <= replayed && !__atomic_load_n(&zombies[i]->busy, __ATOMIC_ACQUIRE)) {
             doomed = doom(doomed, zombies[i]);
             zombies[i] = zombies[--nzombies];
         } else {
@@ -546,7 +551,9 @@ static uint8_t *flatten_recording(const uint8_t *p, size_t n) {
             break;
         }
     }
-    *(copy_prefix *)out = (copy_prefix){.magic = COPY_MAGIC, .bytes = n, .pins = pins_named};
+    if (pins_named > UINT32_MAX) rt_fatal("nvn: recording at %p names %llu texture pins", (const void *)p,
+                                          (unsigned long long)pins_named);
+    *(copy_prefix *)out = (copy_prefix){.magic = COPY_MAGIC, .bytes = n, .pins = (uint32_t)pins_named};
     return out + sizeof(copy_prefix);
 }
 
@@ -769,7 +776,8 @@ static void release_copies(uintptr_t lo, uintptr_t hi) {
             copy_bytes -= pf->bytes;
             age_add(pf->used_min, pf, -1);
             pf->magic = 0;
-            if (pf->used_at > replayed) zombie_add(pf);   // a queued submission still reads it
+            // a queued submission still reads it, or another thread's synchronous one is in flight
+            if (pf->used_at > replayed || __atomic_load_n(&pf->busy, __ATOMIC_ACQUIRE)) zombie_add(pf);
             else doomed = doom(doomed, pf);
             b->v[i] = b->v[--b->n];
         }
@@ -1417,50 +1425,74 @@ NVN_API(nvnCommandBufferSetPatchSize) { (void)c; }
 // ---------- submit
 // What the console reads at the submit call is read here, on the game thread: every handle must be a live recording,
 // and deferred binds take the handles the game's arrays hold now (the game fills its tables for the next frame as soon
-// as the submit returns). The result is written into the recording copy.
-static uint64_t def_reads, def_changed, n_clones;
+// as the submit returns). The result is written into the recording copy, or into a clone of it (nvn_submit_guard.h).
+static uint64_t def_reads, def_changed, n_clones, n_sync_clones;
 
-static int resolve_deferred(const uint8_t *p, int depth) {   // returns the number of deferred binds
-    int nd = 0;
-    for (;;) {
-        op_hdr h;
-        memcpy(&h, p, sizeof h);
-        if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_)
-            rt_fatal("nvn: corrupt recording at %p while resolving deferred binds (op %u size %u)", (const void *)p,
-                     h.op, h.size);
-        if (h.op == OP_END) return nd;
-        if (h.op == OP_JUMP) {
-            memcpy(&p, p + 8, 8);
-            continue;
-        }
-        if (h.op == OP_CALL) {
-            uint64_t t;
-            memcpy(&t, p + 8, 8);
-            if (depth >= 16) rt_fatal("nvn: deferred bind resolution: call depth over 16");
-            nd += resolve_deferred((const uint8_t *)(uintptr_t)t, depth + 1);
-        } else if (h.op == OP_BIND_TEX || h.op == OP_BIND_IMG || h.op == OP_BIND_SAMP) {
-            p_bind_handles *b = (p_bind_handles *)(uintptr_t)(p + 8);
-            if (b->src && b->n > 0 && b->n <= 32) {
-                nd++;
-                uint64_t cur[32];
-                memcpy(cur, (const void *)(uintptr_t)b->src, 8 * (size_t)b->n);
-                __atomic_fetch_add(&def_reads, 1, __ATOMIC_RELAXED);
-                if (memcmp(cur, b->h, 8 * (size_t)b->n)) {
-                    if (__atomic_fetch_add(&def_changed, 1, __ATOMIC_RELAXED) < 6)
-                        NVN_LOG("deferred bind read new handles at submit: stage %d slot %d, %#llx at record -> %#llx",
-                                b->stage, b->first, (unsigned long long)b->h[0], (unsigned long long)cur[0]);
-                    memcpy(b->h, cur, 8 * (size_t)b->n);
-                }
-            }
-        }
-        p += h.size;
-    }
+static void note_first_changes(const p_bind_handles *b, const uint64_t *now, uint64_t nth) {
+    if (nth < 6)
+        NVN_LOG("deferred bind read new handles at submit: stage %d slot %d, %#llx at record -> %#llx", b->stage,
+                b->first, (unsigned long long)b->h[0], (unsigned long long)now[0]);
 }
 
-void nvn_submit_prepare(const uint64_t *handles, int n) {
-    uint64_t now = __atomic_add_fetch(&nsubmits, 1, __ATOMIC_RELAXED);
-    for (int i = 0; i < n; i++) copy_touch(handles[i], now, "QueueSubmitCommands");
-    for (int i = 0; i < n; i++) resolve_deferred((const uint8_t *)(uintptr_t)handles[i], 0);
+static int resolve_deferred(const uint8_t *p) {   // returns the number of deferred binds
+    const uint8_t *bad = NULL;
+    int nd = nvn_resolve_binds(p, 0, &def_reads, &def_changed, note_first_changes, &bad);
+    if (nd >= 0) return nd;
+    op_hdr h;
+    memcpy(&h, bad, sizeof h);
+    if (h.op == OP_CALL && h.size >= 8 && !(h.size & 7)) rt_fatal("nvn: deferred bind resolution: call depth over 16");
+    rt_fatal("nvn: corrupt recording at %p while resolving deferred binds (op %u size %u)", (const void *)bad, h.op,
+             h.size);
+}
+
+// Synchronous replay. Each copy counts the submissions between this prepare and their nvn_submit_done (busy): the first
+// in flight resolves the copy in place; one another thread makes while that is replayed resolves a clone of its own
+// (nvn_submit_guard.h), unless the copy is known to hold no deferred binds. out: the handles to replay.
+void nvn_submit_prepare(const uint64_t *handles, uint64_t *out, int n) {
+    uint64_t now = __atomic_add_fetch(&nsubmits, 1, __ATOMIC_RELAXED), min = copy_minute(), k = 0, cloned = 0;
+    plat_mutex_lock_shared(&copy_lock);   // keeps every copy found here alive while it is cloned
+    for (int i = 0; i < n; i++) {
+        copy_prefix *pf = copy_find(handles[i]);
+        if (!pf) {
+            plat_mutex_unlock_shared(&copy_lock);
+            rt_fatal("nvn: QueueSubmitCommands: command handle %#llx is not a live recording (released or never recorded)",
+                     (unsigned long long)handles[i]);
+        }
+        __atomic_store_n(&pf->used_at, now, __ATOMIC_RELAXED);
+        copy_age(pf, min);
+        out[i] = handles[i];
+        if (nvn_copy_enter(&pf->busy) || __atomic_load_n(&pf->deferred, __ATOMIC_RELAXED) == 1) continue;
+        size_t sz = sizeof *pf + pf->bytes;
+        copy_prefix *cl = malloc(sz);
+        if (!cl) {
+            plat_mutex_unlock_shared(&copy_lock);
+            rt_fatal("nvn: out of memory (recording clone, %zu bytes)", sz);
+        }
+        memcpy(cl, pf, sz);
+        cl->magic = 0, cl->busy = 0;   // not a live handle: the game never sees it
+        if (cl->pins) pin_refs((const uint8_t *)(cl + 1), 1);
+        nvn_copy_leave(&pf->busy);
+        out[i] = (uintptr_t)(cl + 1);
+        cloned = handles[i], k = __atomic_add_fetch(&n_sync_clones, 1, __ATOMIC_RELAXED);
+    }
+    plat_mutex_unlock_shared(&copy_lock);
+    for (int i = 0; i < n; i++) {
+        int nd = resolve_deferred((const uint8_t *)(uintptr_t)out[i]);
+        if (out[i] == handles[i])
+            __atomic_store_n(&((copy_prefix *)(uintptr_t)out[i] - 1)->deferred, (uint64_t)(nd ? 2 : 1), __ATOMIC_RELAXED);
+    }
+    if (k && (k <= 4 || !(k & (k - 1))))
+        rt_log("nvn: thread %u submits the recording %#llx while another thread's submission of it is replayed: its "
+               "deferred binds go into a copy of its own (%llu so far)", plat_thread_id(), (unsigned long long)cloned,
+               (unsigned long long)k);
+}
+
+// After the replay of what nvn_submit_prepare handed out: clones are freed, copies resolved in place leave.
+void nvn_submit_done(const uint64_t *handles, const uint64_t *out, int n) {
+    for (int i = 0; i < n; i++) {
+        if (out[i] != handles[i]) copy_free((copy_prefix *)(uintptr_t)out[i] - 1);
+        else nvn_copy_leave(&((copy_prefix *)(uintptr_t)handles[i] - 1)->busy);
+    }
 }
 
 // Asynchronous replay. A copy a queued submission still reads keeps that submission's deferred binds: when it holds
@@ -1498,7 +1530,7 @@ void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
     plat_mutex_unlock(&copy_lock);
     doom_free(doomed);
     for (int i = 0; i < n; i++) {
-        int nd = resolve_deferred((const uint8_t *)(uintptr_t)out[i], 0);
+        int nd = resolve_deferred((const uint8_t *)(uintptr_t)out[i]);
         if (out[i] == handles[i]) ((copy_prefix *)(uintptr_t)out[i] - 1)->deferred = nd ? 2 : 1;
     }
     if (now % 7200 == 0)
