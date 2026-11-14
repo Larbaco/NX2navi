@@ -3776,9 +3776,9 @@ static void snap_free(void *arg) {   // completion thread: the submission is don
 // from the prologue of a part split off earlier) it writes back, as ever, what it skipped and finds no longer armed;
 // the snapshot for that merge is taken in the part's own prologue, before its GPU work. From that check to the part's
 // hand-over (vk_mem_lazy_handed) memory.c's window keeps a fault from releasing a range unseen.
-// Fetches run on several threads at once (memory.c "Ranges in flight": no memory.c lock is held around one), each in a
-// slot of its own: a command pool (used by one thread at a time), its command buffer and a fence. LZ_SLOTS is more than
-// the threads that touch armed pages together; a fetch that finds every slot busy waits 20 us at a time.
+// Fetches run on several threads at once (memory.c "Ranges in flight": mostly no memory.c lock is held around one, see
+// lazy_fetch), each in a slot of its own: a command pool (used by one thread at a time), its command buffer and a fence.
+// Fetches past LZ_SLOTS at once wait 20 us at a time for a slot (lz_slot_waits counts them).
 #define LZ_SLOTS 4
 static struct { VkCommandPool pool; VkCommandBuffer cb; VkFence fence; } lz_slot[LZ_SLOTS];
 static volatile uint32_t lz_slot_free;   // bit i: slot i is free
@@ -3808,9 +3808,10 @@ static int lz_slot_take(void) {
     }
 }
 
-// memory.c's fetch, with no memory.c lock held (frz_lock in a mapping change's thaw or with
-// NX2NAVI_WB_LAZY_UNLOCKED=0): each copy cp[i], [off, off + size) of the mirror h0 into the imported buffer h1, after
-// all the GPU work handed over so far, in one submission with one wait.
+// memory.c's fetch, with no memory.c lock held (frz_lock in a thaw under the lock: a mapping change, the lazy heap's
+// commit or a write fault lazy_fault did not take; and with NX2NAVI_WB_LAZY_UNLOCKED=0): each copy cp[i],
+// [off, off + size) of the mirror h0 into the imported buffer h1, after all the GPU work handed over so far, in one
+// submission with one wait.
 static void lazy_fetch(const MemLazyCopy *cp, int n) {
     if (vk_device_is_lost() || n <= 0) return;   // the run is ending (vk_device.c vk_device_lost_check): bytes stay
     VkCtx *c = vk_ctx();

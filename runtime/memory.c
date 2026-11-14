@@ -72,8 +72,9 @@ static int reserve_at(uint64_t at, uint64_t size, int watch) { return plat_mem_r
 // read still in flight writes its buffer later. Nothing writes guest memory under frz_lock. It is not a leaf: lz_lock
 // and vm_lock come inside it, a strict thaw's page calls run under it (thaw_pages_vm), and a holder may wait for a
 // range of the lazy write-back in flight, whose fetch (vk_memory.c lazy_fetch) takes the queue lock and waits for the
-// GPU ("Ranges in flight"; in a mapping change's thaw, and with NX2NAVI_WB_LAZY_UNLOCKED=0, the fetch itself runs
-// under frz_lock). So no holder of the queue lock may touch guest memory or take frz_lock.
+// GPU ("Ranges in flight"; in a thaw under the lock: a mapping change, the lazy heap's commit or a write fault
+// lazy_fault did not take; and with NX2NAVI_WB_LAZY_UNLOCKED=0 the fetch itself runs under frz_lock). So no holder of
+// the queue lock may touch guest memory or take frz_lock.
 #define FRZ_SHIFT 21
 #define FRZ_SIZE (1ull << FRZ_SHIFT)
 #define FRZ_HOLD_MS 5000u
@@ -348,9 +349,10 @@ static int lazy_fly_start_locked(LzSeg s) {
     return k;
 }
 
-// No lock held (frz_lock in a mapping change's thaw, in mem_lazy_skip's give-back and with NX2NAVI_WB_LAZY_UNLOCKED=0):
-// the n segments s[] in flight in the entries k[] get the mirror's bytes, the stale ones in one call of lz_fetch, then
-// their pages' access, and leave flight. n is at most LZ_BATCH.
+// No lock held (frz_lock in a thaw under the lock: a mapping change, the lazy heap's commit or a write fault lazy_fault
+// did not take; in mem_lazy_skip's give-back, which fetches nothing; and with NX2NAVI_WB_LAZY_UNLOCKED=0): the n
+// segments s[] in flight in the entries k[] get the mirror's bytes, the stale ones in one call of lz_fetch, then their
+// pages' access, and leave flight. n is at most LZ_BATCH.
 static void lazy_fly_run(const int *k, const LzSeg *s, int n) {
     MemLazyCopy cp[LZ_BATCH];
     int nc = 0;
@@ -480,10 +482,11 @@ static int lazy_take_batch_locked(const uint64_t (*rg)[3], int nr, int *k, LzSeg
     return n;
 }
 
-// frz_lock held exclusively (a thaw: a mapping change, a commit of the lazy heap, a write fault in a frozen region):
-// every segment that reaches into region r goes, its fetch under frz_lock, since the caller's page calls follow under
-// it; then the ranges other threads have in flight there end first. Not a fault on an armed page: no hold. mem_thaw
-// releases its regions before it takes the lock (lazy_release_regions), so what is left here is rare.
+// frz_lock held exclusively (a thaw under the lock: a mapping change, a commit of the lazy heap, a write fault
+// lazy_fault did not take): every segment that reaches into region r goes, its fetch under frz_lock, since the
+// caller's page calls follow under it; then the ranges other threads have in flight there end first. Not a fault on an
+// armed page: no hold. mem_thaw releases its regions before it takes the lock (lazy_release_regions), so what is left
+// here is rare.
 static void lazy_drop_region_locked(uint64_t r) {
     uint64_t rg[1][3] = {{r << FRZ_SHIFT, (r + 1) << FRZ_SHIFT, 0}};
     for (;;) {
