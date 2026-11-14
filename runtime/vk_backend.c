@@ -322,6 +322,8 @@ void vk_present_frames_owed(void) {
     if (fo_waiting(&FO)) __atomic_add_fetch(&fo_late_n, fo_run(&FO, fo_end, NULL), __ATOMIC_RELAXED);
 }
 
+static void order_log(uint64_t frame, int total);   // after the held present's state (PH)
+
 // The present after the frame count: resolves the image and hands the blit to the present thread. queued: when the game
 // presented; value: the timeline value queued for this present (asynchronous replay), 0 for the next one (synchronous).
 static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uint64_t queued, uint64_t frame,
@@ -335,6 +337,7 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
     } else {
         frame_end(frame, t);
     }
+    if ((rt_trace & RT_TRACE_PERF) && frame % 600 == 0 && !gfx_replay_async()) order_log(frame, 0);
     vk_sampler_aniso_live();   // NX2NAVI_ANISO changed in the menu: the surface textures' samplers take the new level
     vk_mem_census(frame);
     if (vk_dump_armed) vk_dump_present(frame);
@@ -557,6 +560,7 @@ static void ph_lock_waited(uint64_t t0) { perf_end(PERF_DRAIN, t0); }   // perf_
 static PhState PH = {.lock = PLAT_MUTEX_INIT, .on_wait = ph_lock_waited};
 static uint64_t ph_ran;      // held work run at a present (held_resume), on any thread: atomic
 static uint64_t ph_logged;   // PH.lock: "went out" lines so far
+static uint64_t ph_other;    // held presents another thread's submission put out (written under PH.lock, atomic)
 
 static int present_held_on(void) {
     static int on = -1;
@@ -581,6 +585,8 @@ static int held_resume(void) {
 // that did not wait (PH_NONE) goes to present_image.
 static void ph_out(const PhJob *j, int why, void *arg) {
     (void)arg;
+    if ((why == PH_AFTER || why == PH_CAPPED) && plat_thread_id() != j->tid)
+        __atomic_add_fetch(&ph_other, 1, __ATOMIC_RELAXED);
     if (why != PH_NONE && ph_logged < 16)
         ph_logged++, rt_log("vk: the present of frame %llu went out %llu submission(s) after the game's present call, %d "
                             "held submissions left (%s)", (unsigned long long)j->frame,
@@ -781,12 +787,38 @@ static void replay_log(uint64_t frame, int total) {
            k ? buf : " no waits");
 }
 
+// What the game's threads met of each other at the present (synchronous replay): presents whose frame bookkeeping
+// went to the next submission because another thread held the submission lock, frames a submission caught up, held
+// presents another thread's submission put out (ph_out), and the presenting thread's waits for PH.lock while one went
+// out (vk_present_held.h ph_lock). total: the run, at exit (gfx_exit_log); else NX2NAVI_TRACE=perf every 600 presents
+// (present_image), the window since the last line, logged only when a count moved.
+static void order_log(uint64_t frame, int total) {
+    static uint64_t last[5], last_frame;   // present_image's (one at a time): the counts at the last line
+    uint64_t v[5] = {__atomic_load_n(&fo_owed_n, __ATOMIC_RELAXED), __atomic_load_n(&fo_late_n, __ATOMIC_RELAXED),
+                     __atomic_load_n(&ph_other, __ATOMIC_RELAXED), __atomic_load_n(&PH.lock_waits, __ATOMIC_RELAXED),
+                     __atomic_load_n(&PH.lock_wait_ns, __ATOMIC_RELAXED)};
+    uint64_t d[5], presents = total ? frame : frame - last_frame;
+    for (int i = 0; i < 5; i++) d[i] = total ? v[i] : v[i] - last[i];
+    if (!total) {
+        if (!d[0] && !d[1] && !d[2] && !d[3]) return;
+        memcpy(last, v, sizeof last), last_frame = frame;
+    }
+    rt_log("%s frame %llu: frame bookkeeping: %llu of %llu presents left it to the next submission (another thread held "
+           "the submission lock), %llu frames caught up by a submission; held presents put out by another thread's "
+           "submission %llu, the presenting thread waited for one %llu times, %.1f ms in all, longest %.1f ms so far",
+           total ? "vk: over the run to" : "perf: since the last such line, at", (unsigned long long)frame,
+           (unsigned long long)d[0], (unsigned long long)presents, (unsigned long long)d[1], (unsigned long long)d[2],
+           (unsigned long long)d[3], d[4] / 1e6, __atomic_load_n(&PH.lock_wait_max, __ATOMIC_RELAXED) / 1e6);
+}
+
 // The run total, once: the game exits through prof_write (boot.c _exit, the window close), probes through
 // vk_backend_shutdown.
 void gfx_exit_log(void) {
-    static int32_t done;
+    static int32_t done, order_done;
     rec_check_log();
     if (gfx_replay_async() && r_started && !plat_xchg32(&done, 1)) replay_log(game_frames, 1);
+    if (!gfx_replay_async() && !plat_xchg32(&order_done, 1))
+        order_log(__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), 1);
 }
 
 static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
@@ -803,7 +835,8 @@ static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
         perf_present(frame);   // before vk_exec_frame_log, which resets the frame's exec counts the flight recorder reads
         uint64_t queued = kern_now_ns();
         if (present_held_on()) {   // present_held
-            PhJob j = {.t = t, .has_crop = crop != NULL, .at_ns = at_ns, .queued = queued, .frame = frame};
+            PhJob j = {.t = t, .has_crop = crop != NULL, .at_ns = at_ns, .queued = queued, .frame = frame,
+                       .tid = plat_thread_id()};
             if (crop) memcpy(j.crop, crop, sizeof j.crop);
             vk_present_drain();    // the present thread's empty submission may run held work: done before it is read
             if (ph_armed(&PH)) held_resume(), ph_flush_next(&PH, ph_out, NULL);   // the last present still waits: out now

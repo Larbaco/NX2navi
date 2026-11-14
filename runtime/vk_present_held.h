@@ -19,6 +19,7 @@ typedef struct {
     const void *t;                          // the game's texture (tex_t)
     int crop[4], has_crop;
     uint64_t at_ns, queued, frame, since;   // since: the replay's submission count when it began to wait
+    uint32_t tid;                           // the thread that presented it (for the counts of who put it out)
 } PhJob;
 
 enum { PH_AFTER, PH_CAPPED, PH_NEXT, PH_WHY_N };   // why a held present went out: work replayed, PH_MAX, next present
