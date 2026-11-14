@@ -342,6 +342,72 @@ static void frame_count(void) {
     CHECK(o.why == RTSS_WHY_NEWER && !o.holds && o.act == RTSS_DO_NOTHING && r.s.over == 1, "a newer want: no count");
 }
 
+// RTSS lists the game with the limit in its profile and pictures go out, but never shows its hold: it may hold the
+// frames beside the game's limiter, so after RTSS_UNPROVEN_POLLS such polls in a row the profile goes back once, for
+// the run. Each sign that never comes counts; a minimised window, RTSS not hooked and no limit do not count, and a poll
+// that shows the hold starts the count again.
+static void unproven(void) {
+    static const struct { uint32_t flags; int period; const char *what, *why; } stuck[] = {
+        {RTSS_API_VULKAN | RTSS_UPDATE_ASKED, 1, "the profile never read",
+         "RivaTuner Statistics Server has not read the game's limit from its profile yet"},
+        {0, 1, "no API seen", "RivaTuner Statistics Server lists the game but has not seen its Vulkan presents yet"},
+        {0x7, 1, "another API's presents",
+         "RivaTuner Statistics Server lists the game but has not seen its Vulkan presents yet"},
+        {RTSS_API_VULKAN, 0, "no period measured", "RivaTuner Statistics Server has measured no frames of the game lately"},
+    };
+    Run r;
+    RtssOut o;
+    for (unsigned k = 0; k < sizeof stuck / sizeof *stuck; k++) {
+        run_init(&r);
+        r.flags = stuck[k].flags;
+        if (!stuck[k].period) r.counting = 0, r.t0 = r.t1 = 0;
+        step(&r, 60000);
+        o = step(&r, 60000);
+        CHECK(o.act == RTSS_DO_APPLY, "%s: written", stuck[k].what);
+        int polls = 0;
+        for (; polls < RTSS_UNPROVEN_POLLS - 1; polls++) o = step(&r, 60000);
+        CHECK(!r.s.fail && !o.holds && !r.st.put_backs, "%s: %d polls, not yet", stuck[k].what, polls);
+        WHY(o, r, stuck[k].why);
+        o = step(&r, 60000);
+        CHECK(o.act == RTSS_DO_PUT_BACK && o.why == RTSS_WHY_FAILED && r.s.fail == RTSS_FAIL_UNPROVEN &&
+                  r.st.put_backs == 1 && r.st.last_put_back_why == RTSS_WHY_FAILED && !r.s.changed,
+              "%s: put back at poll %d", stuck[k].what, RTSS_UNPROVEN_POLLS);
+        for (int i = 0; i < 10; i++) o = step(&r, i < 5 ? 60000 : 144000);
+        CHECK(r.st.put_backs == 1 && r.st.applies == 1 && o.why == RTSS_WHY_FAILED && !o.holds,
+              "%s: once, out for the run", stuck[k].what);
+        WHY(o, r, "RivaTuner Statistics Server never showed it holds the game");
+        CHECK(rtss_out_of_limit(60000, r.s.fail), "%s: a setting of RTSS's own may still hold the game", stuck[k].what);
+    }
+    // a minimised window, RTSS not hooked, or no limit: nothing to count
+    run_init(&r);
+    r.flags = RTSS_API_VULKAN | RTSS_UPDATE_ASKED;
+    step(&r, 60000);
+    step(&r, 60000);
+    r.presenting = 0;
+    for (int i = 0; i < 3 * RTSS_UNPROVEN_POLLS; i++) o = step(&r, 60000);
+    CHECK(!r.s.fail && !r.st.put_backs && r.s.unproven == 0, "minimised: not counted");
+    r.presenting = 1, r.listed = 0;
+    for (int i = 0; i < 3 * RTSS_UNPROVEN_POLLS; i++) o = step(&r, 60000);
+    CHECK(!r.s.fail && !r.st.put_backs && o.why == RTSS_WHY_NOT_LISTED, "not hooked: not counted");
+    r.listed = 1;
+    for (int i = 0; i < 3 * RTSS_UNPROVEN_POLLS; i++) o = step(&r, 0);
+    CHECK(!r.s.fail && !r.st.put_backs && r.st.applies == 2, "no limit: not counted");
+    // one poll that shows the hold starts the count again
+    run_init(&r);
+    r.flags = RTSS_API_VULKAN | RTSS_UPDATE_ASKED;
+    step(&r, 60000);
+    step(&r, 60000);
+    for (int i = 0; i < RTSS_UNPROVEN_POLLS - 1; i++) step(&r, 60000);
+    r.flags = RTSS_API_VULKAN;
+    o = step(&r, 60000);
+    CHECK(o.holds && r.s.unproven == 0, "shown once: the count starts again");
+    r.flags = RTSS_API_VULKAN | RTSS_UPDATE_ASKED;
+    for (int i = 0; i < RTSS_UNPROVEN_POLLS - 1; i++) o = step(&r, 60000);
+    CHECK(!r.s.fail && o.why == RTSS_WHY_UPDATE, "%d polls again: not yet", RTSS_UNPROVEN_POLLS - 1);
+    o = step(&r, 60000);
+    CHECK(o.act == RTSS_DO_PUT_BACK && r.s.fail == RTSS_FAIL_UNPROVEN, "the full count again: put back");
+}
+
 // No picture went out for 200 ms (a minimised window, a frame hold) or none yet: RTSS has nothing to hold, and the
 // game's limiter takes the limit back until pictures go out again. Before the first picture nothing is written.
 static void idle(void) {
@@ -613,6 +679,7 @@ int main(void) {
     readonly();
     refused();
     frame_count();
+    unproven();
     idle();
     kept_out();
     churn();

@@ -795,6 +795,28 @@ static void api_run(void) {
     CHECK(rtss_limit_active() && saves == 1, "RTSS limits, no second write");
 }
 
+// RTSS lists the game with the limit and pictures go out, but it never reads the profile again (its update flag stays
+// set): after 30 s the profile goes back, the menu says RTSS does not limit the game, and the game's limiter holds for
+// the run.
+static void unproven_run(void) {
+    app_set(1, 0xA | 0x10000000u, 1000, 2000, 60);
+    ask(60000);
+    poll();
+    CHECK(own.exists && own.limit == 60, "written");
+    for (int i = 0; i < RTSS_UNPROVEN_POLLS - 1; i++) poll();
+    show("29.5 s with the update flag set");
+    CHECK(own.exists && rtss_limit_state() == 0 && !rtss_limit_active(), "not yet");
+    poll();
+    show("30 s");
+    CHECK(!own.exists && rtss_limit_state() == 3 && !rtss_limit_active(), "put back; the menu's note");
+    CHECK(logged("RivaTuner Statistics Server listed the game with its limit at 60.000 fps for 30 s and never showed "
+                 "it holds it; the game's own limiter for the rest of the run"),
+          "logged");
+    CHECK(logged("the game's own limiter (RivaTuner Statistics Server never showed it holds the game)"), "the reason");
+    settle(144000);
+    CHECK(saves == 1 && !own.exists && rtss_limit_state() == 3, "out for the run");
+}
+
 // No picture goes out (a minimised window): RTSS has nothing to hold, and the game's limiter holds until pictures go
 // out again; the profile stays as it is.
 static void idle_run(void) {
@@ -1113,6 +1135,7 @@ static const struct { const char *name; void (*run)(void); } scenarios[] = {
     {"over_slack_run", over_slack_run},
     {"over_unlimited_run", over_unlimited_run},
     {"api_run", api_run},
+    {"unproven_run", unproven_run},
     {"idle_run", idle_run},
     {"quit_run", quit_run},
     {"library_run", library_run},

@@ -488,8 +488,9 @@ memory against a fake `RTSSSharedMemoryV2` (a bad header, short entries, an entr
 find nothing; the flags and the period where RTSS keeps them) and the worker's decisions poll by poll against a fake
 profile and a fake RTSS clock: RTSS's injection delay through listed with no API, the profile not read yet and no
 period measured, RTSS quitting and coming back, a read-only profile, a refused limit, the frame count rule (1.05 times
-the limit over three new periods, a frozen period never counted), no picture going out, kept-out wants and their
-reasons, a want that must stay two polls and low latency switching at every poll, a movie at 144 and at 40, a closed
+the limit over three new periods, a frozen period never counted), an RTSS that lists the game and never shows its
+hold (given up after 30 s, a minimised window not counted), no picture going out, kept-out wants and their
+reasons, a want that must stay two polls and low latency switching at every poll, a movie at 144, 60 and 40, a closed
 run, a hooks library that does not load, and two limiters. It also checks the pacer's period beside RTSS
 (`rtss_pace_period`), the limit's rounding without a denominator, and the state file `rtss-profile.txt`: its lines,
 its rewrite and what a start does with a line a run that did not close left. Statically, a crash and a fatal error

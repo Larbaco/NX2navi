@@ -29,8 +29,9 @@
 # (rtss-profile.txt next to the game keeps what it held). Changing that profile needs the game run as administrator
 # (RTSS keeps its profiles under Program Files). Without it the game limits by itself, as it does with frame generation
 # on (RTSS would count the generated frames), while the window is minimised, and for the rest of the run when RTSS's
-# own frame counter shows the game past the limit (RTSS then hooks the game without holding it back); the game paces
-# movies itself. With low latency on, the driver holds the limit. rtss = 0 always leaves it to the game. With rtss = 0,
+# own frame counter shows the game past the limit (RTSS then hooks the game without holding it back) or RTSS is not
+# seen holding the game within 30 s; the game paces movies itself. With low latency on, the driver holds the limit.
+# rtss = 0 always leaves it to the game. With rtss = 0,
 # frame generation or low latency, a limit set in RTSS itself (its global profile or the game's, a frame time limit or
 # scanline sync) limits the game a second time: the log and the settings menu say so, and setting it to 0 in RTSS
 # leaves one limiter.

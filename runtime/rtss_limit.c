@@ -20,7 +20,9 @@
 // has read the profile the game wrote, it measured a period of the game's frames lately, no movie plays and pictures
 // go out. Until then, and again whenever one of these ends (RTSS quits, the window is minimised), the game's own limiter
 // paces the frames. While RTSS limits, each new period RTSS measures for the game is checked against the limit: above
-// 1.05 times it for three periods in a row, and the game takes the limiting back for the rest of the run.
+// 1.05 times it for three periods in a row, and the game takes the limiting back for the rest of the run. So it does
+// when RTSS lists the game with the limit for 30 s while pictures go out and never shows its hold: RTSS may then hold
+// the frames beside the game's limiter.
 //
 // The calls run on a thread of their own, every half second, which also looks RTSS up (find_rtss), so a present never
 // waits on the registry or profile files. On every orderly exit (rtss_limit_restore) the profile gets back what it held
@@ -348,9 +350,13 @@ static int left_start(int64_t w, int hooks) {
 
 static void put_back_op(void *ctx, const RtssOut *o) {   // rtss_poll's RtssOps.put_back
     (void)ctx;
-    if (o->why == RTSS_WHY_FAILED)   // the frame count check gave up on RTSS
+    if (o->why == RTSS_WHY_FAILED && S.fail == RTSS_FAIL_NOT_LIMITING)   // the frame count check gave up on RTSS
         rt_log("frame rate: RivaTuner Statistics Server measures %.1f fps with its limit at %.3f fps", o->fps,
                o->mhz / 1000.0);
+    else if (o->why == RTSS_WHY_FAILED)   // the lines before say which sign of its hold never came
+        rt_log("frame rate: RivaTuner Statistics Server listed the game with its limit at %.3f fps for %d s and never "
+               "showed it holds it; the game's own limiter for the rest of the run", o->mhz / 1000.0,
+               RTSS_UNPROVEN_POLLS * POLL_MS / 1000);
     put_back();
 }
 
@@ -557,7 +563,8 @@ int rtss_limit_state(void) {
     if (atomic_load_explicit(&closed, memory_order_relaxed)) return 0;
     int f = atomic_load_explicit(&failed, memory_order_relaxed);
     int64_t w = atomic_load(&want);
-    if (w >= 0 && (f == RTSS_FAIL_READONLY || f == RTSS_FAIL_NOT_LIMITING)) return f == RTSS_FAIL_READONLY ? 2 : 3;
+    if (w >= 0 && (f == RTSS_FAIL_READONLY || f == RTSS_FAIL_NOT_LIMITING || f == RTSS_FAIL_UNPROVEN))
+        return f == RTSS_FAIL_READONLY ? 2 : 3;
     if (w < 0 && w != RTSS_UNSET && atomic_load_explicit(&two, memory_order_relaxed)) return 4;
     return rtss_limit_active() && w > 0;
 }
