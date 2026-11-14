@@ -719,37 +719,44 @@ void audio_mixer_close(AudioRenderer *r) {
 // lock held) it stores the records: a record that names a splitter or destination the renderer does not have is left
 // out, a destination id in a splitter's list that the renderer does not have is stored as -1, which both splitter loops
 // of audio_mixer_render skip, and a destination filter with a coefficient that is not a finite number is off (audio_bad
-// each). A framing fault while applying (the game's input changed between the two walks) stops the walk there.
-// Offsets are 64-bit, so a huge id count cannot wrap a bounds test.
+// each). Offsets are 64-bit, so a huge id count cannot wrap a bounds test.
+// A framing fault (SPL_FAULT): with `apply` 0 the update is refused (AUDIO_REFUSE). With `apply` 1 it can only come
+// from the game rewriting its input during its own RequestUpdate, between the two walks; the update is taken by then,
+// so the walk stops there, the records before it stay applied, the mix section is applied after it, and the log says
+// the rest of the splitter section is left out (audio_mixer_update_routing ignores the result).
+#define SPL_FAULT(kind, fmt, ...)                                                                                      \
+    (apply ? (audio_bad(r, (kind), fmt "; the rest of the splitter section is left out", ##__VA_ARGS__),             \
+              AUDREN_R_INVALID_UPDATE)                                                                                 \
+           : AUDIO_REFUSE(r, (kind), fmt, ##__VA_ARGS__))
 static uint32_t splitters_walk(AudioRenderer *r, uint32_t revision, const uint8_t *p, uint32_t n, int apply) {
     Mixer *m = r->mixer;
     const uint32_t nsplit = (uint32_t)r->param.splitter_count, ndest = (uint32_t)r->param.splitter_destination_count;
     if (!n) return 0;
     if (n < 0x20)
-        return AUDIO_REFUSE(r, AB_SPL_HEADER, "the splitter section is %u bytes, under its 32-byte header", n);
+        return SPL_FAULT(AB_SPL_HEADER, "the splitter section is %u bytes, under its 32-byte header", n);
     uint32_t hdr[3];
     memcpy(hdr, p, 12);
-    if (hdr[0] != SNDH) return AUDIO_REFUSE(r, AB_SPL_MAGIC, "the splitter section starts with %08x, not SNDH", hdr[0]);
+    if (hdr[0] != SNDH) return SPL_FAULT(AB_SPL_MAGIC, "the splitter section starts with %08x, not SNDH", hdr[0]);
     const uint32_t ni = hdr[1], nd = hdr[2];
     const unsigned rev = (revision >> 24) - '0', stride = rev >= 15 ? 0xa8 : rev >= 12 ? 0x90 : 0x70;
     uint64_t at = 0x20;
     for (uint32_t i = 0; i < ni; i++) {
         uint32_t h[4];
         if (at + 16 > n)
-            return AUDIO_REFUSE(r, AB_SPL_INFO_OVERRUN,
-                                "splitter info %u of %u at %#llx overruns the %u-byte splitter section", i, ni,
-                                (unsigned long long)at, n);
+            return SPL_FAULT(AB_SPL_INFO_OVERRUN,
+                             "splitter info %u of %u at %#llx overruns the %u-byte splitter section", i, ni,
+                             (unsigned long long)at, n);
         memcpy(h, p + at, 16);
         at += 16;
         if (h[0] != SNDI || at + 4ull * h[3] > n)
-            return AUDIO_REFUSE(r, AB_SPL_INFO,
-                                "splitter info %u at %#llx: %08x %08x %08x %08x (section %u bytes, infos %u, "
-                                "destinations %u)",
-                                i, (unsigned long long)(at - 16), h[0], h[1], h[2], h[3], n, ni, nd);
+            return SPL_FAULT(AB_SPL_INFO,
+                             "splitter info %u at %#llx: %08x %08x %08x %08x (section %u bytes, infos %u, "
+                             "destinations %u)",
+                             i, (unsigned long long)(at - 16), h[0], h[1], h[2], h[3], n, ni, nd);
         if (at + 4ull * h[3] + 12 > n)
-            return AUDIO_REFUSE(r, AB_SPL_PADDING,
-                                "the reserved bytes after splitter info %u's %u ids overrun the %u-byte splitter "
-                                "section", i, h[3], n);
+            return SPL_FAULT(AB_SPL_PADDING,
+                             "the reserved bytes after splitter info %u's %u ids overrun the %u-byte splitter "
+                             "section", i, h[3], n);
         if (apply && (h[1] >= nsplit || h[3] > ndest)) {
             audio_bad(r, AB_SPL_ID,
                       "splitter info %u names splitter %u of %u with %u destinations of %u: that record is left out",
@@ -774,9 +781,9 @@ static uint32_t splitters_walk(AudioRenderer *r, uint32_t revision, const uint8_
     for (uint32_t i = 0; i < nd; i++) {
         uint8_t e[0xa8] = {0};
         if (at > n || stride > n - at)
-            return AUDIO_REFUSE(r, AB_DEST_OVERRUN,
-                                "splitter destination %u of %u at %#llx overruns the %u-byte splitter section "
-                                "(records of %#x bytes)", i, nd, (unsigned long long)at, n, stride);
+            return SPL_FAULT(AB_DEST_OVERRUN,
+                             "splitter destination %u of %u at %#llx overruns the %u-byte splitter section "
+                             "(records of %#x bytes)", i, nd, (unsigned long long)at, n, stride);
         memcpy(e, p + at, stride);
         at += stride;
         uint32_t magic, id;
@@ -785,8 +792,8 @@ static uint32_t splitters_walk(AudioRenderer *r, uint32_t revision, const uint8_
         memcpy(&id, e + 4, 4);
         memcpy(&dst, e + 0x68, 4);
         if (magic != SNDD)
-            return AUDIO_REFUSE(r, AB_DEST_MAGIC, "splitter destination %u at %#llx starts with %08x, not SNDD", i,
-                                (unsigned long long)(at - stride), magic);
+            return SPL_FAULT(AB_DEST_MAGIC, "splitter destination %u at %#llx starts with %08x, not SNDD", i,
+                             (unsigned long long)(at - stride), magic);
         if (!apply) continue;
         if (id >= ndest) {
             audio_bad(r, AB_DEST_ID, "splitter destination record %u names destination %u of %u: that record is left "
@@ -821,11 +828,12 @@ static uint32_t splitters_walk(AudioRenderer *r, uint32_t revision, const uint8_
     }
     if (at <= n && n - at < 16) at = n;   // the padding to 16 bytes, which the game does not clear (measured)
     if (at != n)
-        return AUDIO_REFUSE(r, AB_SPL_SIZE,
-                            "the splitter section is %u bytes and its records end at %#llx (infos %u, destinations %u)",
-                            n, (unsigned long long)at, ni, nd);
+        return SPL_FAULT(AB_SPL_SIZE,
+                         "the splitter section is %u bytes and its records end at %#llx (infos %u, destinations %u)",
+                         n, (unsigned long long)at, ni, nd);
     return 0;
 }
+#undef SPL_FAULT
 uint32_t audio_mixer_routing_check(AudioRenderer *r, uint32_t revision, const uint8_t *splitters,
                                    uint32_t splitter_bytes, const uint8_t *mixes, uint32_t mix_bytes, int mix_count) {
     uint32_t refused = splitters_walk(r, revision, splitters, splitter_bytes, 0);
@@ -848,7 +856,9 @@ uint32_t audio_mixer_routing_check(AudioRenderer *r, uint32_t revision, const ui
 // negative count of a mix in use would start the mixes after it before buffer 0, and more buffers than the renderer
 // has would run past them, so such an update is refused before anything of it is applied; the render's layout check is
 // then an invariant. The update's records are applied as audio_mixer_update_routing applies them (a changed-mix record
-// with an id the renderer does not have is left out).
+// with an id the renderer does not have is left out). This check and audio_mixer_update_routing each read the mix
+// section from guest memory, so the check holds for the apply only because the game does not rewrite its input during
+// its own RequestUpdate (its sending thread waits in the IPC call).
 uint32_t audio_mixer_mix_layout_check(AudioRenderer *r, const uint8_t *mixes, uint32_t mix_bytes, int mix_count) {
     int32_t buffers[256];
     uint8_t used[256];

@@ -667,6 +667,34 @@ static void left_out_records(void) {
     CHECK(apply(r, &u) == 0 && r->mixes[1].volume == 0.5f, "the valid changed mix next to mix 5 is applied");
     CHECK(left_out(r, lines, AB_MIX_ID), "mix 5 is logged once (%s)", last_once);
     close_renderer(r);
+
+    /* A splitter section whose framing breaks between audio_mixer_routing_check's walk and the apply walk (the game
+       rewriting its input during its own RequestUpdate): audio_mixer_update_routing is called directly, as
+       audren.c request_update calls it once the update was taken. The splitter info before the fault and the mix
+       section after it are applied, the destination record at the fault is not, and the log says the rest of the
+       splitter section is left out, not that the update was refused. */
+    r = open_renderer();
+    update_default(&u, 11);
+    u.split_bytes = splitter_section(u.split, 11, 0, 2, both_ids, 2, both_dests);
+    apply(r, &u);
+    lines = once_lines;
+    dest0 = ((Mixer *)r->mixer)->dest[0];
+    const int32_t swapped[2] = {1, 0};
+    Dest dq[2] = {both_dests[0], both_dests[1]};
+    dq[0].volume = 0.25f;
+    u.split_bytes = splitter_section(u.split, 11, 0, 2, swapped, 2, dq);
+    u.split[0x44] = 'X';   /* the first destination record's magic, after the splitter info and its 2 ids */
+    u.mix[1].volume = 0.5f;
+    build(&u);
+    audio_mixer_update_routing(r, in + L.splitters, u.split_bytes, in + L.mixes, 2 * sizeof(AudrenMixIn), 2);
+    CHECK(split_is(r, 1, 0) && r->mixes[1].volume == 0.5f,
+          "a fault in the apply walk: the splitter info before it and the mix section are applied");
+    CHECK(!memcmp(&dest0, &((Mixer *)r->mixer)->dest[0], sizeof dest0),
+          "a fault in the apply walk: the destination record at the fault is left out");
+    CHECK(left_out(r, lines, AB_DEST_MAGIC) && strstr(last_once, "the rest of the splitter section is left out") &&
+              !strstr(last_once, "refused"),
+          "a fault in the apply walk is logged once as the rest of the section left out (%s)", last_once);
+    close_renderer(r);
 }
 
 /* 4. Effects and sinks the renderer cannot use: passed through or skipped in each render pass. */
@@ -923,6 +951,6 @@ int main(int argc, char **argv) {
     effects_left_out();
     in_range_quiet();
     printf("audio_params_check: %s (%d refused updates, %d left-out records, %d effects and sinks)\n",
-           fails ? "FAIL" : "ok", R_ROWS, 10, EFFECT_ROWS);
+           fails ? "FAIL" : "ok", R_ROWS, 11, EFFECT_ROWS);
     return fails ? 1 : 0;
 }

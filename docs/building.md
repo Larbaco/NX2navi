@@ -517,22 +517,24 @@ not queued; the silence before the first prefill and across a stop is not owed, 
 up. The render thread's own timing (`runtime/audren.c` `render_thread`) is not built by it. No game files and no audio
 device.
 
-A change to what the audio renderer does with values the game sends (`runtime/audren.c` `update_check`,
-`request_update` and `audio_bad`; `runtime/audio_mixer.c` `splitters_walk`, `audio_mixer_routing_check`,
-`audio_mixer_mix_layout_check`, `audio_mixer_update_effects` and the render-pass effects; `runtime/audio_effects.c`
-`audio_effect_invalid`; `runtime/audio_reverb.c` `audio_reverb_invalid`) passes `python tests\audio_params_check.py`.
-It builds `audren.c` and `audio_mixer.c` with the rest of the runtime stubbed and the real effect DSPs linked, and
-sends hand-built RequestUpdates through `renderer_handler`. An update whose sections do not match the renderer (sizes,
-magic words, overruns, the output buffer, a mix layout with a negative count or more buffers than the renderer has, a
-splitter id run whose length wraps in 32 bits) answers 0x5299, a result the SDK hands back to the game (it aborts on
-any result but 0x5299, 0x5499 and 0x5699), and writes no output, changes no renderer state and places no C buffers. A channel, voice or splitter
-record with an id the renderer does not have, a wave buffer index of 4, a filter that is not a finite number and a
-changed mix with a foreign id are left out of an update that is otherwise applied; a splitter destination id the
-renderer does not have is never read (a guard entry before the destination table would make it heard). Each effect and
-sink whose values the renderer cannot use is passed through or skipped in every render pass, with nothing written to
-the game's rings or sink buffer, and runs again once its values are usable. Each kind is logged once and counted every
-time; valid effects of every type over 20 passes leave nothing out. With `NX2NAVI_AUDIO_STRICT=1` such a value ends
-the process, in two runs of their own. No game files and no audio device.
+A change to what the audio renderer does with values the game sends (`runtime/audren.c` `update_check`, `request_update`
+and `audio_bad`; `runtime/audio_mixer.c` `splitters_walk`, `audio_mixer_routing_check`, `audio_mixer_mix_layout_check`,
+`audio_mixer_update_effects` and the render-pass effects; `runtime/audio_effects.c` `audio_effect_invalid`;
+`runtime/audio_reverb.c` `audio_reverb_invalid`) passes `python tests\audio_params_check.py`. It builds `audren.c` and
+`audio_mixer.c` with the rest of the runtime stubbed and the real effect DSPs linked, and sends hand-built
+RequestUpdates through `renderer_handler`. An update whose sections do not match the renderer (sizes, magic words,
+overruns, the output buffer, a mix layout with a negative count or more buffers than the renderer has, a splitter id run
+whose length wraps in 32 bits) answers 0x5299, a result the SDK hands back to the game (it aborts on any result but
+0x5299, 0x5499 and 0x5699), and writes no output, changes no renderer state and places no C buffers. A channel, voice or
+splitter record with an id the renderer does not have, a wave buffer index of 4, a filter that is not a finite number
+and a changed mix with a foreign id are left out of an update that is otherwise applied; a splitter destination id the
+renderer does not have is never read (a guard entry before the destination table would make it heard); a splitter
+section whose framing breaks between the check and the apply keeps what came before the fault and is logged as the rest
+of the section left out, not as a refused update. Each effect and sink whose values the renderer cannot use is passed
+through or skipped in every render pass, with nothing written to the game's rings or sink buffer, and runs again once
+its values are usable. Each kind is logged once and counted every time; valid effects of every type over 20 passes leave
+nothing out. With `NX2NAVI_AUDIO_STRICT=1` such a value ends the process, in two runs of their own. No game files and no
+audio device.
 
 A change to the sprint button (`runtime/sprint.c`, the set `sprint` of `recomp/patches-v111.txt`, its call in
 `runtime/ov_input.c` `npad_states`) passes `python tests\sprint_check.py`, which builds `sprint.c` with the rest of the
