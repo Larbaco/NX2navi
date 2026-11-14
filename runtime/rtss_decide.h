@@ -25,7 +25,7 @@ static inline const char *rtss_out_text(int64_t want) {
 
 // The limiter that holds the frames while RTSS is kept out, for the log.
 static inline const char *rtss_out_limiter(int64_t want) {
-    return want == RTSS_OUT_FRAMEGEN ? "frame generation and the game's limiter"
+    return want == RTSS_OUT_FRAMEGEN ? "frame generation and Reflex or the game's limiter"
            : want == RTSS_OUT_LOWLAT ? "the driver's low latency"
                                      : "the game's limiter";
 }
