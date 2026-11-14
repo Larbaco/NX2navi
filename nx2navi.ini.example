@@ -1,9 +1,11 @@
 # nx2navi.ini: settings for nx2navi.exe. Copy this file to nx2navi.ini next to nx2navi.exe and remove the '#' of a line to change it.
 # Each line shows the default; on a Steam Deck the device profile ([display]) changes a few of them. A NX2NAVI_*
 # environment variable of the same name (NX2NAVI_FPS_LIMIT for fps_limit) overrides the file. Keys are case-insensitive;
-# '#' and ';' start a comment; [sections] only group lines. After a number or one of a setting's words, a space or tab
-# then '#' or ';' starts a comment too ("fps_limit = 144 # my monitor" is 144); a path, a name or a size keeps its whole
-# text. A setting of 0 or 1 also takes off, false and no for 0 and on, true and yes for 1.
+# '#' and ';' start a comment; [sections] only group lines. After the value of a setting with a list of choices or a
+# range, a space or tab then '#' or ';' starts a comment too ("fps_limit = 144 # my monitor" is 144); a path, a name, a
+# size, a keyboard key and the settings that take any number (gpu_index, compute_keep, tex_released_max, floor_probe,
+# floor_scan) keep their whole text. A setting whose only values are 0 and 1 also takes off, false and no for 0 and on,
+# true and yes for 1; a setting with more choices than 0 and 1 takes only the choices its lines here list.
 # Only the keys in this file are settings. A line with any other key does nothing: the game's log names it at the
 # start ("no setting of this version") and the settings menu (F1) shows it in its bottom row.
 # Updates and rebuilds of the game never rewrite nx2navi.ini; the settings menu changes only the lines of the settings
