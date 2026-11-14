@@ -345,7 +345,7 @@ uint64_t frame_step_cap_ns(void) {
     paced_hz = hz;
     rtss_limit_want(rtss_out ? rtss_out : play_mhz);
     return rtss_pace_period(rtss_limit_active(), movie_hz, kern_now_ns(), gfx_window_hosted_ns(),
-                            (uint64_t)(1e9 / hz + 0.5), (uint64_t)(1e9 / LIMIT_FREE_MAX_HZ + 0.5));
+                            (uint64_t)(1e9 / hz + 0.5), frame_step_ceiling_ns());
 }
 
 // The limit as it is set, for the performance overlay: the setting, the monitor's rate for "display", 60 at
