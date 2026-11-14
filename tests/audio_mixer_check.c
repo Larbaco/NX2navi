@@ -62,7 +62,11 @@ int cfg_bool(const char *name) {
 double cfg_double(const char *name) { (void)name; return 100; }
 unsigned cfg_version(void) { return 1; }
 int audio_buffer_empty(const AudrenWaveBuffer *b) { return !b->address || !b->size || b->end <= b->start; }
-/* no effects in these renderers */
+/* no effects in these renderers, and no value the mixer leaves out (audren.c audio_bad: counted, none expected) */
+static int bad_calls;
+void audio_bad(AudioRenderer *r, int kind, const char *fmt, ...) { (void)r, (void)kind, (void)fmt; bad_calls++; }
+const char *audio_effect_invalid(unsigned type, const void *param) { (void)type, (void)param; return NULL; }
+const char *audio_reverb_invalid(const Reverb3dParam *p) { (void)p; return NULL; }
 AudioEffectDsp *audio_effect_create(unsigned type, const void *param, unsigned revision) { (void)type, (void)param, (void)revision; return NULL; }
 void audio_effect_free(AudioEffectDsp *s) { (void)s; }
 void audio_effect_update(AudioEffectDsp *s, const void *param) { (void)s, (void)param; }
@@ -431,6 +435,7 @@ int main(void) {
     ramps_off();
     catch_up();
     change_events_once();
+    CHECK(!bad_calls, "the mixer left %d values of these renderers out", bad_calls);
     printf("audio_mixer_check: %s\n", fails ? "FAIL" : "ok");
     return fails ? 1 : 0;
 }

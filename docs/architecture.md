@@ -34,6 +34,10 @@ from other projects, with its license, is listed in [THIRD_PARTY_NOTICES.md](../
 
 - The SDK boundary is at the `nn::*` function level: threads and synchronisation, IPC, memory, fs/RomFS, time,
   account, applet, hid, audio renderer and effects run as host code. Only `audren:u` and `sm:` are real IPC services.
+  What the game sends the audio renderer never ends the process (`audren.c` `audio_bad`): an update whose sections do
+  not match the renderer is refused whole with 0x5299, which the SDK hands back to the game, and a record, effect or
+  sink whose values the renderer cannot use is left out, passed through or skipped, with one log line per kind.
+  `NX2NAVI_AUDIO_STRICT=1` ends the process there instead, for bug reports.
 - Window, keyboard and mouse: Win32 (`gfx_window_win.c`, `input_win.c`). Gamepads and audio output: SDL3 (every
   connected gamepad is open; the game reads the one pressed last, `input.c`). Voice: libopus. Movies: a host VP9
   decoder over libvpx replaces the SDK's `movie::Decoder` (`runtime/ov_movie.c`).

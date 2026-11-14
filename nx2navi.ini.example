@@ -869,6 +869,10 @@
 # skipped. 0 plays on from where the sound stopped, which leaves it later than the picture by every gap so far.
 # Takes effect at the next start.
 # audio_catchup = 1
+# When the game sends an audio value this version cannot use (an effect setting out of range, an id it does not have),
+# that effect or sound is left out and the log gets one line per kind (0, the default). 1 ends the game there instead,
+# with the details in the log, as versions before 0.10.2 did: for bug reports. Takes effect at the next start.
+# audio_strict = 0
 # Volume in percent (0 to 100), on top of the game's own. Changes while the game runs take effect at once.
 # volume = 100
 # Speakers: stereo, 5.1 or auto (5.1 when the Windows speaker setup has six or more channels, stereo otherwise). The
