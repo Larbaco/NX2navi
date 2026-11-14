@@ -122,12 +122,10 @@ static void fatal_end(int code, const char *fmt, va_list ap) {
     kern_free_cores_note();
     fs_save_crash_wait();   // a save the game already reported as done finishes first (bounded)
     prof_sampler_write();   // NX2NAVI_PROFILE: what was sampled until now, else a crash loses the whole profile
-    // RivaTuner Statistics Server's profile as it was: left with the game's limit in it, the next run would take that
-    // limit for the player's own (rtss_limit.c; it gives up after a second if the failing thread holds its lock). Not
-    // from RTSS's own thread, which may hold that lock: the restore would spend its second for nothing (as in main.c
-    // crash_handler).
-    const char *thread = plat_thread_name();
-    if (!thread || strcmp(thread, "rtss")) rtss_limit_restore();
+    // RivaTuner Statistics Server's profile goes back at the next start, from the line the run keeps for it in
+    // rtss-profile.txt (rtss_limit.c rtss_limit_crash, as in main.c crash_handler): no call into RTSS's library here,
+    // from any thread
+    rtss_limit_crash();
     rt_rumble_stop_bounded();   // a controller on HD rumble: nothing renews or stops its vibration after the end
     // "frametime: at a fatal error" and the stutter map, the session's last period: after what a kill of the process
     // must not lose, as in the orderly end (gfx_present.c rt_exit_steps); ft_stop waits up to 50 ms

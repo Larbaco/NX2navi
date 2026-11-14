@@ -231,16 +231,121 @@ static inline void rtss_why_text(char *out, size_t n, const RtssOut *o, int fail
 // gfx_present.c gfx_window_hosted_ns, 0 before the first). The limit's own period while RTSS does not hold the game,
 // while a movie plays (from its first frame: the pacer keeps the movie's slots, which RTSS does not know, and the
 // worker's next poll gives the movie to the pacer for its length, rtss_target), before the first host present, and
-// once no host present went out for RTSS_HOLD_IDLE_NS: a minimised window or a
-// frame hold (vk_backend.c frame_hold) gives RTSS nothing to hold, and a pacer that held nothing then let the quick menu
-// run at the 640-700 fps that read address 0 (frame_rate.c LIMIT_FREE_MAX_HZ). While RTSS holds, the ceiling's period
-// and never 0: the frames RTSS lets through come further apart than that, so pace() waits for none of them, and it
-// still holds the game's frames to the ceiling the game's code needs.
+// once no host present went out for RTSS_HOLD_IDLE_NS: a minimised window or a frame hold (vk_backend.c frame_hold)
+// gives RTSS nothing to hold, and a pacer that held nothing then let the quick menu run at the 640-700 fps that read
+// address 0 (frame_rate.c LIMIT_FREE_MAX_HZ). While RTSS holds, the ceiling's period and never 0: the frames RTSS lets
+// through come further apart than that, so pace() waits for none of them, and it still holds the game's frames to the
+// ceiling the game's code needs.
 static inline uint64_t rtss_pace_period(int holds, int movie, uint64_t now_ns, uint64_t hosted_ns, uint64_t period,
                                         uint64_t ceiling) {
     uint64_t idle = now_ns > hosted_ns ? now_ns - hosted_ns : 0;
     if (!holds || movie || !hosted_ns || idle >= RTSS_HOLD_IDLE_NS) return period;
     return ceiling < period ? ceiling : period;
+}
+
+// ---- the state file (rtss_limit.c, rtss-profile.txt next to the executable): each RTSS profile a run changed, as it
+// was before, so that a start after a run that did not close (a kill, a hang, a crash) puts it back. One line per
+// profile, so executables that share the folder keep their own:
+//   rtss1 <existed 0|1> <old limit> <old denominator> <written limit> <written denominator> <profile name>
+// The name comes last and may hold spaces; lines that start with # are comments.
+#define RTSS_SAVED_HEADER                                                                                              \
+    "# RivaTuner Statistics Server's profiles as they were before the game changed them (rtss_limit.c): existed, old\n" \
+    "# limit and denominator, the game's limit and denominator, profile. The game puts a profile back and removes its\n" \
+    "# line when it closes; a start that finds a line puts that profile back first.\n"
+enum { RTSS_NAME_MAX = 260 };
+
+typedef struct {
+    int existed;                   // the profile existed before the run changed it
+    uint32_t old_limit, old_den;   // what it held then
+    uint32_t limit, den;           // what the run wrote last
+    char name[RTSS_NAME_MAX];      // the profile's name, the executable's (ocarina.exe)
+} RtssSaved;
+
+// The line of r, with its newline: its length, 0 when it does not fit n.
+static inline size_t rtss_saved_format(char *out, size_t n, const RtssSaved *r) {
+    int k = snprintf(out, n, "rtss1 %d %u %u %u %u %s\n", r->existed ? 1 : 0, r->old_limit, r->old_den, r->limit,
+                     r->den, r->name);
+    return k > 0 && (size_t)k < n ? (size_t)k : 0;
+}
+
+// One line (len bytes, no newline) into r: 1 when it is a well-formed line of this format, 0 otherwise.
+static inline int rtss_saved_parse(const char *line, size_t len, RtssSaved *r) {
+    char buf[RTSS_NAME_MAX + 96];
+    while (len && (line[len - 1] == '\r' || line[len - 1] == ' ')) len--;
+    if (len >= sizeof buf) return 0;
+    memcpy(buf, line, len);
+    buf[len] = 0;
+    int existed = -1, at = 0;
+    unsigned v[4];
+    if (sscanf(buf, "rtss1 %d %u %u %u %u %n", &existed, &v[0], &v[1], &v[2], &v[3], &at) != 5 || !at) return 0;
+    size_t name = len - (size_t)at;
+    if ((existed != 0 && existed != 1) || !v[1] || !v[3] || !name || name >= RTSS_NAME_MAX) return 0;
+    r->existed = existed, r->old_limit = v[0], r->old_den = v[1], r->limit = v[2], r->den = v[3];
+    memcpy(r->name, buf + at, name + 1);
+    return 1;
+}
+
+// Profile names compare as Windows compares file names: ASCII letters in either case.
+static inline int rtss_name_eq(const char *a, const char *b) {
+    for (;; a++, b++) {
+        int x = *a >= 'A' && *a <= 'Z' ? *a + 32 : *a, y = *b >= 'A' && *b <= 'Z' ? *b + 32 : *b;
+        if (x != y) return 0;
+        if (!x) return 1;
+    }
+}
+
+// The line of profile name in the file's text (NUL-terminated): 1 and r, or 0. A line that is not well formed is
+// passed over, and the lines after it are still read.
+static inline int rtss_saved_find(const char *text, const char *name, RtssSaved *r) {
+    for (const char *p = text; p && *p;) {
+        const char *end = strchr(p, '\n');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        if (*p != '#' && rtss_saved_parse(p, len, r) && rtss_name_eq(r->name, name)) return 1;
+        p = end ? end + 1 : NULL;
+    }
+    return 0;
+}
+
+// The file's text with profile name's line replaced by r's (r NULL: removed): the header, every other profile's
+// well-formed line as it was, then r's. Comments, blank and malformed lines are dropped. Writes the text into out and
+// returns its length (0 when it does not fit cap); *records is the number of profile lines in it, 0 when the file is
+// to go.
+static inline size_t rtss_saved_update(const char *text, const char *name, const RtssSaved *r, char *out, size_t cap,
+                                       int *records) {
+    size_t at = (size_t)snprintf(out, cap, "%s", RTSS_SAVED_HEADER);
+    *records = 0;
+    if (at >= cap) return 0;
+    for (const char *p = text; p && *p;) {
+        const char *end = strchr(p, '\n');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        RtssSaved other;
+        if (*p != '#' && rtss_saved_parse(p, len, &other) && !rtss_name_eq(other.name, name)) {
+            size_t k = rtss_saved_format(out + at, cap - at, &other);
+            if (!k) return 0;
+            at += k, ++*records;
+        }
+        p = end ? end + 1 : NULL;
+    }
+    if (r) {
+        size_t k = rtss_saved_format(out + at, cap - at, r);
+        if (!k) return 0;
+        at += k, ++*records;
+    }
+    return at;
+}
+
+// What a start does with a line a run that did not close left (r), given the profile as it is now: whether it exists
+// and the limit and denominator it holds.
+enum {
+    RTSS_PLAN_NONE,     // no profile, and there was none before that run: as it was
+    RTSS_PLAN_LEAVE,    // the player changed or removed the profile since: theirs as it is
+    RTSS_PLAN_WRITE,    // it still holds what the run wrote: the old limit and denominator back
+    RTSS_PLAN_DELETE,   // the same, for a profile that run made: removed
+};
+static inline int rtss_restore_plan(const RtssSaved *r, int exists, uint32_t limit, uint32_t den) {
+    if (!exists) return r->existed ? RTSS_PLAN_LEAVE : RTSS_PLAN_NONE;
+    if (limit != r->limit || (den ? den : 1) != r->den) return RTSS_PLAN_LEAVE;
+    return r->existed ? RTSS_PLAN_WRITE : RTSS_PLAN_DELETE;
 }
 
 // ---- RTSS's own settings

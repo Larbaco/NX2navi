@@ -5,8 +5,9 @@ checks statically that no runtime file outside the platform layer ends the proce
 error's end and the lost device's (runtime/vk_device.c lost_wait_exit) end with plat_terminate. No game files, no GPU.
 
 A fatal error stops HD rumble on a thread of its own and waits for it 300 ms at most (runtime/dispatch.c
-rt_rumble_stop_bounded), so a stop that hangs on SDL's lock does not hold the end. A fatal error on RTSS's own thread
-("rtss") skips RivaTuner's restore, whose lock that thread may hold.
+rt_rumble_stop_bounded), so a stop that hangs on SDL's lock does not hold the end. RivaTuner's profile is left to the
+next start (runtime/rtss_limit.c rtss_limit_crash), which on RTSS's own thread ("rtss"), whose lock that thread may
+hold, makes no call into RTSS's library and takes no lock.
 
 Two failures at once end once: two threads that fault, a fault while a fatal error is reported and a fatal error
 while a crash is: the first report is written whole, the process ends with its code, and the second adds no line
@@ -86,13 +87,13 @@ def static_checks():
     print(f'static: perf.c perf_summary_flush_try tries the stutter map\'s lock and leaves the back end out: '
           f'{"ok" if ok else "FAIL"}', flush=True)
     bad += not ok
-    # both failed ends stop HD rumble through the bounded stop, after RivaTuner's restore
+    # both failed ends stop HD rumble through the bounded stop, after RivaTuner's profile is left to the next start
     fatal = re.sub(r'//[^\n]*', '', function((RT / 'dispatch.c').read_text(encoding='utf-8'),
                                               'static void fatal_end(int code, const char *fmt, va_list ap) {'))
     for name, code in (('dispatch.c fatal_end', fatal), ('main.c crash_handler', body)):
-        r, s = code.find('rtss_limit_restore('), code.find('rt_rumble_stop_bounded(')
+        r, s = code.find('rtss_limit_crash('), code.find('rt_rumble_stop_bounded(')
         ok = 0 <= r < s and 'input_rumble_hd_stop(' not in code
-        print(f'static: {name} stops HD rumble through rt_rumble_stop_bounded after the RTSS restore: '
+        print(f'static: {name} stops HD rumble through rt_rumble_stop_bounded after rtss_limit_crash: '
               f'{"ok" if ok else "FAIL"}', flush=True)
         bad += not ok
     # a first report that hangs: the thread that waits for it ends the process after 30 s with that report's code, and
@@ -104,10 +105,10 @@ def static_checks():
     print(f'static: dispatch.c rt_ending_enter ends a hung first report with that report\'s code: '
           f'{"ok" if ok else "FAIL"}', flush=True)
     bad += not ok
-    # the fatal error's frame-time summary comes after the RTSS restore and the rumble stop, as in the orderly end
+    # the fatal error's frame-time summary comes after RTSS's end and the rumble stop, as in the orderly end
     s, p = fatal.find('rt_rumble_stop_bounded('), fatal.find('perf_summary_flush_try(')
     ok = 0 <= s < p
-    print(f'static: dispatch.c fatal_end writes the frame-time summary after the RTSS restore and the rumble stop: '
+    print(f'static: dispatch.c fatal_end writes the frame-time summary after RTSS\'s end and the rumble stop: '
           f'{"ok" if ok else "FAIL"}', flush=True)
     bad += not ok
     return bad
@@ -115,10 +116,11 @@ def static_checks():
 
 CASES = [
     # mode, exit code, lines that must be there, lines that must not
-    ('fatal', 70, ['FATAL: the test\'s fatal error 1', 'frametime: at a fatal error', 'rumble: stopped', 'rtss: restored'],
+    ('fatal', 70, ['FATAL: the test\'s fatal error 1', 'frametime: at a fatal error', 'rumble: stopped',
+                   'rtss: left to the next start'], ['detach:']),
+    # rt_fatal on RTSS's own thread: rtss_limit_crash runs from there too, and takes no lock there
+    ('fatal_rtss', 70, ['FATAL: the test\'s fatal error 3', 'rumble: stopped', 'rtss: left to the next start'],
      ['detach:']),
-    # rt_fatal on RTSS's own thread, which may hold the lock the restore tries: no restore from there
-    ('fatal_rtss', 70, ['FATAL: the test\'s fatal error 3', 'rumble: stopped'], ['rtss: restored', 'detach:']),
     # the rumble stop hangs (SDL's lock held by a thread that crashed): the end goes on after 300 ms
     ('fatal_rumble', 70, ['FATAL: the test\'s fatal error 1'], ['rumble: stopped', 'detach:']),
     # two faults at once: the first report whole, the second thread waits (dispatch.c rt_ending_enter)

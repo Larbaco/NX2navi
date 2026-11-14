@@ -472,6 +472,8 @@ int rtss_limit_state(void);                               // menu: 1 RTSS limits
                                                            // game run past its limit, 4 kept out while a limit set in
                                                            // RTSS itself holds the game too
 void rtss_limit_restore(void);                            // before the process ends: the profile's old limit back
+void rtss_limit_crash(void);                              // a crash or fatal error: no call into RTSS, the next start
+                                                           // puts the profile back (rtss-profile.txt)
 int64_t frame_step_world_us(void);                         // game time since the loaded save's first frame, -1 before
                                                            // (NX2NAVI_FPS_LIMIT, live)
 uint64_t frame_step_ticks(void);                           // game time since the first present in 60 Hz ticks (input scripts)

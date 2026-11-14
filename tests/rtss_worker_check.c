@@ -1,8 +1,10 @@
 // The real runtime/rtss_limit.c against a fake RivaTuner Statistics Server: the Win32 calls it makes go to the fakes
 // below (its folder in the registry, its hooks library with the profile calls, the profile files, the shared memory
 // RTSSSharedMemoryV2), and its worker thread polls when a scenario says so (plat_sleep_ms on that thread waits for the
-// next poll). Each scenario runs in a process of its own, since rtss_limit.c's state lasts the process. Windows only;
-// built and run by tests/rtss_limit_check.py. Prints the log and each failed check, and exits 1 on any.
+// next poll). Each scenario runs in a process of its own, since rtss_limit.c's state lasts the process, with the state
+// file (rtss-profile.txt) in a folder of its own beside this program; the kill scenarios run two more processes of it,
+// a run that is killed and the next start, which share the fake profile through a file there. Windows only; built and
+// run by tests/rtss_limit_check.py. Prints the log and each failed check, and exits 1 on any.
 //
 // rtss_worker_check <scenario>
 #include <windows.h>
@@ -42,6 +44,7 @@ DWORD stub_GetCurrentProcessId(void);
 #define GetCurrentProcessId stub_GetCurrentProcessId
 
 #include "rtss_limit.c"
+#undef GetModuleFileNameA   // this program's own path (main), not the game's
 
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL line %d: ", __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -237,6 +240,52 @@ void rt_log(const char *fmt, ...) {
 static int logged(const char *text) { return strstr(logged_lines, text) != NULL; }
 int rt_knob(const char *name, const char *def) { (void)name, (void)def; return 0; }
 
+// The state file next to the executable: here the scenario's folder.
+static char exe_dir[MAX_PATH];
+static int state_readonly;   // the state file cannot be written
+static int no_exe_path;      // the executable's path is unknown: no state file at all
+int plat_exe_path(char *out, size_t cap) {
+    int k = snprintf(out, cap, "%s\\ocarina.exe", exe_dir);
+    return !no_exe_path && k > 0 && (size_t)k < cap;
+}
+uint8_t *plat_file_read(const char *path, uint64_t *size) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t *b = n > 0 ? malloc((size_t)n + 1) : NULL;
+    if (b && fread(b, 1, (size_t)n, f) != (size_t)n) free(b), b = NULL;
+    fclose(f);
+    if (b) b[n] = 0, *size = (uint64_t)n;
+    return b;
+}
+int plat_file_write_atomic(const char *path, const void *data, size_t n) {
+    if (state_readonly) return 0;
+    FILE *f = fopen(path, "wb");
+    if (!f) return 0;
+    int ok = fwrite(data, 1, n, f) == n;
+    return !fclose(f) && ok;
+}
+void plat_file_delete(const char *path) { remove(path); }
+int plat_file_exists(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (f) fclose(f);
+    return f != NULL;
+}
+uint32_t plat_thread_id(void) { return GetCurrentThreadId(); }
+static char state_text[4096];
+static const char *state(void) {   // the state file as it is now; "" when there is none
+    char path[MAX_PATH + 32];
+    snprintf(path, sizeof path, "%s\\rtss-profile.txt", exe_dir);
+    uint64_t n = 0;
+    uint8_t *b = plat_file_read(path, &n);
+    snprintf(state_text, sizeof state_text, "%s", b ? (char *)b : "");
+    free(b);
+    return state_text;
+}
+static int state_has(const char *line) { return strstr(state(), line) != NULL; }
+
 static DWORD worker_tid;
 static HANDLE tick, done, at_lock, go;
 static volatile LONG pause_at_lock;   // the worker's next plat_mutex_lock stops before it takes the lock
@@ -277,6 +326,23 @@ void plat_sleep_ms(uint32_t ms) {
     if (free_run) return;
     SetEvent(done);                      // a poll ended
     WaitForSingleObject(tick, INFINITE);   // the next one starts when the scenario says
+}
+
+// The fake profile kept across the processes of a kill scenario.
+static void prof_save(void) {
+    char path[MAX_PATH + 16];
+    snprintf(path, sizeof path, "%s\\own.bin", exe_dir);
+    FILE *f = fopen(path, "wb");
+    if (f) fwrite(&own, sizeof own, 1, f), fclose(f);
+}
+static void prof_load(void) {
+    char path[MAX_PATH + 16];
+    snprintf(path, sizeof path, "%s\\own.bin", exe_dir);
+    FILE *f = fopen(path, "rb");
+    if (f) {
+        if (fread(&own, sizeof own, 1, f) != 1) memset(&own, 0, sizeof own);
+        fclose(f);
+    }
 }
 
 // ---- the scenarios' steps
@@ -434,6 +500,7 @@ static void kept_framegen(void) {
 // game's limiter paces, never RTSS's hold of the limit before (the worker's store for a want that changed after it
 // read it must not count for the new one).
 static void active_race(void) {
+    no_exe_path = 1;   // 400000 writes and removals of the state file would take minutes
     app_set(1, 0xA, 1000, 2000, 60);
     ask(60000);
     poll();
@@ -726,6 +793,147 @@ static void churn_run(void) {
     CHECK(rtss_limit_active(), "RTSS limits after the last want of a limit");
 }
 
+// The state file: the run's first write records the profile as it was, each later one the value written, and the exit's
+// restore removes the line and the file with it.
+static void state_record(void) {
+    app_set(1, 0xA, 1000, 2000, 60);
+    ask(60000);
+    poll();
+    show("playing at 60");
+    CHECK(own.exists && own.limit == 60 && state_has("\nrtss1 0 0 1 60 1 ocarina.exe\n"), "recorded:\n%s", state());
+    CHECK(!strncmp(state(), "# RivaTuner Statistics Server's profiles", 40), "the header first");
+    ask(144000);
+    poll();
+    CHECK(own.limit == 144 && state_has("\nrtss1 0 0 1 144 1 ocarina.exe\n"), "the line follows:\n%s", state());
+    rtss_limit_restore();
+    show("after the restore");
+    CHECK(!own.exists && !*state(), "the profile and the state file gone:\n%s", state());
+}
+static void state_player(void) {
+    own = (Prof){1, 30, 1, 0, 0, 0, 0, 0, 0, 0, 1};
+    app_set(1, 0xA, 1000, 2000, 60);
+    ask(60000);
+    poll();
+    CHECK(own.limit == 60 && state_has("\nrtss1 1 30 1 60 1 ocarina.exe\n"), "recorded:\n%s", state());
+    ask(RTSS_OUT_LOWLAT);   // kept out: put back during the run, and the line goes with it
+    poll();
+    CHECK(own.limit == 30 && !*state(), "put back, no line:\n%s", state());
+    ask(60000);
+    poll();
+    CHECK(own.limit == 60 && state_has("\nrtss1 1 30 1 60 1 ocarina.exe\n"), "recorded again:\n%s", state());
+    rtss_limit_restore();
+    CHECK(own.exists && own.limit == 30 && !*state(), "the player's 30 back, no line");
+}
+
+// The state file cannot be written: the run goes on as before it, with a line in the log, and a crash puts the profile
+// back as an orderly exit does.
+static void state_unwritable(void) {
+    state_readonly = 1;
+    app_set(1, 0xA, 1000, 2000, 60);
+    ask(60000);
+    poll();
+    show("no state file");
+    CHECK(own.exists && own.limit == 60 && rtss_limit_active(), "RTSS limits as before");
+    CHECK(logged("rtss-profile.txt could not be written; a crash would leave the game's limit in RivaTuner Statistics "
+                 "Server's profile ocarina.exe"),
+          "logged");
+    rtss_limit_crash();
+    show("a crash");
+    CHECK(!own.exists && !rtss_limit_active(), "the crash put the profile back");
+}
+
+// A crash with the line in the state file: no call into RTSS's library, the profile and the line stay for the next
+// start, and nothing after it reaches the profile.
+static void crash_recorded(void) {
+    app_set(1, 0xA, 1000, 2000, 60);
+    ask(60000);
+    poll();
+    long s0 = saves, d0 = deletes, u0 = updates;
+    rtss_limit_crash();
+    show("a crash");
+    CHECK(saves == s0 && deletes == d0 && updates == u0, "no profile call");
+    CHECK(own.exists && own.limit == 60 && state_has("\nrtss1 0 0 1 60 1 ocarina.exe\n"), "left for the next start");
+    CHECK(!rtss_limit_active() && !rtss_limit_state(), "the game's limiter");
+    ask(144000);
+    poll();
+    CHECK(saves == s0 && own.limit == 60, "a want after it changes nothing");
+}
+
+// A run killed while RTSS held its limit (kill_first), and the next start (kill_next): the profile as before the killed
+// run, then the next run's own limit, and back again at its close. variant 1: the player had a profile with 30/1;
+// variant 2: the player set 75 in RTSS between the two runs.
+static int variant;
+static void kill_first(void) {
+    prof_load();
+    app_set(1, 0xA, 1000, 2000, 60);
+    ask(60000);
+    poll();
+    show("the run before the kill");
+    CHECK(own.exists && own.limit == 60 && state_has(variant == 1 ? "\nrtss1 1 30 1 60 1 ocarina.exe\n"
+                                                                  : "\nrtss1 0 0 1 60 1 ocarina.exe\n"),
+          "recorded:\n%s", state());
+    prof_save();   // killed: no restore
+}
+static void kill_next(void) {
+    prof_load();
+    app_set(1, 0xA, 1000, 2000, 144);
+    ask(144000);
+    poll();
+    show("the next start");
+    if (variant == 0) {
+        CHECK(logged("profile ocarina.exe had the game's limit of 60/1 from a run that did not close") &&
+                  logged("; removed, as before that run"),
+              "the killed run's profile removed");
+        CHECK(logged("created; it goes away when the game closes (creation 1 this run)"), "made again by this run");
+        CHECK(state_has("\nrtss1 0 0 1 144 1 ocarina.exe\n"), "this run's line:\n%s", state());
+    } else if (variant == 1) {
+        CHECK(logged("profile ocarina.exe had the game's limit of 60/1 from a run that did not close") &&
+                  logged("; its limit of 30/1 is back"),
+              "the player's 30 back");
+        CHECK(logged("held a limit of 30/1; it gets that back"), "this run takes 30 for the player's");
+        CHECK(state_has("\nrtss1 1 30 1 144 1 ocarina.exe\n"), "this run's line:\n%s", state());
+    } else {
+        CHECK(logged("profile ocarina.exe changed since a run that did not close") && logged("; left as it is"),
+              "the player's 75 left");
+        CHECK(state_has("\nrtss1 1 75 1 144 1 ocarina.exe\n"), "this run's line:\n%s", state());
+    }
+    CHECK(own.exists && own.limit == 144, "this run's limit");
+    rtss_limit_restore();
+    show("closed");
+    CHECK(!*state(), "no line left:\n%s", state());
+    prof_save();
+}
+static int run_phase(const char *phase) {
+    char exe[MAX_PATH], cmd[3 * MAX_PATH];
+    GetModuleFileNameA(NULL, exe, sizeof exe);
+    snprintf(cmd, sizeof cmd, "\"%s\" --phase %s %d \"%s\"", exe, phase, variant, exe_dir);
+    STARTUPINFOA si = {sizeof si};
+    PROCESS_INFORMATION pi;
+    if (!CreateProcessA(NULL, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) return -1;
+    WaitForSingleObject(pi.hProcess, 60000);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    return (int)code;
+}
+static void kill_restart_as(int v) {
+    variant = v;
+    if (v == 1) own = (Prof){1, 30, 1, 0, 0, 0, 0, 0, 0, 0, 1};
+    prof_save();
+    CHECK(run_phase("kill_first") == 0, "the killed run");
+    prof_load();
+    if (v == 2) own.limit = 75, touch(&own), prof_save();
+    CHECK(run_phase("kill_next") == 0, "the next start");
+    prof_load();
+    show("after the next start closed");
+    if (v == 0) CHECK(!own.exists, "the profile is gone, as before the killed run");
+    if (v == 1) CHECK(own.exists && own.limit == 30, "the player's 30");
+    if (v == 2) CHECK(own.exists && own.limit == 75, "the player's 75");
+    CHECK(!*state(), "no state file:\n%s", state());
+}
+static void kill_restart(void) { kill_restart_as(0); }
+static void kill_restart_player(void) { kill_restart_as(1); }
+static void kill_restart_edited(void) { kill_restart_as(2); }
+
 // A movie at 60 under a limit of 144: the want stays 144 (frame_rate.c frame_step_cap_ns) and RTSS's profile keeps it
 // with no write, while the game's pacer holds the movie at its rate; RTSS holds the game again at its end.
 static void movie_run(void) {
@@ -790,6 +998,13 @@ static const struct { const char *name; void (*run)(void); } scenarios[] = {
     {"churn_run", churn_run},
     {"movie_run", movie_run},
     {"movie_low_run", movie_low_run},
+    {"state_record", state_record},
+    {"state_player", state_player},
+    {"state_unwritable", state_unwritable},
+    {"crash_recorded", crash_recorded},
+    {"kill_restart", kill_restart},
+    {"kill_restart_player", kill_restart_player},
+    {"kill_restart_edited", kill_restart_edited},
 };
 
 int main(int argc, char **argv) {
@@ -800,9 +1015,30 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < sizeof scenarios / sizeof *scenarios; i++) printf("%s\n", scenarios[i].name);
         return 0;
     }
+    if (argc == 5 && !strcmp(argv[1], "--phase")) {   // a process of a kill scenario, in that scenario's folder
+        variant = atoi(argv[3]);
+        snprintf(exe_dir, sizeof exe_dir, "%s", argv[4]);
+        printf(" phase %s\n", argv[2]);
+        if (!strcmp(argv[2], "kill_first")) kill_first();
+        else if (!strcmp(argv[2], "kill_next")) kill_next();
+        else return 2;
+        return fails != 0;
+    }
     for (size_t i = 0; argc == 2 && i < sizeof scenarios / sizeof *scenarios; i++) {
         if (strcmp(argv[1], scenarios[i].name)) continue;
         printf("scenario %s\n", argv[1]);
+        char exe[MAX_PATH], *cut;   // the scenario's folder, emptied: rtss_state\<scenario> beside this program
+        GetModuleFileNameA(NULL, exe, sizeof exe);
+        if ((cut = strrchr(exe, '\\'))) *cut = 0;
+        snprintf(exe_dir, sizeof exe_dir, "%s\\rtss_state", exe);
+        CreateDirectoryA(exe_dir, NULL);
+        snprintf(exe_dir, sizeof exe_dir, "%s\\rtss_state\\%s", exe, argv[1]);
+        CreateDirectoryA(exe_dir, NULL);
+        char path[MAX_PATH + 32];
+        snprintf(path, sizeof path, "%s\\rtss-profile.txt", exe_dir);
+        remove(path);
+        snprintf(path, sizeof path, "%s\\own.bin", exe_dir);
+        remove(path);
         scenarios[i].run();
         return fails != 0;
     }

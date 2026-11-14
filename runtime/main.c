@@ -436,9 +436,9 @@ static void crash_handler(const PlatCrash *x) {
     rt_fatal_notes();   // the card, its driver and the memory settings in effect (vk_device.c fatal_note)
     kern_free_cores_note();
     fs_save_crash_wait();   // a save the game already reported as done finishes first (bounded; fs_host.c)
-    // after the report: RivaTuner Statistics Server's profile as it was; not from its own thread, which holds the lock
-    // the restore would try for a second
-    if (!on_rtss) rtss_limit_restore();
+    // after the report: RivaTuner Statistics Server's profile goes back at the next start, from the line the run keeps
+    // for it (rtss_limit.c rtss_limit_crash): no call into RTSS's library from a process that failed
+    rtss_limit_crash();
     rt_rumble_stop_bounded();   // a controller on HD rumble stops (dispatch.c: 300 ms at most, SDL may be the crash)
     fflush(stderr);
     prof_sampler_write();   // NX2NAVI_PROFILE: what was sampled until the crash (it gives up after 2 s if the sampler hangs)

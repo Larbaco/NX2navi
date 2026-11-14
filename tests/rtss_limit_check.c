@@ -419,6 +419,67 @@ static void pace_period(void) {
     CHECK(rtss_pace_period(1, 60, now, now - 10000000, p60, ceiling) == p60, "a movie: its period and slots");
 }
 
+// The state file (rtss-profile.txt): its lines, the file's text as the worker rewrites it, and what a start does with a
+// line that a run which did not close left behind.
+static void saved(void) {
+    RtssSaved a = {0, 0, 1, 60, 1, "ocarina.exe"}, r;
+    char line[400], out[2048];
+    size_t n = rtss_saved_format(line, sizeof line, &a);
+    CHECK(n == strlen(line) && !strcmp(line, "rtss1 0 0 1 60 1 ocarina.exe\n"), "the line: %s", line);
+    CHECK(rtss_saved_parse(line, n - 1, &r) && !r.existed && !r.old_limit && r.old_den == 1 && r.limit == 60 &&
+              r.den == 1 && !strcmp(r.name, "ocarina.exe"),
+          "read back");
+    const char *spaced = "rtss1 1 59940 1000 144 1 My Game.exe\r";
+    CHECK(rtss_saved_parse(spaced, strlen(spaced), &r) && r.existed && r.old_limit == 59940 && r.old_den == 1000 &&
+              !strcmp(r.name, "My Game.exe"),
+          "a name with a space, a line ending in CR");
+    static const char *bad[] = {"rtss1 2 0 1 60 1 x.exe", "rtss1 0 0 0 60 1 x.exe", "rtss1 0 0 1 60 0 x.exe",
+                                "rtss1 0 0 1 60 1", "rtss1 0 0 1 60 1 ", "rtss2 0 0 1 60 1 x.exe", "rtss1 0 0 1 x 1 x.exe",
+                                "", "# rtss1 0 0 1 60 1 x.exe"};
+    for (unsigned i = 0; i < sizeof bad / sizeof *bad; i++)
+        CHECK(!rtss_saved_parse(bad[i], strlen(bad[i]), &r), "not a line: '%s'", bad[i]);
+    CHECK(!rtss_saved_format(line, 20, &a), "a line that does not fit");
+
+    // found past a comment, a malformed line and another profile's line, whatever the case of its letters
+    const char *text = RTSS_SAVED_HEADER "rtss1 9 garbage\nrtss1 1 30 1 144 1 My Game.exe\nrtss1 0 0 1 60 1 OCARINA.EXE";
+    CHECK(rtss_saved_find(text, "ocarina.exe", &r) && r.limit == 60 && !r.existed, "ours, the last line, no newline");
+    CHECK(rtss_saved_find(text, "my game.exe", &r) && r.limit == 144 && r.old_limit == 30, "the other one");
+    CHECK(!rtss_saved_find(text, "ocarina_dev.exe", &r) && !rtss_saved_find("", "ocarina.exe", &r), "none");
+
+    // rewritten: ours replaced, the other kept, the malformed line and comments dropped, the header first
+    int records = -1;
+    RtssSaved a2 = a;
+    a2.limit = 144;
+    n = rtss_saved_update(text, "ocarina.exe", &a2, out, sizeof out, &records);
+    CHECK(n == strlen(out) && records == 2 &&
+              !strcmp(out, RTSS_SAVED_HEADER "rtss1 1 30 1 144 1 My Game.exe\nrtss1 0 0 1 144 1 ocarina.exe\n"),
+          "replaced:\n%s", out);
+    char again[2048];
+    n = rtss_saved_update(out, "OCARINA.exe", NULL, again, sizeof again, &records);
+    CHECK(records == 1 && !strcmp(again, RTSS_SAVED_HEADER "rtss1 1 30 1 144 1 My Game.exe\n"), "removed:\n%s", again);
+    n = rtss_saved_update(again, "My Game.exe", NULL, out, sizeof out, &records);
+    CHECK(n && !records, "the last line removed: no record left, the file goes");
+    n = rtss_saved_update("", "ocarina.exe", &a, out, sizeof out, &records);
+    CHECK(records == 1 && !strcmp(out, RTSS_SAVED_HEADER "rtss1 0 0 1 60 1 ocarina.exe\n"), "a new file:\n%s", out);
+    CHECK(!rtss_saved_update(text, "ocarina.exe", &a, out, sizeof RTSS_SAVED_HEADER + 10, &records),
+          "a text that does not fit");
+
+    // What a start does. Run A made the profile and wrote 60/1, and was killed: B finds 60/1 and removes the profile.
+    RtssSaved made = {0, 0, 1, 60, 1, "ocarina.exe"}, had = {1, 30, 1, 60, 1, "ocarina.exe"};
+    CHECK(rtss_restore_plan(&made, 1, 60, 1) == RTSS_PLAN_DELETE, "the run's own profile: removed");
+    CHECK(rtss_restore_plan(&made, 1, 75, 1) == RTSS_PLAN_LEAVE, "the player set 75 since: theirs");
+    CHECK(rtss_restore_plan(&made, 0, 0, 1) == RTSS_PLAN_NONE, "the player removed it, or the run was killed before "
+                                                               "its first write: nothing to do");
+    CHECK(rtss_restore_plan(&had, 1, 60, 1) == RTSS_PLAN_WRITE, "the player's profile with 30/1 before: 30/1 back");
+    CHECK(rtss_restore_plan(&had, 1, 30, 1) == RTSS_PLAN_LEAVE, "killed before the write landed: the player's 30/1");
+    CHECK(rtss_restore_plan(&had, 0, 0, 1) == RTSS_PLAN_LEAVE, "the player removed their profile since: left so");
+    CHECK(rtss_restore_plan(&had, 1, 60, 0) == RTSS_PLAN_WRITE, "an RTSS without the denominator reads none: 1");
+    RtssSaved frac = {1, 0, 1, 59940, 1000, "ocarina.exe"};
+    CHECK(rtss_restore_plan(&frac, 1, 59940, 1) == RTSS_PLAN_LEAVE && rtss_restore_plan(&frac, 1, 59940, 1000) ==
+                                                                          RTSS_PLAN_WRITE,
+          "the denominator is compared too");
+}
+
 int main(void) {
     settings();
     reasons();
@@ -434,6 +495,7 @@ int main(void) {
     unset_and_library();
     two();
     pace_period();
+    saved();
     printf("rtss_limit_check: %s\n", fails ? "FAIL" : "ok");
     return fails != 0;
 }

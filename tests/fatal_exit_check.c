@@ -8,7 +8,7 @@
 //   fatal_exit_check fatal_crash   a fault on another thread while rt_fatal reports: its FATAL line alone, exit code 70
 //   fatal_exit_check crash_fatal   rt_fatal on another thread while a crash is reported: the whole report, exit code 71
 //   fatal_exit_check fatal_rumble  rt_fatal while the HD rumble stop hangs (SDL's lock held): exit code 70 all the same
-//   fatal_exit_check fatal_rtss    rt_fatal on RTSS's thread ("rtss"): exit code 70, no RTSS restore from there
+//   fatal_exit_check fatal_rtss    rt_fatal on RTSS's thread ("rtss"): exit code 70, through rtss_limit_crash too
 //
 // The crash handler here is a stand-in for main.c crash_handler with its first line (the static check in
 // tests/fatal_exit_check.py holds main.c to it): it writes three report lines 100 ms apart and ends with plat_exit(71).
@@ -59,7 +59,7 @@ void rt_log(const char *fmt, ...) {
 }
 void kern_free_cores_note(void) {}
 void prof_sampler_write(void) {}
-void rtss_limit_restore(void) { say("rtss: restored\n"); }
+void rtss_limit_crash(void) { say("rtss: left to the next start\n"); }   // rtss_limit.c: no call into RTSS
 void kern_checkpoint(void) {}
 
 // perf.c's summary at a fatal error, which dispatch.c calls through a weak symbol

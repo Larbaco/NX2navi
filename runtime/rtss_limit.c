@@ -22,9 +22,12 @@
 // The calls run on a thread of their own, every half second, which also looks RTSS up (find_rtss), so a present never
 // waits on the registry or profile files. On every orderly exit (rtss_limit_restore) the profile gets back what it held
 // before the game changed it: the old limit, or no profile of its own when there was none; from then on no want reaches
-// it and the game's own limiter paces the frames left. An exit that skips it (a kill, the device-lost watchdog, a crash
-// inside the crash handler) leaves the game's limit in the profile, and the next run takes that limit for the player's
-// own.
+// it and the game's own limiter paces the frames left. What it held is also kept in rtss-profile.txt next to the
+// executable (rtss_decide.h RtssSaved), written before the run's first change of the profile and removed once the
+// profile is back: an exit that skips the restore (a kill, a hang, the device-lost watchdog) leaves the line, and the
+// next start puts the profile back from it before it changes anything (restore_left), unless the player changed the
+// profile since. A crash and a fatal error leave it to that start too (rtss_limit_crash), with no call into RTSS's
+// library from the failing process.
 //
 // NX2NAVI_RTSS=0 keeps RTSS out of it. Frame generation keeps it out too (RTSS counts every presented frame, the
 // generated ones included), and so does a driver's low latency (vk_lowlat.c), which holds the frames where they start.
@@ -34,6 +37,7 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "host.h"
@@ -70,6 +74,11 @@ static int has_denominator;   // this RTSS knows FramerateLimitDenominator
 static int had_profile;       // the profile existed before this run changed it
 static DWORD old_limit, old_denominator = 1;
 static int creations, removals;   // the profile's "created" and "removed" lines this run, numbered (under lock)
+static char state_path[MAX_PATH + 32];   // rtss-profile.txt next to the executable; "" when its path is unknown
+static RtssSaved rec;                    // this run's line in it, while the profile holds a value of this run
+static _Atomic int recorded;             // the file holds rec: a crash leaves the profile to the next start
+static int state_off;                    // a line this run could not act on stays as it is: no writes of the file
+static _Atomic uint32_t rtss_tid;        // the worker's thread, which may hold the lock when a crash comes
 
 // RTSS's shared memory as rtss_parse reads it: whether RTSS runs, whether it lists this process, and its frame count.
 static void rtss_map(RtssApp *a) {
@@ -150,8 +159,48 @@ static int write_limit(DWORD limit, DWORD denominator) {
     return l == limit && (!has_denominator || d == denominator) ? 1 : -1;
 }
 
+// The state file with this profile's line set to r, or removed for r NULL; the file goes once it holds no line. Worker
+// thread only, under lock. 1 when the file holds what was asked.
+static int state_put(const RtssSaved *r) {
+    if (state_off || !*state_path) return 0;
+    uint64_t n = 0;
+    char *text = (char *)plat_file_read(state_path, &n);
+    size_t cap = (size_t)(text ? n : 0) + sizeof RTSS_SAVED_HEADER + 2 * (RTSS_NAME_MAX + 96);
+    char *out = malloc(cap);
+    int records = 0, ok = 0;
+    size_t len = out ? rtss_saved_update(text ? text : "", profile, r, out, cap, &records) : 0;
+    if (len && !records) {
+        plat_file_delete(state_path);
+        ok = !plat_file_exists(state_path);
+    } else if (len) {
+        ok = plat_file_write_atomic(state_path, out, len);
+    }
+    free(out);
+    free(text);
+    return ok;
+}
+
+// The state file did not take this run's line: a crash then puts the profile back as an orderly exit does
+// (rtss_limit_crash). Logged once a run.
+static void unrecorded(void) {
+    static int said;
+    atomic_store(&recorded, 0);
+    if (!state_off && !said++)
+        rt_log("frame rate: %s could not be written; a crash would leave the game's limit in RivaTuner Statistics "
+               "Server's profile %s", *state_path ? state_path : "rtss-profile.txt", profile);
+}
+
+// rec's written value is limit/denominator now: the line follows it, so that the next start tells the game's value from
+// a value the player set since.
+static void record(DWORD limit, DWORD denominator) {
+    if (!atomic_load(&recorded) || (rec.limit == limit && rec.den == denominator)) return;
+    rec.limit = limit, rec.den = denominator;
+    if (!state_put(&rec)) unrecorded();
+}
+
 // Writes mhz into the profile (rtss_poll's RtssOps.apply): RTSS_WROTE_*. first: the run's first write, which records
-// what to put back on exit; clear: on a refusal, clear the limit of this run the profile holds.
+// what to put back on exit, in the state file too before anything changes; clear: on a refusal, clear the limit of this
+// run the profile holds.
 static int apply(void *ctx, int64_t mhz, int first, int clear) {
     (void)ctx;
     if (first) {   // what to put back on exit
@@ -166,10 +215,17 @@ static int apply(void *ctx, int64_t mhz, int first, int clear) {
     if (mhz % 1000 == 0) limit = (DWORD)(mhz / 1000);
     else if (has_denominator) limit = (DWORD)mhz, denominator = 1000;
     else limit = (DWORD)((mhz + 500) / 1000);
+    if (first) {   // the line goes in before the profile changes: a kill between the two finds it as it was
+        rec = (RtssSaved){had_profile, old_limit, old_denominator, limit, denominator, ""};
+        snprintf(rec.name, sizeof rec.name, "%s", profile);
+        if (state_put(&rec)) atomic_store(&recorded, 1);
+        else unrecorded();
+    }
     int r = write_limit(limit, denominator);
     if (r < 0) {
         rt_log("frame rate: RivaTuner Statistics Server's profile %s did not keep the limit: its Profiles folder needs the "
                "game run as administrator", profile);
+        if (first && atomic_exchange(&recorded, 0)) state_put(NULL);   // the profile is as it was
         return RTSS_WROTE_READONLY;
     }
     if (first) {
@@ -183,11 +239,13 @@ static int apply(void *ctx, int64_t mhz, int first, int clear) {
     if (r == 0) {   // RTSS must not keep an earlier limit of this run under the game's own one
         rt_log("frame rate: RivaTuner Statistics Server refused a limit of %.3f fps", mhz / 1000.0);
         if (clear && write_limit(0, 1) > 0) {
+            record(0, 1);
             update_profiles();
             return RTSS_WROTE_REFUSED_CLEARED;
         }
         return RTSS_WROTE_REFUSED;
     }
+    record(limit, denominator);
     update_profiles();
     if (!mhz) rt_log("frame rate: RivaTuner Statistics Server's profile %s has no limit", profile);
     else if ((int64_t)limit * 1000 == mhz * denominator)
@@ -198,8 +256,10 @@ static int apply(void *ctx, int64_t mhz, int first, int clear) {
     return RTSS_WROTE_HELD;
 }
 
-// The profile as it was before this run changed it (the caller checked S.changed, and marks it done).
+// The profile as it was before this run changed it (the caller checked S.changed, and marks it done). Its line in the
+// state file goes once it is back; one that did not take its old limit keeps it for the next start.
 static void put_back(void) {
+    int back = 1;
     if (!had_profile) {
         delete_profile(profile);
         rt_log("frame rate: RivaTuner Statistics Server profile %s removed, as before the game started "
@@ -209,8 +269,54 @@ static void put_back(void) {
                old_denominator);
     } else {
         rt_log("frame rate: RivaTuner Statistics Server profile %s did not take its old limit back", profile);
+        back = 0;
     }
     update_profiles();
+    if (back && atomic_exchange(&recorded, 0)) state_put(NULL);
+}
+
+// A line of this profile in the state file, left by a run that did not close: on the first poll with the hooks library,
+// before this run changes anything, the profile gets back what it held before that run (rtss_restore_plan), unless the
+// player changed it since, and the line goes. A profile that does not take its old limit keeps the line, and this run
+// leaves the file alone.
+static void restore_left(void) {
+    uint64_t n = 0;
+    char *text = *state_path ? (char *)plat_file_read(state_path, &n) : NULL;
+    RtssSaved r;
+    int found = text && rtss_saved_find(text, profile, &r);
+    free(text);
+    if (!found) return;
+    int exists = profile_exists();
+    load_profile(profile);
+    DWORD limit = 0, den = 1;
+    get_property("FramerateLimit", (LPBYTE)&limit, sizeof limit);
+    has_denominator = get_property("FramerateLimitDenominator", (LPBYTE)&den, sizeof den);
+    int plan = rtss_restore_plan(&r, exists, limit, den);
+    if (plan == RTSS_PLAN_WRITE && write_limit(r.old_limit, r.old_den) <= 0) {
+        rt_log("frame rate: RivaTuner Statistics Server profile %s still has the game's limit of %u/%u from a run that "
+               "did not close, and did not take its old limit back; %s keeps its line", profile, r.limit, r.den,
+               state_path);
+        state_off = 1;
+        return;
+    }
+    if (plan == RTSS_PLAN_DELETE) delete_profile(profile);
+    if (plan == RTSS_PLAN_WRITE || plan == RTSS_PLAN_DELETE) update_profiles();
+    if (plan == RTSS_PLAN_WRITE)
+        rt_log("frame rate: RivaTuner Statistics Server profile %s had the game's limit of %u/%u from a run that did not "
+               "close (%s); its limit of %u/%u is back", profile, r.limit, r.den, state_path, r.old_limit, r.old_den);
+    else if (plan == RTSS_PLAN_DELETE)
+        rt_log("frame rate: RivaTuner Statistics Server profile %s had the game's limit of %u/%u from a run that did not "
+               "close (%s); removed, as before that run", profile, r.limit, r.den, state_path);
+    else if (plan == RTSS_PLAN_LEAVE)
+        rt_log("frame rate: RivaTuner Statistics Server profile %s changed since a run that did not close (%s); left as "
+               "it is", profile, state_path);
+    else
+        rt_log("frame rate: RivaTuner Statistics Server profile %s is as it was before a run that did not close (%s)",
+               profile, state_path);
+    if (!state_put(NULL)) {
+        rt_log("frame rate: %s could not be written; its line for %s stays", state_path, profile);
+        state_off = 1;
+    }
 }
 
 static void put_back_op(void *ctx, const RtssOut *o) {   // rtss_poll's RtssOps.put_back
@@ -339,6 +445,9 @@ static int find_rtss(void) {
     for (const char *s = exe; *s; s++)
         if (*s == '\\' || *s == '/') base = s + 1;
     snprintf(profile, sizeof profile, "%s", base);   // RTSS names a profile after the executable, as ocarina.exe
+    char path[MAX_PATH], *cut;   // the state file next to the executable, where nx2navi.ini is (cfg.c find_ini)
+    if (plat_exe_path(path, sizeof path) && (cut = plat_last_sep(path)))
+        snprintf(state_path, sizeof state_path, "%.*s%s", (int)(cut + 1 - path), path, "rtss-profile.txt");
     int64_t first = atomic_load(&want);
     if (first >= 0)
         rt_log("frame rate: RivaTuner Statistics Server found in %s; it takes the frame limit while it runs", dir);
@@ -351,9 +460,10 @@ static int find_rtss(void) {
 
 static void worker(void *arg) {
     (void)arg;
+    atomic_store(&rtss_tid, plat_thread_id());
     if (!find_rtss()) return;
     atomic_store_explicit(&ready, 1, memory_order_release);   // rtss_limit_restore may read the names now
-    int was_running = -1, was_listed = 0;
+    int was_running = -1, was_listed = 0, left_checked = 0;
     const RtssOps ops = {NULL, apply, put_back_op};
     for (;; plat_sleep_ms(POLL_MS)) {
         int64_t w = atomic_load(&want);
@@ -372,6 +482,7 @@ static void worker(void *arg) {
             was_running = in.app.running, was_listed = in.app.listed;
         }
         in.hooks = dll ? 1 : rtss_wants_hooks(&S, &in) ? load_hooks() : -1;
+        if (in.hooks == 1 && !left_checked) left_checked = 1, restore_left();
         in.current = atomic_load(&want) == w;
         RtssOut o = rtss_poll(&S, &in, &ops);
         atomic_store(&failed, S.fail);
@@ -432,10 +543,23 @@ void rtss_limit_restore(void) {
     }
 }
 
+// A crash's and a fatal error's end (main.c crash_handler, dispatch.c fatal_end), from any thread: no want reaches the
+// profile any more, and no call goes into RTSS's library, which may be what failed and is no safe call on a damaged
+// heap. The state file keeps this run's line, and the next start puts the profile back from it (restore_left). Without
+// that line (the file could not be written) the profile goes back as at an orderly exit, but not from the worker's own
+// thread, which may hold the lock that takes.
+void rtss_limit_crash(void) {
+    atomic_store(&closed, 1);
+    atomic_store(&active_for, RTSS_UNSET);
+    if (atomic_load(&recorded) || plat_thread_id() == atomic_load(&rtss_tid)) return;
+    rtss_limit_restore();
+}
+
 #else
 void rtss_limit_want(int64_t mhz) { (void)mhz; }
 void rtss_limit_movie(int hz) { (void)hz; }
 int rtss_limit_active(void) { return 0; }
 int rtss_limit_state(void) { return 0; }
 void rtss_limit_restore(void) {}
+void rtss_limit_crash(void) {}
 #endif
