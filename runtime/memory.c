@@ -236,8 +236,10 @@ static uint64_t lz_foreign;             // frz_lock, since the start: segments o
 #define LZ_NOTES 8
 static struct { uint64_t addr, lo, hi, out; uint32_t tid; uint8_t write, stale, hold; } lz_note[LZ_NOTES];
 static int lz_nnote;
-// frz_lock: since the last report: faults by a read, by a write, other releases, fetches, their bytes and time
-static uint64_t lz_faults[2], lz_other, lz_fetches, lz_fetch_bytes, lz_fetch_ns, lz_gaps;
+// frz_lock: since the last report: faults by a read, by a write, other releases, fetches, their bytes and time, the
+// longest fetch, and the longest wait of a fault for frz_lock (behind other threads' fetches, thaws, freezes and arms)
+static uint64_t lz_faults[2], lz_other, lz_fetches, lz_fetch_bytes, lz_fetch_ns, lz_fetch_max_ns, lz_lock_wait_max_ns;
+static uint64_t lz_gaps;
 static volatile uint32_t lz_win_tid;    // lz_lock: the replay thread's id while its part is between check and hand-over
 // For a fatal error's summary line (mem_lazy_note): written under frz_lock and read without it, since the thread that
 // fails may be the one inside a fetch.
@@ -285,7 +287,9 @@ static void lazy_gone_locked(LzSeg s, int why) {
         __atomic_store_n(&lz_fetch_ms, (uint32_t)plat_now_ms() | 1, __ATOMIC_RELAXED);
         __atomic_store_n(&lz_fetch_total, lz_fetch_total + 1, __ATOMIC_RELAXED);
         __atomic_store_n(&lz_fetch_tid, 0, __ATOMIC_RELEASE);
-        lz_fetches++, lz_fetch_bytes += s.hi - s.lo, lz_fetch_ns += plat_now_ns() - t0;
+        uint64_t ns = plat_now_ns() - t0;
+        lz_fetches++, lz_fetch_bytes += s.hi - s.lo, lz_fetch_ns += ns;
+        if (ns > lz_fetch_max_ns) lz_fetch_max_ns = ns;
     }
     for (uint64_t a = s.lo, b; a < s.hi; a = b)
         if (plat_mem_state(a, s.hi, &b) == PLAT_PROT_NONE && !plat_mem_protect(a, b - a, PLAT_PROT_RW))
@@ -364,7 +368,9 @@ static uint64_t lazy_piece_fetch_locked(LzPiece p, uint64_t a, int write) {
         __atomic_store_n(&lz_fetch_ms, (uint32_t)plat_now_ms() | 1, __ATOMIC_RELAXED);
         __atomic_store_n(&lz_fetch_total, lz_fetch_total + 1, __ATOMIC_RELAXED);
         __atomic_store_n(&lz_fetch_tid, 0, __ATOMIC_RELEASE);
-        lz_fetches++, lz_fetch_bytes += c1 - c0, lz_fetch_ns += plat_now_ns() - t0;
+        uint64_t ns = plat_now_ns() - t0;
+        lz_fetches++, lz_fetch_bytes += c1 - c0, lz_fetch_ns += ns;
+        if (ns > lz_fetch_max_ns) lz_fetch_max_ns = ns;
     }
     for (uint64_t x = c0, y; x < c1; x = y)
         if (plat_mem_state(x, c1, &y) == PLAT_PROT_NONE && !plat_mem_protect(x, y - x, PLAT_PROT_RW))
@@ -653,7 +659,10 @@ static int lazy_fault(uint64_t a, int write) {
     if (a >= RT_ADDRESS_LIMIT || !__atomic_load_n(&lzr[a >> FRZ_SHIFT], __ATOMIC_ACQUIRE)) return 0;
     uint32_t me = plat_thread_id();
     for (int tries = 0;; tries++) {
+        uint64_t w0 = plat_now_ns();
         plat_mutex_lock(&frz_lock);
+        uint64_t waited = plat_now_ns() - w0;
+        if (waited > lz_lock_wait_max_ns) lz_lock_wait_max_ns = waited;
         plat_mutex_lock(&lz_lock);   // the window's test and the segment's leaving the list in one step
         int i = 0;
         while (i < lz_n && !(a >= lzs[i].lo && a < lzs[i].hi)) i++;
@@ -745,10 +754,12 @@ void mem_lazy_report(uint64_t frame, uint64_t skipped) {
     if (!__atomic_load_n(&lz_on, __ATOMIC_RELAXED)) return;
     plat_mutex_lock(&frz_lock);
     uint64_t bytes = 0, fr = lz_faults[0], fw = lz_faults[1], other = lz_other, nf = lz_fetches, fb = lz_fetch_bytes,
-             fns = lz_fetch_ns, gaps = lz_gaps, unclean = lz_unclean, no[LZ_NO_N];
+             fns = lz_fetch_ns, fmax = lz_fetch_max_ns, wmax = lz_lock_wait_max_ns, gaps = lz_gaps, unclean = lz_unclean,
+             no[LZ_NO_N];
     int n = lz_n;
     for (int i = 0; i < lz_n; i++) bytes += lzs[i].hi - lzs[i].lo;
     lz_faults[0] = lz_faults[1] = lz_other = lz_fetches = lz_fetch_bytes = lz_fetch_ns = lz_gaps = lz_unclean = 0;
+    lz_fetch_max_ns = lz_lock_wait_max_ns = 0;
     uint64_t small = lz_no_small, calls = lz_arm_calls;
     int nnote = lz_nnote;
     __typeof__(lz_note) note;
@@ -768,10 +779,10 @@ void mem_lazy_report(uint64_t frame, uint64_t skipped) {
     }
     rt_log("mem: lazy write-back at frame %llu: %d ranges armed, %.1f MiB; since the last line %.1f MiB left in the "
            "mirror, %llu read and %llu write faults (%llu inside a part's window), %llu other releases, %llu fetches of "
-           "%.1f MiB in %.2f ms, %llu arms refused (a CPU write not in the mirror yet)", (unsigned long long)frame, n,
-           bytes / 1048576.0, skipped / 1048576.0, (unsigned long long)fr, (unsigned long long)fw,
-           (unsigned long long)gaps, (unsigned long long)other, (unsigned long long)nf, fb / 1048576.0, fns / 1e6,
-           (unsigned long long)unclean);
+           "%.1f MiB in %.2f ms, the longest %.2f ms, faults waited up to %.2f ms for the freeze lock, %llu arms refused "
+           "(a CPU write not in the mirror yet)", (unsigned long long)frame, n, bytes / 1048576.0, skipped / 1048576.0,
+           (unsigned long long)fr, (unsigned long long)fw, (unsigned long long)gaps, (unsigned long long)other,
+           (unsigned long long)nf, fb / 1048576.0, fns / 1e6, fmax / 1e6, wmax / 1e6, (unsigned long long)unclean);
     for (int i = 0; i < nnote && (rt_trace & RT_TRACE_PERF); i++)
         rt_log("mem: lazy write-back: thread %u %s %#llx, %llu KiB into an armed range of %.2f MiB at %#llx; %llu KiB of "
                "it given back%s and held for %u s", note[i].tid, note[i].write ? "wrote" : "read",

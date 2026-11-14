@@ -691,8 +691,9 @@ its reason by platform, by GPU driver and by what the player set. No game files,
 A change to the lazy write-back's arms, faults and releases (`runtime/memory.c` "Lazy write-back") passes
 `python tests\lazy_fetch_check.py`, which builds memory.c with the Windows fault handler and a fetch that only waits,
 and runs each scenario as its own process, so an access violation fails it: a thread that reads a range over and over
-while it is armed and given back again never reaches the crash handler, also when the arm's clean test takes 100 ms.
-Windows only; no game files, no GPU.
+while it is armed and given back again never reaches the crash handler, also when the arm's clean test takes 100 ms;
+and the "mem: lazy write-back" line gives the longest fetch and the longest wait of a fault for the freeze lock since
+the line before. Windows only; no game files, no GPU.
 
 A change to when the freezing of idle guest regions waits (`runtime/freeze_hold.h`, `runtime/vk_memory.c`
 `freeze_pass`) passes `python tests\freeze_hold_check.py`, which builds the header alone: the backoff after a slow

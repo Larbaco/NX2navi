@@ -77,6 +77,34 @@ static int fake_clean(uint64_t lo, uint64_t hi, void *ctx) {
 
 // the range [a, a + n) of the heap, as written back from buffer h0 into the heap's own (h1 = heap, offset a - heap)
 static uint64_t arm_buf(uint64_t a, uint64_t n, uint64_t h0) { return mem_lazy_arm(a, n, h0, heap, a - heap, NULL); }
+// the replay leaves its writes to [a, a + n) in the mirror h0: the armed parts there are stale (a touch fetches them)
+static int stale(uint64_t a, uint64_t n, uint64_t h0) {
+    uint64_t out[16][2];
+    return mem_lazy_skip(a, n, h0, -(int64_t)heap, out, 16);
+}
+static double ms(uint64_t t0) { return (plat_now_ns() - t0) / 1e6; }
+// the number after "what" in the last log line, -1 when it is not there
+static double logged(const char *what) {
+    const char *p = strstr(last_log, what);
+    return p ? strtod(p + strlen(what), NULL) : -1;
+}
+
+// ---- threads that touch guest memory, as the game's CPU code does
+typedef struct { uint64_t at; int write; volatile int done; uint8_t got; uint64_t end_ns; double took; } Touch;
+static void toucher(void *arg) {
+    Touch *t = arg;
+    volatile uint8_t *p = (volatile uint8_t *)(uintptr_t)t->at;
+    uint64_t t0 = plat_now_ns();
+    if (t->write) *p = 0x77;
+    t->got = *p;
+    t->end_ns = plat_now_ns();
+    t->took = (t->end_ns - t0) / 1e6;
+    __atomic_store_n(&t->done, 1, __ATOMIC_SEQ_CST);
+}
+static void *touch(Touch *t, uint64_t a, int write) {
+    t->at = a, t->write = write, t->done = 0;
+    return plat_thread_new(toucher, t, "toucher");
+}
 
 static volatile int spin_stop;
 static volatile uint64_t spin_reads;
@@ -116,6 +144,30 @@ int main(int argc, char **argv) {
         plat_thread_join(th);
         CHECK(armed, "nothing was armed");
         printf("  %llu arms, %llu reads\n", (unsigned long long)armed, (unsigned long long)spin_reads);
+    } else if (!strcmp(what, "report")) {
+        // The report line gives the longest fetch since the last line, and the longest wait of a fault for frz_lock;
+        // the next line starts from nothing.
+        uint64_t s1 = heap + (80ull << 20), s2 = heap + (84ull << 20), s3 = heap + (88ull << 20);
+        CHECK(arm_buf(s1, K64, 1) == K64 && arm_buf(s2, K64, 1) == K64 && arm_buf(s3, K64, 1) == K64, "arms");
+        CHECK(stale(s1, K64, 1) == 1 && stale(s2, K64, 1) == 1 && stale(s3, K64, 1) == 1, "stale marks");
+        Touch a;
+        fetch_ns = 30000000ull;
+        plat_thread_join(touch(&a, s1, 0));
+        fetch_ns = 120000000ull;
+        plat_thread_join(touch(&a, s2, 0));
+        fetch_ns = 10000000ull;
+        plat_mutex_lock(&frz_lock);   // another thread's thaw, freeze or arm, 60 ms long
+        void *th = touch(&a, s3, 1);
+        plat_wait_ns(60000000);
+        plat_mutex_unlock(&frz_lock);
+        plat_thread_join(th);
+        CHECK(fetch_calls == 3 && a.got == 0x77, "%d fetches, the write read back %#x", fetch_calls, a.got);
+        mem_lazy_report(1, 0);
+        double longest = logged("the longest "), waited = logged("faults waited up to ");
+        CHECK(longest >= 119 && longest < 200, "the longest fetch read %.2f ms", longest);
+        CHECK(waited >= 40 && waited < 200, "the longest wait for the lock read %.2f ms", waited);
+        mem_lazy_report(2, 0);
+        CHECK(logged("the longest ") == 0 && logged("faults waited up to ") == 0, "the next line did not start over");
     } else {
         printf("unknown scenario %s\n", what);
         return 2;

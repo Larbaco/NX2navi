@@ -20,6 +20,7 @@ MSYS_BIN = Path(r'C:\msys64\ucrt64\bin')
 SCENARIOS = {
     'arm_race': ('arm_race', {}),
     'arm_race_slow': ('arm_race_slow', {}),
+    'report': ('report', {}),
 }
 
 
