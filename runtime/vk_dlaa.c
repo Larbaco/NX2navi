@@ -2068,18 +2068,23 @@ static void stale_sizes(const struct Size *cur, const struct Size *host) {
 // has (retire_feat, vk_upscaler_let_go), after it. None of them is evaluated again: its size makes a new one.
 static void release_kept(const struct Size *making, int all) {
     int n = 0;
+    NgxHandle *mine[DLSS_SIZES];   // this call's features, to tell them in dead from those let go of before
     for (int i = 0; i < DLSS_SIZES; i++) {
         struct Size *s = &D.sizes[i];
         if (s == making || !s->feat) continue;
         if (!all && (uint64_t)s->w * s->h <= (uint64_t)making->w * making->h) continue;
+        mine[n] = s->feat;
         retire_feat(s, 0), n++;
         if (D.last == s) D.last = NULL;
         if (D.host == s) D.host = NULL;
     }
     if (!n) return;
     vk_upscaler_let_go();
-    int left = upd_count(&dead, UPD_FEAT);   // older ones have older fences and went first: those left are this call's
-    if (left > n) left = n;
+    // this call's features still in dead: the GPU is not past their last frame (a feature goes into dead once and
+    // leaves it only through its release, and no feature is made in between, so a handle there is one of them)
+    int left = 0;
+    for (int i = 0; i < dead.n; i++)
+        for (int j = 0; j < n; j++) left += dead.e[i].kind == UPD_FEAT && dead.e[i].handle == (void *)mine[j];
     char later[80] = "";
     if (left) snprintf(later, sizeof later, "; %d of them once the GPU is past their last frame", left);
     rt_log("dlaa: %d DLSS feature(s) released before the one for %ux%u is made (%s); made again when used%s", n,
