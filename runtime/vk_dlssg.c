@@ -199,9 +199,34 @@ VkResult vk_dlssg_enumerate(VkInstance inst, uint32_t *n, VkPhysicalDevice *pd) 
     return f ? f(inst, n, pd) : vkEnumeratePhysicalDevices(inst, n, pd);
 }
 
+int vk_dlssg_interposed(void) { return S.loaded > 0; }
+
+// Frame generation is off for the run from here on: every later call goes to the loader alone, as when Streamline's
+// files are missing, and the settings menu says it is unavailable (vk_dlssg_status).
+static void give_up(const char *why) {
+    S.loaded = -1, S.fail = DLSSG_UNAVAILABLE;
+    rt_log("dlssg: DLSS Frame Generation is off in this run: %s", why);
+}
+
+// The interposer's vkCreateDevice asks the device for NVIDIA's extensions (VK_NV_low_latency2 among them) and fails
+// without them (VK_ERROR_EXTENSION_NOT_PRESENT). On a laptop with an NVIDIA card and Intel graphics, frame generation
+// set to DLSS and the Graphics card setting on the Intel one, that ended every start with "no usable Vulkan device"
+// (exit code 70) until nx2navi.ini was edited by hand: four reports on 0.10.1. A device of another vendor is now made
+// by the loader, without frame generation, and so is one the interposer refuses for any other reason.
 VkResult vk_dlssg_create_device(VkInstance inst, VkPhysicalDevice pd, const VkDeviceCreateInfo *ci, VkDevice *out) {
+    if (S.loaded > 0) {
+        VkPhysicalDeviceProperties p;
+        vkGetPhysicalDeviceProperties(pd, &p);
+        if (p.vendorID != 0x10de) give_up("the graphics card in use is not an NVIDIA card (the Graphics card setting, gpu_index)");
+    }
     PFN_vkCreateDevice f = S.loaded > 0 ? (PFN_vkCreateDevice)S.gipa()(inst, "vkCreateDevice") : NULL;
-    return f ? f(pd, ci, NULL, out) : vkCreateDevice(pd, ci, NULL, out);
+    if (!f) return vkCreateDevice(pd, ci, NULL, out);
+    VkResult r = f(pd, ci, NULL, out);
+    if (r == VK_SUCCESS) return r;
+    char why[96];
+    snprintf(why, sizeof why, "Streamline could not make the device (%d)", (int)r);
+    give_up(why);
+    return vkCreateDevice(pd, ci, NULL, out);
 }
 
 void vk_dlssg_device_ready(VkPhysicalDevice physical, VkDevice dev) {

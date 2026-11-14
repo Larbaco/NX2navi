@@ -268,6 +268,14 @@ retry:
                    VK_API_VERSION_MAJOR(p.apiVersion), VK_API_VERSION_MINOR(p.apiVersion), VK_API_VERSION_PATCH(p.apiVersion));
         if (want >= 0 && (int)i != want) continue;
         if (name && *name && !name_has(p.deviceName, name)) continue;
+        // A chosen card of another vendor while DLSS Frame Generation is on: the interposer cannot make its device
+        // (vk_dlssg_create_device), and the settings ask for what only an NVIDIA card runs. Not usable, so the best
+        // usable one is taken below, as for a card that is gone; where no NVIDIA card is usable either, the pass
+        // without a choice takes what there is and the device is made without frame generation.
+        if ((want >= 0 || (name && *name)) && vk_dlssg_interposed() && p.vendorID != 0x10de) {
+            rt_log("vk: gpu %u skipped: DLSS Frame Generation is on (framegen = dlss), which only an NVIDIA card runs", i);
+            continue;
+        }
         if (p.apiVersion < VK_API_VERSION_1_3) { rt_log("vk: gpu %u skipped: Vulkan below 1.3", i); continue; }
         const char *miss = missing_required(pd[i]);
         if (miss) { rt_log("vk: gpu %u skipped: missing extension %s", i, miss); continue; }
