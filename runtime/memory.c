@@ -630,6 +630,14 @@ uint64_t mem_lazy_arm(uint64_t a, uint64_t n, uint64_t h0, uint64_t h1, uint64_t
     return armed;
 }
 
+// lz_lock held: the last armed segment that meets [a, a + n) and was armed for another buffer or offset than h0 and
+// delta, -1 none (mem_lazy_skip).
+static int lazy_foreign_locked(uint64_t a, uint64_t n, uint64_t h0, int64_t delta) {
+    int i = lz_n;
+    while (i-- > 0 && !(lzs[i].lo < a + n && lzs[i].hi > a && (lzs[i].h0 != h0 || lzs[i].delta != delta))) {}
+    return i;
+}
+
 // The armed parts of [a, a + n), sorted, into out (at most max); they count as stale from here on: the caller leaves
 // the bytes it is about to write there in the mirror h0, at buffer offset address + delta. Returns how many.
 // A segment there that was armed for another buffer (a mirror evicted since, whose range a write-back armed while the
@@ -644,18 +652,18 @@ int mem_lazy_skip(uint64_t a, uint64_t n, uint64_t h0, int64_t delta, uint64_t o
     // A segment armed for another buffer goes back under frz_lock, through flight without a fetch (stale 0: its pages
     // only), with arms held off until the rest is marked, as before lz_lock; that is rare, and the replay's per-draw
     // check holds lz_lock only.
-    int foreign = 0;
     plat_mutex_lock(&lz_lock);
-    for (int i = 0; i < lz_n && !foreign; i++)
-        foreign = lzs[i].lo < a + n && lzs[i].hi > a && (lzs[i].h0 != h0 || lzs[i].delta != delta);
+    int foreign = lazy_foreign_locked(a, n, h0, delta) >= 0;
     if (foreign) {
         plat_mutex_unlock(&lz_lock);
         plat_mutex_lock(&frz_lock);
         for (;;) {
             plat_mutex_lock(&lz_lock);
-            lazy_fly_room_locked();
-            int i = lz_n, f = -1;
-            while (i-- > 0 && !(lzs[i].lo < a + n && lzs[i].hi > a && (lzs[i].h0 != h0 || lzs[i].delta != delta))) {}
+            int i = lazy_foreign_locked(a, n, h0, delta), f = -1;
+            if (i >= 0 && lz_nfly >= LZ_FLY) {   // one to take and every entry in use: wait for one, then look again
+                lazy_fly_room_locked();
+                i = lazy_foreign_locked(a, n, h0, delta);
+            }
             LzSeg s;
             if (i >= 0) {
                 lzs[i].stale = 0;
