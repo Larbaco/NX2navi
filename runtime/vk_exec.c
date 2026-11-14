@@ -1138,7 +1138,7 @@ static int split_n = -1, split_idle, split_in_pass, split_draws, split_at, part_
 static uint64_t split_ns, part_t0;
 static uint64_t n_parts, n_subs, n_idle_parts, n_pass_splits, n_cuts;
 
-// ---- the early tail (NX2NAVI_TAIL_EARLY, default 1; off by default in 0.10.1 only)
+// ---- the early tail (NX2NAVI_TAIL_EARLY, default 1 since 0.10.0; 0 turns it off)
 // Standing in Hyrule Field with FSR 4 (RX 7900 XT, 2026-11-13) a frame's main submission ends with one part of 4.7 ms
 // of GPU time, the temporal upscaler and the interface drawn after it, and one of 1.4 ms, the write-backs of what the
 // shaders wrote into VRAM mirrors. The game waits for all of it before it writes the next frame's data (the wait after
@@ -1891,8 +1891,8 @@ static void op_one(VkExec *ex, const op_hdr *h) {
 }
 
 // ---- replay workers (NX2NAVI_REPLAY_WORKERS, default auto: as many as the CPU's cores make worth it,
-// vk_exec_replay_workers_auto; 0, the default in 0.10.1 only: the replay records every op on the submitting thread;
-// the Game tab's CPU helper threads row sets it)
+// vk_exec_replay_workers_auto; 0: the replay records every op on the submitting thread; the Game tab's CPU helper
+// threads row sets it)
 // 3 workers: on an RX 7900 XT with a Ryzen 7 5800X3D, Hyrule Field standing went from 41.2 to 50.4 fps (2026-11-12, one
 // batch), with the same pictures there and in Kokiri Forest, Kakariko, Goron City, a graveyard house and Gerudo
 // Valley; 5 or 7 workers measured the same as 3. Players' games crashed with 3 on by default

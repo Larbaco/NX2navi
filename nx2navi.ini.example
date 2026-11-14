@@ -102,19 +102,19 @@
 # the game has sometimes rewritten by then.
 # replay_async = 0
 # EXPERIMENTAL. Record the large groups of draws of a submission on this many replay worker threads beside the
-# submitting one: auto or 0 to 16; 0 records everything on the submitting thread. Default: auto (0 in 0.10.1 only):
-# half the CPU's physical cores less one (2 on 6 cores, 3 on 8, 5 on 12, at most 6), none on four cores or
-# fewer and none on AMD's driver for RX 6000 and older Radeon cards, where a player's game lost its graphics device with
-# workers on; the log's "replay workers automatic" line says how many. 3 gave 51.7 instead of 43.6 fps standing in Hyrule Field on an RX
+# submitting one: auto or 0 to 16. Default: auto, half the CPU's physical cores less one (2 on 6 cores, 3 on 8, 5 on
+# 12, at most 6), none on four cores or fewer and none on AMD's driver for RX 6000 and older Radeon cards, where a
+# player's game lost its graphics device with workers on; the log's "replay workers automatic" line says how many.
+# 0: the replay records everything on one thread. 3 gave 51.7 instead of 43.6 fps standing in Hyrule Field on an RX
 # 7900 XT, and more than 3 gave nothing more there. Also in the menu: Game, Testing, CPU helper threads.
 # With 1 a worker records each long run of draws while the submitting thread waits for it: no faster, it checks that
 # the pictures stay the same.
 # replay_workers = auto
-# EXPERIMENTAL. 1 lets the game start on its next frame while the graphics card still runs the end of the last one: the
+# 1, the default, lets the game start on its next frame while the graphics card still runs the end of the last one: the
 # upscaler (FSR 4, FSR 3.1 or DLSS) and the interface drawn after it. The graphics card runs the same work, with the
 # copies of what it wrote for the game moved before that end, and the game's waits end once those copies and the
-# results it reads are there. A frame whose end hands the game anything else runs as before. Default: 1 (0 in 0.10.1
-# only). Standing in Hyrule Field on an RX 7900 XT with FSR 4: 50.7 instead of 42.5 fps, and 63.5
+# results it reads are there. A frame whose end hands the game anything else runs as before. Default: 1 (0 up to
+# 0.9.2); 0 turns it off. Standing in Hyrule Field on an RX 7900 XT with FSR 4: 50.7 instead of 42.5 fps, and 63.5
 # instead of 49.4 with replay_workers = 3.
 # Does nothing without one of those upscalers, nor with the lazy write-back (the default on NVIDIA and Intel cards).
 # Also in the menu: Game, Testing, Start next frame early.
