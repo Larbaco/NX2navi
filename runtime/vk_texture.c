@@ -1107,11 +1107,20 @@ static int astc_opaque(const tex_t *t, uint64_t addr, const TexVkFormat *f) {
 //
 // auto: full from DETAIL_FULL_MB of device-local budget on, low under DETAIL_LOW_MB, reduced between. Textures give
 // way from 80% of the budget on (sweep_pressure), so a level wants its use at or under that: full, 6.9 to 7.5 GiB in
-// the town and in Hyrule Field, on cards of 10 GiB and more (their budgets start near 9 GiB; an 8 GiB card's is about
-// 7.2 GiB); reduced, 5.5 GiB, on 8 GiB cards; and every 6 GiB card, whose budget stays under 5.5 GiB, gets low.
+// the town and in Hyrule Field; reduced, 5.5 GiB, on 8 GiB cards (their budget is about 7.2 GiB); and every 6 GiB
+// card, whose budget stays under 5.5 GiB, gets low.
+// Full was chosen from 8,192 MiB, which is the cards of 10 GiB (their budgets start near 9 GiB). What full takes is
+// more than its textures, though: after a tour of eleven areas at 2560x1440 the driver counted 12.7 GiB in use on a
+// 24 GiB card, 4.6 GiB of it free space inside the allocator's blocks, which the pressure check leaves out and the
+// driver does not (vk_mem_vram_live). With that card filled to the room of an 8 GiB one, memory went to system memory
+// and the same tour ran at 29.6 fps with a 1% low of 11.4; with reduced, 42.8 and 36.4, and nothing spilled. So full
+// starts at 10,240 MiB of budget, the cards of 12 GiB (a 12 GiB card's budget was 11,313 MiB in a player's log).
+// An integrated GPU's budget is a share of the system's memory, not memory of its own: one reported 10,361 MiB on a
+// handheld with 16 GiB of memory in all, auto chose full, and the game ended when a save was loaded until its player
+// set reduced. auto never chooses full there.
 #define DETAIL_MIN 256
 #define DETAIL_LOW_MIN 1024
-#define DETAIL_FULL_MB 8192
+#define DETAIL_FULL_MB 10240
 #define DETAIL_LOW_MB 6144
 // The levels above assume the ASTC textures end as BC3 (or stay ASTC), a byte a texel. Where they stay RGBA8 (astc =
 // cpu, a card without the decoder, astc_bc = 0) they take four times that, which is what one level left out gives
@@ -1126,6 +1135,12 @@ static int alias_has_gpu_content(const struct Tex *src);
 
 static int64_t detail_budget_mb = -1;   // the device-local budget auto went by, in MiB; 0: the device reports none
 
+// The device's video memory is the system's own (an integrated GPU): see DETAIL_FULL_MB.
+static int detail_shared(void) {
+    const VkCtx *c = vk_ctx();
+    return c && c->props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+}
+
 int vk_texture_detail_auto(void) {
     int64_t mb = __atomic_load_n(&detail_budget_mb, __ATOMIC_RELAXED);
     if (mb < 0 && !vk_ctx()) return 0;   // asked before there is a device: nothing is kept
@@ -1136,6 +1151,7 @@ int vk_texture_detail_auto(void) {
         __atomic_store_n(&detail_budget_mb, mb, __ATOMIC_RELAXED);
     }
     int most = !mb || mb >= DETAIL_FULL_MB ? 0 : mb >= DETAIL_LOW_MB ? 1 : 2;
+    if (mb && !most && detail_shared()) most = 1;
     if (mb && mb < DETAIL_RGBA8_MB && most < 2 && vk_astc_mode() != VK_ASTC_NATIVE && !vk_astc_bc()) most++;
     return most;
 }
@@ -1162,7 +1178,9 @@ static int detail_most(void) {   // the most levels a texture is made without: 0
             rt_log("vk: texture detail: full (texture_detail = %s; the device reports no video memory budget)", v);
         else
             rt_log("vk: texture detail: %s, chosen for a video memory budget of %lld MiB (texture_detail = %s; full from "
-                   "%d MiB, low under %d MiB%s)", detail_names[most],(long long)detail_budget_mb, v, DETAIL_FULL_MB, DETAIL_LOW_MB,
+                   "%d MiB, low under %d MiB%s%s)", detail_names[most],(long long)detail_budget_mb, v, DETAIL_FULL_MB, DETAIL_LOW_MB,
+                   detail_shared() && detail_budget_mb >= DETAIL_FULL_MB
+                       ? "; not full on an integrated GPU, whose budget is a share of the system's memory" : "",
                    vk_astc_mode() != VK_ASTC_NATIVE && !vk_astc_bc() && detail_budget_mb < DETAIL_RGBA8_MB
                        ? "; one step lower because ASTC textures stay uncompressed here" : "");
     }

@@ -643,8 +643,9 @@
 # memory, and three quarters of a texture is its largest mip level. reduced makes the large surface textures (256x256 and
 # more, with smaller levels) without that level, low without the two largest when they are 1024x1024 or more. Surfaces
 # seen up close look softer; interface art, small textures, shadow maps and everything the game draws itself keep their
-# size. auto picks by the video memory Windows grants the game: full from 8192 MiB (cards of 10 GB and more), low under
-# 6144 MiB (cards of 6 GB and less), reduced between (8 GB cards). Where the ASTC textures stay uncompressed (astc =
+# size. auto picks by the video memory Windows grants the game: full from 10240 MiB (cards of 12 GB and more), low under
+# 6144 MiB (cards of 6 GB and less), reduced between (8 and 10 GB cards), and never full on integrated graphics, whose
+# video memory is the PC's own memory. Where the ASTC textures stay uncompressed (astc =
 # cpu or astc_bc = 0) and the budget is under 20480 MiB, auto goes one step lower, as they take four times the memory.
 # The log says what was picked ("texture detail:"). Read at start.
 # texture_detail = auto
