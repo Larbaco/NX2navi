@@ -767,6 +767,13 @@ A change to the copy of each event-ordered queue's first held wait (`runtime/vk_
 `vk_exec_held_ready`) passes `python tests\evo_peek_check.py`, which builds the header alone: one writer republishes
 while three readers copy, no copy mixes two publishes, and no reader waits for the writer. No GPU, no game files.
 
+A change to the present that waits for held work (`runtime/vk_present_held.h`, `runtime/vk_backend.c` `submit_sync`,
+`vk_be_present`, `ph_out`) passes `python tests\present_held_check.py`, which builds the header with the platform layer:
+one presenting and three submitting threads over 200,000 frames, every frame out once, in order and never two at once,
+each reason a held present goes out seen; step by step what keeps and what puts out a held present; and with the lock
+held elsewhere a submitting thread gives up at once while the presenting thread waits and counts its wait. No GPU, no
+game files.
+
 A change to how `runtime/memory.c` `mem_copy_readable` reads the lazy heap (`NX2NAVI_HEAP_LAZY=1`) passes
 `python tests\heap_lazy_copy_check.py`, which builds `memory.c` with the Windows platform layer and its fault handler:
 every copy returns, a heap page nothing touched yet reads zero and stays reserved, and pages past the heap's end are

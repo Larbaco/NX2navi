@@ -37,6 +37,7 @@
 #include "vk_dlssg.h"
 #include "vk_fg.h"
 #include "vk_lowlat.h"
+#include "vk_present_held.h"
 
 #define WEAK __attribute__((weak))
 
@@ -490,15 +491,17 @@ uint64_t gfx_replayed_submits(void) {
 // first, in a submission of its own (held_resume); if work is still held, the present waits and goes out right after
 // the submission that replays the last of it, at the next present, or after PH_MAX submissions at the latest. Only with
 // the replay on the submitting thread, as the event order. NX2NAVI_PRESENT_HELD=0: every present goes out at once.
+// The game presents from one thread while others submit, so the submission that puts a held present out may be another
+// thread's, while the presenting thread goes on to its next present. vk_present_held.h keeps that whole: one lock
+// (PH.lock) around arming, putting out and every synchronous present while held presents are on, so a held frame goes
+// out once, in one piece and before the next one. A submitting thread only tries it and never waits; the presenting
+// thread waits for it only while another thread is putting a held present out (counted, and timed as PERF_DRAIN). No
+// path holds it across held_resume, which is a replay; present_image's callees take sub_lock only by trying it.
 #define PH_MAX 8
-static struct {
-    int on;                      // a present waits
-    const tex_t *t;
-    int crop[4], has_crop;
-    uint64_t at_ns, queued, frame, since;   // since: vk_exec_submit_seq when it began to wait
-    uint64_t waited, ran, after, capped, next, logged;   // presents that waited; held work run first at a present;
-                                                         // presents out after the held work, at PH_MAX, at the next present
-} PH;
+static void ph_lock_waited(uint64_t t0) { perf_end(PERF_DRAIN, t0); }   // perf_begin's clock is plat_now_ns's
+static PhState PH = {.lock = PLAT_MUTEX_INIT, .on_wait = ph_lock_waited};
+static uint64_t ph_ran;      // held work run at a present (held_resume), on any thread: atomic
+static uint64_t ph_logged;   // PH.lock: "went out" lines so far
 
 static int present_held_on(void) {
     static int on = -1;
@@ -510,37 +513,53 @@ static uint64_t submit_sync(const uint64_t *handles, int n);
 
 // The held work that can go on now, in a submission of its own (vk_exec_record syncs it like any other: held_sync).
 // The present thread first finishes what it was handed: its empty submission replays held work and frees what it
-// replayed (vk_exec_record), which this walk reads. A present ph_flush handed it a moment ago is such a case.
+// replayed (vk_exec_record), which this walk reads. A present ph_out handed it a moment ago is such a case.
 static int held_resume(void) {
     vk_present_drain();
     if (!vk_exec_held() || !vk_exec_held_ready()) return 0;
     submit_sync(NULL, 0);
-    PH.ran++;
+    __atomic_add_fetch(&ph_ran, 1, __ATOMIC_RELAXED);
     return 1;
 }
 
-static void ph_flush(uint64_t *why) {
-    if (!PH.on) return;
-    PH.on = 0, (*why)++;
-    if (PH.logged < 16)
-        PH.logged++, rt_log("vk: the present of frame %llu went out %llu submission(s) after the game's present call, %d "
-                            "held submissions left (%s)", (unsigned long long)PH.frame,
-                            (unsigned long long)(vk_exec_submit_seq_now() - PH.since), vk_exec_held(),
-                            why == &PH.after ? "the held work was replayed" : why == &PH.capped ? "PH_MAX reached"
+// vk_present_held.h's present callback, with PH.lock held: a held present (why PH_AFTER, PH_CAPPED, PH_NEXT) or one
+// that did not wait (PH_NONE) goes to present_image.
+static void ph_out(const PhJob *j, int why, void *arg) {
+    (void)arg;
+    if (why != PH_NONE && ph_logged < 16)
+        ph_logged++, rt_log("vk: the present of frame %llu went out %llu submission(s) after the game's present call, %d "
+                            "held submissions left (%s)", (unsigned long long)j->frame,
+                            (unsigned long long)(vk_exec_submit_seq_now() - j->since), vk_exec_held(),
+                            why == PH_AFTER ? "the held work was replayed" : why == PH_CAPPED ? "PH_MAX reached"
                                                                                          : "the next present came");
-    present_image(PH.t, PH.has_crop ? PH.crop : NULL, PH.at_ns, PH.queued, PH.frame, 0);
-    if (PH.waited % 600 == 0)
+    present_image(j->t, j->has_crop ? j->crop : NULL, j->at_ns, j->queued, j->frame, 0);
+    if (why != PH_NONE && PH.waited % 600 == 0)
         rt_log("vk: presents that waited for held work: %llu (held work run at the present %llu times; out after it %llu, "
                "at %d submissions %llu, at the next present %llu)", (unsigned long long)PH.waited,
-               (unsigned long long)PH.ran, (unsigned long long)PH.after, PH_MAX, (unsigned long long)PH.capped,
-               (unsigned long long)PH.next);
+               (unsigned long long)__atomic_load_n(&ph_ran, __ATOMIC_RELAXED), (unsigned long long)PH.out[PH_AFTER],
+               PH_MAX, (unsigned long long)PH.out[PH_CAPPED], (unsigned long long)PH.out[PH_NEXT]);
+}
+
+// Asked with PH.lock held, after a submission that ran held work first (before) or after this thread's submission:
+// whether the held present goes out now.
+static int ph_why_before(const PhJob *j, void *arg) {
+    (void)j, (void)arg;
+    return vk_exec_held() ? PH_NONE : PH_AFTER;
+}
+static int ph_why_after(const PhJob *j, void *arg) {
+    (void)arg;
+    return !vk_exec_held() ? PH_AFTER : vk_exec_submit_seq_now() - j->since >= PH_MAX ? PH_CAPPED : PH_NONE;
+}
+static int ph_hold(void *arg) {   // the presenting thread, PH.lock held: work is still held, so its present waits
+    (void)arg;
+    return vk_exec_held() != 0;
 }
 
 static uint64_t submit_sync(const uint64_t *handles, int n) {
     vk_sync_start();
-    if (PH.on && n) {   // a present waits: what can go on goes first, then the present, then this submission
+    if (n && ph_armed(&PH)) {   // a present waits: what can go on goes first, then the present, then this submission
         held_resume();
-        if (!vk_exec_held()) ph_flush(&PH.after);
+        ph_flush_try(&PH, ph_why_before, ph_out, NULL);
     }
     vk_present_drain();
     vk_exec_gate_wait(handles, n);   // a submission that begins with a wait for the CPU's signal: before its copies
@@ -550,10 +569,7 @@ static uint64_t submit_sync(const uint64_t *handles, int n) {
     // the CPU signals"): it goes on now, in a submission of its own with copies taken after the signal, and that
     // submission's value is the one the game's fence stands for.
     if (n && vk_exec_event_at_sync() && vk_exec_held() && vk_exec_held_ready()) f = submit_sync(NULL, 0);
-    if (PH.on && n) {
-        if (!vk_exec_held()) ph_flush(&PH.after);
-        else if (vk_exec_submit_seq_now() - PH.since >= PH_MAX) ph_flush(&PH.capped);
-    }
+    if (n) ph_flush_try(&PH, ph_why_after, ph_out, NULL);   // at once unless a present waits
     return f;
 }
 
@@ -732,17 +748,16 @@ static void vk_be_present(const tex_t *t, const int crop[4], uint64_t at_ns) {
         perf_present(frame);   // before vk_exec_frame_log, which resets the frame's exec counts the flight recorder reads
         uint64_t queued = kern_now_ns();
         if (present_held_on()) {   // present_held
+            PhJob j = {.t = t, .has_crop = crop != NULL, .at_ns = at_ns, .queued = queued, .frame = frame};
+            if (crop) memcpy(j.crop, crop, sizeof j.crop);
             vk_present_drain();    // the present thread's empty submission may run held work: done before it is read
-            if (PH.on) held_resume(), ph_flush(&PH.next);   // the last present still waits: out now
+            if (ph_armed(&PH)) held_resume(), ph_flush_next(&PH, ph_out, NULL);   // the last present still waits: out now
             if (vk_exec_held()) held_resume();
-            if (vk_exec_held()) {
-                PH.on = 1, PH.t = t, PH.has_crop = crop != NULL, PH.at_ns = at_ns, PH.queued = queued, PH.frame = frame;
-                if (crop) memcpy(PH.crop, crop, sizeof PH.crop);
-                PH.since = vk_exec_submit_seq_now(), PH.waited++;
-                return;
-            }
+            j.since = vk_exec_submit_seq_now();
+            ph_present(&PH, &j, ph_hold, ph_out, NULL);   // waits for the held work, or goes out now
+            return;
         }
-        present_image(t, crop, at_ns, queued, frame, 0);
+        present_image(t, crop, at_ns, queued, frame, 0);   // only this thread presents: no lock
         return;
     }
     // Frame bound: the replay thread handled the previous present before this one is queued.
