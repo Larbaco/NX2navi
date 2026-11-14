@@ -31,9 +31,12 @@ def main():
     env = dict(os.environ)
     if os.name == 'nt' and MSYS_BIN.exists():
         env['PATH'] = str(MSYS_BIN) + os.pathsep + env.get('PATH', '')
-    # undefined behaviour traps: an overflow in the period arithmetic fails the check instead of passing by chance
-    subprocess.check_call([compiler(), '-std=gnu11', '-O1', '-Wall', '-Werror', '-fsanitize=undefined',
-                           '-fsanitize-trap=undefined', '-I', str(ROOT / 'runtime'),
+    # undefined behaviour and unsigned wrap-around trap: every period and time in dlssg_pace.h is a uint64_t, which
+    # -fsanitize=undefined alone lets wrap, so an overflow in that arithmetic fails the check instead of passing by
+    # chance
+    ub = 'undefined,unsigned-integer-overflow'
+    subprocess.check_call([compiler(), '-std=gnu11', '-O1', '-Wall', '-Werror', f'-fsanitize={ub}',
+                           f'-fsanitize-trap={ub}', '-I', str(ROOT / 'runtime'),
                            str(ROOT / 'tests' / 'dlssg_pace_check.c'), '-o', str(exe)], env=env)
     return subprocess.run([str(exe)], env=env).returncode
 
