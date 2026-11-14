@@ -634,7 +634,14 @@ static uint64_t submit_sync(const uint64_t *handles, int n) {
     return f;
 }
 
+// vk_sub_in_frame is the replay's: vk_sync.c submit sets it under the submission lock from the place the submitting
+// thread noted for its submission (vk_sub_in_frame_publish), so another thread about to submit cannot change it under
+// a replay in progress (vk_memory.c sub_place reads it there and on the replay workers). Submissions without commands
+// of their own (held work, the present thread's blit) leave it as it was.
 int vk_sub_in_frame;
+static _Thread_local int sub_place_next;   // this thread's next submission's place in its frame
+
+void vk_sub_in_frame_publish(void) { vk_sub_in_frame = sub_place_next; }
 
 static void replay_main(void *arg) {
     (void)arg;
@@ -650,7 +657,7 @@ static void replay_main(void *arg) {
         plat_cond_broadcast(&rcv);
         plat_mutex_unlock(&rl);
         if (it.kind == RI_SUBMIT) {
-            vk_sub_in_frame = sub_idx++;
+            sub_place_next = sub_idx++;
             uint64_t f = submit_sync(it.h, it.n);
             if (f != it.value)
                 rt_fatal("vk: replayed submission signalled %llu, queued as %llu", (unsigned long long)f,
@@ -933,7 +940,7 @@ static void vk_be_program_release(const prog_t *p) { replay_drain(DR_PROG_RELEAS
 static uint64_t vk_be_submit(const uint64_t *handles, int n) {
     vk_lowlat_submit_start();   // a frame's first submission: its simulation is over (nothing while low latency is off)
     if (!gfx_replay_async()) {
-        vk_sub_in_frame = __atomic_load_n(&nvn_submits_in_frame, __ATOMIC_RELAXED);   // the front end counts it up after the submit returns
+        sub_place_next = __atomic_load_n(&nvn_submits_in_frame, __ATOMIC_RELAXED);   // counted up after the submit returns
         return submit_sync(handles, n);
     }
     vk_sync_start();

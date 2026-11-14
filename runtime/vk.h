@@ -963,6 +963,9 @@ void vk_gpu_parts_log(uint64_t frame, uint64_t t0, uint64_t t1, double fence_ms)
 void vk_gtl_note(int kind, uint64_t sub_ns, uint64_t start_tick, uint64_t end_tick);
 void vk_gtl_log(uint64_t frame, int frames);
 extern int vk_sub_in_frame;   // replay: the submission being recorded is the frame's n-th (0 the first; vk_backend.c)
+// vk_sync.c submit, sub_lock held, for a submission with commands: vk_sub_in_frame takes the place in its frame the
+// submitting thread noted for it (vk_backend.c vk_be_submit, replay_main).
+void vk_sub_in_frame_publish(void);
 // Runs fn(arg) on the completion thread once fence is done on the GPU (event writes, counter reports, sync state).
 // Callbacks run in the order they were added, after those of earlier values; a value already done runs at once there.
 void vk_completion_add(uint64_t fence, void (*fn)(void *), void *arg);
