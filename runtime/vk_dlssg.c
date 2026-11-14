@@ -42,6 +42,7 @@
 #include "vk.h"
 #include "vk_dlaa.h"
 #include "vk_dlssg.h"
+#include "vk_dlssg_device.h"
 #include "dlssg/nx2_sl.h"
 #include "ui/menu.h"
 
@@ -213,20 +214,31 @@ static void give_up(const char *why) {
 // set to DLSS and the Graphics card setting on the Intel one, that ended every start with "no usable Vulkan device"
 // (exit code 70) until nx2navi.ini was edited by hand: four reports on 0.10.1. A device of another vendor is now made
 // by the loader, without frame generation, and so is one the interposer refuses for any other reason.
+// The order of the attempts is vk_dlssg_device.h's dlssg_device_create (tests/dlssg_device_check.c).
+typedef struct { PFN_vkCreateDevice f; VkPhysicalDevice pd; const VkDeviceCreateInfo *ci; VkDevice *out; } DevCreate;
+static int create_interposed(void *u) {
+    const DevCreate *d = u;
+    return (int)d->f(d->pd, d->ci, NULL, d->out);
+}
+static int create_loader(void *u) {
+    const DevCreate *d = u;
+    return (int)vkCreateDevice(d->pd, d->ci, NULL, d->out);
+}
+
 VkResult vk_dlssg_create_device(VkInstance inst, VkPhysicalDevice pd, const VkDeviceCreateInfo *ci, VkDevice *out) {
-    if (S.loaded > 0) {
-        VkPhysicalDeviceProperties p;
-        vkGetPhysicalDeviceProperties(pd, &p);
-        if (p.vendorID != 0x10de) give_up("the graphics card in use is not an NVIDIA card (the Graphics card setting, gpu_index)");
+    VkPhysicalDeviceProperties p;
+    vkGetPhysicalDeviceProperties(pd, &p);
+    DevCreate d = {S.loaded > 0 ? (PFN_vkCreateDevice)S.gipa()(inst, "vkCreateDevice") : NULL, pd, ci, out};
+    int how, refused;
+    VkResult r = (VkResult)dlssg_device_create(d.f != NULL, p.vendorID, create_interposed, create_loader, &d, &how, &refused);
+    if (how == DLSSG_DEV_NOT_NVIDIA) {
+        give_up("the graphics card in use is not an NVIDIA card (the Graphics card setting, gpu_index)");
+    } else if (how == DLSSG_DEV_REFUSED) {
+        char why[96];
+        snprintf(why, sizeof why, "Streamline could not make the device (%d)", refused);
+        give_up(why);
     }
-    PFN_vkCreateDevice f = S.loaded > 0 ? (PFN_vkCreateDevice)S.gipa()(inst, "vkCreateDevice") : NULL;
-    if (!f) return vkCreateDevice(pd, ci, NULL, out);
-    VkResult r = f(pd, ci, NULL, out);
-    if (r == VK_SUCCESS) return r;
-    char why[96];
-    snprintf(why, sizeof why, "Streamline could not make the device (%d)", (int)r);
-    give_up(why);
-    return vkCreateDevice(pd, ci, NULL, out);
+    return r;
 }
 
 void vk_dlssg_device_ready(VkPhysicalDevice physical, VkDevice dev) {

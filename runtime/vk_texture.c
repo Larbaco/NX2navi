@@ -29,6 +29,7 @@
 #include "vk_dlaa.h"
 #include "vk_exec.h"
 #include "vk_tex_compact.h"
+#include "vk_tex_detail.h"
 #include "vk_tex_release.h"
 #include "prof.h"
 #include "platform/platform.h"
@@ -1118,15 +1119,13 @@ static int astc_opaque(const tex_t *t, uint64_t addr, const TexVkFormat *f) {
 // An integrated GPU's budget is a share of the system's memory, not memory of its own: one reported 10,361 MiB on a
 // handheld with 16 GiB of memory in all, auto chose full, and the game ended when a save was loaded until its player
 // set reduced. auto never chooses full there.
+// The choice itself is vk_tex_detail.h's tex_detail_auto, with the three budgets (tests/tex_detail_check.c).
 #define DETAIL_MIN 256
 #define DETAIL_LOW_MIN 1024
-#define DETAIL_FULL_MB 10240
-#define DETAIL_LOW_MB 6144
 // The levels above assume the ASTC textures end as BC3 (or stay ASTC), a byte a texel. Where they stay RGBA8 (astc =
 // cpu, a card without the decoder, astc_bc = 0) they take four times that, which is what one level left out gives
 // back: under this budget auto then goes one step lower. A card with 8 GiB that decoded on the CPU held two texture
 // arrays of 852 MiB each, was 560 MiB over its budget and lost its device.
-#define DETAIL_RGBA8_MB 20480
 #define EXACT_MAX 65536
 static nvn_hmap exact = {.klen = sizeof(TexKey)};   // keys made whole whatever the setting; value 1
 static uint64_t n_exact;                             // textures made whole again so far
@@ -1150,10 +1149,7 @@ int vk_texture_detail_auto(void) {
         mb = vk_mem_vram(&used, &budget, &exact_budget) ? (int64_t)(budget >> 20) : 0;
         __atomic_store_n(&detail_budget_mb, mb, __ATOMIC_RELAXED);
     }
-    int most = !mb || mb >= DETAIL_FULL_MB ? 0 : mb >= DETAIL_LOW_MB ? 1 : 2;
-    if (mb && !most && detail_shared()) most = 1;
-    if (mb && mb < DETAIL_RGBA8_MB && most < 2 && vk_astc_mode() != VK_ASTC_NATIVE && !vk_astc_bc()) most++;
-    return most;
+    return tex_detail_auto(mb, detail_shared(), vk_astc_mode() != VK_ASTC_NATIVE && !vk_astc_bc());
 }
 
 static const char *const detail_names[3] = {"full", "reduced", "low"};

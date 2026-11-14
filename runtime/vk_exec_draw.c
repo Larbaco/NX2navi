@@ -31,6 +31,7 @@
 #include "vk_exec.h"
 #include "vk_gpa.h"
 #include "mesh_fb.h"
+#include "mesh_fb_hold.h"
 #include "vk_mesh_fb.h"
 #include "vk_scratch_lru.h"
 #include "vk_index_rewrite.h"
@@ -4482,10 +4483,8 @@ static const VkPipeInfo *PD_info;   // the pipeline of the last draw prepare_dra
 // skipped in and clears the stamp when it is drawn; the depth-only draw, which comes first in the frame, is held when
 // the stamp is at most MFB_HOLD_PRESENTS presents old, so a list whose colour draw no longer comes is held no longer
 // than that. A draw whose stages write memory is never held (mfb_draw): the writes are wanted whatever is drawn.
-// One word per slot (the address above 24 bits of the present count), read and written by the replay's threads without
-// a lock: a lost update costs a list one frame of the hold. NX2NAVI_MESH_FALLBACK_HOLD=0 turns it off.
-#define MFB_HOLD_SLOTS 1024
-#define MFB_HOLD_PRESENTS 2
+// The table is mesh_fb_hold.h's (tests/mesh_fb_hold_check.c), read and written by the replay's threads without a lock:
+// a lost update costs a list one frame of the hold. NX2NAVI_MESH_FALLBACK_HOLD=0 turns it off.
 static volatile uint64_t mfb_hold[MFB_HOLD_SLOTS];
 static volatile uint64_t mfb_held_draws;
 
@@ -4495,23 +4494,13 @@ static int mfb_hold_on(void) {
     return on;
 }
 
-static volatile uint64_t *mfb_hold_slot(uint64_t list) {
-    return &mfb_hold[(uint32_t)((list >> 2) * 0x9e3779b1u) >> 22];
-}
-
 // The list's colour draw was skipped for its modules or pipeline (waits 1), or was drawn (0).
 static void mfb_hold_set(uint64_t list, int waits) {
-    volatile uint64_t *slot = mfb_hold_slot(list);
-    if (waits)
-        __atomic_store_n(slot, list << 24 | (__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) & 0xffffff),
-                         __ATOMIC_RELAXED);
-    else if (__atomic_load_n(slot, __ATOMIC_RELAXED) >> 24 == list) __atomic_store_n(slot, 0, __ATOMIC_RELAXED);
+    mfb_hold_mark(mfb_hold, list, waits, __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED));
 }
 
 static int mfb_held(uint64_t list) {
-    uint64_t w = __atomic_load_n(mfb_hold_slot(list), __ATOMIC_RELAXED);
-    if (!w || w >> 24 != list) return 0;
-    return ((__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) - w) & 0xffffff) <= MFB_HOLD_PRESENTS;
+    return mfb_hold_test(mfb_hold, list, __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED));
 }
 
 // A held depth-only draw is left out, counted as a draw whose own pipeline is building: the frame lacks it for the
