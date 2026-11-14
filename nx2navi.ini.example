@@ -1241,6 +1241,10 @@
 # Threads that prepare those compute passes for the mesh programs a place uses, the first time each is drawn (until
 # then its draws are left out). auto (default): one for each 4 logical processors, 1 to 4.
 # mesh_fallback_workers = auto
+# 1 (default): while the colour draw of a patch of grass or leaves is left out because it is still being prepared, its
+# depth draw is left out too, so the ground shows as it does without the grass. 0: the depth draw is made alone, as
+# before, and the sky's colour can show through the ground in the shape of the grass until the patch is ready.
+# mesh_fallback_hold = 1
 # Windows, 1 (experimental): the game's heap is committed a 64 KiB run at a time where it is first used, instead of
 # all of it when the game sizes it. Windows counts committed memory against RAM plus the page file whether it is used
 # or not, and in Castle Town after Hyrule Field about 3.4 of the heap's 6.8 GiB had never been used. 0: committed up

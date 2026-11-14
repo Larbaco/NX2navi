@@ -189,6 +189,10 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
     they are ready (`mesh_fallback_workers`, auto: one for each 4 logical processors, 1 to 4, so a place's programs,
     which all arrive in its first frames, are not made one after the other); they are not recorded for the next start,
     where the pipeline cache makes them quick.
+  - The game draws a culled list of grass or leaves twice from one indirect record, depth first and colour after, and
+    the depth draw's smaller program is ready first. While the colour draw is skipped for its modules or pipeline,
+    the depth draw of the same record is skipped too (`mfb_hold_role`, `mesh_fallback_hold`): alone it left the
+    list's depth in the scene with nothing drawn over it, and the sky's colour showed through the ground.
     Not carried: the far shadow cascades' coarser shading rate, a draw's first workgroup other than 0, and more
     workgroups in one draw than one compute dispatch may have.
 - Pipelines: `VK_EXT_graphics_pipeline_library` where the driver has it: stage libraries compiled ahead, a fast link

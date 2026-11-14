@@ -295,6 +295,7 @@ typedef struct DrawCtx {
     int sf_mvprev;                       // shader_for asks for the vertex shader's previous-frame variant (motion)
     int mfb_stage;                       // the mesh fallback binds this NVN stage's resources (nvn_stage_of)
     const GfxShader *mfb_cur_vs;         // the mesh fallback's vertex stage (prepare_draw_ex)
+    uint64_t mfb_list;                   // the address of its draw's indirect record, 0: none or not held (mfb_hold_role)
     PbCount *pb_cap;                     // per-binding reuse: where the resolving descriptor's census count goes
     int pb_spoiled;                      // ... and it may not be kept
     PbEntry PB[PB_N];
@@ -4469,6 +4470,74 @@ static const VkPipeInfo *PD_info;   // the pipeline of the last draw prepare_dra
 // vertex-related (vertex buffers, motion vector bookkeeping of vertex shaders) is bound or noted. 2: a mesh draw of
 // the mesh fallback (mfb_draw): the vertex stage is DrawCtx.mfb_cur_vs, in an ordinary pipeline without vertex input.
 
+// ---- mesh fallback: a list's depth-only draw is held while its colour draw waits for a pipeline
+// The game draws a culled list of grass or leaves twice from one indirect record: into the depth target alone, then
+// into the colour targets. Each draw has modules and a pipeline of its own, and the depth-only one, the smaller, is
+// built first. Drawn without its colour draw it leaves the list's depth in the scene with nothing drawn over it: what
+// lies behind fails the depth test there, and the sky's colour shows through the ground in the shape of the grass for
+// as long as the colour draw's pipeline builds, seconds each on the drivers the fallback is the default for. So while
+// a list's colour draw is skipped for its modules or pipeline, its depth-only draw is skipped too, and the ground
+// shows as it does without the grass.
+// A list is its record's address in the game's memory. The colour draw stamps the list with the present it was
+// skipped in and clears the stamp when it is drawn; the depth-only draw, which comes first in the frame, is held when
+// the stamp is at most MFB_HOLD_PRESENTS presents old, so a list whose colour draw no longer comes is held no longer
+// than that. A draw whose stages write memory is never held (mfb_draw): the writes are wanted whatever is drawn.
+// One word per slot (the address above 24 bits of the present count), read and written by the replay's threads without
+// a lock: a lost update costs a list one frame of the hold. NX2NAVI_MESH_FALLBACK_HOLD=0 turns it off.
+#define MFB_HOLD_SLOTS 1024
+#define MFB_HOLD_PRESENTS 2
+static volatile uint64_t mfb_hold[MFB_HOLD_SLOTS];
+static volatile uint64_t mfb_held_draws;
+
+static int mfb_hold_on(void) {
+    static int on = -1;
+    if (on < 0) on = rt_knob("MESH_FALLBACK_HOLD", "1");
+    return on;
+}
+
+static volatile uint64_t *mfb_hold_slot(uint64_t list) {
+    return &mfb_hold[(uint32_t)((list >> 2) * 0x9e3779b1u) >> 22];
+}
+
+// The list's colour draw was skipped for its modules or pipeline (waits 1), or was drawn (0).
+static void mfb_hold_set(uint64_t list, int waits) {
+    volatile uint64_t *slot = mfb_hold_slot(list);
+    if (waits)
+        __atomic_store_n(slot, list << 24 | (__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) & 0xffffff),
+                         __ATOMIC_RELAXED);
+    else if (__atomic_load_n(slot, __ATOMIC_RELAXED) >> 24 == list) __atomic_store_n(slot, 0, __ATOMIC_RELAXED);
+}
+
+static int mfb_held(uint64_t list) {
+    uint64_t w = __atomic_load_n(mfb_hold_slot(list), __ATOMIC_RELAXED);
+    if (!w || w >> 24 != list) return 0;
+    return ((__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) - w) & 0xffffff) <= MFB_HOLD_PRESENTS;
+}
+
+// A held depth-only draw is left out, counted as a draw whose own pipeline is building: the frame lacks it for the
+// same reason (draw_skipped, vk_backend.c frame_hold).
+static int mfb_hold_skip(VkExec *ex) {
+    uint64_t n = __atomic_add_fetch(&mfb_held_draws, 1, __ATOMIC_RELAXED);
+    if (!(n & (n - 1)))   // the first, then at powers of two
+        rt_log("vk: mesh fallback: a list's depth-only draw is left out while its colour draw waits for a pipeline (%llu "
+               "so far; NX2NAVI_MESH_FALLBACK_HOLD=0 draws it)", (unsigned long long)n);
+    return draw_skipped(ex, 1, SK_PIPE_PENDING);
+}
+
+// A colour target is bound (OP_SET_RT), whatever the draw's write masks are.
+static int mfb_hold_colour(const VkExec *ex) {
+    for (int i = 0; i < ex->rt.n && i < 8; i++)
+        if (ex->rt.color[i]) return 1;
+    return 0;
+}
+
+// What a fallback draw with state s writes: 1 a colour target, 2 depth and no colour, 0 neither.
+static int mfb_hold_role(const VkExec *ex, const VkPipeState *s) {
+    for (uint32_t i = 0; i < ex->pass_ncolor; i++)
+        if (ex->color[i].image && vk_pipeline_target_wmask(s, (int)i)) return 1;
+    return ex->depth.image && s->ds.dt && s->ds.dw ? 2 : 0;
+}
+
 static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int mesh) {
     DrawCtx *const cx = ex->dc;
     int fb = mesh == 2;   // from here on mesh says what the draw is, and !fb that its pipeline is a mesh pipeline
@@ -4671,6 +4740,11 @@ static int prepare_draw_ex(VkExec *ex, int prim, int32_t count, int restart, int
                (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1, waited / 1e6, why,
                s.feedback ? ", feedback loop" : "", pending ? ", skipped after all" : "", count, ex->pass_w, ex->pass_h,
                tg);
+    }
+    if (fb && cx->mfb_list) {   // the list's depth-only draw goes with its colour draw (mfb_hold_role)
+        int role = mfb_hold_role(ex, &s);
+        if (role == 1) mfb_hold_set(cx->mfb_list, pending);
+        else if (role == 2 && !pending && mfb_held(cx->mfb_list)) return mfb_hold_skip(ex);
     }
     if (pending) return draw_skipped(ex, mesh, SK_PIPE_PENDING);   // a background worker is building it: skipped until it is ready
     if (!p || !info) return draw_skipped(ex, mesh, SK_PIPE_FAILED);
@@ -6004,9 +6078,11 @@ static int mfb_dispatch(VkExec *ex, const GfxShader *cs, int stage, VkBuffer rec
     return 1;
 }
 
-// A mesh draw of `count` workgroups, or of the count in the game's record at ind (4 bytes, GPU-written).
-static void mfb_draw(VkExec *ex, uint32_t count, const VkMemSpan *ind) {
+// A mesh draw of `count` workgroups, or of the count in the game's record at ind (4 bytes, GPU-written), which lies
+// at `list` in the game's memory (0: no record).
+static void mfb_draw(VkExec *ex, uint32_t count, const VkMemSpan *ind, uint64_t list) {
     DrawCtx *const cx = ex->dc;
+    cx->mfb_list = 0;
     if (ex->render_disabled) {
         vk_cond_draws_skip += ex->has_render_cond;
         draw_skipped(ex, 1, SK_DISABLED);
@@ -6027,6 +6103,11 @@ static void mfb_draw(VkExec *ex, uint32_t count, const VkMemSpan *ind) {
         return;
     }
     if (!ms || (has_ts && !ts) || (has_fs && !fs)) { draw_skipped(ex, 1, SK_SHADER_FAILED); return; }
+    // the list's hold (mfb_hold_role): not for a draw whose stages write memory
+    if (list && mfb_hold_on() && !stage_writes(ms) && !stage_writes(ts) && !stage_writes(fs)) cx->mfb_list = list;
+    // without a colour target the draw is its list's depth-only one, known before its dispatches are recorded; with
+    // colour targets bound and their write masks off it is known where its state is (prepare_draw_ex)
+    if (cx->mfb_list && !mfb_hold_colour(ex) && mfb_held(cx->mfb_list)) { mfb_hold_skip(ex); return; }
     MfbCs *c = mfb_cs_get(ex, ms, ts);
     int state = __atomic_load_n(&c->state, __ATOMIC_ACQUIRE);
     if (!state && !vk_exec_targets_recent(ex, pipe_skip_mode() >= 1)) {
@@ -6036,7 +6117,14 @@ static void mfb_draw(VkExec *ex, uint32_t count, const VkMemSpan *ind) {
         while (!state && pool_ms(pool, t0)) plat_sleep_ms(1), state = __atomic_load_n(&c->state, __ATOMIC_ACQUIRE);
         pool_charge(pool, t0);
     }
-    if (!state) { MFB.pending_skips++; draw_skipped(ex, 1, SK_PIPE_PENDING); return; }
+    if (!state) {
+        // its modules are being made: with a colour target bound it counts as the list's colour draw. Its write masks
+        // are not known here; a depth-only draw taken for one holds itself for MFB_HOLD_PRESENTS presents at most.
+        if (cx->mfb_list && mfb_hold_colour(ex)) mfb_hold_set(cx->mfb_list, 1);
+        MFB.pending_skips++;
+        draw_skipped(ex, 1, SK_PIPE_PENDING);
+        return;
+    }
     const GfxShader *vs = state > 0 ? mfb_vs_get(c, fs) : NULL;
     if (!vs || !vk_meshfb_init()) { draw_skipped(ex, 1, SK_PIPE_FAILED); return; }
     uint32_t verts = c->mi.maxp * c->mi.ipp, slot_words = meshfb_slot_words(&c->mi);
@@ -6116,7 +6204,7 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d) {
     if (!d->count || !on) return;
     if (vk_ctx()->mesh_fallback) {
         if (d->first) warn_once(W_MESH, "a mesh draw from workgroup %u: drawn from workgroup 0", d->first);
-        mfb_draw(ex, d->count, NULL);
+        mfb_draw(ex, d->count, NULL, 0);
         return;
     }
     if (!fn) return warn_once(W_MESH, "mesh draws need VK_EXT_mesh_shader (mesh_emulation = 1 emulates them): skipped");
@@ -6324,7 +6412,7 @@ static void op_draw_mesh_ind(VkExec *ex, const p_draw_mesh_ind *d) {
         return;
     }
     if (fallback) {
-        mfb_draw(ex, 0, &ip);
+        mfb_draw(ex, 0, &ip, d->ind);
         vk_mem_count(ip.cls, VK_MUSE_IND, 4);
         VK_MEM_BOUND(ip);
         return;
