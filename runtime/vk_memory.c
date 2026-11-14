@@ -2828,13 +2828,15 @@ static uint64_t mirror_evict(uint64_t need, uint32_t min_idle, const char *why) 
     // victims are mirrored still, so an arm can land on them before the lock is taken again: the release under the lock
     // below takes that, usually nothing. The mirrored list changes meanwhile only by vk_pool_fini, which takes a pool
     // off it under the lock: mirror_create, hot_check and this run on the replay thread, under use_lock while chunks
-    // record.
+    // record. A victim finalized meanwhile is skipped below and the next candidate taken in its place, its fetch under
+    // the lock as in 0.10.1 (rare: a finalize between the two locks). rel holds every candidate's range and mirror; the
+    // first nr are the victims.
     uint64_t rel[MAXV][3], f = 0;
     int nr = 0;
-    for (; nr < nv && f < need; nr++) {
-        PoolRec *r = v[nr];
-        rel[nr][0] = r->import_lo, rel[nr][1] = r->import_hi, rel[nr][2] = (uint64_t)(uintptr_t)r->mbuf;
-        f += r->import_hi - r->import_lo;
+    for (int i = 0; i < nv; i++) {
+        PoolRec *r = v[i];
+        rel[i][0] = r->import_lo, rel[i][1] = r->import_hi, rel[i][2] = (uint64_t)(uintptr_t)r->mbuf;
+        if (f < need) f += r->import_hi - r->import_lo, nr++;
     }
     if (nr && evict_unlocked()) {
         plat_mutex_unlock(&pool_lock);
@@ -2849,13 +2851,13 @@ static uint64_t mirror_evict(uint64_t need, uint32_t min_idle, const char *why) 
     // All under the exclusive lock: vk_pool_fini, on another thread, takes a pool off the list under it, so a victim
     // still on the list is a live pool here, and a finalize that follows finds it imported, its table pages on the
     // imported buffer.
-    for (int k = 0; k < nr; k++) {
+    for (int k = 0; k < nv && freed < need; k++) {
         PoolRec *r = v[k];
         int on = 0;
         for (int i = 0; i < nm && !on; i++) on = mlist[i] == r;
         if (!on || r->mbuf != (VkBuffer)(uintptr_t)rel[k][2]) continue;   // finalized meanwhile: its mirror is fini's
         idle_for[n] = msub - r->acc_sub;
-        mem_lazy_release((const uint64_t (*)[3])&rel[k], 1);   // all of it at 0, else what was armed since
+        mem_lazy_release((const uint64_t (*)[3])&rel[k], 1);   // all of it at 0 or past nr, else what was armed since
         mirror_forget(r);   // off the list, mirror_gen bumped: no buffer use gets the mirror from here on
         r->mstate = MS_NONE, r->acc_sub = 0, r->retry_sub = 0;
         dead[n] = r->mbuf, dead_a[n] = r->malloc_;
@@ -4231,6 +4233,8 @@ static void hot_check(void) {
     }
     // What only the mirrors hold comes down first, without pool_lock with NX2NAVI_WB_LAZY_UNLOCKED=1, as in mirror_evict
     // (which says why, and why the release under the lock below usually finds nothing); under it with the setting at 0.
+    // A candidate finalized while the lock was down is not replaced: its mirror goes with the pool, and the pools past
+    // the eighth wait for the next check as ever.
     if (evict_unlocked()) {
         plat_mutex_unlock(&pool_lock);
         mem_lazy_release((const uint64_t (*)[3])rel, nc);
