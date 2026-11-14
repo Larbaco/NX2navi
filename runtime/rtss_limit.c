@@ -80,6 +80,7 @@ static RtssState S = RTSS_STATE_INIT;   // the worker's decisions (rtss_decide.h
 static int has_denominator;   // this RTSS knows FramerateLimitDenominator
 static int had_profile;       // the profile existed before this run changed it
 static DWORD old_limit, old_denominator = 1;
+static int owed;              // this run changed the profile and has not put it back: the three above stay as found
 static int creations, removals;   // the profile's "created" and "removed" lines this run, numbered (under lock)
 static char state_path[MAX_PATH + 32];   // rtss-profile.txt next to the executable; "" when its path is unknown
 static RtssSaved rec;                    // this run's line in it, while the profile holds a value of this run
@@ -197,11 +198,21 @@ static void unrecorded(void) {
                "Server's profile %s", *state_path ? state_path : "rtss-profile.txt", profile);
 }
 
-// rec's written value is limit/denominator now: the line follows it, so that the next start tells the game's value from
-// a value the player set since.
-static void record(DWORD limit, DWORD denominator) {
+// Before a write of limit/denominator into the profile: rec's written value is that one, and the one written before it
+// stays as the previous one (rtss_decide.h RtssSaved), so that a run that ends before the profile changed, or after,
+// leaves a profile the next start tells from a value the player set since.
+static void record_before(DWORD limit, DWORD denominator) {
     if (!atomic_load(&recorded) || (rec.limit == limit && rec.den == denominator)) return;
+    rec.prev_limit = rec.limit, rec.prev_den = rec.den;
     rec.limit = limit, rec.den = denominator;
+    if (!state_put(&rec)) unrecorded();
+}
+
+// After that write: the profile holds the written value alone (landed), or kept the previous one.
+static void record_after(int landed) {
+    if (!atomic_load(&recorded) || (rec.limit == rec.prev_limit && rec.den == rec.prev_den)) return;
+    if (landed) rec.prev_limit = rec.limit, rec.prev_den = rec.den;
+    else rec.limit = rec.prev_limit, rec.den = rec.prev_den;
     if (!state_put(&rec)) unrecorded();
 }
 
@@ -210,7 +221,7 @@ static void record(DWORD limit, DWORD denominator) {
 // run the profile holds.
 static int apply(void *ctx, int64_t mhz, int first, int clear) {
     (void)ctx;
-    if (first) {   // what to put back on exit
+    if (first && !owed) {   // what to put back on exit; after a put back that did not land, the profile still owes it
         had_profile = profile_exists();
         load_profile(profile);
         old_limit = 0, old_denominator = 1;
@@ -222,18 +233,24 @@ static int apply(void *ctx, int64_t mhz, int first, int clear) {
     rtss_limit_value(mhz, has_denominator, &l, &d);
     DWORD limit = l, denominator = d;
     if (first) {   // the line goes in before the profile changes: a kill between the two finds it as it was
-        rec = (RtssSaved){had_profile, old_limit, old_denominator, limit, denominator, ""};
+        RtssSaved was = rec;   // still in the file after a put back that did not land: the profile holds its value
+        int kept = atomic_load(&recorded);
+        rec = (RtssSaved){had_profile, old_limit, old_denominator, limit, denominator, kept ? was.limit : limit,
+                          kept ? was.den : denominator, ""};
         snprintf(rec.name, sizeof rec.name, "%s", profile);
         if (state_put(&rec)) atomic_store(&recorded, 1);
         else unrecorded();
+    } else {
+        record_before(limit, denominator);
     }
     int r = write_limit(limit, denominator);
-    if (r < 0) {
+    if (r < 0) {   // the line keeps both values: the profile may hold either
         rt_log("frame rate: RivaTuner Statistics Server's profile %s did not keep the limit: its Profiles folder needs the "
                "game run as administrator", profile);
-        if (first && atomic_exchange(&recorded, 0)) state_put(NULL);   // the profile is as it was
+        if (first && !owed && atomic_exchange(&recorded, 0)) state_put(NULL);   // the profile is as it was
         return RTSS_WROTE_READONLY;
     }
+    owed = 1;
     if (first) {
         if (!had_profile)   // numbered: a want that flips between a limit and kept out creates it again at each flip
             rt_log("frame rate: RivaTuner Statistics Server profile %s created; it goes away when the game closes "
@@ -244,14 +261,16 @@ static int apply(void *ctx, int64_t mhz, int first, int clear) {
     }
     if (r == 0) {   // RTSS must not keep an earlier limit of this run under the game's own one
         rt_log("frame rate: RivaTuner Statistics Server refused a limit of %.3f fps", mhz / 1000.0);
-        if (clear && write_limit(0, 1) > 0) {
-            record(0, 1);
-            update_profiles();
-            return RTSS_WROTE_REFUSED_CLEARED;
-        }
-        return RTSS_WROTE_REFUSED;
+        record_after(0);
+        if (!clear) return RTSS_WROTE_REFUSED;
+        record_before(0, 1);
+        int cleared = write_limit(0, 1) > 0;
+        record_after(cleared);
+        if (!cleared) return RTSS_WROTE_REFUSED;
+        update_profiles();
+        return RTSS_WROTE_REFUSED_CLEARED;
     }
-    record(limit, denominator);
+    record_after(1);
     update_profiles();
     if (!mhz) rt_log("frame rate: RivaTuner Statistics Server's profile %s has no limit", profile);
     else if ((int64_t)limit * 1000 == mhz * denominator)
@@ -262,14 +281,19 @@ static int apply(void *ctx, int64_t mhz, int first, int clear) {
     return RTSS_WROTE_HELD;
 }
 
-// The profile as it was before this run changed it (the caller checked S.changed, and marks it done). Its line in the
-// state file goes once it is back; one that did not take its old limit keeps it for the next start.
+// The profile as it was before this run changed it (the caller checked S.changed or owed, and marks S done). Its line
+// in the state file goes once it is back; one that did not go back keeps the line, and owed, for the exit and the next
+// start.
 static void put_back(void) {
     int back = 1;
     if (!had_profile) {
         delete_profile(profile);
-        rt_log("frame rate: RivaTuner Statistics Server profile %s removed, as before the game started "
-               "(removal %d this run)", profile, ++removals);
+        back = !profile_exists();
+        if (back)
+            rt_log("frame rate: RivaTuner Statistics Server profile %s removed, as before the game started "
+                   "(removal %d this run)", profile, ++removals);
+        else
+            rt_log("frame rate: RivaTuner Statistics Server profile %s did not go away", profile);
     } else if (write_limit(old_limit, old_denominator) > 0) {
         rt_log("frame rate: RivaTuner Statistics Server profile %s has its limit of %lu/%lu back", profile, old_limit,
                old_denominator);
@@ -278,6 +302,7 @@ static void put_back(void) {
         back = 0;
     }
     update_profiles();
+    if (back) owed = 0;
     if (back && atomic_exchange(&recorded, 0)) state_put(NULL);
 }
 
@@ -292,30 +317,30 @@ static int left_line(RtssSaved *r) {
 
 // The line r of this profile, left in the state file by a run that did not close (left_start): before this run changes
 // anything, the profile gets back what it held before that run (rtss_restore_plan), unless the player changed it since,
-// and the line goes. A profile that does not take its old limit keeps the line, and this run leaves the file alone.
+// and the line goes. A profile that does not go back keeps the line, and this run leaves the file alone.
 static void restore_left(const RtssSaved *r) {
     int exists = profile_exists();
     load_profile(profile);
     DWORD limit = 0, den = 1;
     get_property("FramerateLimit", (LPBYTE)&limit, sizeof limit);
     has_denominator = get_property("FramerateLimitDenominator", (LPBYTE)&den, sizeof den);
+    if (!den) den = 1;
     int plan = rtss_restore_plan(r, exists, limit, den);
-    if (plan == RTSS_PLAN_WRITE && write_limit(r->old_limit, r->old_den) <= 0) {
-        rt_log("frame rate: RivaTuner Statistics Server profile %s still has the game's limit of %u/%u from a run that "
-               "did not close, and did not take its old limit back; %s keeps its line", profile, r->limit, r->den,
-               state_path);
+    if (plan == RTSS_PLAN_DELETE) delete_profile(profile);
+    if ((plan == RTSS_PLAN_WRITE && write_limit(r->old_limit, r->old_den) <= 0) ||
+        (plan == RTSS_PLAN_DELETE && profile_exists())) {
+        rt_log("frame rate: RivaTuner Statistics Server profile %s still has the game's limit of %lu/%lu from a run "
+               "that did not close, and did not go back as it was; %s keeps its line", profile, limit, den, state_path);
         state_off = 1;
         return;
     }
-    if (plan == RTSS_PLAN_DELETE) delete_profile(profile);
     if (plan == RTSS_PLAN_WRITE || plan == RTSS_PLAN_DELETE) update_profiles();
     if (plan == RTSS_PLAN_WRITE)
-        rt_log("frame rate: RivaTuner Statistics Server profile %s had the game's limit of %u/%u from a run that did not "
-               "close (%s); its limit of %u/%u is back", profile, r->limit, r->den, state_path, r->old_limit,
-               r->old_den);
+        rt_log("frame rate: RivaTuner Statistics Server profile %s had the game's limit of %lu/%lu from a run that did "
+               "not close (%s); its limit of %u/%u is back", profile, limit, den, state_path, r->old_limit, r->old_den);
     else if (plan == RTSS_PLAN_DELETE)
-        rt_log("frame rate: RivaTuner Statistics Server profile %s had the game's limit of %u/%u from a run that did not "
-               "close (%s); removed, as before that run", profile, r->limit, r->den, state_path);
+        rt_log("frame rate: RivaTuner Statistics Server profile %s had the game's limit of %lu/%lu from a run that did "
+               "not close (%s); removed, as before that run", profile, limit, den, state_path);
     else if (plan == RTSS_PLAN_LEAVE)
         rt_log("frame rate: RivaTuner Statistics Server profile %s changed since a run that did not close (%s); left as "
                "it is", profile, state_path);
@@ -579,7 +604,7 @@ void rtss_limit_restore(void) {
     // the exit may come from a crash on any thread: give up after a second rather than wait on a lock held there
     for (int i = 0; i < 100; i++) {
         if (plat_mutex_trylock(&lock)) {
-            if (dll && S.changed) put_back(), rtss_put_back_done(&S);
+            if (dll && (S.changed || owed)) put_back(), rtss_put_back_done(&S);
             plat_mutex_unlock(&lock);
             return;
         }

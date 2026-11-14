@@ -341,25 +341,29 @@ static inline uint64_t rtss_pace_period(int holds, int movie, uint64_t now_ns, u
 // ---- the state file (rtss_limit.c, rtss-profile.txt next to the executable): each RTSS profile a run changed, as it
 // was before, so that a start after a run that did not close (a kill, a hang, a crash) puts it back. One line per
 // profile, so executables that share the folder keep their own:
-//   rtss1 <existed 0|1> <old limit> <old denominator> <written limit> <written denominator> <profile name>
-// The name comes last and may hold spaces; lines that start with # are comments.
+//   rtss1 <existed 0|1> <old limit> <old denominator> <written limit> <written denominator> <previous limit>
+//         <previous denominator> <profile name>
+// on one line. The name comes last and may hold spaces; lines that start with # are comments. The line takes a new
+// value before the profile does, and the value written before it stays as the previous one until the profile holds the
+// new one: a run that ends between the two leaves either value in the profile, and both are the game's.
 #define RTSS_SAVED_HEADER                                                                                              \
     "# RivaTuner Statistics Server's profiles as they were before the game changed them (rtss_limit.c): existed, old\n" \
-    "# limit and denominator, the game's limit and denominator, profile. The game puts a profile back and removes its\n" \
-    "# line when it closes; a start that finds a line puts that profile back first.\n"
+    "# limit and denominator, the game's limit and denominator, the game's previous ones, profile. The game puts a\n"   \
+    "# profile back and removes its line when it closes; a start that finds a line puts that profile back first.\n"
 enum { RTSS_NAME_MAX = 260 };
 
 typedef struct {
     int existed;                   // the profile existed before the run changed it
     uint32_t old_limit, old_den;   // what it held then
     uint32_t limit, den;           // what the run wrote last
+    uint32_t prev_limit, prev_den;   // what it wrote before, while the profile may still hold it; else limit and den
     char name[RTSS_NAME_MAX];      // the profile's name, the executable's (ocarina.exe)
 } RtssSaved;
 
 // The line of r, with its newline: its length, 0 when it does not fit n.
 static inline size_t rtss_saved_format(char *out, size_t n, const RtssSaved *r) {
-    int k = snprintf(out, n, "rtss1 %d %u %u %u %u %s\n", r->existed ? 1 : 0, r->old_limit, r->old_den, r->limit,
-                     r->den, r->name);
+    int k = snprintf(out, n, "rtss1 %d %u %u %u %u %u %u %s\n", r->existed ? 1 : 0, r->old_limit, r->old_den,
+                     r->limit, r->den, r->prev_limit, r->prev_den, r->name);
     return k > 0 && (size_t)k < n ? (size_t)k : 0;
 }
 
@@ -371,11 +375,14 @@ static inline int rtss_saved_parse(const char *line, size_t len, RtssSaved *r) {
     memcpy(buf, line, len);
     buf[len] = 0;
     int existed = -1, at = 0;
-    unsigned v[4];
-    if (sscanf(buf, "rtss1 %d %u %u %u %u %n", &existed, &v[0], &v[1], &v[2], &v[3], &at) != 5 || !at) return 0;
+    unsigned v[6];
+    if (sscanf(buf, "rtss1 %d %u %u %u %u %u %u %n", &existed, &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &at) != 7 ||
+        !at)
+        return 0;
     size_t name = len - (size_t)at;
-    if ((existed != 0 && existed != 1) || !v[1] || !v[3] || !name || name >= RTSS_NAME_MAX) return 0;
+    if ((existed != 0 && existed != 1) || !v[1] || !v[3] || !v[5] || !name || name >= RTSS_NAME_MAX) return 0;
     r->existed = existed, r->old_limit = v[0], r->old_den = v[1], r->limit = v[2], r->den = v[3];
+    r->prev_limit = v[4], r->prev_den = v[5];
     memcpy(r->name, buf + at, name + 1);
     return 1;
 }
@@ -430,7 +437,7 @@ static inline size_t rtss_saved_update(const char *text, const char *name, const
 }
 
 // What a start does with a line a run that did not close left (r), given the profile as it is now: whether it exists
-// and the limit and denominator it holds.
+// and the limit and denominator it holds. Either value of the line is the game's (RtssSaved.prev_limit).
 enum {
     RTSS_PLAN_NONE,     // no profile, and there was none before that run: as it was
     RTSS_PLAN_LEAVE,    // the player changed or removed the profile since: theirs as it is
@@ -439,7 +446,8 @@ enum {
 };
 static inline int rtss_restore_plan(const RtssSaved *r, int exists, uint32_t limit, uint32_t den) {
     if (!exists) return r->existed ? RTSS_PLAN_LEAVE : RTSS_PLAN_NONE;
-    if (limit != r->limit || (den ? den : 1) != r->den) return RTSS_PLAN_LEAVE;
+    den = den ? den : 1;
+    if ((limit != r->limit || den != r->den) && (limit != r->prev_limit || den != r->prev_den)) return RTSS_PLAN_LEAVE;
     return r->existed ? RTSS_PLAN_WRITE : RTSS_PLAN_DELETE;
 }
 

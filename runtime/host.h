@@ -469,8 +469,8 @@ void rtss_limit_want(int64_t mhz);                        // the pacer's limit i
 void rtss_limit_movie(int hz);                            // the rate of a movie that plays, 0 none: the pacer holds it
 int rtss_limit_active(void);                              // RTSS limits to the wanted rate: the pacer keeps the ceiling
 int rtss_limit_state(void);                               // menu: 1 RTSS limits, 2 its profile is read-only, 3 it let the
-                                                           // game run past its limit or never showed it holds it, 4 kept
-                                                           // out while a limit set in RTSS itself holds the game too
+                                                           // game run past its limit or never showed it holds it, 4
+                                                           // kept out while a limit set in RTSS holds the game too
 void rtss_limit_restore(void);                            // before the process ends: the profile's old limit back
 void rtss_limit_crash(void);                              // a crash or fatal error: no call into RTSS, the next start
                                                            // puts the profile back (rtss-profile.txt)
