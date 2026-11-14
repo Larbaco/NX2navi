@@ -270,10 +270,13 @@ static volatile uint32_t lz_fetch_ms;      // plat_now_ms() | 1 at the end of th
 // starts under frz_lock and lz_lock and ends under lz_lock alone, so a holder of frz_lock may wait for one: its fetch
 // takes the queue lock, and no holder of the queue lock takes frz_lock. Every store to lzr is made under lz_lock, from
 // the list, the entries and the region an arm is protecting (lz_arm_r). Fetches of different ranges run at once (the
-// back end has a slot for each, vk_memory.c lazy_fetch). NX2NAVI_WB_LAZY_UNLOCKED=0 keeps frz_lock from the moment a
-// fault or a release takes a range out until its entry ends, as before.
+// back end has a slot for each, vk_memory.c lazy_fetch). NX2NAVI_WB_LAZY_UNLOCKED=0 brings back 0.10.1's locking: frz_lock
+// is kept from the moment a fault or a release takes a range out until its entry ends, a release takes one segment at a
+// time, mem_thaw releases under the lock, and vk_memory.c mirror_evict and hot_check release their victims under
+// pool_lock, so one fetch runs at a time. The entries stay with it: a touch of a range in flight waits for that entry
+// and runs again, the hold is set at the take-out, and mem_lazy_touches counts the range.
 #define LZ_FLY 64          // more than the threads that touch armed pages at once; when full, a touch waits for room
-#define LZ_BATCH 16        // segments a release takes out together and fetches in one call
+#define LZ_BATCH 16        // segments a release takes out together and fetches in one call (1 with the setting at 0)
 typedef struct { uint64_t lo, hi, h0, bytes; uint32_t seq, tid; uint8_t used; } LzFly;   // bytes: to fetch, 0 none
 static LzFly lz_fly[LZ_FLY];               // lz_lock
 static volatile int32_t lz_nfly;           // lz_lock: entries in use (read without it as a hint)
@@ -457,12 +460,12 @@ static void lazy_piece_hold_locked(uint64_t a) {
     e->until = (now + (uint32_t)e->back * 1000u) | 1;
 }
 
-// frz_lock and lz_lock held: up to LZ_BATCH armed segments that meet any of rg[j] = {lo, hi, buffer or 0 for any} leave
-// the list into flight, into k[] and s[]. Returns how many; -1 when some meet but no entry is free (wait for one with
-// lazy_fly_room_locked, then again).
+// frz_lock and lz_lock held: up to LZ_BATCH armed segments (one with NX2NAVI_WB_LAZY_UNLOCKED=0, each fetched on its
+// own as in 0.10.1) that meet any of rg[j] = {lo, hi, buffer or 0 for any} leave the list into flight, into k[] and
+// s[]. Returns how many; -1 when some meet but no entry is free (wait for one with lazy_fly_room_locked, then again).
 static int lazy_take_batch_locked(const uint64_t (*rg)[3], int nr, int *k, LzSeg *s) {
-    int n = 0;
-    for (int i = lz_n; i-- > 0 && n < LZ_BATCH;) {
+    int n = 0, max = lz_unlocked ? LZ_BATCH : 1;
+    for (int i = lz_n; i-- > 0 && n < max;) {
         int hit = 0;
         for (int j = 0; j < nr && !hit; j++)
             hit = lzs[i].lo < rg[j][1] && lzs[i].hi > rg[j][0] && (!rg[j][2] || lzs[i].h0 == rg[j][2]);
@@ -747,7 +750,7 @@ int mem_copy_readable(uint8_t *const *dst, const uint64_t (*src)[2], int n, uint
 // Releases what is armed in each range rg[j] = {lo, hi, buffer} (buffer 0: any), and returns once the ranges of those
 // buffers in flight there have ended as well: before the buffers a fetch would read go away (vk_memory.c mirror_evict,
 // hot_check), and before the kernel's access in a thaw (mem_thaw). Up to LZ_BATCH segments go out at a time and are
-// fetched in one call, without frz_lock (with it when NX2NAVI_WB_LAZY_UNLOCKED=0).
+// fetched in one call, without frz_lock (with it, one segment at a time, when NX2NAVI_WB_LAZY_UNLOCKED=0).
 void mem_lazy_release(const uint64_t (*rg)[3], int nr) {
     if (!__atomic_load_n(&lz_on, __ATOMIC_RELAXED) || nr <= 0) return;
     for (;;) {

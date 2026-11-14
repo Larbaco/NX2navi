@@ -42,6 +42,7 @@ SCENARIOS = {
     'locked_join': ('join', LOCKED),
     'locked_loser': ('loser', LOCKED),
     'locked_arm_race': ('arm_race_slow', LOCKED),
+    'locked_release': ('release', LOCKED),
     'report': ('report', {}),
     'flood': ('flood', {}),
     'freeze': ('freeze', {}),

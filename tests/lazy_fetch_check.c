@@ -331,7 +331,8 @@ int main(int argc, char **argv) {
         CHECK(fetch_calls == 2, "%d fetches", fetch_calls);
     } else if (!strcmp(what, "release")) {
         // A release of one buffer's ranges (a mirror eviction): one fetch of its two armed stale segments, and it
-        // returns after the fetch another thread runs of its third; the other buffer's range stays armed.
+        // returns after the fetch another thread runs of its third; the other buffer's range stays armed. With
+        // NX2NAVI_WB_LAZY_UNLOCKED=0 each segment is fetched on its own, as in 0.10.1.
         uint64_t base = heap + 64 * M;
         uint64_t x1 = base, x2 = base + M, x3 = base + 3 * M, y = base + 2 * M;
         CHECK(arm_buf(x1, K64, 1) == K64 && arm_buf(x2, K64, 1) == K64 && arm_buf(x3, K64, 1) == K64, "arms of X");
@@ -345,9 +346,10 @@ int main(int argc, char **argv) {
         CHECK(fe && now >= fe, "the release returned before the other thread's fetch of the buffer ended");
         CHECK(!armed(x1, K64) && !armed(x2, K64) && page_rw(x1) && page_rw(x2), "X still armed");
         CHECK(armed(y, K64), "Y was released");
-        CHECK(fetch_batch_most == 2, "the release's fetch had %d copies", fetch_batch_most);
+        CHECK(fetch_batch_most == (lz_unlocked ? 2 : 1), "the release's fetch had %d copies", fetch_batch_most);
         plat_thread_join(ta);
-        CHECK(fetch_calls == 2 && fetch_copies == 3, "%d fetches of %d copies", fetch_calls, fetch_copies);
+        CHECK(fetch_calls == (lz_unlocked ? 2 : 3) && fetch_copies == 3, "%d fetches of %d copies", fetch_calls,
+              fetch_copies);
     } else if (!strcmp(what, "release_join")) {
         // a thread writes a range a release (a mirror eviction) is fetching: it waits for that fetch, its write
         // survives, one fetch in all
