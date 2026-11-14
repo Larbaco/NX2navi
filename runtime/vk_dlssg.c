@@ -283,10 +283,19 @@ static int multiplier_wanted(void) {
 PFN_vkGetDeviceProcAddr vk_dlssg_dpa(void) { return S.loaded > 0 && S.gdpa ? S.gdpa() : NULL; }
 
 // gfx_present.c create_swapchain, under the present and queue locks: the new swapchain has neither the mode nor the
-// limit, so both go to Streamline again, the limit as the presenting guest thread last asked for it.
+// limit, so both go to Streamline again, the limit as the presenting guest thread last asked for it. One line for each
+// of the first 16 swapchains says the limit sent and the one Streamline took: nx2_sl.cpp nx2sl_reflex2 logs only its
+// first calls, and the start (the device, the first swapchain, the first hand-over, a movie) uses them up.
 VkResult vk_dlssg_create_swapchain(VkDevice d, const VkSwapchainCreateInfoKHR *ci, VkSwapchainKHR *sc) {
     VkResult r = S.create_sc(d, ci, NULL, sc);
-    if (r == VK_SUCCESS) reflex_apply(__atomic_load_n(&S.limit_want, __ATOMIC_ACQUIRE));
+    if (r == VK_SUCCESS) {
+        static int made;
+        uint32_t want = __atomic_load_n(&S.limit_want, __ATOMIC_ACQUIRE);
+        reflex_apply(want);
+        if (S.reflex2 && made++ < 16)
+            rt_log("dlssg: swapchain %d: Reflex's mode and frame limit sent again (%.3f ms asked, %.3f ms taken; 0 is "
+                   "none)", made, want / 1000.0, __atomic_load_n(&S.limit_set, __ATOMIC_ACQUIRE) / 1000.0);
+    }
     return r;
 }
 void vk_dlssg_destroy_swapchain(VkDevice d, VkSwapchainKHR sc) { S.destroy_sc(d, sc, NULL); }
