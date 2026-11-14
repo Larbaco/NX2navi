@@ -152,6 +152,9 @@ static void releaser(void *arg) {
     mem_lazy_release((const uint64_t (*)[3])rel_rg, 1);
     __atomic_store_n(&rel_done, 1, __ATOMIC_SEQ_CST);
 }
+// the completion thread's arm (vk_memory.c vk_gpu_written_back) of 64 KiB at arg, written back from buffer 1
+static volatile uint64_t arm_n;
+static void armer(void *arg) { arm_n = arm_buf((uint64_t)(uintptr_t)arg, 0x10000, 1); }
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -360,6 +363,26 @@ int main(int argc, char **argv) {
         plat_thread_join(tr);
         CHECK(page_rw(s) && !lzr[r], "the range in flight was not given back");
         CHECK(arm_buf(s, K64, 1) == K64 && armed(s, K64), "the range was not armed again after its flight");
+    } else if (!strcmp(what, "arm_flight")) {
+        // A range in flight (a release, so no hold) in region r ends while an arm of another range in r is in its
+        // clean test: the region keeps its mark (memory.c lz_arm_r), so a read of the arming range that faults after
+        // that end waits for the arm instead of reaching the crash handler.
+        uint64_t R = heap + 120 * M, s1 = R, s2 = R + M;
+        CHECK(arm_buf(s1, K64, 1) == K64 && stale(s1, K64, 1) == 1, "arm s1");
+        fetch_ns = 100000000ull;
+        rel_rg[0][0] = s1, rel_rg[0][1] = s1 + K64, rel_rg[0][2] = 0;
+        void *tr = plat_thread_new(releaser, NULL, "releaser");
+        wait_fetch();
+        clean_ns = 400000000ull;
+        void *tc = plat_thread_new(armer, (void *)(uintptr_t)s2, "armer");
+        while (!__atomic_load_n(&rel_done, __ATOMIC_SEQ_CST)) plat_wait_ns(1000000);
+        plat_wait_ns(30000000);   // the flight has ended; the arm is in its clean test
+        Touch b;
+        void *tb = touch(&b, s2 + 0x10, 0);
+        plat_thread_join(tr);
+        plat_thread_join(tc);
+        plat_thread_join(tb);
+        CHECK(arm_n == K64 && b.done, "armed %llu, read done %d", (unsigned long long)arm_n, b.done);
     } else if (!strcmp(what, "foreign")) {
         // a write by the replay to a range armed for another buffer (a mirror gone since) gives it back without a
         // fetch: that buffer may be gone

@@ -33,6 +33,7 @@ SCENARIOS = {
     'release': ('release', {}),
     'release_join': ('release_join', {}),
     'arm_busy': ('arm_busy', {}),
+    'arm_flight': ('arm_flight', {}),
     'foreign': ('foreign', {}),
     'chunk': ('chunk', CHUNK),
     'locked': ('locked', LOCKED),
