@@ -1,8 +1,9 @@
-// Amiibo / NFC menu page (Dear ImGui): browser and scan controls.
+// Amiibo / NFC menu page (Dear ImGui): browser and scan controls, the figure's data, the keys file and write-back.
 #include <algorithm>
 #include <cctype>
 #include <cfloat>
 #include <filesystem>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +17,7 @@
 
 extern "C" {
 #include "amiibo.h"
+#include "amiibo_crypto.h"
 #include "cfg.h"
 #include "folder_pick.h"
 #include "platform/platform.h"
@@ -42,8 +44,13 @@ static void set_status(UiTextId id, const std::string &arg = std::string()) {
     g_status_arg = arg;
 }
 
+// Erase game data asks twice: the first press arms the button, a second one within kEraseConfirmS seconds erases.
+static const double kEraseConfirmS = 3.0;
+static double g_erase_armed_at = -1.0;   // ImGui::GetTime() of the first press; negative while not armed
+
 // Loads a dump and puts it on the reader; the status names the file.
 static void tap(const std::string &dir, const std::string &name) {
+    g_erase_armed_at = -1.0;   // a press armed for the previous figure does not erase this one
     std::string full_path = (fs::path(dir) / name).string();
     set_status(amiibo_scan_and_tap(full_path.c_str()) ? UI_MENU_AMIIBO_TAPPED : UI_MENU_AMIIBO_LOAD_FAILED, name);
 }
@@ -62,6 +69,7 @@ static bool iequals(std::string_view a, std::string_view b) {
 static void set_current_dir(const std::string &path) {
     g_current_dir = path;
     cfg_set("NX2NAVI_AMIIBO_DIR", g_current_dir.c_str());
+    opt_save_soon();   // nx2navi.ini follows a moment later, as after a row's change
 }
 
 // The host's folder dialog (folder_pick.h) answers on its own thread; the page takes the answer when it draws.
@@ -113,6 +121,10 @@ static void refresh_dir(void) {
             if (!iequals(ext, ".bin") && !iequals(ext, ".nfc")) {
                 continue;
             }
+            // amiibo_load_file takes whole 540-byte dumps only, so other files of that name (the keys file
+            // key_retail.bin among them) stay out of the list
+            std::error_code size_ec;
+            if (entry.file_size(size_ec) != (uintmax_t)AMIIBO_DUMP_SIZE || size_ec) continue;
         }
 
         g_entries.push_back({std::move(filename), is_dir});
@@ -124,6 +136,108 @@ static void refresh_dir(void) {
         if (a.is_dir != b.is_dir) return a.is_dir;
         return a.name < b.name;
     });
+}
+
+// A catalog format and its arguments, wrapped to the pane (a path or a long translation does not fit one line).
+static void text_wrapped_fmt(const char *fmt, ...) {
+    char buf[768];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    ImGui::TextWrapped("%s", buf);
+}
+
+// The loaded figure's own data (amiibo.h amiibo_get_figure_data) and the button that erases its game data.
+static void draw_figure_data(void) {
+    AmiiboFigureData fd;
+    if (!amiibo_get_figure_data(&fd)) {
+        g_erase_armed_at = -1.0;
+        return;
+    }
+    fd.nickname[sizeof fd.nickname - 1] = 0;
+    ImGui::Spacing();
+    if (fd.registered)
+        text_wrapped_fmt(menu_text(UI_MENU_AMIIBO_NICKNAME), fd.nickname);
+    else
+        ImGui::TextWrapped("%s", menu_text(UI_MENU_AMIIBO_NOT_REGISTERED));
+    UiTextId source = fd.source == AMIIBO_SOURCE_SAVED  ? UI_MENU_AMIIBO_SOURCE_SAVED
+                      : fd.source == AMIIBO_SOURCE_DUMP ? UI_MENU_AMIIBO_SOURCE_DUMP
+                                                        : UI_MENU_AMIIBO_SOURCE_NEW;
+    text_wrapped_fmt(menu_text(UI_MENU_AMIIBO_SOURCE), menu_text(source));
+    ImGui::TextWrapped("%s", menu_text(fd.decrypted ? UI_MENU_AMIIBO_DECRYPTED : UI_MENU_AMIIBO_NOT_DECRYPTED));
+    text_wrapped_fmt(menu_text(UI_MENU_AMIIBO_WRITES), (unsigned)fd.write_counter, (unsigned)fd.write_year,
+                     (unsigned)fd.write_month, (unsigned)fd.write_day);
+    if (fd.has_app_area)
+        text_wrapped_fmt(menu_text(UI_MENU_AMIIBO_GAME_DATA), (unsigned)fd.app_area_size, (unsigned)fd.access_id);
+    else
+        ImGui::TextWrapped("%s", menu_text(UI_MENU_AMIIBO_NO_GAME_DATA));
+
+    // The game data goes for good (the port's copy in the profile too), so the button asks for a second press. "###"
+    // keeps one id under both labels: the controller's cursor stays on the button when its label changes.
+    const double now = ImGui::GetTime();
+    if (!fd.has_app_area || now - g_erase_armed_at >= kEraseConfirmS) g_erase_armed_at = -1.0;
+    const bool armed = g_erase_armed_at >= 0.0;
+    const std::string label =
+        std::string(menu_text(armed ? UI_MENU_AMIIBO_ERASE_CONFIRM : UI_MENU_AMIIBO_ERASE)) + "###amiibo_erase";
+    ImGui::Spacing();
+    ImGui::BeginDisabled(!fd.has_app_area);
+    if (armed) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.3f, 0.3f, 1.0f));
+    const bool pressed = ImGui::Button(label.c_str(), ImVec2(ImGui::GetContentRegionAvail().x, 0));
+    if (armed) ImGui::PopStyleColor();
+    ImGui::EndDisabled();
+    if (pressed && !armed) {
+        g_erase_armed_at = now;
+    } else if (pressed) {
+        g_erase_armed_at = -1.0;
+        set_status(amiibo_erase_app_area() ? UI_MENU_AMIIBO_ERASED : UI_MENU_AMIIBO_ERASE_FAILED);
+    }
+}
+
+// The keys file amiibo_reload_keys reads: NX2NAVI_AMIIBO_KEYS, else key_retail.bin in the amiibo folder
+// (NX2NAVI_AMIIBO_DIR, else ./amiibo).
+static std::string keys_path(void) {
+    const char *keys = cfg_get("NX2NAVI_AMIIBO_KEYS");
+    if (keys && *keys) return keys;
+    const char *dir = cfg_get("NX2NAVI_AMIIBO_DIR");
+    std::string path = dir && *dir ? dir : kDefaultAmiiboDir;
+    if (path.back() != '/' && path.back() != '\\') path += '/';
+    return path + "key_retail.bin";
+}
+
+// The keys: loaded or not, the file in effect, Reload keys; and the write-back setting (NX2NAVI_AMIIBO_WRITEBACK, a live
+// setting), saved like a row's change (option_rows.h opt_apply).
+static void draw_keys(void) {
+    // amiibo.c reads the keys with the first dump; the tab's first draw reads them too, so the line below is right
+    // before any tap
+    static bool g_keys_read;
+    if (!g_keys_read) {
+        g_keys_read = true;
+        if (!amiibo_keys_loaded()) amiibo_reload_keys();
+    }
+    const bool loaded = amiibo_keys_loaded();
+    ImGui::TextUnformatted(menu_text(UI_MENU_AMIIBO_KEYS));
+    ImGui::SameLine();
+    ImGui::TextColored(loaded ? ImVec4(0.3f, 0.9f, 0.3f, 1.0f) : ImVec4(0.9f, 0.3f, 0.3f, 1.0f), "%s",
+                       menu_text(loaded ? UI_MENU_AMIIBO_KEYS_LOADED : UI_MENU_AMIIBO_KEYS_MISSING));
+    const std::string path = keys_path();
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    text_wrapped_fmt(menu_text(UI_MENU_AMIIBO_KEYS_FILE), path.c_str());
+    ImGui::PopStyleColor();
+    if (ImGui::Button(menu_text(UI_MENU_AMIIBO_RELOAD_KEYS), ImVec2(ImGui::GetContentRegionAvail().x, 0)))
+        set_status(amiibo_reload_keys() ? UI_MENU_AMIIBO_KEYS_RELOADED : UI_MENU_AMIIBO_KEYS_FAILED, path);
+
+    ImGui::Spacing();
+    const bool env = cfg_from_env("NX2NAVI_AMIIBO_WRITEBACK") != 0;
+    bool writeback = cfg_bool("NX2NAVI_AMIIBO_WRITEBACK") != 0;
+    ImGui::BeginDisabled(env);
+    if (ImGui::Checkbox(menu_text(UI_MENU_AMIIBO_WRITEBACK), &writeback))
+        opt_apply("NX2NAVI_AMIIBO_WRITEBACK", writeback ? "1" : "0");
+    ImGui::EndDisabled();
+    if (env)
+        ImGui::TextDisabled("%s", menu_text(UI_MENU_SET_BY_ENV));
+    else if (!loaded)
+        ImGui::TextDisabled("%s", menu_text(UI_MENU_AMIIBO_WRITEBACK_NEEDS_KEYS));
 }
 
 void tab_amiibo(float scale) {
@@ -291,9 +405,15 @@ void tab_amiibo(float scale) {
         ImGui::Text(menu_text(UI_MENU_AMIIBO_TAG_FILE), info->filename);
         ImGui::Text(menu_text(UI_MENU_AMIIBO_TAG_ID), character, info->series_id, info->numbering_id, info->nfp_type);
         ImGui::Text(menu_text(UI_MENU_AMIIBO_TAG_UID), uid);
+        draw_figure_data();
     } else {
         ImGui::TextDisabled("%s", menu_text(UI_MENU_AMIIBO_NO_TAG));
+        g_erase_armed_at = -1.0;
     }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    draw_keys();
 
     ImGui::Spacing();
     ImGui::Separator();
