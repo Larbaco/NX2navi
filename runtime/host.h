@@ -469,6 +469,7 @@ void frame_rate_sound_gate_host(Cpu *c);                  // the sound job at wh
 void frame_rate_sound_step_host(Cpu *c);                  // the step the sound job hands on (set osound, page +0xf00)
 float frame_step_frames(void);                            // the 60 Hz frames the game steps per update (set ostep), else 1
 void frame_step_flight(float *page, float *game, uint64_t *presents);   // flight.c: the step at a host present
+uint64_t frame_step_presents(void);                       // the game's presents so far: one per update of the game
 // rtss_limit.c: RivaTuner Statistics Server takes the frame limit where it runs
 void rtss_limit_want(int64_t mhz);                        // the pacer's limit in millihertz: >0, 0 none; or why RTSS is
                                                            // kept out (rtss_decide.h RTSS_OUT_*)

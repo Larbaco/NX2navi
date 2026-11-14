@@ -756,6 +756,11 @@ files.
 A change to how a gamepad's axes are read (`runtime/input.c` `pad_axis`: an axis counts once it has been seen at rest)
 passes `python tests\pad_rest_check.py`, which builds that function with stand-ins for SDL. No game files.
 
+A change to the shake key (`runtime/input.c` `shake_stick`) passes `python tests\shake_key_check.py`, which builds that
+function with stand-ins for the clock and the game's present count: each side lasts two of the game's updates from 20
+to 240 fps, also with two reads an update, a press swings for 800 ms, a hold keeps swinging until its release, and a
+swing without presents keeps its side. No game files.
+
 A change to HD rumble's encoding or report schedule (`runtime/rumble_hd.c`: a vibration value as the bytes of a Switch
 controller's rumble report, and which reports are written when) passes `python tests\rumble_hd_check.py`, which builds
 that file alone: known values and the neutral one, the frequency and amplitude clamps (no amplitude step above the

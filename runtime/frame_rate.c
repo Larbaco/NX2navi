@@ -425,7 +425,10 @@ static double ocarina_step_s(void) {
     return base * speed / 60.0;
 }
 
-static _Atomic uint64_t guest_presents;   // frame_step_present calls so far (frame_step_flight)
+static _Atomic uint64_t guest_presents;   // frame_step_present calls so far (frame_step_flight, frame_step_presents)
+
+// The game's presents so far, one per update of the game at any frame rate (input.c shake_stick counts its updates).
+uint64_t frame_step_presents(void) { return atomic_load_explicit(&guest_presents, memory_order_relaxed); }
 
 // The flight recorder's view of the step at a host present (flight.c, render thread): the newest step the patch page
 // holds in 60 Hz frames per update (set ostep; -1 without), the game's own step from its time manager in 60 Hz frames
