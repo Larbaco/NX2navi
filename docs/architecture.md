@@ -91,6 +91,16 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   queues"); a CPU signal counts for a submission only when it came before the copies above were taken, and a
   submission it comes too late for goes on at once in one of its own (`vk_exec_xfer.c`, "events the CPU signals").
   `NX2NAVI_EVO_TRACE=1` logs the order every frame was replayed in.
+- Several submitting threads. The game submits from several threads and presents from one of them. Their replays take
+  turns on the submission lock (`vk_sync.c`). The state a present closes for the frame (the DLSS state, the motion
+  tables, the frame count conditional draws go by) is reset between two replays: by the present when the lock is free,
+  else first thing in the next submission (`vk_frame_owed.h`, `NX2NAVI_PRESENT_ORDER`). A present held for
+  event-ordered work is put out once and in order by whichever thread's submission finds its work done
+  (`vk_present_held.h`); submitting threads only try its lock, and the presenting thread waits for it only while
+  another thread puts a held present out. A recording two threads submit at once gets a copy of its own for the
+  second, for its deferred binds (`nvn_submit_guard.h`). Held work is asked about without the lock from a published
+  copy (`vk_evo_peek.h`). The log counts the overlaps with `NX2NAVI_TRACE=perf` ("enters a submit ... while"), and at
+  exit what they cost ("frame bookkeeping: ...").
 - Driver data. The NVN driver keeps a per-stage constant bank (c0). The back end fills it as the driver does: storage
   and uniform tables, push constants and, for NVN 2 compute, the dispatch's group counts in bytes 0-0xb.
 - Storage buffers the shaders reach through pointer tables in memory are bound at the address the table holds
