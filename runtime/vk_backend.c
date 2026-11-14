@@ -42,12 +42,20 @@
 
 #define WEAK __attribute__((weak))
 
-// handoff_ns: how long the presenting thread waited to hand this job over (present_image), for the present lines
-typedef struct { VkImage image; VkFormat format; int w, h, has_crop, crop[4]; uint64_t frame, at, queued, value, handoff_ns; } PresentJob;
+// handoff_ns: how long the presenting thread waited to hand this job over (present_image), for the present lines.
+// owed: the presenting thread left the frame's bookkeeping to the next holder of the submission lock (present_image,
+// vk_frame_owed.h); the present thread makes sure it ran before the blit (present_frame_closed).
+typedef struct {
+    VkImage image;
+    VkFormat format;
+    int w, h, has_crop, crop[4], owed;
+    uint64_t frame, at, queued, value, handoff_ns;
+} PresentJob;
 
 static PlatMutex pl = PLAT_MUTEX_INIT;
 static PlatCond pcv = PLAT_COND_INIT;   // job queued, job taken, job submitted
 static PresentJob job;
+static void present_frame_closed(uint64_t frame);   // "a frame's bookkeeping in replay order"
 static int pending, busy, present_thread;
 
 // Sleeps on a high-resolution timer to 1 ms before at, then yields until at: the timer alone wakes up to ~0.5 ms late.
@@ -115,6 +123,7 @@ static void present_main(void *arg) {
         unsigned tr = rt_trace;   // read once: the stamps and both lines below follow the same flags
         int timed = (tr & (RT_TRACE_PRESENT | RT_TRACE_PERF)) != 0;
         uint64_t b0 = timed ? kern_now_ns() : 0;
+        if (j.owed) present_frame_closed(j.frame);   // vk_dlaa_frame's state of this frame, before anything reads it
         if (flight_on || vk_dump_white) vk_thumbs_frame(j.frame);   // NX2NAVI_DUMP_WHITE reads them too
         vk_dlssg_present_frame(j.frame);
         vk_lowlat_present_frame(j.frame);   // the frame's number for the blit's submit and the present's markers
@@ -277,11 +286,14 @@ static int frame_hold(uint32_t skipped, int resized, uint64_t frame) {
 // then reset it in the middle of that replay: a DLSS frame reset halfway (a shake, a frame without the upscaler), the
 // motion tables swapped halfway (a ghost; with NX2NAVI_MVPREV_CHECK=1 a write out of bounds), the conditional draws
 // counted against the next frame. So it runs under the submission lock: at the present when the lock is free, else
-// first thing in the next submission, on whichever thread makes it (vk_sync.c submit, vk_present_frames_owed), the
-// present thread's blit submission included. The present never waits for another thread's replay for it. Nothing in
-// frame_end may wait for the present thread, submit or flush with a wait: the hand-off, vk_texture_get with its upload
-// flush and vk_present_drain stay in present_image, outside the lock. NX2NAVI_PRESENT_ORDER=0: at the present, whatever
-// another thread replays, as in 0.10.1.
+// first thing in the next submission, on whichever thread makes it (vk_sync.c submit, vk_present_frames_owed), or on
+// the present thread before the frame's blit (present_frame_closed), whichever takes the lock first. The blit reads what
+// vk_dlaa_frame closed (the inputs frame generation must not get across an upscaler or frame generation switch), so a
+// frame's bookkeeping always comes before its blit, as in 0.10.1. The presenting thread never waits for another
+// thread's replay for it; the present thread may, for a frame still owed, as it waits for the lock for the blit's
+// submission a moment later anyway. Nothing in frame_end may wait for the present thread, submit or flush with a wait:
+// the hand-off, vk_texture_get with its upload flush and vk_present_drain stay in present_image, outside the lock.
+// NX2NAVI_PRESENT_ORDER=0: at the present, whatever another thread replays, as in 0.10.1.
 static void frame_end(uint64_t frame, const tex_t *t) {   // t: the presented texture, for the trace = gfx line
     vk_exec_frame_log(t, frame);
     dynres_frame();   // before vk_dlaa_frame reads the DLSS mode it may override
@@ -296,6 +308,8 @@ static void frame_end(uint64_t frame, const tex_t *t) {   // t: the presented te
 static FrameOwed FO;
 static const tex_t *fo_tex[FO_TEX];   // the newest frames' presented textures, by frame % FO_TEX (atomics)
 static uint64_t fo_owed_n, fo_late_n;   // presents that left it to a submission; frames a submission caught up (atomics)
+static uint64_t fo_blit_n, fo_blit_ns;  // frames the present thread caught up before their blits, and the time it took
+                                        // with the wait for the lock (the present thread's; read by order_log: atomics)
 
 static int present_order_on(void) {   // read once; present_image runs one at a time
     static int on = -1;
@@ -322,6 +336,23 @@ void vk_present_frames_owed(void) {
     if (fo_waiting(&FO)) __atomic_add_fetch(&fo_late_n, fo_run(&FO, fo_end, NULL), __ATOMIC_RELAXED);
 }
 
+// The present thread, before it uses frame (present_main): frame_end of a frame the presenting thread left owed has run
+// by then. When no submission came between, the present thread runs it itself, under sub_lock, waiting for a replay in
+// progress. Not one of the game's threads, it waits for the same lock for the blit's submission a moment later anyway;
+// a frame whose bookkeeping ran (the presenting thread got the lock, or a submission came first) takes no lock here.
+static void fo_blit_here(void) {
+    __atomic_add_fetch(&fo_blit_n, fo_run(&FO, fo_end, NULL), __ATOMIC_RELAXED);
+}
+static void fo_blit_locked(void *arg) {
+    (void)arg;
+    vk_sync_locked(fo_blit_here);
+}
+static void present_frame_closed(uint64_t frame) {
+    uint64_t t0 = kern_now_ns();
+    if (fo_close(&FO, frame, fo_blit_locked, NULL))
+        __atomic_add_fetch(&fo_blit_ns, kern_now_ns() - t0, __ATOMIC_RELAXED);
+}
+
 static void order_log(uint64_t frame, int total);   // after the held present's state (PH)
 
 // The present after the frame count: resolves the image and hands the blit to the present thread. queued: when the game
@@ -331,9 +362,10 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
     static volatile int32_t n_skipped;
     static int vram_probe;
     if (!vram_probe) vram_probe = 1, perfmon_set_vram_game(vk_mem_device_used_mb);   // the overlay's "game" beside VRAM
+    int owed = 0;   // the frame's bookkeeping may still be owed when the present thread takes it (PresentJob.owed)
     if (present_order_on()) {
         __atomic_store_n(&fo_tex[frame % FO_TEX], t, __ATOMIC_RELAXED);
-        if (!fo_present(&FO, frame, fo_try, NULL)) __atomic_add_fetch(&fo_owed_n, 1, __ATOMIC_RELAXED);
+        if (!fo_present(&FO, frame, fo_try, NULL)) owed = 1, __atomic_add_fetch(&fo_owed_n, 1, __ATOMIC_RELAXED);
     } else {
         frame_end(frame, t);
     }
@@ -355,7 +387,7 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
         return;
     }
     PresentJob j = {.image = img->image, .format = img->format, .w = (int)img->width, .h = (int)img->height, .frame = frame,
-                    .at = at_ns, .queued = queued, .value = value};
+                    .at = at_ns, .queued = queued, .value = value, .owed = owed};
     vk_hdr_present_source(img, &j.image, &j.format);   // NX2NAVI_HDR: the float picture the game copied into it, same size
     if (crop) {
         j.has_crop = 1;
@@ -795,27 +827,31 @@ static void replay_log(uint64_t frame, int total) {
 }
 
 // What the game's threads met of each other at the present (synchronous replay): presents whose frame bookkeeping
-// went to the next submission because another thread held the submission lock, frames a submission caught up, held
-// presents another thread's submission put out (ph_out), and the presenting thread's waits for PH.lock while one went
-// out (vk_present_held.h ph_lock). total: the run, at exit (gfx_exit_log); else NX2NAVI_TRACE=perf every 600 presents
-// (present_image), the window since the last line, logged only when a count moved.
+// went to the next submission because another thread held the submission lock, frames a submission caught up, frames
+// the present thread caught up before their blits (present_frame_closed) and how long that took it, the wait for the
+// lock included, held presents another thread's submission put out (ph_out), and the presenting thread's waits for
+// PH.lock while one went out (vk_present_held.h ph_lock). total: the run, at exit (gfx_exit_log); else
+// NX2NAVI_TRACE=perf every 600 presents (present_image), the window since the last line, logged only when a count moved.
 static void order_log(uint64_t frame, int total) {
-    static uint64_t last[5], last_frame;   // present_image's (one at a time): the counts at the last line
-    uint64_t v[5] = {__atomic_load_n(&fo_owed_n, __ATOMIC_RELAXED), __atomic_load_n(&fo_late_n, __ATOMIC_RELAXED),
+    static uint64_t last[7], last_frame;   // present_image's (one at a time): the counts at the last line
+    uint64_t v[7] = {__atomic_load_n(&fo_owed_n, __ATOMIC_RELAXED), __atomic_load_n(&fo_late_n, __ATOMIC_RELAXED),
                      __atomic_load_n(&ph_other, __ATOMIC_RELAXED), __atomic_load_n(&PH.lock_waits, __ATOMIC_RELAXED),
-                     __atomic_load_n(&PH.lock_wait_ns, __ATOMIC_RELAXED)};
-    uint64_t d[5], presents = total ? frame : frame - last_frame;
-    for (int i = 0; i < 5; i++) d[i] = total ? v[i] : v[i] - last[i];
+                     __atomic_load_n(&PH.lock_wait_ns, __ATOMIC_RELAXED), __atomic_load_n(&fo_blit_n, __ATOMIC_RELAXED),
+                     __atomic_load_n(&fo_blit_ns, __ATOMIC_RELAXED)};
+    uint64_t d[7], presents = total ? frame : frame - last_frame;
+    for (int i = 0; i < 7; i++) d[i] = total ? v[i] : v[i] - last[i];
     if (!total) {
-        if (!d[0] && !d[1] && !d[2] && !d[3]) return;
+        if (!d[0] && !d[1] && !d[2] && !d[3] && !d[5]) return;
         memcpy(last, v, sizeof last), last_frame = frame;
     }
     rt_log("%s frame %llu: frame bookkeeping: %llu of %llu presents left it to the next submission (another thread held "
-           "the submission lock), %llu frames caught up by a submission; held presents put out by another thread's "
-           "submission %llu, the presenting thread waited for one %llu times, %.1f ms in all, longest %.1f ms so far",
+           "the submission lock), %llu frames caught up by a submission, %llu by the present thread before their blits "
+           "(%.1f ms in all with its wait for the lock); held presents put out by another thread's submission %llu, the "
+           "presenting thread waited for one %llu times, %.1f ms in all, longest %.1f ms so far",
            total ? "vk: over the run to" : "perf: since the last such line, at", (unsigned long long)frame,
-           (unsigned long long)d[0], (unsigned long long)presents, (unsigned long long)d[1], (unsigned long long)d[2],
-           (unsigned long long)d[3], d[4] / 1e6, __atomic_load_n(&PH.lock_wait_max, __ATOMIC_RELAXED) / 1e6);
+           (unsigned long long)d[0], (unsigned long long)presents, (unsigned long long)d[1], (unsigned long long)d[5],
+           d[6] / 1e6, (unsigned long long)d[2], (unsigned long long)d[3], d[4] / 1e6,
+           __atomic_load_n(&PH.lock_wait_max, __ATOMIC_RELAXED) / 1e6);
 }
 
 // The run total, once: the game exits through prof_write (boot.c _exit, the window close), probes through

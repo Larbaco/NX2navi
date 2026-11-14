@@ -898,6 +898,10 @@ uint64_t vk_sync_submit_own(void (*record)(VkCommandBuffer, void *), void *arg);
 // Runs fn() under the submission lock when it is free now and returns 1; returns 0 at once, without running it, when
 // another thread holds the lock (vk_backend.c present_image: a frame's bookkeeping never waits for another replay).
 int vk_sync_try_locked(void (*fn)(void));
+// Runs fn() under the submission lock, waiting for it. For the present thread only, which is not one of the game's
+// threads and waits for the lock for its blit's submission anyway (vk_backend.c present_frame_closed: a frame's
+// bookkeeping still owed runs before the frame's blit).
+void vk_sync_locked(void (*fn)(void));
 // vk_backend.c (vk_frame_owed.h): the bookkeeping of the frames presented while another thread held the submission
 // lock. vk_sync.c submit calls it right after taking the lock, before its replay; a no-op without the back end.
 void vk_present_frames_owed(void);

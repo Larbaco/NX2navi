@@ -775,11 +775,12 @@ held elsewhere a submitting thread gives up at once while the presenting thread 
 game files.
 
 A change to where a frame's bookkeeping at its present runs (`runtime/vk_frame_owed.h`, `runtime/vk_backend.c`
-`present_image` and `frame_end`, `runtime/vk_sync.c` `submit` and `vk_sync_try_locked`) passes
-`python tests\frame_owed_check.py`, which builds the header with the platform layer: one presenting and three
-replaying threads, some replays holding the lock 40 ms, over 20,000 frames; every frame's bookkeeping runs once, in
-order, never during a replay and before any replay that took the lock after its present, and no present waits for a
-replay. No GPU, no game files.
+`present_image`, `present_frame_closed` and `frame_end`, `runtime/vk_sync.c` `submit`, `vk_sync_try_locked` and
+`vk_sync_locked`) passes `python tests\frame_owed_check.py`, which builds the header with the platform layer: one
+presenting thread, three replaying threads, some replays holding the lock 40 ms, and a present thread that blits each
+frame handed to it, over 20,000 frames; every frame's bookkeeping runs once, in order, never during a replay, before
+any replay that took the lock after its present and before the frame's blit, and no present waits for a replay. No
+GPU, no game files.
 
 A change to a synchronous submission's deferred binds (`runtime/nvn_submit_guard.h`, `runtime/nvn_api_cmd.c`
 `nvn_submit_prepare`, `nvn_submit_done`, `resolve_deferred`) passes `python tests\submit_clone_check.py`, which builds the

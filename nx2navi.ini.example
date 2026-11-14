@@ -1013,8 +1013,9 @@
 # wait_watch_s = 0
 # 1: what the game's present closes for the frame (the DLSS state, the motion tables, the frame count conditional
 # draws go by) is closed between two replays: when another game thread is replaying at the present, the next
-# submission does it first thing, and the present goes on at once. 0: at the present, as in 0.10.1, whatever another
-# thread replays (a rare one-frame fault at area changes). Read at start.
+# submission does it first thing, or the present thread before the picture's blit, and the game's present goes on at
+# once. 0: at the present, as in 0.10.1, whatever another thread replays (a rare one-frame fault at area changes).
+# Read at start.
 # present_order = 1
 # A report in the log when nothing moves for this many seconds: no frame shown while the window is in front, or a GPU
 # submission not finished. It names who holds the present and queue locks and what the game's threads wait for, at

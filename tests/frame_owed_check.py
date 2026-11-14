@@ -1,10 +1,13 @@
 """Build and run tests/frame_owed_check.c: runtime/vk_frame_owed.h, a frame's bookkeeping at its present in replay order
-(vk_backend.c "a frame's bookkeeping in replay order", vk_sync.c submit). One presenting thread and three replaying
-threads that hold the lock for their replays, a few of them for 40 ms, over 20,000 frames: every frame's bookkeeping
-runs once and in frame order, never during a replay, and before the body of any replay that took the lock after the
-frame was presented, and no present takes 20 ms, so the presenting thread never waits for a replay. Step by step: a
-present with the lock free runs its own frame's, presents past a held lock leave theirs to the next holder, which
-runs them in order, and an older frame number runs nothing again.
+(vk_backend.c "a frame's bookkeeping in replay order", vk_sync.c submit). One presenting thread, three replaying
+threads that hold the lock for their replays, a few of them for 40 ms, and a present thread that takes each frame
+from the presenting thread, blits it and submits, over 20,000 frames: every frame's bookkeeping runs once and in frame
+order, never during a replay, before the body of any replay that took the lock after the frame was presented and
+before the present thread's blit of the frame (vk_backend.c present_frame_closed), and no present takes 20 ms, so the
+presenting thread never waits for a replay. Step by step: a present with the lock free runs its own frame's, presents
+past a held lock leave theirs to the next holder, which runs them in order, an older frame number runs nothing again,
+and the present thread takes the lock only for a frame still owed. The exe's "old" argument leaves the present
+thread's catch-up out and fails on the blits that come before their frame's bookkeeping.
 
 No GPU, no game files, any Python.
 

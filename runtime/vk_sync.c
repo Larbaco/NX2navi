@@ -1582,6 +1582,12 @@ int vk_sync_try_locked(void (*fn)(void)) {
     return 1;
 }
 
+void vk_sync_locked(void (*fn)(void)) {
+    plat_mutex_lock(&sub_lock);
+    fn();
+    plat_mutex_unlock(&sub_lock);
+}
+
 // vk_backend.c's, which run the frames' bookkeeping (vk_frame_owed.h) and set the place in the frame of the submission
 // being recorded; builds without the back end have neither.
 WEAK void vk_present_frames_owed(void) {}
