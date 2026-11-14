@@ -803,7 +803,9 @@ static void dead_release(const UpdEntry *e, void *teardown) {
 
 // What the upscalers let go of goes once the GPU is past it: DLSS's here, FSR's in vk_ffx.cpp and vk_ffx4.cpp.
 static void upscalers_drain(void) {
-    if (dead.n) upd_take(&dead, vk_sync_fence_done(), presents_now(), dead_release, NULL);
+    const uint64_t done = vk_sync_fence_done();
+    if (dead.n) upd_take(&dead, done, presents_now(), dead_release, NULL);
+    vk_ffx_dead_take(done);   // returns at once with both of its lists empty
 }
 
 // A wait for the device, then everything the upscalers let go of that a submission made so far names goes. An image a
@@ -812,6 +814,7 @@ void vk_upscaler_settle(void) {
     const uint64_t issued = vk_sync_issued();   // read before the wait: every submission up to it is done after it
     vk_upscaler_device_idle();
     upd_take(&dead, issued, presents_now(), dead_release, NULL);
+    vk_ffx_dead_take(issued);
 }
 
 void vk_upscaler_let_go(void) {
@@ -3054,7 +3057,6 @@ static void retire_idle(void) {
     if (!retire_off_at) retire_off_at = now ? now : 1;
     if (now < retire_off_at + RETIRE_PRESENTS || !up_holds()) return;
     for (int i = 0; i < SNAPS; i++) retire_snap(&R.s[i]);
-    if (vk_ffx_holds()) vk_upscaler_device_idle();   // vk_ffx_release_idle destroys the FSR contexts at once
     vk_ffx_release_idle();
     if (D.failed) {   // as idle_release does for a size: frame generation is handed nothing of one from here on
         for (int i = 0; i < DLSS_SIZES; i++) retire_size(&D.sizes[i]);
