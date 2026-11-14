@@ -102,31 +102,31 @@
 # the game has sometimes rewritten by then.
 # replay_async = 0
 # EXPERIMENTAL. Record the large groups of draws of a submission on this many replay worker threads beside the
-# submitting one: auto or 0 to 16. Default: 0, the replay records everything on one thread. auto (the default in
-# 0.10.0 only): half the CPU's physical cores less one (2 on 6 cores, 3 on 8, 5 on 12, at most 6), none on four cores or
+# submitting one: auto or 0 to 16; 0 records everything on the submitting thread. Default: auto (0 in 0.10.1 only):
+# half the CPU's physical cores less one (2 on 6 cores, 3 on 8, 5 on 12, at most 6), none on four cores or
 # fewer and none on AMD's driver for RX 6000 and older Radeon cards, where a player's game lost its graphics device with
 # workers on; the log's "replay workers automatic" line says how many. 3 gave 51.7 instead of 43.6 fps standing in Hyrule Field on an RX
 # 7900 XT, and more than 3 gave nothing more there. Also in the menu: Game, Testing, CPU helper threads.
 # With 1 a worker records each long run of draws while the submitting thread waits for it: no faster, it checks that
 # the pictures stay the same.
-# replay_workers = 0
+# replay_workers = auto
 # EXPERIMENTAL. 1 lets the game start on its next frame while the graphics card still runs the end of the last one: the
 # upscaler (FSR 4, FSR 3.1 or DLSS) and the interface drawn after it. The graphics card runs the same work, with the
 # copies of what it wrote for the game moved before that end, and the game's waits end once those copies and the
-# results it reads are there. A frame whose end hands the game anything else runs as before. Default: 0 (1 in 0.10.0
+# results it reads are there. A frame whose end hands the game anything else runs as before. Default: 1 (0 in 0.10.1
 # only). Standing in Hyrule Field on an RX 7900 XT with FSR 4: 50.7 instead of 42.5 fps, and 63.5
 # instead of 49.4 with replay_workers = 3.
 # Does nothing without one of those upscalers, nor with the lazy write-back (the default on NVIDIA and Intel cards).
 # Also in the menu: Game, Testing, Start next frame early.
-# tail_early = 0
-# EXPERIMENTAL, with replay_workers. replay_pipe = N (1 to 4, default 0): the submitting thread goes on past up to N
-# groups its workers still record. replay_small = N (0 to 63, default 0, needs replay_pipe): a group of N draws or more
+# tail_early = 1
+# EXPERIMENTAL, with replay_workers. replay_pipe = N (0 to 4, default 4): the submitting thread goes on past up to N
+# groups its workers still record. replay_small = N (0 to 63, default 16, needs replay_pipe): a group of N draws or more
 # that is too small to share out (fewer than 64 draws) goes whole to one worker; 64 or more reads as 63. Kokiri Forest
 # standing on an RX 7900 XT with FSR 4, tail_early = 1, replay_workers = 5, replay_pipe = 4 and replay_small = 16: 63
 # instead of 45 fps with all of them off. Also in the menu: Game, Testing, Helpers work ahead (replay_pipe) and Helpers
-# take small jobs (replay_small).
-# replay_pipe = 0
-# replay_small = 0
+# take small jobs (replay_small). Neither does anything without replay workers.
+# replay_pipe = 4
+# replay_small = 16
 # EXPERIMENTAL, THE GAME CRASHES WITH 1. 1 lifts the virtual core gate: guest threads run without the console's limit
 # of one thread per core, and the game keeps per-core data without locks. With 1 the game crashes or hangs,
 # usually at start. Keep 0 to play.

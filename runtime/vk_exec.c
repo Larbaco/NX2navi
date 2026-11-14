@@ -1138,7 +1138,7 @@ static int split_n = -1, split_idle, split_in_pass, split_draws, split_at, part_
 static uint64_t split_ns, part_t0;
 static uint64_t n_parts, n_subs, n_idle_parts, n_pass_splits, n_cuts;
 
-// ---- the early tail (NX2NAVI_TAIL_EARLY, default 0; on by default in 0.10.0 only)
+// ---- the early tail (NX2NAVI_TAIL_EARLY, default 1; off by default in 0.10.1 only)
 // Standing in Hyrule Field with FSR 4 (RX 7900 XT, 2026-11-13) a frame's main submission ends with one part of 4.7 ms
 // of GPU time, the temporal upscaler and the interface drawn after it, and one of 1.4 ms, the write-backs of what the
 // shaders wrote into VRAM mirrors. The game waits for all of it before it writes the next frame's data (the wait after
@@ -1890,16 +1890,17 @@ static void op_one(VkExec *ex, const op_hdr *h) {
     }
 }
 
-// ---- replay workers (NX2NAVI_REPLAY_WORKERS, default 0: the replay records every op on the submitting thread; auto:
-// as many as the CPU's cores make worth it, vk_exec_replay_workers_auto, the default in 0.10.0 only; the Game tab's CPU
-// helper threads row sets it)
+// ---- replay workers (NX2NAVI_REPLAY_WORKERS, default auto: as many as the CPU's cores make worth it,
+// vk_exec_replay_workers_auto; 0, the default in 0.10.1 only: the replay records every op on the submitting thread;
+// the Game tab's CPU helper threads row sets it)
 // 3 workers: on an RX 7900 XT with a Ryzen 7 5800X3D, Hyrule Field standing went from 41.2 to 50.4 fps (2026-11-12, one
 // batch), with the same pictures there and in Kokiri Forest, Kakariko, Goron City, a graveyard house and Gerudo
-// Valley; 5 or 7 workers measured the same as 3. Default 0 again after players' games crashed with 3 on by default
+// Valley; 5 or 7 workers measured the same as 3. Players' games crashed with 3 on by default
 // (0.9.1, 0.9.2): an RX 6700 XT lost its device after about 18,000 frames, its last mark the game's own compute
 // dispatch (op_dispatch: 20x1x1 groups of cs d7566eb1, a depth probe) and nothing after it marked, since the group of
 // draws that followed was recorded by the workers, whose passes have no marks; an occlusion query slot was found
-// unavailable after its fence just before. An RX 6600 lost it the same way twice (0.9.2). The cause is not known.
+// unavailable after its fence just before. An RX 6600 lost it the same way twice (0.9.2). The cause is not known;
+// auto gives that driver no workers (vk_exec_replay_workers_auto), and auto is the default again since 0.10.2.
 // A submission's draws come in runs between ops that have to stay in the replay's order on its own thread (dispatches,
 // copies, texture and buffer clears, events, the game's barriers, calls). Hyrule Field, standing (NX2NAVI_REPLAY_RUNS,
 // 2026-11-11): about 3,500 draws a frame in 82 runs, 96% of them in runs of 16 draws or more and 67% in runs of 256 or
@@ -1922,7 +1923,7 @@ static void op_one(VkExec *ex, const op_hdr *h) {
 // replays the op again once in turn, and so do the contact shadows' pass and the HDR pass's source. Per-object motion
 // lists its draws under a lock (vk_exec_draw.c mvobj_draw), and the occlusion queries' slots and segments follow the
 // stream (vk_exec_xfer.c vk_exec_xfer_slots, vk_exec_xfer_group_merge).
-// NX2NAVI_REPLAY_PIPE=N (1-4, default 0): the submitting thread hands the group to the workers, takes chunks of it as
+// NX2NAVI_REPLAY_PIPE=N (0-4, default 4): the submitting thread hands the group to the workers, takes chunks of it as
 // they do until none is left to take, and goes on with the ops after it, in a new command buffer after the chunks'
 // places in the part (vk_sync_append_later), while the last chunks are recorded; also into the front pass of the next
 // group: up to N (at most LIVE_GROUPS) groups are handed out and not in their part yet, their chunks taken from one
@@ -2471,7 +2472,7 @@ static const op_hdr *group_start(VkExec *ex, const op_hdr *h, int depth) {
     int n = (int)(draws / CHUNK_DRAWS);
     if (n > RW.n + 1) n = RW.n + 1;
     if (n > GROUP_CHUNKS) n = GROUP_CHUNKS;
-    // NX2NAVI_REPLAY_SMALL=N (default 0, with NX2NAVI_REPLAY_PIPE): a group of N draws or more that is too small to cut
+    // NX2NAVI_REPLAY_SMALL=N (default 16, with NX2NAVI_REPLAY_PIPE): a group of N draws or more that is too small to cut
     // goes whole to one worker, and the submitting thread goes on with what follows it without taking the chunk
     // itself. Kokiri Forest standing, 5 workers, 4 groups out, the early tail on (2026-11-13): about 700 draws a frame
     // were in such groups, 3.6 ms of the submitting thread; with 16 the replay took 10.2 instead of 11.0 ms a frame

@@ -328,11 +328,11 @@ static const CfgMeta metas[] = {
     {"DISCORD_IMAGE", NX2NAVI_DISCORD_IMAGE_DEFAULT, NULL, LIVE},
     // Advanced: scheduling
     {"ASYNC_PREEMPT", "1", "0|1|2", RESTART}, {"REPLAY_ASYNC", "0", "0|1", RESTART},
-    {"REPLAY_PIPE", "0", "0..4", RESTART},
-    {"REPLAY_WORKERS", "0", "auto|0|1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16", RESTART},   // vk_exec.c rw_init, vk_exec_replay_workers_auto
-    // vk_exec.c "the early tail"; off by default (on in 0.10.0 only)
-    {"TAIL_EARLY", "0", "0|1", RESTART},
-    {"REPLAY_SMALL", "0", "0..63", RESTART},   // vk_exec.c group_start
+    {"REPLAY_PIPE", "4", "0..4", RESTART},
+    {"REPLAY_WORKERS", "auto", "auto|0|1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16", RESTART},   // vk_exec.c rw_init, vk_exec_replay_workers_auto
+    // vk_exec.c "the early tail"; on by default (off in 0.10.1 only)
+    {"TAIL_EARLY", "1", "0|1", RESTART},
+    {"REPLAY_SMALL", "16", "0..63", RESTART},   // vk_exec.c group_start
     {"FREE_CORES", "0", "0|1", RESTART}, {"TIMER_1MS", "1", "0|1", RESTART},
     // dynamic resolution (dynres.c): the scene follows the GPU time toward DYN_RES_TARGET milliseconds (under 1: the
     // frame limit's frame time), holding each step DYN_RES_STEP 60 Hz frames of the clock

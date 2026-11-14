@@ -1476,7 +1476,7 @@ static void tab_game(float scale) {
     opt_group_text("Testing");
     // vk_exec.c rw_init and tail_enabled read these at start: each row notes the restart and the bar's Restart does
     // it. A row whose setting does nothing without another one (rw_init) is greyed out until that one is set.
-    // Automatic first (vk_exec.c vk_exec_replay_workers_auto), named with the count it gives on this PC; 0 is the default
+    // Automatic first, the default (vk_exec.c vk_exec_replay_workers_auto), named with the count it gives on this PC
     {
         static const char *const vals[] = {"auto", "0", "1", "2", "3", "4", "5", "6", "7", "8"};
         static char auto_name[64];
