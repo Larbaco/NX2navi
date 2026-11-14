@@ -190,14 +190,17 @@ static void why_is(const RtssOut *o, const RtssState *s, const char *want, int l
 #define WHY(o, r, text) why_is(&(o), &(r).s, text, __LINE__)
 
 // RTSS's injection delay: it runs but has not hooked the game for 30 polls. The limit goes into the profile at the
-// first poll, with no second write. Once RTSS lists the game the game's limiter stands aside only after RTSS has seen
-// its Vulkan presents, read the profile and measured a period of its frames lately.
+// second poll (the first sees the want new), with no second write. Once RTSS lists the game the game's limiter stands
+// aside only after RTSS has seen its Vulkan presents, read the profile and measured a period of its frames lately.
 static void injection_delay(void) {
     Run r;
     run_init(&r);
     r.listed = 0;
     RtssOut o = step(&r, 60000);
-    CHECK(o.act == RTSS_DO_APPLY && !o.holds && o.why == RTSS_WHY_NOT_LISTED, "written at once, not held yet");
+    CHECK(o.act == RTSS_DO_NOTHING && !o.holds && o.why == RTSS_WHY_SETTLING, "a new want: not written yet");
+    WHY(o, r, "a new limit: RivaTuner Statistics Server gets it once it stays");
+    o = step(&r, 60000);
+    CHECK(o.act == RTSS_DO_APPLY && !o.holds && o.why == RTSS_WHY_NOT_LISTED, "written, not held yet");
     CHECK(r.st.firsts == 1 && r.s.applied == 60000 && r.s.changed, "the first write of the run");
     for (int i = 0; i < 30; i++) o = step(&r, 60000);
     CHECK(r.st.applies == 1 && !o.holds && o.why == RTSS_WHY_NOT_LISTED, "no write while not listed");
@@ -227,6 +230,7 @@ static void quit(void) {
     Run r;
     run_init(&r);
     step(&r, 60000);
+    step(&r, 60000);
     RtssOut o = step(&r, 60000);
     CHECK(o.holds, "held");
     r.running = 0;
@@ -243,6 +247,7 @@ static void readonly(void) {
     Run r;
     run_init(&r);
     r.st.readonly = 1;
+    step(&r, 60000);
     RtssOut o = step(&r, 60000);
     CHECK(o.act == RTSS_DO_APPLY && !o.holds && o.why == RTSS_WHY_FAILED && r.s.fail == RTSS_FAIL_READONLY, "failed");
     CHECK(!r.s.changed, "nothing of the run in the profile");
@@ -252,27 +257,32 @@ static void readonly(void) {
 }
 
 // A limit out of RTSS's range: refused and kept by the game; the earlier limit of this run is cleared to none; a limit
-// in range goes to RTSS at once.
+// in range goes to RTSS once it stays.
 static void refused(void) {
     Run r;
     run_init(&r);
     r.st.refuse_above = 200000;
     step(&r, 60000);
+    step(&r, 60000);
+    step(&r, 240000);
     RtssOut o = step(&r, 240000);
     CHECK(o.act == RTSS_DO_APPLY && !o.holds && o.why == RTSS_WHY_REFUSED, "refused");
     CHECK(r.s.refused == 240000 && r.s.applied == 0 && r.st.clears == 1 && r.st.holds == 0, "the 60 cleared to none");
     for (int i = 0; i < 5; i++) o = step(&r, 240000);
     CHECK(r.st.applies == 2 && o.why == RTSS_WHY_REFUSED && !o.holds, "not written again");
     o = step(&r, 144000);
-    CHECK(o.act == RTSS_DO_APPLY && !o.holds && r.st.holds == 144000, "144 at once");
+    CHECK(o.act == RTSS_DO_NOTHING && o.why == RTSS_WHY_SETTLING, "144 settles first");
+    o = step(&r, 144000);
+    CHECK(o.act == RTSS_DO_APPLY && !o.holds && r.st.holds == 144000, "144 written");
     o = step(&r, 144000);
     CHECK(o.holds, "held from the next poll");
     CHECK(r.st.firsts == 1, "one first write in the run (%d)", r.st.firsts);
     o = step(&r, 240000);
-    CHECK(o.act == RTSS_DO_NOTHING && o.why == RTSS_WHY_REFUSED, "the refused limit stays with the game");
+    CHECK(o.act == RTSS_DO_NOTHING && o.why == RTSS_WHY_REFUSED, "the refused limit stays with the game at once");
     // refused as the run's first write: the profile is the run's from then on
     run_init(&r);
     r.st.refuse_above = 200000;
+    step(&r, 240000);
     o = step(&r, 240000);
     CHECK(o.why == RTSS_WHY_REFUSED && r.s.changed && r.st.clears == 1, "a first refusal clears too, as it stands");
 }
@@ -319,7 +329,7 @@ static void frame_count(void) {
     // two periods over, then one under: the count starts again
     run_init(&r);
     r.frames = 144;
-    for (int i = 0; i < 6; i++) step(&r, 60000);
+    for (int i = 0; i < 7; i++) step(&r, 60000);
     CHECK(r.s.over == 2, "two periods over (%d)", r.s.over);
     r.frames = 60;
     for (int i = 0; i < 2; i++) step(&r, 60000);
@@ -327,21 +337,24 @@ static void frame_count(void) {
     // a want that changed while the poll ran: nothing decided, the count waits
     run_init(&r);
     r.frames = 144;
-    for (int i = 0; i < 4; i++) step(&r, 60000);
+    for (int i = 0; i < 5; i++) step(&r, 60000);
     o = step_ex(&r, 60000, 0);
     CHECK(o.why == RTSS_WHY_NEWER && !o.holds && o.act == RTSS_DO_NOTHING && r.s.over == 1, "a newer want: no count");
 }
 
 // No picture went out for 200 ms (a minimised window, a frame hold) or none yet: RTSS has nothing to hold, and the
-// game's limiter takes the limit back until pictures go out again.
+// game's limiter takes the limit back until pictures go out again. Before the first picture nothing is written.
 static void idle(void) {
     Run r;
     run_init(&r);
     r.presenting = 0;
-    step(&r, 60000);
-    RtssOut o = step(&r, 60000);
-    CHECK(!o.holds && o.why == RTSS_WHY_IDLE, "no host present yet");
+    RtssOut o;
+    for (int i = 0; i < 4; i++) o = step(&r, 60000);
+    CHECK(!o.holds && o.why == RTSS_WHY_NO_PRESENT && !r.st.applies, "no host present yet: nothing written");
+    WHY(o, r, "no picture has gone out yet");
     r.presenting = 1;
+    o = step(&r, 60000);
+    CHECK(o.act == RTSS_DO_APPLY && !o.holds, "written at the first picture, the want having stayed");
     o = step(&r, 60000);
     CHECK(o.holds, "held once pictures go out");
     r.presenting = 0;
@@ -362,16 +375,22 @@ static void kept_out(void) {
     Run r;
     run_init(&r);
     step(&r, 60000);
+    step(&r, 60000);
     RtssOut o = step(&r, RTSS_OUT_FRAMEGEN);
+    CHECK(o.act == RTSS_DO_NOTHING && o.why == RTSS_WHY_OUT && !o.holds && r.st.holds == 60000,
+          "the game's limiter at once, the profile once the want stays");
+    o = step(&r, RTSS_OUT_FRAMEGEN);
     CHECK(o.act == RTSS_DO_PUT_BACK && o.why == RTSS_WHY_OUT && !o.holds && r.st.holds == -1, "put back");
     CHECK(r.st.last_put_back_why == RTSS_WHY_OUT, "the put back says why");
     o = step(&r, RTSS_OUT_FRAMEGEN);
     CHECK(o.act == RTSS_DO_NOTHING && r.st.put_backs == 1, "once");
-    o = step(&r, RTSS_OUT_LOWLAT);
-    CHECK(o.act == RTSS_DO_NOTHING && o.mhz == RTSS_OUT_LOWLAT, "a second reason: nothing more");
+    for (int i = 0; i < 3; i++) o = step(&r, RTSS_OUT_LOWLAT);
+    CHECK(o.act == RTSS_DO_NOTHING && o.mhz == RTSS_OUT_LOWLAT && r.st.put_backs == 1, "a second reason: nothing more");
     WHY(o, r, "RivaTuner Statistics Server kept out: the driver's low latency");
     o = step(&r, 60000);
-    CHECK(o.act == RTSS_DO_APPLY && !o.holds && r.st.firsts == 2, "written at once, the run's first write again");
+    CHECK(o.act == RTSS_DO_NOTHING && o.why == RTSS_WHY_SETTLING, "a limit again: settles first");
+    o = step(&r, 60000);
+    CHECK(o.act == RTSS_DO_APPLY && !o.holds && r.st.firsts == 2, "written, the run's first write again");
     o = step(&r, 60000);
     CHECK(o.holds, "held from the next poll");
     // kept out from the start: the hooks library is never wanted, and nothing is written or put back
@@ -380,13 +399,31 @@ static void kept_out(void) {
     CHECK(!r.st.loaded && !r.st.applies && !r.st.put_backs && o.why == RTSS_WHY_OUT, "read only");
 }
 
-// Low latency switching on and off at every poll: each switch writes or puts back, as it stands.
+// Low latency switching on and off at every poll (a swapchain rebuild, the time before the first swapchain): the want
+// never stays two polls, so the profile keeps the limit written before, and the game's limiter holds the frames while
+// the want is new. From the start, the same flips write nothing.
 static void churn(void) {
     Run r;
     run_init(&r);
     step(&r, 60000);
+    step(&r, 60000);
+    RtssOut o;
+    for (int i = 0; i < 20; i++) {
+        o = step(&r, i & 1 ? 60000 : RTSS_OUT_LOWLAT);
+        CHECK(!(i & 1) ? !o.holds : 1, "kept out at poll %d: the game's limiter", i);
+    }
+    CHECK(r.st.applies == 1 && !r.st.put_backs && r.st.holds == 60000, "%d writes, %d put backs", r.st.applies,
+          r.st.put_backs);
+    o = step(&r, 60000);
+    CHECK(o.holds && r.st.applies == 1, "held once the limit stays");
+    run_init(&r);
     for (int i = 0; i < 20; i++) step(&r, i & 1 ? 60000 : RTSS_OUT_LOWLAT);
-    CHECK(r.st.applies == 11 && r.st.put_backs == 10, "%d writes, %d put backs", r.st.applies, r.st.put_backs);
+    CHECK(!r.st.applies && !r.st.put_backs, "from the start: nothing written");
+    // a flip every two polls is a want that stays: each one acts
+    run_init(&r);
+    for (int i = 0; i < 8; i++) step(&r, i & 2 ? RTSS_OUT_LOWLAT : 60000);
+    CHECK(r.st.applies == 2 && r.st.put_backs == 2, "two polls each: %d writes, %d put backs", r.st.applies,
+          r.st.put_backs);
 }
 
 // A movie under RTSS: the want stays the play limit and the game's pacer holds the movie. At a limit of 144 the profile
@@ -395,6 +432,7 @@ static void churn(void) {
 static void movie(void) {
     Run r;
     run_init(&r);
+    step(&r, 144000);
     step(&r, 144000);
     r.movie_mhz = 60000;
     RtssOut o = step(&r, 144000);
@@ -406,6 +444,7 @@ static void movie(void) {
     o = step(&r, 144000);
     CHECK(o.act == RTSS_DO_NOTHING && o.holds && o.why == RTSS_WHY_HOLDS && r.st.applies == 1, "held again after it");
     run_init(&r);
+    step(&r, 40000);
     step(&r, 40000);
     r.movie_mhz = 60000;
     o = step(&r, 40000);

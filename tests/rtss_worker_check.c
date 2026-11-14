@@ -379,6 +379,11 @@ static void ask(int64_t mhz) {   // a want at a present; the first one that star
         CHECK(WaitForMultipleObjects(2, h, FALSE, 5000) != WAIT_TIMEOUT, "the worker did not finish its first poll");
     }
 }
+static void settle(int64_t mhz) {   // a new want, then the polls it takes to reach the profile (RTSS_SETTLE_POLLS)
+    ask(mhz);
+    poll();
+    poll();
+}
 static void show(const char *what) {
     printf("  %s: profile %s %lu/%lu; active %d; state %d; saves %ld deletes %ld updates %ld loads %ld\n", what,
            own.exists ? "exists," : "absent,", own.limit, own.denom, rtss_limit_active(), rtss_limit_state(), saves,
@@ -498,8 +503,7 @@ static void kept_lowlat_then_limit(void) {
                  "the driver's low latency"),
           "the two-limiter line names the game's profile and low latency");
     CHECK(!loads, "kept out, the hooks library is never loaded");
-    ask(60000);
-    poll();
+    settle(60000);
     show("low latency off, limit 60");
     CHECK(loads == 1 && own.exists && own.limit == 60, "the limit goes into the profile once RTSS is let in");
     poll();
@@ -524,6 +528,7 @@ static void active_race(void) {
     no_exe_path = 1;   // 400000 writes and removals of the state file would take minutes
     app_set(1, 0xA, 1000, 2000, 60);
     ask(60000);
+    poll();
     poll();
     CHECK(rtss_limit_active(), "RTSS limits at 60");
     quiet = 1, free_run = 1;
@@ -555,6 +560,7 @@ static void active_logged(void) {
     app_set(1, 0xA, 1000, 2000, 60);
     during_save = framegen_on;
     ask(60000);
+    poll();
     show("frame generation switched on during the first write");
     CHECK(own.exists && own.limit == 60, "the limit went into the profile");
     CHECK(!rtss_limit_active(), "the game's limiter paces the kept-out want");
@@ -589,11 +595,9 @@ static void round_logged_whole(void) {
     show("display at 59.94 Hz, RTSS without a denominator");
     CHECK(own.limit == 60, "rounded to whole frames");
     CHECK(logged("profile ocarina.exe limits to 60/1 (60.000 fps; the game asked 59.940)"), "the log names 60/1");
-    ask(143856);
-    poll();
+    settle(143856);
     CHECK(logged("profile ocarina.exe limits to 144/1 (144.000 fps; the game asked 143.856)"), "the log names 144/1");
-    ask(60000);
-    poll();
+    settle(60000);
     CHECK(logged("profile ocarina.exe limits to 60.000 fps\n"), "a whole limit as it is");
 }
 
@@ -712,9 +716,9 @@ static void refused_run(void) {
     app_set(1, 0xA, 1000, 2000, 60);
     ask(60000);
     poll();
-    CHECK(own.limit == 60 && rtss_limit_active(), "60 taken");
-    ask(240000);
     poll();
+    CHECK(own.limit == 60 && rtss_limit_active(), "60 taken");
+    settle(240000);
     show("240 refused");
     CHECK(own.exists && own.limit == 0, "the earlier limit of this run is cleared to none");
     CHECK(!rtss_limit_active() && rtss_limit_state() == 0, "the game's limiter keeps 240");
@@ -722,15 +726,15 @@ static void refused_run(void) {
     poll();
     poll();
     CHECK(saves == s0, "the refused limit is not written again");
-    ask(144000);
-    poll();
+    settle(144000);
     show("144 after the refusal");
-    CHECK(own.limit == 144, "144 written at once");
+    CHECK(own.limit == 144, "144 written once it stayed");
     poll();
     CHECK(rtss_limit_active(), "and held from the next poll");
     ask(240000);
+    CHECK(!rtss_limit_active(), "240 with the game at once");
     poll();
-    CHECK(!rtss_limit_active(), "240 stays with the game");
+    CHECK(!rtss_limit_active() && own.limit == 144, "240 stays with the game");
 }
 
 // RTSS lists the game but lets it run well over the limit: three fresh periods in a row over 1.05 times the limit, each
@@ -738,15 +742,14 @@ static void refused_run(void) {
 static void over_run(void) {
     app_set(1, 0xA, 1000, 2000, 144);
     ask(60000);
-    for (int i = 0; i < 3; i++) poll();
+    for (int i = 0; i < 4; i++) poll();
     CHECK(rtss_limit_active() && own.exists, "two periods over: RTSS still limits");
     poll();
     show("three periods at 144 fps with the limit at 60");
     CHECK(rtss_limit_state() == 3 && !rtss_limit_active(), "the menu says RTSS does not limit the game");
     CHECK(!own.exists, "the profile is put back");
     CHECK(logged("RivaTuner Statistics Server measures 144.0 fps with its limit at 60.000 fps"), "logged");
-    ask(30000);
-    poll();
+    settle(30000);
     CHECK(saves == 1 && rtss_limit_state() == 3, "out for the run");
 }
 // 1.05 times the limit is not caught; a period RTSS no longer moves (the limit lowered, then the window minimised)
@@ -796,6 +799,7 @@ static void idle_run(void) {
     app_set(1, 0xA, 1000, 2000, 60);
     ask(60000);
     poll();
+    poll();
     CHECK(rtss_limit_active(), "RTSS limits");
     presenting = 0;
     poll();
@@ -843,26 +847,36 @@ static void library_run(void) {
     CHECK(logged("RivaTuner Statistics Server's hooks library did not load"), "logged");
 }
 
-// Low latency switching on and off at every poll (the want flips between a limit and kept out): each switch writes or
-// puts back the profile, as it stands, and the log numbers each creation and removal so a play-test can count them.
+// Low latency switching on and off at every poll (the want flips between a limit and kept out, as at each swapchain
+// rebuild): a want acts on the profile only once it stayed two polls, so the flips write and remove nothing, and the
+// game's limiter holds each kept-out want at once. A want that stays two polls each time does act, and the log numbers
+// each creation and removal so a play-test can count them.
 static void churn_run(void) {
     app_set(1, 0xA, 1000, 2000, 60);
     ask(60000);
     poll();
+    poll();
     for (int i = 0; i < 10; i++) {
         ask(i & 1 ? 60000 : RTSS_OUT_LOWLAT);
+        if (!(i & 1)) CHECK(!rtss_limit_active(), "kept out at flip %d: the game's limiter at once", i);
         poll();
     }
     show("ten polls with the want flipping");
+    CHECK(created == 1 && removed == 0, "%ld creations, %ld removals", created, removed);
     poll();
-    CHECK(created == 6 && removed == 5, "%ld creations, %ld removals", created, removed);
+    CHECK(rtss_limit_active(), "RTSS limits once the limit stays");
+    for (int i = 0; i < 4; i++) {
+        settle(RTSS_OUT_LOWLAT);
+        settle(60000);
+    }
+    show("four flips of two polls each");
+    CHECK(created == 5 && removed == 4, "%ld creations, %ld removals", created, removed);
     CHECK(logged("created; it goes away when the game closes (creation 1 this run)\n") &&
-              logged("(creation 6 this run)\n") && !logged("(creation 7"),
+              logged("(creation 5 this run)\n") && !logged("(creation 6"),
           "the created lines are numbered");
-    CHECK(logged("removed, as before the game started (removal 1 this run)\n") && logged("(removal 5 this run)\n") &&
-              !logged("(removal 6"),
+    CHECK(logged("removed, as before the game started (removal 1 this run)\n") && logged("(removal 4 this run)\n") &&
+              !logged("(removal 5"),
           "the removed lines are numbered");
-    CHECK(rtss_limit_active(), "RTSS limits after the last want of a limit");
 }
 
 // The state file: the run's first write records the profile as it was, each later one the value written, and the exit's
@@ -874,8 +888,7 @@ static void state_record(void) {
     show("playing at 60");
     CHECK(own.exists && own.limit == 60 && state_has("\nrtss1 0 0 1 60 1 ocarina.exe\n"), "recorded:\n%s", state());
     CHECK(!strncmp(state(), "# RivaTuner Statistics Server's profiles", 40), "the header first");
-    ask(144000);
-    poll();
+    settle(144000);
     CHECK(own.limit == 144 && state_has("\nrtss1 0 0 1 144 1 ocarina.exe\n"), "the line follows:\n%s", state());
     rtss_limit_restore();
     show("after the restore");
@@ -887,11 +900,9 @@ static void state_player(void) {
     ask(60000);
     poll();
     CHECK(own.limit == 60 && state_has("\nrtss1 1 30 1 60 1 ocarina.exe\n"), "recorded:\n%s", state());
-    ask(RTSS_OUT_LOWLAT);   // kept out: put back during the run, and the line goes with it
-    poll();
+    settle(RTSS_OUT_LOWLAT);   // kept out: put back during the run, and the line goes with it
     CHECK(own.limit == 30 && !*state(), "put back, no line:\n%s", state());
-    ask(60000);
-    poll();
+    settle(60000);
     CHECK(own.limit == 60 && state_has("\nrtss1 1 30 1 60 1 ocarina.exe\n"), "recorded again:\n%s", state());
     rtss_limit_restore();
     CHECK(own.exists && own.limit == 30 && !*state(), "the player's 30 back, no line");
@@ -903,6 +914,7 @@ static void state_unwritable(void) {
     state_readonly = 1;
     app_set(1, 0xA, 1000, 2000, 60);
     ask(60000);
+    poll();
     poll();
     show("no state file");
     CHECK(own.exists && own.limit == 60 && rtss_limit_active(), "RTSS limits as before");
