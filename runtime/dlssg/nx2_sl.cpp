@@ -71,8 +71,9 @@ template <class T> T *proc(const char *name) { return reinterpret_cast<T *>(GetP
 
 // Whether Reflex's sleep runs on this GPU and driver: Streamline takes a frame limit without it and then sets nothing
 // (its slReflexSetOptions hands the limit to the driver only with the low-latency sleep available). Asked until
-// Streamline answers, from nx2sl_available on the device's thread and from nx2sl_reflex2 under the runtime's present
-// lock, never at once: slReflexGetState is not thread safe.
+// Streamline answers, from nx2sl_available and nx2sl_reflex2 (nx2sl_reflex too, which an older runtime calls), which
+// the runtime calls on the device's thread before any present or under its present lock (vk_dlssg.c reflex_apply),
+// never two at once: slReflexGetState is not thread safe.
 void reflex_state() {
     static sl::ReflexState rs;
     if (g_low_latency < 0 && p_reflex_state && p_reflex_state(rs) == sl::Result::eOk)
