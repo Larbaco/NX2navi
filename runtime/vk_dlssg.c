@@ -334,8 +334,11 @@ VkResult vk_dlssg_present(VkQueue q, const VkPresentInfoKHR *pi) {
 // while no host present went out for DLSSG_HOLD_IDLE_NS (the window minimized: gfx_present.c skips the host presents
 // while the game runs on): the driver then has no present to time the frame by, and the sleep would wait out
 // Streamline's half-second timeout each frame. The guest thread gave its core up for the acquire (NVN_BLOCKING). The
-// sleep counts as the pacer's wait (PERF_PACE), whose place it takes while Reflex holds the limit, on whichever guest
-// thread acquires (perf_end_any), as the acquire's own waits do.
+// sleep counts as the pacer's wait (PERF_PACE) only while Reflex holds a frame limit (limit_set), whose place it then
+// takes, on whichever guest thread acquires (perf_end_any), as the acquire's own waits do. Without one (reflex_limit 0,
+// an older DLL, a movie, a refused limit, frames that showed Reflex does not hold it) the sleep is only the driver's
+// wait for the GPU while the pacer waits as well, so it stays out of PERF_PACE, as before Reflex held a frame limit:
+// counted there, GPU-bound frames read as paced in the perf windows.
 void vk_dlssg_frame_start(void) {
     if (!S.active) return;
     uint32_t f = __atomic_load_n(&S.game, __ATOMIC_RELAXED) + 1;
@@ -343,13 +346,14 @@ void vk_dlssg_frame_start(void) {
     S.started = f;
     uint64_t hosted = __atomic_load_n(&S.hosted_ns, __ATOMIC_ACQUIRE), t0 = kern_now_ns();   // in this order: t0 >= hosted
     int hold = hosted && t0 - hosted < DLSSG_HOLD_IDLE_NS;
-    uint64_t p0 = hold ? perf_begin() : 0;
+    int paced = hold && __atomic_load_n(&S.limit_set, __ATOMIC_ACQUIRE) != 0;
+    uint64_t p0 = paced ? perf_begin() : 0;
     S.sleep(f, hold);
     if (!hold) {
         __atomic_add_fetch(&S.n_unheld, 1, __ATOMIC_RELAXED);
         return;
     }
-    perf_end_any(PERF_PACE, p0);
+    if (paced) perf_end_any(PERF_PACE, p0);
     __atomic_add_fetch(&S.hold_ns, kern_now_ns() - t0, __ATOMIC_RELAXED);
     __atomic_add_fetch(&S.n_hold, 1, __ATOMIC_RELAXED);
 }
