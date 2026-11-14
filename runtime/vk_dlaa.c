@@ -730,7 +730,8 @@ static int idle_free(void) {
 
 // The upscalers' waits for the device to be idle before they free what the GPU may still use (vk_dlaa.c, vk_ffx.cpp,
 // vk_ffx4.cpp), with the queue lock held: the present's flip, the completion thread's hold release and every upload
-// submit wait as long. NX2NAVI_TRACE=perf names them "upscaler device waits" on a slow frame's line.
+// submit wait as long. NX2NAVI_TRACE=perf names them "upscaler GPU waits" on a slow frame's line, together with
+// vk_upscaler_gpu_wait's timeline waits after a refused creation, which touch no queue.
 void vk_upscaler_device_idle(void) {
     uint64_t t0 = perf_mark_begin();
     vk_queue_lock(), vkDeviceWaitIdle(vk_ctx()->device), vk_queue_unlock();

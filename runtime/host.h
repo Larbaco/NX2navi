@@ -63,7 +63,8 @@ void perf_count(int kind);
 // pipe_create_in), guest memory maps (heap size, MapPhysicalMemory), NVN memory pool initialize and finalize
 // (vk_memory.c vk_pool_init, vk_pool_fini), device memory VMA allocates (blocks and dedicated memory, vk_device.c
 // timed_alloc), and DLSS and DLSS frame generation feature creates (vk_dlaa.c). perf_mark_begin returns 0 while the trace is off, so a normal run pays one branch per site.
-// UPWAIT: the upscalers' waits for the GPU before they free what they let go of (vk_dlaa.c vk_upscaler_device_idle);
+// UPWAIT: the upscalers' waits for the GPU before they free what they let go of (vk_dlaa.c vk_upscaler_device_idle,
+// and vk_upscaler_gpu_wait's timeline wait after a refused creation);
 // UPREL: their releases of DLSS features and FSR contexts (vk_dlaa.c, vk_ffx.cpp, vk_ffx4.cpp).
 enum { PERF_M_FILE, PERF_M_ZSTD, PERF_M_PIPE, PERF_M_GMEM, PERF_M_POOL, PERF_M_DEVMEM, PERF_M_NGX, PERF_M_UPWAIT,
        PERF_M_UPREL, PERF_M_N };

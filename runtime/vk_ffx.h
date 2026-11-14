@@ -17,7 +17,7 @@ typedef struct { float fov_y, znear, zfar, meters; } VkFfxCamera;
 // vk_dlaa.c: the share (0..1) of the extra sharpening FSR 3.1 gets at a render width w of an output width ow
 float vk_dlaa_fsr3_boost(uint32_t w, uint32_t ow);
 // vk_dlaa.c: a wait for the device to be idle, the queue lock held, before an upscaler frees what the GPU may still
-// use (NX2NAVI_TRACE=perf: "upscaler device waits")
+// use (NX2NAVI_TRACE=perf: "upscaler GPU waits", with vk_upscaler_gpu_wait's)
 void vk_upscaler_device_idle(void);
 // vk_dlaa.c "what the upscalers let go of while the GPU may still use it", on the thread that makes the upscalers'
 // calls (vk_dlaa.c's pass hooks):
