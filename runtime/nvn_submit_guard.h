@@ -18,9 +18,23 @@
 #include "nvn_obj.h"
 
 // 1: no other submission has the copy in flight; resolve it in place and call nvn_copy_leave after the replay. 0:
-// another one has; take a clone and call nvn_copy_leave once the clone is made.
+// another one has, or this call holds it already (nvn_copy_again); else take a clone and call nvn_copy_leave once the
+// clone is made.
 static inline int nvn_copy_enter(uint32_t *busy) { return __atomic_fetch_add(busy, 1, __ATOMIC_ACQ_REL) == 0; }
 static inline void nvn_copy_leave(uint32_t *busy) { __atomic_fetch_sub(busy, 1, __ATOMIC_RELEASE); }
+
+// After nvn_copy_enter returned 0 for handles[i] of one submit call: whether the same handle came earlier in this call
+// and resolves in place there (out[j] == handles[j]). Then the count that made it busy is this thread's own: the copy
+// is this submission's to resolve in place, and another thread that submits it meanwhile takes a clone. So this
+// occurrence stays in place too: its count is left after the replay like the first one's (nvn_submit_done, per
+// occurrence), and no clone is made or logged for it. The
+// asynchronous path keeps a repeat in one call in place by its own rule (nvn_api_cmd.c nvn_submit_prepare_async:
+// used_at != now).
+static inline int nvn_copy_again(const uint64_t *handles, const uint64_t *out, int i) {
+    for (int j = 0; j < i; j++)
+        if (handles[j] == handles[i] && out[j] == handles[j]) return 1;
+    return 0;
+}
 
 // Told of a bind whose handles changed, before they are written: b holds the handles at record, now the game's, nth
 // how many changed binds came before this one (the changed count).

@@ -784,10 +784,11 @@ GPU, no game files.
 
 A change to a synchronous submission's deferred binds (`runtime/nvn_submit_guard.h`, `runtime/nvn_api_cmd.c`
 `nvn_submit_prepare`, `nvn_submit_done`, `resolve_deferred`) passes `python tests\submit_clone_check.py`, which builds the
-header with the platform layer: four threads submit two recording copies while another rewrites the arrays their
-deferred binds read, and no replay sees its handles change while both the in-place and the clone path run; then the
-bind resolution step by step (changed and unchanged arrays, binds it leaves alone, calls 16 deep and not 17, a corrupt
-record). No GPU, no game files.
+header with the platform layer: four threads submit two recording copies, a quarter of the calls giving theirs twice,
+while another rewrites the arrays their deferred binds read, and no replay sees its handles change while the in-place,
+the given-again and the clone path run; then step by step a copy given twice in one call (in place both times, cloned
+both times when another submission has it), and the bind resolution (changed and unchanged arrays, binds it leaves
+alone, calls 16 deep and not 17, a corrupt record). No GPU, no game files.
 
 A change to how `runtime/memory.c` `mem_copy_readable` reads the lazy heap (`NX2NAVI_HEAP_LAZY=1`) passes
 `python tests\heap_lazy_copy_check.py`, which builds `memory.c` with the Windows platform layer and its fault handler:

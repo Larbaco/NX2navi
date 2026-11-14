@@ -1447,7 +1447,8 @@ static int resolve_deferred(const uint8_t *p) {   // returns the number of defer
 
 // Synchronous replay. Each copy counts the submissions between this prepare and their nvn_submit_done (busy): the first
 // in flight resolves the copy in place; one another thread makes while that is replayed resolves a clone of its own
-// (nvn_submit_guard.h), unless the copy is known to hold no deferred binds. out: the handles to replay.
+// (nvn_submit_guard.h), unless the copy is known to hold no deferred binds. A handle the call gives twice stays in
+// place both times when its first occurrence does. out: the handles to replay.
 void nvn_submit_prepare(const uint64_t *handles, uint64_t *out, int n) {
     uint64_t now = __atomic_add_fetch(&nsubmits, 1, __ATOMIC_RELAXED), min = copy_minute(), k = 0, cloned = 0;
     plat_mutex_lock_shared(&copy_lock);   // keeps every copy found here alive while it is cloned
@@ -1461,7 +1462,11 @@ void nvn_submit_prepare(const uint64_t *handles, uint64_t *out, int n) {
         __atomic_store_n(&pf->used_at, now, __ATOMIC_RELAXED);
         copy_age(pf, min);
         out[i] = handles[i];
-        if (nvn_copy_enter(&pf->busy) || __atomic_load_n(&pf->deferred, __ATOMIC_RELAXED) == 1) continue;
+        // in place: the first submission in flight, a copy known to hold no deferred binds, or the same handle again in
+        // this call after an occurrence that resolves in place (nvn_copy_again; only this branch pays for its scan)
+        if (nvn_copy_enter(&pf->busy) || __atomic_load_n(&pf->deferred, __ATOMIC_RELAXED) == 1 ||
+            nvn_copy_again(handles, out, i))
+            continue;
         size_t sz = sizeof *pf + pf->bytes;
         copy_prefix *cl = malloc(sz);
         if (!cl) {

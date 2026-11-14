@@ -1,8 +1,10 @@
 """Build and run tests/submit_clone_check.c: runtime/nvn_submit_guard.h, a synchronous submission's deferred binds when
 another guest thread may be replaying the same recording copy (nvn_api_cmd.c nvn_submit_prepare, nvn_submit_done).
-Four threads submit two hand-built copies 200,000 times each while a "game" thread rewrites the arrays their deferred
-binds read: no replay sees its copy's handles change between its resolve and its end, the in-flight counts end at 0,
-and both the in-place and the clone path run. nvn_resolve_binds step by step: a changed array is copied in and counted,
+Four threads submit two hand-built copies 200,000 times each, a quarter of the calls giving their copy twice, while a
+"game" thread rewrites the arrays their deferred binds read: no replay sees its copy's handles change between its
+resolve and its end, the in-flight counts end at 0, and the in-place, the given-again and the clone path run.
+nvn_copy_again step by step: a copy given twice in one call stays in place both times, and is cloned both times when
+another submission has it in flight. nvn_resolve_binds step by step: a changed array is copied in and counted,
 an unchanged one is not counted, binds without src, with n 0 or over 32 stay untouched, OP_CALL is followed 16 deep and
 refused at 17, and a corrupt record is reported where it is. Then the unguarded 0.10.1 shape runs through the same
 harness and only prints what it saw, to show that the harness catches the race.
