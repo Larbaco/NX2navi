@@ -463,8 +463,21 @@ uint64_t mem_lazy_arm(uint64_t a, uint64_t n, uint64_t h0, uint64_t h1, uint64_t
                 }
         }
         int no = frz[r] ? LZ_NO_FROZEN : prb[r] ? LZ_NO_PAGES : lz_hot[r] && (int32_t)(lz_hot[r] - now) > 0 ? LZ_NO_HOT :
-                 thaw_ms[r] && (int32_t)(now - thaw_ms[r]) < (int32_t)FRZ_HOLD_MS ? LZ_NO_THAW :
-                 !lazy_protect_locked(x, e, ctx) ? LZ_NO_PAGES : -1;
+                 thaw_ms[r] && (int32_t)(now - thaw_ms[r]) < (int32_t)FRZ_HOLD_MS ? LZ_NO_THAW : -1;
+        if (no < 0) {
+            // The region is marked before its pages become inaccessible. A fault on them from the protect on then finds
+            // the mark, waits in lazy_fault for frz_lock, held here, and finds the segment or its pages given back.
+            // Marked only after the push, a read in between had lazy_fault return 0 at once, and access_fault passed
+            // the read of an inaccessible page to the crash handler. had: a segment of the region, or an earlier turn
+            // of this loop, marked it already; when the arm is refused the mark goes back to what it was (every store
+            // to lzr is made under frz_lock).
+            int had = lzr[r];
+            if (!had) __atomic_store_n(&lzr[r], 1, __ATOMIC_RELEASE);
+            if (!lazy_protect_locked(x, e, ctx)) {
+                no = LZ_NO_PAGES;
+                if (!had) __atomic_store_n(&lzr[r], 0, __ATOMIC_RELEASE);
+            }
+        }
         if (no >= 0) {
             lz_no[no] += e - x;
             continue;
@@ -482,7 +495,6 @@ uint64_t mem_lazy_arm(uint64_t a, uint64_t n, uint64_t h0, uint64_t h1, uint64_t
             }
         lazy_push_locked((LzSeg){slo, shi, h0, h1, delta, stale});
         plat_mutex_unlock(&lz_lock);
-        __atomic_store_n(&lzr[r], 1, __ATOMIC_RELEASE);
         armed += e - x;
     }
     plat_mutex_unlock(&frz_lock);
