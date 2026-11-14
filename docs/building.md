@@ -911,8 +911,16 @@ random frames in which the census part never passes the frame and the parts keep
 
 A change to how the on/off switches read their value (`runtime/perf.c` `rt_knob`) passes `python tests\rt_knob_check.py`,
 which cuts the function out of the file with its warning table and builds it with stand-ins for the settings and the
-log: 0, 1 and ab read as before without a line, and any other value reads as 1 and is logged once per switch. No game
-files.
+log: 0, 1 and ab read as before without a line, false, off and no in any case read as 0 and true, on and yes as 1
+without a line, and any other value reads as 1 and is logged once per switch. No game files.
+
+A change to how nx2navi.ini and the environment are read (`runtime/cfg.c` `cfg_load`, `cut_comment`, `switch_word`,
+`cfg_bool`, `check_value`) passes `python tests\cfg_parse_check.py`, which builds `cfg.c` with stand-ins for what it
+links with and loads scratch files: a comment after a value of a setting with a set of values is cut and logged once
+with its line, free text, a value in double quotes and the environment keep theirs; switches written as words read as
+0 or 1 through every reader; values outside their sets are logged with their line, at most 16 lines and a count; a
+full settings table logs one line at load and one for the menu. The launcher's reader (`launcher/gameini.py`) has the
+same comment lines in `tests\launcher_test.py` `PlayerIniTest`. No game files.
 
 The lifter (`recomp/`) and the CPU headers (`runtime/cpu.h`, `runtime/simd.h`) are checked against Unicorn. Every lifter
 change passes these, all run with `.venv`:

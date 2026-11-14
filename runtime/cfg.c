@@ -1,7 +1,10 @@
 ﻿// nx2navi.ini: file-backed defaults for the NX2NAVI_* environment variables (docs/controls.md, nx2navi.ini.example).
 // Format: "key = value" lines, '#' or ';' at the start of a line begins a comment, [sections] only group. A key is a
 // variable name without "NX2NAVI_" (an optional NX2NAVI_ prefix is accepted), case-insensitive. A value is the rest of the
-// line, trimmed, optionally in double quotes; an empty value counts as unset. The environment wins over the file.
+// line, trimmed, optionally in double quotes; an empty value counts as unset. For a setting with a set of values (a row
+// of metas[] with values), a blank followed by ';' or '#' starts a comment after the value too (cut_comment). A switch
+// (values 0|1) reads false, off and no as 0 and true, on and yes as 1 (switch_word). The environment wins over the
+// file.
 //
 // Live settings: cfg_set changes a value in memory (readers see the new pointer; the old string is kept, so a pointer
 // cfg_get handed out stays valid) and cfg_save writes only the changed keys back, keeping the rest of the file.
@@ -553,8 +556,45 @@ static char *norm_key(char *key) {
 
 static int entry_line[CFG_MAX_KEYS];   // the file line each entry's value came from (cfg_load's check_values)
 
+// ---- a comment after a value (cfg_load)
+// "pace_smooth = 0 ; off" kept the comment in the value, which cfg_bool read as on, and "fps_limit = 144 # monitor"
+// gave 60. For a key whose row has a set of values (numbers, ranges, words: none has a blank followed by ';' or '#')
+// the value ends at the first blank followed by ';' or '#' in the text after '=' ("key = ; note" is empty), and the
+// line is logged once at load. Free text keeps the whole value: a row without a set (window_size, monitor,
+// audio_device) and a key without a row (mods_dir, pipeline_cache, the bindings), where a path or a name may hold
+// " #". So does a value in double quotes. The menu's save writes a changed key's line again without its comment
+// (cfg_save_to), the same way every time. At most CHECK_LINES lines per load, then a count (check_end).
+#define CHECK_LINES 16
+static int cuts;
+
+// raw: the text after '=' as written; returns the value trimmed, cut at its comment when key has a set of values.
+static char *cut_comment(const char *key, char *raw, int line) {
+    char *v = trim(raw);
+    size_t n = strlen(v);
+    if (n >= 2 && v[0] == '"' && v[n - 1] == '"') return v;
+    const CfgMeta *m = cfg_meta(key);
+    if (!m || !m->values) return v;
+    char *c = raw;
+    while (*c && !((*c == ' ' || *c == '\t') && (c[1] == ';' || c[1] == '#'))) c++;
+    if (!*c) return v;
+    char note[160];
+    snprintf(note, sizeof note, "%s", c + 1);
+    *c = 0;
+    v = trim(raw);
+    if (++cuts <= CHECK_LINES) {
+        char low[64];
+        size_t k = 0;
+        for (; key[k] && k < sizeof low - 1; k++) low[k] = (char)tolower((unsigned char)key[k]);
+        low[k] = 0;
+        rt_log("cfg: nx2navi.ini line %d: %s = '%s', and '%s' after it is a comment", line, low, v, note);
+    }
+    return v;
+}
+
+// value: the text after '=' as written (cut_comment trims it).
 static void add(char *key, char *value, int line) {
     key = norm_key(key);
+    value = cut_comment(key, value, line);
     size_t vl = strlen(value);
     if (vl >= 2 && value[0] == '"' && value[vl - 1] == '"') value[vl - 1] = 0, value++;
     if (!*key) return;
@@ -580,19 +620,20 @@ static void add(char *key, char *value, int line) {
     entries[n_entries++] = (CfgEntry){strdup(key), strdup(value), 0, 0};
 }
 
-// ---- values outside their rows' sets, logged at load (the values are read as they are written)
-// Hand-edited files had values no consumer takes, and nothing said so: "pace_smooth = 0 ; off" keeps the comment in
-// the value, which cfg_bool reads as on; "fullscreen = false" is on too; "sharpness = 250" is past 0..100. Only the
-// sets that are the consumers' own are checked: 0|1, ranges lo..hi, and lists of words. A list with a number in it is
-// the menu's presets, and its consumer takes more (fps_limit any rate from 30 to 240, render_scale 25..400), so it is
-// left alone. A list of words names the menu's choices; a consumer may take more (dlss_preset any letter a..m), so the
-// line says no more than that. At most CHECK_LINES lines per load, then a count.
-#define CHECK_LINES 16
+// ---- values outside their rows' sets, logged at load (the values are read as they are written, a comment after a
+// value of a row with a set cut first, cut_comment)
+// Hand-edited files had values no consumer takes, and nothing said so: "sharpness = 250" is past 0..100. Only the
+// sets that are the consumers' own are checked: 0|1 (with the words switch_word reads), ranges lo..hi, and lists of
+// words. A list with a number in it is the menu's presets, and its consumer takes more (fps_limit any rate from 30 to
+// 240, render_scale 25..400), so it is left alone. A list of words names the menu's choices; a consumer may take more
+// (dlss_preset any letter a..m), so the line says no more than that. A ';' or '#' after a blank is still named where it
+// stays in the value: a free-text row's value, and the environment's. At most CHECK_LINES lines per load, then a count.
 static int misfits;
+static int switch_of(const char *v);
 
 // NULL when v fits the set, else what the log line says of it (in buf).
 static const char *misfit(const char *set, const char *v, char *buf, size_t cap) {
-    if (!strcmp(set, "0|1")) return strcmp(v, "0") && strcmp(v, "1") ? "is not 0 or 1" : NULL;
+    if (!strcmp(set, "0|1")) return switch_of(v) < 0 ? "is not 0, 1, on, off, true, false, yes or no" : NULL;
     const char *dots = strstr(set, "..");
     if (dots && !strchr(set, '|')) {
         char lo_s[32], *end;   // the low end apart: strtod would take "0." of "0..100" for a number
@@ -647,7 +688,8 @@ static void check_value(const char *key, const char *v, int line) {
 static void check_end(void) {
     if (misfits > CHECK_LINES)
         rt_log("cfg: %d more values outside their settings' choices are not listed", misfits - CHECK_LINES);
-    misfits = 0;
+    if (cuts > CHECK_LINES) rt_log("cfg: %d more comments after a value are not listed", cuts - CHECK_LINES);
+    misfits = cuts = 0;
 }
 
 static void check_values(void) {
@@ -727,7 +769,7 @@ int cfg_load(const char *path) {
             if (!eq) rt_log("cfg: nx2navi.ini line %d: no '=' in '%s'", line, s);
             else {
                 *eq = 0;
-                add(trim(s), trim(eq + 1), line);
+                add(trim(s), eq + 1, line);
             }
         }
         if (!eol) break;
@@ -848,11 +890,33 @@ static const char *raw_get(const char *name) {
     return NULL;
 }
 
+// A switch written as a word: 0 for false, off and no, 1 for true, on and yes (any case); -1 for anything else but 0
+// and 1, which give themselves.
+static int switch_of(const char *v) {
+    static const char *const word[] = {"false", "off", "no", "true", "on", "yes"};
+    if (!strcmp(v, "0") || !strcmp(v, "1")) return v[0] - '0';
+    for (int i = 0; i < 6; i++)
+        if (!strcasecmp(v, word[i])) return i >= 3;
+    return -1;
+}
+
+// The value of a switch (a row whose set is 0|1) written as a word, as "0" or "1" for every reader: cfg_bool, rt_knob
+// and the readers that compare with "0" (frame_rate.c frame_step_cap_ns for rtss) or parse a number (cfg_int).
+// "fullscreen = false" and "rtss = off" were on, read as anything but "0". Other values and other rows are handed on
+// as they are.
+static const char *switch_word(const char *name, const char *v) {
+    if (!v || !strcmp(v, "0") || !strcmp(v, "1")) return v;
+    int on = switch_of(v);
+    if (on < 0) return v;
+    const CfgMeta *m = cfg_meta(name);
+    return m && m->values && !strcmp(m->values, "0|1") ? (on ? "1" : "0") : v;
+}
+
 static const char *cfg_get_now(const char *name) {
     const char *v = raw_get(name);
     if (strncmp(name, PREFIX, PREFIX_LEN)) return v;
     if (!lowend_of() && lowend_only(name + PREFIX_LEN)) return NULL;   // the mode is off: its settings are not read
-    if (v) return v;
+    if (v) return switch_word(name, v);
     if (profile_of())
         for (size_t i = 0; i < sizeof DECK / sizeof *DECK; i++)
             if (!strcasecmp(DECK[i].key, name + PREFIX_LEN)) return DECK[i].value;
@@ -1031,7 +1095,11 @@ int cfg_int(const char *name) {
     return end == v || *end ? (int)default_number(name) : (int)l;
 }
 
-int cfg_bool(const char *name) { return strcmp(cfg_value(name), "0") != 0; }
+// Off for "0" and for false, off and no in any case (switch_of), also for a key whose row is not 0|1; on otherwise.
+int cfg_bool(const char *name) {
+    const char *v = cfg_value(name);
+    return strcmp(v, "0") != 0 && switch_of(v) != 0;
+}
 
 // ---- the restart-only settings' values at start (cfg_init), which the running game keeps using whatever the menu sets
 // later: cfg_pending compares against them, so the menu says "after restart" only while a restart would change

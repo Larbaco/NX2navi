@@ -3,6 +3,8 @@
 // cfg.c logged ("log: ...") and what the case reads back ("got: ...").
 //   load     cfg_load on the file; then cfg_init's check of the environment (the variables the script set)
 //   full     cfg_load on the file, then two cfg_set of keys the file does not have
+//   read     cfg_load on the file and cfg_init's check of the environment; then what cfg_get, cfg_bool and cfg_int give
+//            for a list of keys
 //   norow    cfg_int and cfg_double of a key without a row whose value (the environment's) does not parse
 #include <stdarg.h>
 #include <stdint.h>
@@ -79,6 +81,24 @@ int main(int argc, char **argv) {
         cfg_set("NX2NAVI_VK_PRESENT", "fifo");
         cfg_set("NX2NAVI_FULLSCREEN", "1");
         printf("got: vk_present %s\n", cfg_get("NX2NAVI_VK_PRESENT") ? cfg_get("NX2NAVI_VK_PRESENT") : "(unset)");
+        return 0;
+    }
+    if (!strcmp(argv[1], "read")) {
+        if (!cfg_load(ini)) return printf("cfg_load failed\n"), 2;
+        printf("--- environment\n");
+        cfg_init();
+        static const char *const keys[] = {"PACE_SMOOTH", "FULLSCREEN", "FPS_LIMIT", "VK_PRESENT", "ASPECT", "RTSS",
+                                           "HDR_LIVE", "CLOTH_REALTIME", "WINDOW_SIZE", "DLSS_PRESET", "MODS_DIR",
+                                           "DYN_RES", "SHADOW_PCF"};
+        for (size_t i = 0; i < sizeof keys / sizeof *keys; i++) {
+            char name[64];
+            snprintf(name, sizeof name, "NX2NAVI_%s", keys[i]);
+            const char *v = cfg_get(name);
+            printf("got: %s '%s'", keys[i], v ? v : "(unset)");
+            const CfgMeta *m = cfg_meta(name);
+            if (m && m->values && !strcmp(m->values, "0|1")) printf(" bool %d int %d", cfg_bool(name), cfg_int(name));
+            printf("\n");
+        }
         return 0;
     }
     if (!strcmp(argv[1], "norow")) {

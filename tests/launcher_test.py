@@ -380,6 +380,32 @@ class PlayerIniTest(Tmp):
         gameini.put(self.tmp, 'discord', 'discord_rpc', '1')
         self.assertEqual(ini.read_bytes(), PLAYER_INI + b'\r\n\r\n[discord]\r\ndiscord_rpc = 1\r\n')
 
+    def test_a_comment_after_a_value_as_the_game_reads_it(self):
+        """runtime/cfg.c cut_comment: for a key whose row has a set of values (choices=True), a blank followed by ';'
+        or '#' starts a comment, "key = ; note" has no value, and a value in double quotes keeps its text; free text,
+        the mods folder and lists the launcher writes, keeps the whole value. tests/cfg_parse_check.py has the same
+        lines for the game."""
+        ini = self.tmp / 'nx2navi.ini'
+        body = (b'[frame rate]\r\npace_smooth = 0 ; off\r\nfps_limit = 144 # my monitor\r\nvk_present = fifo\t; x\r\n'
+                b'aspect = ; later\r\ndlss_preset = "k ; quoted"\r\n[mods]\r\nmods_dir = D:\\My Mods #2\r\n'
+                b'mods_disabled = a #1|b ; c\r\n')
+        ini.write_bytes(body)
+        for key, want in (('pace_smooth', '0'), ('fps_limit', '144'), ('vk_present', 'fifo'), ('aspect', ''),
+                          ('dlss_preset', 'k ; quoted')):
+            self.assertEqual(gameini.get(self.tmp, key, choices=True), want, key)
+        self.assertEqual(gameini.get(self.tmp, 'fps_limit'), '144 # my monitor')
+        self.assertEqual(gameini.get(self.tmp, 'mods_dir'), 'D:\\My Mods #2')
+        self.assertEqual(gameini.get(self.tmp, 'mods_disabled'), 'a #1|b ; c')
+        from launcher import mods
+        self.assertEqual(mods._names(self.tmp, 'MODS_DISABLED'), ['a #1', 'b ; c'])
+        # a key's line that has only a comment has no value as the game reads it: the change goes on the line before
+        ini.write_bytes(b'vk_present = fifo\r\nvk_present = ; later\r\n')
+        gameini.put(self.tmp, 'display', 'vk_present', 'mailbox', choices=True)
+        self.assertEqual(ini.read_bytes(), b'vk_present = mailbox\r\nvk_present = ; later\r\n')
+        ini.write_bytes(b'pace_smooth = 0 ; off\r\n')   # the line is written again whole, as the game's menu writes it
+        gameini.put(self.tmp, 'performance', 'pace_smooth', '1', choices=True)
+        self.assertEqual(ini.read_bytes(), b'pace_smooth = 1\r\n')
+
     def test_the_older_installer_changes_the_language_line_only(self):
         """installer/ini.py sets the language, in the older installer's last step at every install and update: the
         one line goes under [language] with the file's own line ends, and every other byte stays (it used to write

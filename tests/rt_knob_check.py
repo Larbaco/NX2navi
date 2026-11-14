@@ -1,6 +1,7 @@
 """Build and run runtime/perf.c's rt_knob (cut out of the file with its warning table) with stand-ins for the settings and
-the log: 0, 1 and ab read as before and log nothing; a value such as "off", "false" or "0 ; a note" still reads as 1
-and is logged once per switch, however often the switch is read.
+the log: 0, 1 and ab read as before and log nothing; false, off and no in any case read as 0 and true, on and yes as 1,
+without a line; any other value, such as "0 ; a note" from the environment (nx2navi.ini's loader cuts that comment) or
+"enabled", reads as 1 and is logged once per switch, however often the switch is read.
 
 No GPU, no game files, any Python.
 
@@ -22,7 +23,9 @@ HARNESS = r'''
 #include <string.h>
 
 static const char *vals[][2] = {{"NX2NAVI_A", "0"}, {"NX2NAVI_B", "1"}, {"NX2NAVI_C", "ab"}, {"NX2NAVI_D", "off"},
-                                {"NX2NAVI_E", "false"}, {"NX2NAVI_F", "0 ; a note"}, {"NX2NAVI_G", ""}};
+                                {"NX2NAVI_E", "false"}, {"NX2NAVI_F", "0 ; a note"}, {"NX2NAVI_G", ""},
+                                {"NX2NAVI_I", "No"}, {"NX2NAVI_J", "OFF"}, {"NX2NAVI_K", "TRUE"}, {"NX2NAVI_L", "on"},
+                                {"NX2NAVI_M", "Yes"}, {"NX2NAVI_N", "enabled"}};
 static const char *cfg_get(const char *key) {
     for (size_t i = 0; i < sizeof vals / sizeof *vals; i++)
         if (!strcmp(vals[i][0], key)) return vals[i][1];
@@ -55,18 +58,27 @@ int main(void) {
         expect("empty, default 0", rt_knob("G", "0"), 0);
     }
     expect("lines for 0, 1, ab and defaults", logs, 0);
-    expect("off", rt_knob("D", "0"), 1);
-    expect("a line for off", logs, 1);
-    if (strcmp(last, "cfg: NX2NAVI_D = 'off' is not 0, 1 or ab: read as 1"))
-        printf("FAIL the line: %%s\n", last), fails++;
-    for (int i = 0; i < 5; i++) rt_knob("D", "0");
-    expect("off read again", logs, 1);
-    expect("false", rt_knob("E", "1"), 1);
+    for (int round = 0; round < 2; round++) {
+        expect("off", rt_knob("D", "1"), 0);
+        expect("false", rt_knob("E", "1"), 0);
+        expect("No", rt_knob("I", "1"), 0);
+        expect("OFF", rt_knob("J", "1"), 0);
+        expect("TRUE", rt_knob("K", "0"), 1);
+        expect("on", rt_knob("L", "0"), 1);
+        expect("Yes", rt_knob("M", "0"), 1);
+    }
+    expect("lines for the words", logs, 0);
     expect("0 with a note", rt_knob("F", "0"), 1);
-    expect("a line each", logs, 3);
-    if (!strstr(last, "'0 ; a note'")) printf("FAIL the line: %%s\n", last), fails++;
-    for (int i = 0; i < 3; i++) rt_knob("E", "1"), rt_knob("F", "0");
-    expect("each once", logs, 3);
+    expect("a line for it", logs, 1);
+    if (strcmp(last, "cfg: NX2NAVI_F = '0 ; a note' is not 0, 1, ab, on, off, true, false, yes or no: read as 1"))
+        printf("FAIL the line: %%s\n", last), fails++;
+    for (int i = 0; i < 5; i++) rt_knob("F", "0");
+    expect("read again", logs, 1);
+    expect("enabled", rt_knob("N", "0"), 1);
+    expect("a line each", logs, 2);
+    if (!strstr(last, "'enabled'")) printf("FAIL the line: %%s\n", last), fails++;
+    for (int i = 0; i < 3; i++) rt_knob("N", "0"), rt_knob("F", "0");
+    expect("each once", logs, 2);
     if (fails) return 1;
     printf("rt_knob_check: all checks passed\n");
     return 0;

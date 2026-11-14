@@ -1,9 +1,15 @@
 """Build and run tests/cfg_parse_check.c: runtime/cfg.c's reading of nx2navi.ini and the environment, against stand-ins
-for what it links with. The values stay as written; what is checked is what the log says about them:
+for what it links with. What the readers get and what the log says about the values:
 
+- a comment after a value (cfg.c cut_comment): cut at a blank followed by ';' or '#' for a key whose row has a set of
+  values, the line logged once with its line number, "key = ; note" left unset; kept whole in free text (a row
+  without a set, a key without a row), in a value in double quotes and in the environment, where the log still says
+  it is part of the value; at most 16 lines, then a count;
+- switches written as words (cfg.c switch_word, cfg_bool): false, off and no in any case read as 0 and true, on and
+  yes as 1 through cfg_get, cfg_bool and cfg_int, from the file and from the environment, with no line about them;
 - values outside their rows' sets (cfg.c check_value): a 0|1 switch with another value, a number outside its range, a
-  word that is none of the menu's choices, and a ';' or '#' comment kept in a value, each named with its line; none
-  for a file whose values fit, nor for a list with numbers in it (the menu's presets); at most 16 lines, then a count;
+  word that is none of the menu's choices, each named with its line; none for a file whose values fit, nor for a list
+  with numbers in it (the menu's presets); at most 16 lines, then a count;
 - a full settings table (cfg.c CFG_MAX_KEYS): one line at load naming the first key not read, one at the first menu
   change not kept;
 - a number read of a key without a row whose set value does not parse gives 0 (cfg.c default_number), not a crash.
@@ -53,6 +59,24 @@ color_gamma = 2
 vk_present = vsync
 fps_limit = 144 # my monitor
 sharpness_typo = 3
+cloth_realtime = disabled
+window_size = 1280x720 # small
+aspect = ; stretch some day
+dlss_preset = "k ; quoted"
+'''
+
+READ = '''[display]
+fullscreen = false
+rtss = OFF
+hdr_live = Yes
+cloth_realtime = on ; the default
+pace_smooth = No
+vk_present = fifo\t; tear-free
+fps_limit = 144 # my monitor
+window_size = 1280x720 # small
+aspect = ; nothing yet
+mods_dir = D:\\My Mods #2
+dlss_preset = "k ; quoted"
 '''
 
 
@@ -94,21 +118,48 @@ def main():
     lines = [l for l in out.splitlines() if l.startswith('log: cfg:') and '=' in l and 'line' in l]
     check(rc == 0 and not lines, 'a file whose values fit logs nothing about them', out)
 
-    # values that do not: one line each, with the line number
+    # values that do not: one line each, with the line number; a comment after a value of a row with a set: cut, and
+    # one line
     rc, out = run(exe, env, 'load', BAD, work, {'NX2NAVI_SHARPNESS': '500', 'NX2NAVI_VK_PRESENT': 'fifo'})
     want = [
-        "line 2: pace_smooth = '0 ; off' is not 0 or 1; a ';' or '#' after the value is part of it",
-        "line 3: fullscreen = 'false' is not 0 or 1",
+        "line 2: pace_smooth = '0', and '; off' after it is a comment",
         "line 4: sharpness = '250' is not a number in 0..100",
         "line 5: color_gamma = '2' is not a number in 0.8..1.2",
         "line 6: vk_present = 'vsync' is none of the menu's choices mailbox|fifo|immediate",
-        "line 7: fps_limit = '144 # my monitor' a ';' or '#' after the value is part of it",
+        "line 7: fps_limit = '144', and '# my monitor' after it is a comment",
+        "line 9: cloth_realtime = 'disabled' is not 0, 1, on, off, true, false, yes or no",
+        "line 10: window_size = '1280x720 # small' a ';' or '#' after the value is part of it",
+        "line 11: aspect = '', and '; stretch some day' after it is a comment",
+        "line 12: dlss_preset = 'k ; quoted' is none of the menu's choices default|k|j; a ';' or '#' after the value "
+        "is part of it",
         "the environment's NX2NAVI_SHARPNESS = '500' is not a number in 0..100",
     ]
     for w in want:
         check(rc == 0 and w in out, f'logged: {w}', out if w not in out else '')
+    cfg_lines = [l for l in out.splitlines() if l.startswith('log: cfg: nx2navi.ini line') and 'unknown key' not in l]
+    check(len(cfg_lines) == 9, f'one line each for the nine lines, none for "fullscreen = false" ({len(cfg_lines)})',
+          out)
+    check(not any(' line 2: ' in l and 'is not 0' in l for l in cfg_lines), 'a cut value is checked as cut', out)
     check('NX2NAVI_VK_PRESENT' not in out, 'an environment value that fits is not logged', out)
-    check("pace_smooth '0 ; off'" in out, 'the value itself is read as written', out)
+    check("got: pace_smooth '0'" in out, 'the value is read without its comment', out)
+
+    # what the readers get: switches written as words, cut comments, free text kept whole, the environment as written
+    rc, out = run(exe, env, 'read', READ, work, {'NX2NAVI_DYN_RES': 'TRUE', 'NX2NAVI_SHADOW_PCF': '0 ; env note'})
+    got = {l.split()[1]: l.split(' ', 2)[2] for l in out.splitlines() if l.startswith('got: ')}
+    want = {'PACE_SMOOTH': "'0' bool 0 int 0", 'FULLSCREEN': "'0' bool 0 int 0", 'RTSS': "'0' bool 0 int 0",
+            'HDR_LIVE': "'1' bool 1 int 1", 'CLOTH_REALTIME': "'1' bool 1 int 1", 'FPS_LIMIT': "'144'",
+            'VK_PRESENT': "'fifo'", 'ASPECT': "'(unset)'", 'WINDOW_SIZE': "'1280x720 # small'",
+            'DLSS_PRESET': "'k ; quoted'", 'MODS_DIR': "'D:\\My Mods #2'", 'DYN_RES': "'1' bool 1 int 1",
+            'SHADOW_PCF': "'0 ; env note' bool 1 int 0"}
+    for k, w in want.items():
+        check(rc == 0 and got.get(k) == w, f'read: {k} {w}', f'got {got.get(k)!r}\n{out}' if got.get(k) != w else '')
+    cut = [l for l in out.splitlines() if 'after it is a comment' in l]
+    check(len(cut) == 4 and any("line 7: vk_present = 'fifo', and '; tear-free'" in l for l in cut),
+          f'four cut lines, a tab before the comment too ({len(cut)})', out)
+    check(not any(w in out for w in ('fullscreen =', 'rtss =', 'hdr_live =', 'pace_smooth =', 'NX2NAVI_DYN_RES =')),
+          'no line about switches written as words', out)
+    check("the environment's NX2NAVI_SHADOW_PCF = '0 ; env note' is not 0, 1, on, off, true, false, yes or no; a ';' "
+          "or '#' after the value is part of it" in out, "the environment's comment stays in its value", out)
 
     # at most 16 lines, then a count
     many = '\n'.join(f'sharpness = {200 + i}' if i % 2 else f'fullscreen = no{i}' for i in range(2)) + '\n'
@@ -121,6 +172,10 @@ def main():
     listed = sum(1 for l in out.splitlines() if l.startswith('log: cfg: nx2navi.ini line') and "= '7'" in l)
     check(rc == 0 and listed == 16 and 'more values outside their settings' in out,
           f'20 values outside their sets: {listed} lines and a count', out)
+    rc, out = run(exe, env, 'load', ''.join(f'vk_present = fifo ; note {i}\n' for i in range(20)), work)
+    listed = sum(1 for l in out.splitlines() if 'after it is a comment' in l)
+    check(rc == 0 and listed == 16 and '4 more comments after a value are not listed' in out,
+          f'20 comments after values: {listed} lines and a count', out)
     # more keys than the table holds: one line at load, one for the menu's changes
     full = ''.join(f'cheat_{0x1000 + i:08x} = 1\n' for i in range(600)) + 'low_latency = 1\n'
     rc, out = run(exe, env, 'full', full, work)
