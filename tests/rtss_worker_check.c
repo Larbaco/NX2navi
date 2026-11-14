@@ -947,7 +947,10 @@ static void crash_recorded(void) {
 
 // A run killed while RTSS held its limit (kill_first), and the next start (kill_next): the profile as before the killed
 // run, then the next run's own limit, and back again at its close. variant 1: the player had a profile with 30/1;
-// variant 2: the player set 75 in RTSS between the two runs.
+// variant 2: the player set 75 in RTSS between the two runs; variant 3: the next start has frame generation on, which
+// keeps RTSS out, and still puts the profile back (the hooks library loaded for that alone) with no write of its own;
+// variant 4: the next start has NX2NAVI_RTSS=0, which keeps the thread read-only: the log says what the file holds,
+// and the profile and the line stay for a start with RTSS let in.
 static int variant;
 static void kill_first(void) {
     prof_load();
@@ -963,6 +966,30 @@ static void kill_first(void) {
 static void kill_next(void) {
     prof_load();
     app_set(1, 0xA, 1000, 2000, 144);
+    if (variant >= 3) {
+        ask(variant == 3 ? RTSS_OUT_FRAMEGEN : RTSS_OUT_SETTING);
+        poll();
+        poll();
+        show("the next start, kept out");
+        CHECK(!saves, "no limit written by this run (%ld saves)", saves);
+        if (variant == 3) {
+            CHECK(loads == 1 && deletes == 1 && updates == 1 &&
+                      logged("profile ocarina.exe had the game's limit of 60/1 from a run that did not close") &&
+                      logged("; removed, as before that run"),
+                  "the killed run's profile removed, with the hooks library loaded once");
+            CHECK(!own.exists && !*state(), "the profile and the line gone:\n%s", state());
+        } else {
+            CHECK(!loads && logged("rtss-profile.txt holds the game's limit of 60/1 for RivaTuner Statistics Server's "
+                                   "profile ocarina.exe from a run that did not close; NX2NAVI_RTSS=0 leaves the "
+                                   "profile as it is"),
+                  "read only: logged");
+            CHECK(own.exists && own.limit == 60 && state_has("\nrtss1 0 0 1 60 1 ocarina.exe\n"), "left:\n%s", state());
+        }
+        rtss_limit_restore();
+        show("closed");
+        prof_save();
+        return;
+    }
     ask(144000);
     poll();
     show("the next start");
@@ -1014,11 +1041,15 @@ static void kill_restart_as(int v) {
     if (v == 0) CHECK(!own.exists, "the profile is gone, as before the killed run");
     if (v == 1) CHECK(own.exists && own.limit == 30, "the player's 30");
     if (v == 2) CHECK(own.exists && own.limit == 75, "the player's 75");
-    CHECK(!*state(), "no state file:\n%s", state());
+    if (v == 3) CHECK(!own.exists, "the profile is gone, as before the killed run");
+    if (v == 4) CHECK(own.exists && own.limit == 60, "the killed run's 60 stays for a start with RTSS let in");
+    CHECK(v == 4 ? state_has("\nrtss1 0 0 1 60 1 ocarina.exe\n") : !*state(), "the state file:\n%s", state());
 }
 static void kill_restart(void) { kill_restart_as(0); }
 static void kill_restart_player(void) { kill_restart_as(1); }
 static void kill_restart_edited(void) { kill_restart_as(2); }
+static void kill_restart_framegen(void) { kill_restart_as(3); }
+static void kill_restart_setting(void) { kill_restart_as(4); }
 
 // A movie at 60 under a limit of 144: the want stays 144 (frame_rate.c frame_step_cap_ns) and RTSS's profile keeps it
 // with no write, while the game's pacer holds the movie at its rate; RTSS holds the game again at its end.
@@ -1095,6 +1126,8 @@ static const struct { const char *name; void (*run)(void); } scenarios[] = {
     {"kill_restart", kill_restart},
     {"kill_restart_player", kill_restart_player},
     {"kill_restart_edited", kill_restart_edited},
+    {"kill_restart_framegen", kill_restart_framegen},
+    {"kill_restart_setting", kill_restart_setting},
 };
 
 int main(int argc, char **argv) {

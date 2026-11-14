@@ -288,15 +288,18 @@ keeps per-core data without locks and relies on that, so the host models it (`ru
   times the limit in three new periods in a row (a period RTSS no longer moves counts neither way); the menu names the
   first and the last of these. Frame generation, the
   driver's low latency and `NX2NAVI_RTSS=0` keep RTSS out (`RTSS_OUT_*`): the profile gets back what it held before
-  the run changed it, and while RTSS is kept out its thread does not load the hooks library and only reads RTSS's own
-  settings for the game; a later limit (frame generation or low latency switched off) loads it and hands RTSS the limit
-  as usual, and `NX2NAVI_RTSS=0` keeps the thread read-only for the run. While RTSS lists the game the log names those
+  the run changed it, and while RTSS is kept out its thread does not load the hooks library (but for the one restore
+  below at the start) and only reads RTSS's own settings for the game; a later limit (frame generation or low latency
+  switched off) loads it and hands RTSS the limit as usual, and `NX2NAVI_RTSS=0` keeps the thread read-only for the
+  run. While RTSS lists the game the log names those
   settings (limit, frame time limit, scanline sync, display sync, Reflex sleep, passive wait) once per change. Every
   orderly exit puts the profile back as it was before the run (`rtss_limit_restore`), and no want reaches it after
   that. What the profile held is also kept in `rtss-profile.txt` next to the executable, one line per profile, written
   before the run's first change of it and removed once it is back: a start that finds a line left by a run that did
   not close (a kill, a hang, the device-lost watchdog, a crash or a fatal error, whose ends make no call into RTSS's
-  library: `rtss_limit_crash`) puts that profile back first, unless the player changed it since. A file that cannot be
+  library: `rtss_limit_crash`) puts that profile back first (`left_start`), unless the player changed it since; frame
+  generation and low latency, which keep RTSS out, have the hooks library loaded for that one restore, and a start with
+  `NX2NAVI_RTSS=0` leaves the profile and the line as they are and says so in the log. A file that cannot be
   written leaves the run as before, with a line in the log; profiles that versions before the file left with the
   game's limit cannot be told from the player's own.
 - Measuring pacing: `NX2NAVI_TRACE=present` logs a line per picture (the host present's interval, the game's present

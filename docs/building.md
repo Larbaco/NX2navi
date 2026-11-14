@@ -497,8 +497,8 @@ its rewrite and what a start does with a line a run that did not close left. Sta
 `rtss_limit.c` against a fake RTSS (its registry key, hooks library, profile files and shared memory) and runs each
 scenario in a process of its own, among them a want after the exit's restore and one the worker read before it, a
 worker polling without pause while the want switches, the registry and file calls a present must not make, and a run
-killed while RTSS held its limit followed by the next start, each in a process of its own. No GPU, no RTSS, no game
-files.
+killed while RTSS held its limit followed by the next start, each in a process of its own (a next start with a limit,
+with frame generation on and with `NX2NAVI_RTSS=0`). No GPU, no RTSS, no game files.
 
 A change to how the mixer applies volumes (`runtime/audio_mixer.c` `accumulate_ramp`, the voice and splitter paths
 of `audio_mixer_render`) or to what it owes the device after a stall (`ring_pull`, `audio_mixer_owed`) passes
