@@ -275,8 +275,9 @@ double frame_step_game_hz(void) {
 }
 
 // RivaTuner Statistics Server (rtss_limit.c) gets the same limit; while it limits this process the pacer holds the
-// frames only to LIMIT_FREE_MAX_HZ, the ceiling the game's code needs, so the two never stack, and it takes the limit
-// back once no picture went out for 200 ms (rtss_decide.h rtss_pace_period): a minimised window or a frame hold leaves
+// frames only to LIMIT_FREE_MAX_HZ, the ceiling the game's code needs, so the two do not stack, except at a limit of
+// 240 or unlimited, where the ceiling is RTSS's own period; and it takes the limit back once no picture went out for
+// 200 ms (rtss_decide.h rtss_pace_period): a minimised window or a frame hold leaves
 // RTSS no present to hold. While a movie plays the pacer holds the movie's rate and keeps its slots whatever RTSS does.
 // NX2NAVI_RTSS=0 and frame generation (RTSS would count the generated frames) keep it out, and so does a driver's low
 // latency while it is in effect (vk_lowlat.c): the driver holds the limit where the frame starts, and RTSS would hold

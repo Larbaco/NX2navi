@@ -330,7 +330,8 @@ static inline void rtss_why_text(char *out, size_t n, const RtssOut *o, int fail
 // gives RTSS nothing to hold, and a pacer that held nothing then let the quick menu run at the 640-700 fps that read
 // address 0 (frame_rate.c LIMIT_FREE_MAX_HZ). While RTSS holds, the ceiling's period and never 0: the frames RTSS lets
 // through come further apart than that, so pace() waits for none of them, and it still holds the game's frames to the
-// ceiling the game's code needs.
+// ceiling the game's code needs. The exception is a limit of 240, or unlimited, which RTSS gets as 240: there the
+// ceiling is RTSS's own period, and both may hold a frame.
 static inline uint64_t rtss_pace_period(int holds, int movie, uint64_t now_ns, uint64_t hosted_ns, uint64_t period,
                                         uint64_t ceiling) {
     uint64_t idle = now_ns > hosted_ns ? now_ns - hosted_ns : 0;

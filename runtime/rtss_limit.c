@@ -1,7 +1,8 @@
 // RivaTuner Statistics Server as the frame limiter (frame_rate.c frame_step_cap_ns): where RTSS is installed and running,
 // the frame limit goes into RTSS's profile for this executable and, while RTSS is seen holding the game to it, the
-// game's own pacer keeps only the 240-frame ceiling (rtss_decide.h rtss_pace_period), so there is one limiter.
-// Anywhere else, or when any step fails, the game's own limiter works as it always did.
+// game's own pacer keeps only the 240-frame ceiling (rtss_decide.h rtss_pace_period), so there is one limiter (at a
+// limit of 240 the ceiling is RTSS's own period). Anywhere else, or when any step fails, the game's own limiter works
+// as it always did.
 //
 // RTSS's hooks library (RTSSHooks64.dll in the folder its installer records under
 // HKLM\SOFTWARE\WOW6432Node\Unwinder\RTSS, InstallDir) exports the profile calls, loaded here at run time:
@@ -32,7 +33,8 @@
 // profile is back: an exit that skips the restore (a kill, a hang, the device-lost watchdog) leaves the line, and the
 // next start puts the profile back from it before it changes anything (left_start, restore_left), unless the player
 // changed the profile since; a start with NX2NAVI_RTSS=0 only logs it. A crash and a fatal error leave it to that start
-// too (rtss_limit_crash), with no call into RTSS's library from the failing process.
+// too (rtss_limit_crash), with no call into RTSS's library from the failing process, unless the file could not be
+// written: then they put the profile back as an orderly exit does, but not from the worker's own thread.
 //
 // NX2NAVI_RTSS=0 keeps RTSS out of it. Frame generation keeps it out too (RTSS counts every presented frame, the
 // generated ones included), and so does a driver's low latency (vk_lowlat.c), which holds the frames where they start.
@@ -167,8 +169,8 @@ static int write_limit(DWORD limit, DWORD denominator) {
     return l == limit && (!has_denominator || d == denominator) ? 1 : -1;
 }
 
-// The state file with this profile's line set to r, or removed for r NULL; the file goes once it holds no line. Worker
-// thread only, under lock. 1 when the file holds what was asked.
+// The state file with this profile's line set to r, or removed for r NULL; the file goes once it holds no line. Under
+// lock: the worker, or rtss_limit_restore's thread at the exit. 1 when the file holds what was asked.
 static int state_put(const RtssSaved *r) {
     if (state_off || !*state_path) return 0;
     uint64_t n = 0;
