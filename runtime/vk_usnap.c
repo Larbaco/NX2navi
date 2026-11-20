@@ -45,9 +45,10 @@ typedef struct Arena {
 } Arena;
 
 typedef struct { uint64_t lo, hi; } Rng;
-// dropped: 0, or the epoch of its first drop in the stream (vk_exec_epoch); epoch: of the write
+// dropped: 0, 1 (a GPU write in flight: dropped for every lookup), or the earliest place in the stream
+// (vk_exec_stream_pos) of a drop that ran; pos: the write's place in the stream
 typedef struct { uint64_t lo, hi, off, dropped; } Reg;
-typedef struct { uint64_t lo, hi, fence, epoch; } Wrote;
+typedef struct { uint64_t lo, hi, fence, pos; } Wrote;
 
 static struct {
     int mode;                   // rt_knob: 0 off, 1 on, 2 ab
@@ -63,6 +64,7 @@ static struct {
     int nwr, cwr;
     // since the last summary
     uint64_t subs, regions, bytes, copy_ns, hits, drops, inflight, refused, off_subs;
+    uint64_t chunk_drops;       // so far: GPU writes recorded by replay chunks that dropped copied ranges
 } U;
 
 static Arena *free_arenas;
@@ -258,6 +260,8 @@ static int wr_hits(uint64_t lo, uint64_t hi) {   // wr_prune ran: disjoint, sort
 
 static void summary(void) {
     if (U.subs + U.off_subs < 3600) return;
+    rt_log("vk_usnap: GPU writes recorded by replay chunks that dropped copied uniform ranges: %llu so far",
+           (unsigned long long)__atomic_load_n(&U.chunk_drops, __ATOMIC_RELAXED));
     double s = U.subs ? (double)U.subs : 1.0;
     char clears[512];   // among the GPU writes: the small buffer clears and the counter records they covered
     vk_exec_clear_stats(clears, sizeof clears);
@@ -397,6 +401,12 @@ static int adopt(const uint64_t *handles, int n) {
 
 void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
     if (!U.mode) U.mode = rt_knob("UBO_SNAPSHOT", "1") + 1;   // stored +1: 0 is "not read yet"
+    static int said;
+    if (!said && RT_KNOB_ON(U.mode - 1)) {
+        said = 1;
+        rt_log("vk_usnap: counting the GPU writes replay chunks record into copied uniform ranges: on (vk_usnap_drop; a "
+               "later chunk may bind the copy before such a drop runs)");
+    }
     free(U.owners), U.owners = NULL;
     U.on = 0, U.fence = fence;
     __atomic_add_fetch(&U.gen, 1, __ATOMIC_RELEASE);
@@ -476,7 +486,7 @@ int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferI
     if (i >= U.nreg) return 0;
     const Reg *r = &U.reg[i];
     uint64_t dropped = __atomic_load_n(&r->dropped, __ATOMIC_RELAXED);
-    if ((dropped && dropped <= vk_exec_epoch(0)) || addr < r->lo || addr + n > r->hi) return 0;
+    if ((dropped && dropped <= vk_exec_stream_pos()) || addr < r->lo || addr + n > r->hi) return 0;
     uint64_t off = r->off + (addr - r->lo);
     if (off % align) return 0;
     *out = (VkDescriptorBufferInfo){U.arena->buf, off, n};
@@ -487,26 +497,40 @@ int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferI
 
 static PlatMutex drop_lock = PLAT_MUTEX_INIT;   // the replay workers' shaders write storage at once
 
-// The replay workers (vk_exec.c NX2SARIA_REPLAY_PIPE) record a group's draws while the submitting thread goes on past
-// it: a drop holds from its place in the stream on (vk_exec_epoch), so a chunk does not see the drops of ops after its
-// group, and the submitting thread sees every one.
+// The replay workers (vk_exec.c) record the chunks of a group at once, and with NX2SARIA_REPLAY_PIPE the submitting
+// thread goes on past the group meanwhile. A drop holds from its place in the stream on (vk_exec_stream_pos): a lookup
+// sees the drops of the ops before it and not those of the chunks after it, in its group or later ones; the earliest
+// place is kept. A drop an earlier chunk has not run yet when a later chunk looks the range up is not seen, and the
+// later draw reads the copy instead of the earlier one's result: the chunks' drops into copied ranges are counted
+// (vk_usnap: lines) so that a scene where that can happen shows in the log. None did in Kokiri Forest, Hyrule Field
+// or Kakariko Village (2026-11-20): every drop into a copied range came from the submitting thread, which a group's
+// chunks never run beside in the stream (tests/usnap_order_check.c forces both orders).
 void vk_usnap_drop(uint64_t addr, uint64_t n) {
     if (!U.mode || !n) return;
-    uint64_t ep = vk_exec_epoch(1);
-    int lk = vk_exec_shared();
+    uint64_t pos = vk_exec_stream_pos();
+    int lk = vk_exec_shared(), hit = 0;
     if (lk) plat_mutex_lock(&drop_lock);
     if (U.nwr == U.cwr) U.wr = grow(U.wr, &U.cwr, sizeof *U.wr);
-    U.wr[U.nwr++] = (Wrote){addr, addr + n, U.fence, ep};
+    U.wr[U.nwr++] = (Wrote){addr, addr + n, U.fence, pos};
     if (U.on)
         for (int i = first_above(addr); i < U.nreg && U.reg[i].lo < addr + n; i++) {
             uint64_t dropped = __atomic_load_n(&U.reg[i].dropped, __ATOMIC_RELAXED);
-            if (!dropped || ep < dropped) {
+            hit = 1;
+            if (!dropped || pos < dropped) {
                 if (!dropped) U.drops++;
-                __atomic_store_n(&U.reg[i].dropped, ep, __ATOMIC_RELAXED);
+                __atomic_store_n(&U.reg[i].dropped, pos, __ATOMIC_RELAXED);
                 __atomic_add_fetch(&U.gen, 1, __ATOMIC_RELEASE);
             }
         }
     if (lk) plat_mutex_unlock(&drop_lock);
+    if (hit && vk_exec_in_chunk()) {
+        uint64_t k = __atomic_add_fetch(&U.chunk_drops, 1, __ATOMIC_RELAXED);
+        if (k <= 4)
+            rt_log("vk_usnap: a replay chunk's GPU write into %#llx+%#llx dropped a copied uniform range at stream place "
+                   "%llu.%llu (%llu so far): a later chunk may have bound the copy before it ran",
+                   (unsigned long long)addr, (unsigned long long)n, (unsigned long long)(pos >> 5),
+                   (unsigned long long)(pos & 31), (unsigned long long)k);
+    }
 }
 
 uint64_t vk_usnap_gen(void) { return __atomic_load_n(&U.gen, __ATOMIC_ACQUIRE); }
@@ -514,9 +538,9 @@ uint64_t vk_usnap_gen(void) { return __atomic_load_n(&U.gen, __ATOMIC_ACQUIRE); 
 // A GPU write of a submission not known to be complete touches [lo, hi). A linear scan: vk_usnap_drop appends after
 // wr_prune sorted the list, so wr_hits's binary search does not hold here; only called on rare paths.
 static int wr_overlaps(uint64_t lo, uint64_t hi) {
-    uint64_t ep = vk_exec_epoch(0);
+    uint64_t pos = vk_exec_stream_pos();
     for (int i = 0; i < U.nwr; i++)
-        if (U.wr[i].lo < hi && lo < U.wr[i].hi && U.wr[i].epoch <= ep) return 1;
+        if (U.wr[i].lo < hi && lo < U.wr[i].hi && U.wr[i].pos <= pos) return 1;
     return 0;
 }
 

@@ -15,6 +15,11 @@ static void rt_log(const char *fmt, ...) {
 #include "../runtime/mesh_pipeline_check.h"
 
 int main(void) {
+    mesh_pipeline_check_start(1);
+    if (lines != 1 || !strstr(last, "check: on")) return 5;
+    mesh_pipeline_check_start(0);
+    if (lines != 2 || !strstr(last, "check: off")) return 6;
+    lines = 0;
     int original = 7;
     const int *info = &original;
     mesh_pipeline_check_report(1);

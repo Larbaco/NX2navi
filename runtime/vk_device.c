@@ -22,6 +22,7 @@
 #include "vk_dlssg.h"
 #include "vk_dlssg_device.h"
 #include "vk_lowlat.h"
+#include "mesh_pipeline_check.h"
 #include "vk_mesh_path.h"
 
 // The loader's vkGetDeviceProcAddr until Streamline is on the device (see vk.h).
@@ -671,6 +672,7 @@ static int create_device(void) {
                    why);
         else if (path == MESH_PATH_NONE)
             rt_log("vk: mesh shaders: not supported and mesh_fallback = 0 (task/mesh draws are skipped)");
+        mesh_pipeline_check_start(path == MESH_PATH_EMULATION);
     }
     if (g_vk.has_maximal_reconvergence && !c->mrc.shaderMaximalReconvergence) g_vk.has_maximal_reconvergence = 0;
     if (g_vk.has_pipeline_binary && !(c->pbin.pipelineBinaries && c->m5.maintenance5)) g_vk.has_pipeline_binary = 0;

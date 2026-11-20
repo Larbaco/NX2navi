@@ -1,5 +1,5 @@
 // Exercise the real uniform snapshot drop, lookup and diagnostic paths concurrently without a GPU. The replay
-// epoch, pool lookup, hit accounting and platform lock are stand-ins; this does not test replay order or GPU fences.
+// stream position, pool lookup, hit accounting and platform lock are stand-ins; this does not test replay order or GPU fences.
 // Phase barriers make both threads progress between blocks without ordering their accesses within each block. They do
 // not force individual operations to interleave: an empty TSan report is not a proof of every schedule.
 #include <pthread.h>
@@ -13,13 +13,14 @@
 static pthread_mutex_t test_drop_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_barrier_t start;
 static _Atomic int failures;
-static _Thread_local uint64_t test_epoch = 2;
+static _Thread_local uint64_t test_pos = 64;   // the caller's place in the stream (vk_exec_stream_pos)
 
 // vk_usnap.c takes only drop_lock along the exercised paths. The other runtime boundaries do not need a device.
 void plat_mutex_lock(PlatMutex *m) { (void)m; pthread_mutex_lock(&test_drop_lock); }
 void plat_mutex_unlock(PlatMutex *m) { (void)m; pthread_mutex_unlock(&test_drop_lock); }
 int vk_exec_shared(void) { return 1; }
-uint64_t vk_exec_epoch(int write) { (void)write; return test_epoch; }
+uint64_t vk_exec_stream_pos(void) { return test_pos; }
+int vk_exec_in_chunk(void) { return 0; }
 void vk_exec_usnap_hit(void) {}
 int vk_mem_lookup(uint64_t addr, uint64_t size, VkMemSpan *out) { (void)addr; (void)size; (void)out; return 0; }
 void rt_fatal(const char *fmt, ...) { (void)fmt; abort(); }
@@ -83,12 +84,12 @@ int main(void) {
     if (vk_usnap_gen() != REGIONS || U.nwr != REGIONS || vk_usnap_why(BASE, 1) != VK_USNAP_DROPPED ||
         vk_usnap_why(BASE + (REGIONS - 1) * STEP, 1) != VK_USNAP_DROPPED || vk_usnap_find(BASE, 1, 1, &info))
         atomic_fetch_add(&failures, 1);
-    // A lookup at an earlier epoch may use the snapshot; at the drop's epoch it may not. why keeps its existing
-    // diagnostic behaviour and reports any drop, including one whose epoch is later than the caller's.
-    test_epoch = 1;
+    // A lookup before the drop's place in the stream may use the snapshot; at or after it, it may not. why keeps its
+    // existing diagnostic behaviour and reports any drop, including one later in the stream than the caller.
+    test_pos = 63;
     if (!vk_usnap_find(BASE, 1, 1, &info) || vk_usnap_why(BASE, 1) != VK_USNAP_DROPPED)
         atomic_fetch_add(&failures, 1);
-    test_epoch = 2;
+    test_pos = 64;
     if (vk_usnap_find(BASE, 1, 1, &info)) atomic_fetch_add(&failures, 1);
     int n = atomic_load(&failures);
     free(U.reg);

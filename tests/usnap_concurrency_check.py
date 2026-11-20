@@ -1,6 +1,6 @@
 """Build the real vk_usnap.c concurrency probe on Linux, with optional ThreadSanitizer.
 
-No game files or GPU are needed. The platform lock and replay epoch are test stand-ins, so this checks the actual
+No game files or GPU are needed. The platform lock and replay stream position are test stand-ins, so this checks the actual
 snapshot data structure's concurrent drop, find and why operations, not GPU synchronization or chunk stream order.
 The Vulkan and VMA headers are needed to compile the runtime's types. Phase barriers require both test threads to
 advance, but do not force a particular interleaving. The bench uses Clang 20; pass its path with --cc if needed.
