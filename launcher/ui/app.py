@@ -337,7 +337,7 @@ class GameRun:
             return False
         if self.proc is not None and self.proc.returncode == 0:
             self.restarted = True
-            self.proc = winsys.game_copy(Path(self.game_dir) / 'ocarina.exe', skip=self.proc.pid)
+            self.proc = winsys.game_copy(Path(self.game_dir) / build.GAME_EXE, skip=self.proc.pid)
         return True
 
     def end(self):
@@ -2103,7 +2103,7 @@ class App:
     def play(self, built=False):
         """built: the build for the mods' code (ModsRebuildJob) just ended, so the game starts without asking again."""
         gd = self.settings.get('game_dir')
-        exe = Path(gd) / 'ocarina.exe'
+        exe = Path(gd) / build.GAME_EXE
         if not exe.is_file():
             self.message = 'The game is not built yet.'
             self.render()
@@ -3177,7 +3177,7 @@ def play_only(ctx):
     Play starts it, and this process waits until it and the copies its own Restart starts have ended, so Steam shows
     the game as running all that time. None when there is no built game: the launcher's window opens instead."""
     gd = ctx.settings.get('game_dir')
-    exe = Path(gd) / 'ocarina.exe' if gd else None
+    exe = Path(gd) / build.GAME_EXE if gd else None
     if not exe or not exe.is_file():
         return None
     # The window or a command may run a job in the game folder meanwhile (a rebuild, an update's install, the mods'

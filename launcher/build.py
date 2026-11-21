@@ -9,6 +9,8 @@ import threading
 
 from . import winsys
 
+GAME_EXE = 'ocarina.exe' if os.name == 'nt' else 'ocarina'
+
 # Runs make_game.py with pydeps/ (zbic) and the script's folder first on sys.path; the embeddable Python's ._pth
 # file leaves both off.
 RUN = ('import os, runpy, sys; p = sys.argv[1]; s = sys.argv[2]; sys.argv = sys.argv[2:]; '
@@ -151,7 +153,7 @@ def _write_open_error(path):
     return 0
 
 
-def game_running(game_dir, exe='ocarina.exe', log=None):
+def game_running(game_dir, exe=GAME_EXE, log=None):
     """True when the built game runs from game_dir: Windows refuses to open a running exe for writing, with a sharing
     violation. A read-only exe (a copy restored from a backup or read-only media) is refused too, with access denied,
     though nothing runs it: its read-only attribute is cleared and the open tried again, as the next build replaces
@@ -195,7 +197,7 @@ def build_state(game_dir):
 def built_version(game_dir):
     """The kit version that last built the game folder ('' when none finished)."""
     st = build_state(game_dir)
-    if 'compile' in st.get('steps', {}) and os.path.isfile(os.path.join(str(game_dir), 'ocarina.exe')):
+    if 'compile' in st.get('steps', {}) and os.path.isfile(os.path.join(str(game_dir), GAME_EXE)):
         return st.get('kit', '')
     return ''
 
@@ -234,4 +236,4 @@ def installed(game_dir):
         return False
     if built_version(game_dir):
         return True
-    return os.path.isfile(os.path.join(str(game_dir), 'ocarina.exe')) and can_rebuild(game_dir)
+    return os.path.isfile(os.path.join(str(game_dir), GAME_EXE)) and can_rebuild(game_dir)

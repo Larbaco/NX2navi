@@ -1781,7 +1781,7 @@ def made_up_game(out, steps=('exefs', 'romfs', 'lift', 'compile', 'shaders'), ex
     (out / 'romfs' / 'romfs.bin').write_bytes(bytes(16))
     (out / 'romfs' / 'index.json').write_text('{}')
     if exe:
-        (out / 'ocarina.exe').write_bytes(b'MZ')
+        (out / ('ocarina.exe' if os.name == 'nt' else 'ocarina')).write_bytes(b'game executable')
     ident = 'nup X 1 1'
     keys = {s: f'{s}-1|{ident}' if s in ('exefs', 'romfs') else f'old-{s}' for s in steps}
     (out / 'build-cache' / 'state.json').write_text(json.dumps(
@@ -3608,7 +3608,7 @@ class MakeGameTest(Tmp):
         self.assertEqual(build.built_version(self.out), '')   # no finished build on record
         self.assertTrue(build.can_rebuild(self.out))
         self.assertTrue(build.installed(self.out))
-        (self.out / 'ocarina.exe').unlink()                  # a first install that stopped there has nothing to play
+        (self.out / build.GAME_EXE).unlink()                  # a first install that stopped there has nothing to play
         self.assertFalse(build.installed(self.out))
         self.assertFalse(build.installed(''))
         self.assertFalse(build.installed(None))
@@ -5463,6 +5463,17 @@ class SteamTest(Tmp):
 
 
 class WhilePlayingTest(Tmp):
+    def test_play_starts_the_native_game_executable(self):
+        exe = self.tmp / ('ocarina.exe' if os.name == 'nt' else 'ocarina')
+        exe.write_bytes(b'game executable')
+        App, a = mock_app(self, self.tmp)
+        a.game_run = None
+        with mock.patch('launcher.ui.app.saves.game_running', return_value=False), \
+                mock.patch('launcher.ui.app.commit.confirm_play_memory', return_value=True), \
+                mock.patch('launcher.ui.app.winsys.start_game') as start:
+            App.play(a, built=True)
+        start.assert_called_once_with(exe)
+
     def test_the_games_restart_does_not_bring_the_launcher_back(self):
         try:
             from launcher.ui import app
@@ -5476,7 +5487,7 @@ class WhilePlayingTest(Tmp):
         with mock.patch('launcher.ui.app.saves.game_running', return_value=True), \
                 mock.patch('launcher.ui.app.winsys.game_copy', return_value=None) as copy:
             App.watch_game(a)                                          # but the restarted game runs from the same exe
-        copy.assert_called_once_with(self.tmp / 'ocarina.exe', skip=11)
+        copy.assert_called_once_with(self.tmp / build.GAME_EXE, skip=11)
         a.root.deiconify.assert_not_called()
         a.root.after.assert_called_once()
         with mock.patch('launcher.ui.app.saves.game_running', return_value=False):
@@ -5698,7 +5709,7 @@ class WhilePlayingTest(Tmp):
         the launcher folder's lock held by another process when lock_held; (the context, the stand-in for tell, the
         log). self.start_game is the stand-in for winsys.start_game."""
         from launcher.ui import app
-        (self.tmp / 'ocarina.exe').write_bytes(b'MZ')
+        (self.tmp / ('ocarina.exe' if os.name == 'nt' else 'ocarina')).write_bytes(b'game executable')
         log = self.tmp / 'logs' / 'nx2navi.log'
         log.parent.mkdir(exist_ok=True)
         log.write_text(log_text, encoding='utf-8')
@@ -6064,7 +6075,7 @@ class UnfinishedUpdateTest(Tmp):
         App.start(a)
         a.show.assert_called_once_with('home')
         a.find_dumps.assert_not_called()
-        (game / 'ocarina.exe').unlink()   # nothing to play: an install that never finished asks for the dump
+        (game / build.GAME_EXE).unlink()   # nothing to play: an install that never finished asks for the dump
         App, a = self.app(game)
         App.start(a)
         a.show.assert_called_once_with('first_run')
