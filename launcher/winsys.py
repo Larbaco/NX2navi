@@ -552,10 +552,11 @@ def uninstall_script(gone, empty):
     return ' & '.join(steps)
 
 
-def uninstall(layout, remove_game='', log=print):
+def uninstall(layout, remove_game='', log=print, keep=()):
     """Remove the shortcuts, the uninstall entry and, once this process has exited, what the launcher put in its folder
     (and the game folder when remove_game names it). A kept game folder and its saves stay, also when it lies inside
-    the launcher's folder."""
+    the launcher's folder. keep: on Linux, paths that stay whatever folder holds them (the game folder when it is not
+    removed, the dump)."""
     stub_run(layout, ['--shortcuts', 'off'])
     gone, empty = uninstall_plan(layout, remove_game)
     if os.name == 'nt':
@@ -577,8 +578,20 @@ def uninstall(layout, remove_game='', log=print):
         if kept:
             log('uninstall: remove these yourself (their names hold %): ' + ', '.join(kept))
         start_detached(f'cmd.exe /c "{uninstall_script(gone, empty)}"', cwd=os.environ.get('TEMP', 'C:\\'))
-    else:
-        log('uninstall: remove these yourself: ' + ', '.join(str(p) for p in gone if p.exists()))
+    elif getattr(layout, 'dev', False):
+        log('uninstall: a checkout is not uninstalled; nothing was removed')
+    else:   # Linux: the AppImage's install, deleted by sh once this process has gone (platform/linux.py uninstall_plan)
+        from .platform import linux
+        if not linux.appimage_install(layout.root):
+            log(f'uninstall: {layout.root} holds no AppImage install; nothing was removed')
+            return
+        gone, empty, kept = linux.uninstall_plan(layout.root, remove_game, keep)
+        log('uninstall: removing once the window has closed: ' +
+            (', '.join(str(p) for p in gone if p.exists() or p.is_symlink()) or 'nothing'))
+        if kept:
+            log('uninstall: kept: ' + '; '.join(f'{p} ({why})' for p, why in kept))
+        start_detached(linux.uninstall_command(os.getpid(), gone, empty, Path(layout.logs) / 'launcher.log'),
+                       cwd='/')
 
 
 # ---------------------------------------------------------------- gamepad (XInput)

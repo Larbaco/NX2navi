@@ -273,8 +273,13 @@ def log_is_new(game_dir, started):
         return False
 
 
-LOG_WHERE = ('Its log is logs\\nx2saria.log (older builds: nx2navi.log).' if os.name == 'nt'
-             else 'Its log is logs/nx2saria.log (older builds: nx2navi.log).')
+def shown_path(*parts):
+    """A path inside the game folder as the player's system writes it, for the window's sentences: logs\\nx2saria.log
+    on Windows, logs/nx2saria.log elsewhere."""
+    return ('\\' if os.name == 'nt' else '/').join(parts)
+
+
+LOG_WHERE = f'Its log is {shown_path("logs", "nx2saria.log")} (older builds: nx2navi.log).'
 GameEnd = collections.namedtuple('GameEnd', 'log message note alarm')
 
 
@@ -1765,7 +1770,8 @@ class App:
         return [
             Row('value', 'Export Save', out.name or str(out), on=self.export_save, desc=export_desc),
             Row('toggle', 'Add Log and Settings', on=report, get=lambda: bool(self.settings.get('export_with_log')),
-                desc=('On: the zip also holds the game\'s latest log (logs\\nx2saria.log) and its settings '
+                desc=(f'On: the zip also holds the game\'s latest log ({shown_path("logs", "nx2saria.log")}) and its '
+                      'settings '
                       '(nx2saria.ini), which show what happened and with which settings. Existing installations may '
                       'still use nx2navi.log and nx2navi.ini. Keep it on for a bug report: '
                       'while the game has no save yet, Export Save then writes these two alone.',
@@ -1854,7 +1860,7 @@ class App:
             text = f'Save imported into {r["slot"]}.'
         else:
             text = f'Save imported: {r["files"]} files from {r["source"].name}.'
-        return text + (f' Your old save is in saves\\{r["backup"].name}.' if r['backup'] else '')
+        return text + (f' Your old save is in {shown_path("saves", r["backup"].name)}.' if r['backup'] else '')
 
     # ---- mods
 
@@ -2342,7 +2348,7 @@ class App:
             Row('divider'),
             Row('value', 'Game Folder', gd or 'Not chosen', on=lambda: gd and self.open(gd),
                 desc=('Open the game folder: saves in profile, settings in nx2saria.ini (or an existing nx2navi.ini), '
-                      'and logs in logs\\nx2saria.log.',)),
+                      f'and logs in {shown_path("logs", "nx2saria.log")}.',)),
             Row('value', 'Game Dump', Path(dump).name if dump else 'Not chosen', on=self.choose_dump,
                 desc=(f'The dump the game was built from: {dump}.' if dump else 'No dump chosen yet.',
                       'Select this row to choose another .nup file.')),
@@ -2422,7 +2428,10 @@ class App:
                       'Off: the game folder and your saves stay where they are.')),
             Row('divider'),
             Row('pair', actions=[('Uninstall', self.do_uninstall), ('Cancel', lambda: self.show('settings'))],
-                desc=('Uninstall removes NX2Saria, its build tools and its shortcuts. Your dump is never touched.',)),
+                desc=('Uninstall removes NX2Saria, its build tools and its shortcuts. Your dump is never touched.'
+                      + ('' if os.name == 'nt' else
+                         f' The launcher\'s logs stay in {self.layout.logs}. A Steam shortcut stays in Steam: '
+                         'remove it there.'),)),
         ]
 
     def do_uninstall(self):
@@ -2432,7 +2441,8 @@ class App:
             self.render()
             return
         self.ctx.log(f'uninstall (game folder too: {bool(gd)})')
-        winsys.uninstall(self.layout, gd, self.ctx.log)
+        keep = [self.settings.get('dump'), '' if gd else self.settings.get('game_dir')]
+        winsys.uninstall(self.layout, gd, self.ctx.log, keep=keep)
         self.root.destroy()
 
     # ---- jobs

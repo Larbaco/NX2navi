@@ -173,6 +173,135 @@ def ended_copies(exe, skip=None, proc_root='/proc', me=None, wait=None):
     return [code for _start, code in sorted(found)]
 
 
+# What the AppImage install (tools/appimage_install.py) puts in the launcher's folder besides data/: the start script
+# (_write_wrapper), the menu icon, the app versions, the Python runtime and the folders an install or an update leaves
+# while it swaps it, the Python packages and the build tools.
+APPIMAGE_OWNED = ('nx2saria-launcher', 'nx2saria-launcher.new', 'nx2saria.png', 'nx2saria.png.new', 'app', 'python',
+                  'python.new', 'python.old', 'python.failed', 'pydeps', 'toolchain')
+# What Uninstall keeps of data/: the launcher's logs, which the player may still want for a report.
+KEPT_DATA = ('logs',)
+
+
+def desktop_entry(env=None, home=None):
+    """The menu entry the AppImage writes (tools/appimage_install.py _write_desktop)."""
+    env = os.environ if env is None else env
+    home = Path.home() if home is None else Path(home)
+    value = env.get('XDG_DATA_HOME', '')
+    data_home = Path(value) if value and Path(value).is_absolute() else home / '.local' / 'share'
+    return data_home / 'applications' / 'nx2saria.desktop'
+
+
+def appimage_install(root):
+    """Whether root holds the AppImage's install: its start script or the record of what it installed
+    (tools/appimage_install.py _write_wrapper, _write_install_manifest). Uninstall deletes nothing elsewhere."""
+    root = Path(root)
+    return (root / 'nx2saria-launcher').is_file() or (root / 'data' / 'appimage-install.json').is_file()
+
+
+def _exec_line(wrapper):
+    """The Exec line tools/appimage_install.py _write_desktop writes for wrapper, quoted as tools/appimage_gui.py
+    exec_quote quotes it."""
+    out = str(wrapper)
+    for ch in '\\"`$':
+        out = out.replace(ch, '\\' + ch)
+    return 'Exec="' + out.replace('\\', '\\\\').replace('%', '%%') + '"'
+
+
+def _starts(entry, wrapper):
+    """Whether the menu entry entry starts the script wrapper: another install's entry is left alone."""
+    try:
+        text = entry.read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        return False
+    return _exec_line(wrapper) in text.splitlines()
+
+
+def _within(path, folder):
+    """Whether path is folder or lies inside it, by the paths as given and as resolved (a symbolic link on the way
+    makes the two differ)."""
+    pairs = [(Path(os.path.abspath(path)), Path(os.path.abspath(folder)))]
+    try:
+        pairs.append((Path(path).resolve(), Path(folder).resolve()))
+    except (OSError, RuntimeError):
+        return True
+    return any(p == f or f in p.parents for p, f in pairs)
+
+
+def _unsafe_game_folder(game, root, home):
+    """Why the folder game must not be deleted as the game folder, or '': it is or holds the launcher's folder or the
+    home folder, or it is a mount point (a drive's or a card's root)."""
+    if _within(root, game):
+        return "it holds the launcher's folder"
+    if _within(home, game):
+        return 'it holds the home folder'
+    try:
+        if os.path.ismount(game) or Path(game).resolve() == Path('/'):
+            return 'it is the root of a drive'
+    except (OSError, RuntimeError):
+        return 'it cannot be checked'
+    return ''
+
+
+def uninstall_plan(root, remove_game='', keep=(), entry=None, home=None):
+    """(paths to delete with all they hold, folders to delete only when that left them empty, (path, why) kept) for
+    the launcher's folder root. The game folder goes only when remove_game names it, and never when it holds the
+    launcher's folder or the home folder or is a drive's root (_unsafe_game_folder). data/logs stays (KEPT_DATA), and
+    so does every path that holds one of keep (the game folder when it stays, the dump) or lies in it: a game folder
+    inside data/ is not deleted with data/."""
+    root = Path(root)
+    home = Path.home() if home is None else Path(home)
+    entry = desktop_entry(home=home) if entry is None else Path(entry)
+    keep = [Path(k) for k in keep if k]
+    gone, kept = [], []
+    if remove_game:
+        why = _unsafe_game_folder(remove_game, root, home)
+        if why:
+            kept.append((Path(remove_game), f'the game folder, as {why}'))
+        else:
+            gone.append(Path(remove_game))
+    gone += [root / name for name in APPIMAGE_OWNED]
+    try:
+        gone += sorted(p for p in (root / 'data').iterdir() if p.name not in KEPT_DATA)
+    except OSError:
+        pass
+    kept += [(root / 'data' / name, "the launcher's logs") for name in KEPT_DATA if (root / 'data' / name).exists()]
+    if _starts(entry, root / 'nx2saria-launcher'):
+        gone += [entry, entry.with_name(entry.name + '.new')]
+    for path in list(gone):
+        held = next((k for k in keep if _within(k, path)), None)
+        if held is not None:
+            gone.remove(path)
+            kept.append((path, f'it holds {held}'))
+    return gone, [root / 'data', root], kept
+
+
+# Run by sh once the launcher has gone: $1 is its process id, $2 the launcher.log the last line goes to, then the paths
+# to delete, "--", and the folders to delete only when empty. The wait is cut at 30 s; a file the launcher still has
+# open is only unlinked, which Linux allows.
+UNINSTALL_SCRIPT = r"""pid=$1; log=$2; shift 2
+i=0
+while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 300 ]; do sleep 0.1; i=$((i + 1)); done
+n=0; failed=0
+while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do
+  if [ -e "$1" ] || [ -L "$1" ]; then
+    if rm -rf -- "$1"; then n=$((n + 1)); else failed=$((failed + 1)); fi
+  fi
+  shift
+done
+[ "$#" -gt 0 ] && shift
+for d in "$@"; do rmdir -- "$d" 2>/dev/null; done
+if [ -d "$(dirname -- "$log")" ]; then
+  printf '%s uninstall: removed %s paths after the window closed, %s could not be removed
+'     "$(date +%H:%M:%S)" "$n" "$failed" >> "$log"
+fi
+"""
+
+
+def uninstall_command(pid, gone, empty, log):
+    """The sh command line that deletes gone, then the empty folders of empty, once process pid has ended."""
+    return ['sh', '-c', UNINSTALL_SCRIPT, 'sh', str(pid), str(log), *map(str, gone), '--', *map(str, empty)]
+
+
 UDMABUF_MINIMUM_MB = 1024
 
 

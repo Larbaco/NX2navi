@@ -596,6 +596,20 @@ toolchain is left alone. The launcher's folder itself goes
 only when that leaves it empty. The built game and its saves stay unless "Remove the Built Game" is On, also when the
 game folder is the default `<launcher>\game`. The dump is never touched.
 
+On Linux, Settings > Uninstall NX2Saria removes what the AppImage install (`tools/appimage_install.py`) put in
+`~/.local/share/nx2saria` (`$XDG_DATA_HOME/nx2saria`): the `nx2saria-launcher` start script, the menu icon, `app`,
+`python` and the `python.*` folders an install leaves, `pydeps`, `toolchain` and `data` (with
+`data/appimage-install.json`) except `data/logs`; and the menu entry `applications/nx2saria.desktop` when it starts
+this install's script (`launcher/platform/linux.py` `APPIMAGE_OWNED`, `uninstall_plan`). An `sh` started beside the
+launcher deletes them once the window has closed and writes `uninstall: removed N paths after the window closed, M
+could not be removed` to the kept `launcher.log`. Before that the launcher logs `uninstall: removing once the window
+has closed: ...` and `uninstall: kept: <path> (<why>)`. As on Windows, the game folder and its saves stay unless
+"Remove the Built Game" is On. A game folder that holds the launcher's folder or the home folder, or is a drive's root,
+is never deleted, and a path that holds the kept game folder or the dump stays (a game folder inside `data/`, a dump
+inside the game folder). Nothing is deleted in a folder without the AppImage's install (`appimage_install`: no
+`nx2saria-launcher` and no `data/appimage-install.json`), nor in a checkout. The old AppImage's
+`~/.config/nx2saria/appimage.json`, which the AppImage only reads, and a Steam shortcut stay.
+
 ## Command line
 
 `launcher/cli.py` runs the same jobs without the window (`python -m launcher.cli`, or in an installed launcher

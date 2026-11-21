@@ -592,6 +592,159 @@ class UninstallTest(Tmp):
         self.assertIn('a', script)
 
 
+@unittest.skipUnless(sys.platform.startswith('linux'), 'the AppImage install and sh')
+class LinuxUninstallTest(Tmp):
+    """Uninstall of the AppImage's install (launcher/platform/linux.py uninstall_plan, uninstall_command): what
+    tools/appimage_install.py put in the launcher's folder and its menu entry go once the window has closed; the game
+    folder, its saves, the launcher's logs and what is not ours stay."""
+
+    def install(self, name="NX2Saria it's $mine 100%"):
+        """A made-up AppImage install in a folder whose name holds a space, a quote, a dollar and a percent sign, its
+        menu entry as the AppImage writes it, another install's entry, a game folder inside it and a file of the
+        player's; (root, home, entry, other entry)."""
+        home = self.tmp / 'home'
+        root = home / '.local' / 'share' / name
+        for rel in ('nx2saria-launcher', 'nx2saria.png', 'app/current.txt', 'app/0.21.1/VERSION',
+                    'python/bin/python3', 'python.old/bin/python3', 'pydeps/zbic/__init__.py', 'toolchain/x',
+                    'data/launcher.json', 'data/appimage-install.json', 'data/launcher.lock', 'data/cache/fonts/a',
+                    'data/downloads/a.part', 'data/logs/launcher.log', 'game/ocarina', 'game/saves/a.zip',
+                    'game/profile/save/1/save.dat', 'game/logs/nx2saria.log', 'mine.txt'):
+            p = root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text('x')
+        apps = home / '.local' / 'share' / 'applications'
+        apps.mkdir(parents=True)
+        entry, other = apps / 'nx2saria.desktop', apps / 'other' / 'nx2saria.desktop'
+        from appimage_gui import exec_quote   # tools/: how tools/appimage_install.py _write_desktop quotes it
+        entry.write_text(f'[Desktop Entry]\nType=Application\nName=NX2Saria\nExec={exec_quote(root / "nx2saria-launcher")}\n')
+        other.parent.mkdir()
+        other.write_text('[Desktop Entry]\nExec=/opt/elsewhere/nx2saria-launcher\n')
+        return root, home, entry, other
+
+    def left(self, root):
+        return sorted(p.relative_to(root).as_posix() for p in root.rglob('*'))
+
+    def test_the_plan_keeps_the_game_the_logs_and_what_is_not_ours(self):
+        from launcher.platform import linux
+        root, home, entry, other = self.install()
+        gone, empty, kept = linux.uninstall_plan(root, entry=entry, home=home)
+        self.assertEqual(empty, [root / 'data', root])
+        self.assertEqual(kept, [(root / 'data' / 'logs', "the launcher's logs")])
+        self.assertIn(entry.with_name('nx2saria.desktop.new'), gone)   # a write the AppImage left half done
+        for rel in ('nx2saria-launcher', 'nx2saria.png', 'app', 'python', 'python.old', 'pydeps', 'toolchain',
+                    'data/launcher.json', 'data/appimage-install.json', 'data/cache', 'data/downloads'):
+            self.assertIn(root / rel, gone)
+        self.assertIn(entry, gone)
+        for p in (root / 'game', root / 'data' / 'logs', root / 'mine.txt', root, other):
+            self.assertNotIn(p, gone)
+        self.assertNotIn(other, linux.uninstall_plan(root, entry=other, home=home)[0])   # another install's entry
+        gone, _, kept = linux.uninstall_plan(root, str(root / 'game'), entry=entry, home=home)
+        self.assertEqual(gone[0], root / 'game')
+        # a "game folder" that holds the launcher or the home folder, or a drive's root, stays
+        for folder, why in ((root, "it holds the launcher's folder"), (root.parent, "it holds the launcher's folder"),
+                            (home, "it holds the launcher's folder"), (Path('/'), "it holds the launcher's folder")):
+            gone, _, kept = linux.uninstall_plan(root, str(folder), entry=entry, home=home)
+            self.assertNotIn(folder, gone)
+            self.assertEqual(kept[0], (folder, f'the game folder, as {why}'))
+        elsewhere, homes = self.tmp / 'xdg' / 'nx2saria', self.tmp / 'homes'   # XDG_DATA_HOME outside the home folder
+        elsewhere.mkdir(parents=True)
+        (homes / 'ana').mkdir(parents=True)
+        gone, _, kept = linux.uninstall_plan(elsewhere, str(homes), entry=entry, home=homes / 'ana')
+        self.assertNotIn(homes, gone)
+        self.assertEqual(kept[0], (homes, 'the game folder, as it holds the home folder'))
+        link = self.tmp / 'link'                                           # the same folder through a link
+        link.symlink_to(root.parent)
+        self.assertNotIn(link, linux.uninstall_plan(root, str(link), entry=entry, home=home)[0])
+
+    def test_what_the_player_keeps_stays_whatever_holds_it(self):
+        """The game folder when it stays and the dump are kept even inside a folder Uninstall deletes: a game folder
+        in data/ or toolchain/, a dump inside the game folder being removed."""
+        from launcher.platform import linux
+        root, home, entry, _ = self.install()
+        (root / 'data' / 'game').mkdir()
+        gone, _, kept = linux.uninstall_plan(root, keep=[root / 'data' / 'game', root / 'toolchain' / 'x'],
+                                             entry=entry, home=home)
+        self.assertNotIn(root / 'data' / 'game', gone)
+        self.assertNotIn(root / 'toolchain', gone)
+        self.assertIn((root / 'toolchain', f'it holds {root / "toolchain" / "x"}'), kept)
+        self.assertIn(root / 'data' / 'cache', gone)
+        dump = root / 'game' / 'OoT.nup'
+        gone, _, kept = linux.uninstall_plan(root, str(root / 'game'), keep=[dump], entry=entry, home=home)
+        self.assertNotIn(root / 'game', gone)
+        self.assertIn((root / 'game', f'it holds {dump}'), kept)
+
+    def test_the_script_waits_for_the_launcher_then_deletes(self):
+        from launcher.platform import linux
+        root, home, entry, other = self.install()
+        gone, empty, _ = linux.uninstall_plan(root, entry=entry, home=home)
+        launcher = subprocess.Popen(['sleep', '1'])                  # stands in for the launcher's process
+        waiter = threading.Thread(target=launcher.wait)
+        waiter.start()
+        started = time.monotonic()
+        subprocess.run(linux.uninstall_command(launcher.pid, gone, empty, root / 'data' / 'logs' / 'launcher.log'),
+                       check=True, timeout=60)
+        waiter.join()
+        self.assertGreater(time.monotonic() - started, 0.8)          # nothing went while the launcher ran
+        self.assertEqual(self.left(root), ['data', 'data/logs', 'data/logs/launcher.log', 'game', 'game/logs',
+                                           'game/logs/nx2saria.log', 'game/ocarina', 'game/profile',
+                                           'game/profile/save', 'game/profile/save/1', 'game/profile/save/1/save.dat',
+                                           'game/saves', 'game/saves/a.zip', 'mine.txt'])
+        self.assertFalse(entry.exists())
+        self.assertTrue(other.is_file())
+        self.assertRegex((root / 'data' / 'logs' / 'launcher.log').read_text(),
+                         r'\d\d:\d\d:\d\d uninstall: removed 13 paths after the window closed, 0 could not be '
+                         r'removed\n$')
+
+    def test_uninstall_with_the_game_leaves_nothing_of_ours(self):
+        """winsys.uninstall from a process that then exits, as the window's Uninstall does: the delete starts on its
+        own, and with Remove the Built Game the game goes too; the logs stay and say what happened."""
+        root, home, entry, other = self.install()
+        (root / 'mine.txt').unlink()
+        start = ('import sys, types\nfrom pathlib import Path\nfrom launcher import winsys\n'
+                 'root = Path(sys.argv[1])\n'
+                 'layout = types.SimpleNamespace(root=root, logs=root / "data" / "logs", dev=False, '
+                 'stub=root / "none", toolchain=root / "toolchain")\n'
+                 'log = root / "data" / "logs" / "launcher.log"\n'
+                 'def line(text):\n'
+                 '    with open(log, "a") as f:\n'
+                 '        f.write(text + "\\n")\n'
+                 'winsys.uninstall(layout, sys.argv[2], line)\n')
+        env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HOME': str(home),
+               'XDG_DATA_HOME': str(home / '.local' / 'share')}
+        subprocess.run([sys.executable, '-c', start, str(root), str(root / 'game')], cwd=ROOT, env=env, check=True,
+                       timeout=60)
+        log = root / 'data' / 'logs' / 'launcher.log'
+        deadline = time.time() + 30
+        while time.time() < deadline and 'uninstall: removed' not in log.read_text():
+            time.sleep(0.1)
+        text = log.read_text()
+        self.assertIn('uninstall: removing once the window has closed: ', text)
+        self.assertIn(f'uninstall: kept: {root / "data" / "logs"} (the launcher\'s logs)\n', text)
+        self.assertIn('uninstall: removed 14 paths after the window closed, 0 could not be removed', text)
+        self.assertEqual(self.left(root), ['data', 'data/logs', 'data/logs/launcher.log'])
+        self.assertFalse(entry.exists())
+        self.assertTrue(other.is_file())
+
+    def test_a_folder_without_the_appimage_install_is_left_alone(self):
+        from types import SimpleNamespace
+        root = self.tmp / 'release'
+        (root / 'app').mkdir(parents=True)
+        lines = []
+        with mock.patch('launcher.winsys.start_detached') as detached:
+            winsys.uninstall(SimpleNamespace(root=root, logs=root / 'data' / 'logs', dev=False, stub=root / 'none',
+                                             toolchain=root / 'toolchain'), '', lines.append)
+        detached.assert_not_called()
+        self.assertEqual(lines, [f'uninstall: {root} holds no AppImage install; nothing was removed'])
+        self.assertTrue((root / 'app').is_dir())
+
+    def test_a_checkout_is_not_uninstalled(self):
+        lines = []
+        with mock.patch('launcher.winsys.start_detached') as detached:
+            winsys.uninstall(Layout(root=self.tmp / 'w', app=ROOT), '', lines.append)
+        detached.assert_not_called()
+        self.assertEqual(lines, ['uninstall: a checkout is not uninstalled; nothing was removed'])
+
+
 # ---------------------------------------------------------------- toolchain
 
 class ToolchainTest(Tmp):

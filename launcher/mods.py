@@ -154,8 +154,9 @@ class Mod:
                         'the one you want into the mods folder.')
             if self.other_version:
                 return 'Its code patches are for another version of the game, not 1.1.1.'
+            atmosphere = ('\\' if os.name == 'nt' else '/').join(('atmosphere', 'contents', mod_files.TITLE, 'romfs'))
             return ('It holds nothing the game reads: a mod\'s files go into a romfs, exefs or cheats folder (or '
-                    'atmosphere\\contents\\' + mod_files.TITLE + '\\romfs).')
+                    f'{atmosphere}).')
         return ''
 
 
